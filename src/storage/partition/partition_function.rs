@@ -1,6 +1,7 @@
+use crate::types::array::ColumnArray;
 use crate::types::scalar::ScalarValue;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PartitionFunction {
     Day,
     Year,
@@ -153,6 +154,38 @@ fn date_parts_from_scalar(val: &ScalarValue) -> Option<DateParts> {
     }
 }
 
+/// Like [`temporal_partition_key`], but without the epoch-micros fallback for
+/// bare integers: a bound that is not a valid YYYYMMDD-style date number (for
+/// example a `deal_time` wall-clock value like `930`, or an invalid date such
+/// as `20261000`) yields `None`. Range-pruning callers treat `None` as "no
+/// bound on this side" so a misparsed literal can never eliminate partitions.
+pub fn strict_temporal_partition_key(
+    func: &PartitionFunction,
+    val: &ScalarValue,
+) -> Option<String> {
+    let parts = match val {
+        ScalarValue::Timestamp(Some(v)) => date_parts_from_epoch_micros(*v),
+        ScalarValue::Date(Some(days)) => date_parts_from_epoch_days(*days as i64),
+        ScalarValue::Int32(Some(v)) => date_parts_from_date_number(*v as i64)?,
+        ScalarValue::Int64(Some(v)) => date_parts_from_date_number(*v)?,
+        ScalarValue::UInt32(Some(v)) => date_parts_from_date_number(*v as i64)?,
+        ScalarValue::UInt64(Some(v)) if *v <= i64::MAX as u64 => {
+            date_parts_from_date_number(*v as i64)?
+        }
+        ScalarValue::VarChar(Some(s)) => date_parts_from_str(s)?,
+        _ => return None,
+    };
+    match func {
+        PartitionFunction::Day => Some(format!(
+            "{:04}{:02}{:02}",
+            parts.year, parts.month, parts.day
+        )),
+        PartitionFunction::Month => Some(format!("{:04}{:02}", parts.year, parts.month)),
+        PartitionFunction::Year => Some(format!("{:04}", parts.year)),
+        _ => None,
+    }
+}
+
 fn date_parts_from_str(s: &str) -> Option<DateParts> {
     let trimmed = s.trim();
     if trimmed.len() >= 10 && trimmed.as_bytes().get(4) == Some(&b'-') {
@@ -244,3 +277,342 @@ fn date_parts_from_epoch_days(days: i64) -> DateParts {
         day: d as u32,
     }
 }
+
+/// Read the raw numeric value of a timestamp/date/time/integer column as
+/// i64, for memoization. `None` for NULL rows and for non-numeric column
+/// types (which never take the memo path). `UInt64` is excluded: wrapping
+/// `as i64` could make two distinct values share a memo entry.
+pub fn numeric_memo_value_at(column: &ColumnArray, row: usize) -> Option<i64> {
+    if column.bitmap().is_null(row) {
+        return None;
+    }
+    match column {
+        ColumnArray::Timestamp { data, .. }
+        | ColumnArray::Time { data, .. }
+        | ColumnArray::Int64 { data, .. } => data.get(row).copied(),
+        ColumnArray::Date { data, .. } | ColumnArray::Int32 { data, .. } => {
+            data.get(row).map(|v| *v as i64)
+        }
+        ColumnArray::UInt32 { data, .. } => data.get(row).map(|v| *v as i64),
+        _ => None,
+    }
+}
+
+fn temporal_key_from_parts(func: &PartitionFunction, parts: Option<DateParts>) -> String {
+    let Some(parts) = parts else {
+        return String::new();
+    };
+    match func {
+        PartitionFunction::Day => format!("{:04}{:02}{:02}", parts.year, parts.month, parts.day),
+        PartitionFunction::Month => format!("{:04}{:02}", parts.year, parts.month),
+        PartitionFunction::Year => format!("{:04}", parts.year),
+        _ => String::new(),
+    }
+}
+
+fn mod_key(v: i64, divisor: i32) -> String {
+    if divisor > 0 {
+        v.rem_euclid(divisor as i64).to_string()
+    } else {
+        "0".to_string()
+    }
+}
+
+/// Compute the partition key directly from typed column storage, producing
+/// exactly the same string as `compute_partition_key_from_scalar(func,
+/// &column.scalar(row))` without constructing the intermediate ScalarValue
+/// (a per-row enum plus a String clone inside `to_text`). Column types
+/// without a typed arm fall back to the scalar function; the
+/// `partition_key_at_matches_scalar` test pins the equivalence.
+pub fn compute_partition_key_at(
+    func: &PartitionFunction,
+    column: &ColumnArray,
+    row: usize,
+) -> String {
+    if column.bitmap().is_null(row) {
+        // Mirrors the scalar `None` arms: Hash/Mod yield 0, temporal and
+        // Value yield an empty key.
+        return match func {
+            PartitionFunction::Hash(_) | PartitionFunction::Mod(_) => "0".to_string(),
+            _ => String::new(),
+        };
+    }
+    match column {
+        ColumnArray::Timestamp { data, .. } => {
+            let v = data[row];
+            match func {
+                PartitionFunction::Day | PartitionFunction::Month | PartitionFunction::Year => {
+                    temporal_key_from_parts(func, Some(date_parts_from_epoch_micros(v)))
+                }
+                PartitionFunction::Hash(_) => func.apply(v).to_string(),
+                PartitionFunction::Mod(divisor) => mod_key(v, *divisor),
+                PartitionFunction::Value => v.to_string(),
+            }
+        }
+        ColumnArray::Date { data, .. } => {
+            let v = data[row] as i64;
+            match func {
+                PartitionFunction::Day | PartitionFunction::Month | PartitionFunction::Year => {
+                    temporal_key_from_parts(func, Some(date_parts_from_epoch_days(v)))
+                }
+                PartitionFunction::Hash(_) => func.apply(v).to_string(),
+                PartitionFunction::Mod(divisor) => mod_key(v, *divisor),
+                PartitionFunction::Value => v.to_string(),
+            }
+        }
+        ColumnArray::Time { data, .. } => {
+            let v = data[row];
+            match func {
+                PartitionFunction::Day | PartitionFunction::Month | PartitionFunction::Year => {
+                    String::new()
+                }
+                PartitionFunction::Hash(_) => func.apply(v).to_string(),
+                PartitionFunction::Mod(divisor) => mod_key(v, *divisor),
+                PartitionFunction::Value => v.to_string(),
+            }
+        }
+        ColumnArray::Int64 { data, .. } => {
+            let v = data[row];
+            match func {
+                PartitionFunction::Day | PartitionFunction::Month | PartitionFunction::Year => {
+                    temporal_key_from_parts(
+                        func,
+                        date_parts_from_date_number(v).or_else(|| {
+                            Some(date_parts_from_epoch_micros(normalize_epoch_to_micros(v)))
+                        }),
+                    )
+                }
+                PartitionFunction::Hash(_) => func.apply(v).to_string(),
+                PartitionFunction::Mod(divisor) => mod_key(v, *divisor),
+                PartitionFunction::Value => v.to_string(),
+            }
+        }
+        ColumnArray::Int32 { data, .. } => {
+            let v = data[row] as i64;
+            match func {
+                PartitionFunction::Day | PartitionFunction::Month | PartitionFunction::Year => {
+                    temporal_key_from_parts(
+                        func,
+                        date_parts_from_date_number(v).or_else(|| {
+                            Some(date_parts_from_epoch_micros(normalize_epoch_to_micros(v)))
+                        }),
+                    )
+                }
+                PartitionFunction::Hash(_) => func.apply(v).to_string(),
+                PartitionFunction::Mod(divisor) => mod_key(v, *divisor),
+                PartitionFunction::Value => v.to_string(),
+            }
+        }
+        ColumnArray::UInt32 { data, .. } => {
+            let v = data[row];
+            match func {
+                PartitionFunction::Day | PartitionFunction::Month | PartitionFunction::Year => {
+                    temporal_key_from_parts(
+                        func,
+                        date_parts_from_date_number(v as i64).or_else(|| {
+                            Some(date_parts_from_epoch_micros(normalize_epoch_to_micros(
+                                v as i64,
+                            )))
+                        }),
+                    )
+                }
+                PartitionFunction::Hash(buckets) => if *buckets > 0 {
+                    (v % *buckets as u32) as i64
+                } else {
+                    0
+                }
+                .to_string(),
+                PartitionFunction::Mod(divisor) => if *divisor > 0 {
+                    (v % *divisor as u32) as i64
+                } else {
+                    0
+                }
+                .to_string(),
+                PartitionFunction::Value => v.to_string(),
+            }
+        }
+        ColumnArray::UInt64 { data, .. } => {
+            let v = data[row];
+            match func {
+                PartitionFunction::Day | PartitionFunction::Month | PartitionFunction::Year => {
+                    temporal_key_from_parts(
+                        func,
+                        (v <= i64::MAX as u64)
+                            .then(|| {
+                                let signed = v as i64;
+                                date_parts_from_date_number(signed).or_else(|| {
+                                    Some(date_parts_from_epoch_micros(normalize_epoch_to_micros(
+                                        signed,
+                                    )))
+                                })
+                            })
+                            .flatten(),
+                    )
+                }
+                PartitionFunction::Hash(buckets) => if *buckets > 0 {
+                    (v % *buckets as u64) as i64
+                } else {
+                    0
+                }
+                .to_string(),
+                PartitionFunction::Mod(divisor) => if *divisor > 0 {
+                    (v % *divisor as u64) as i64
+                } else {
+                    0
+                }
+                .to_string(),
+                PartitionFunction::Value => v.to_string(),
+            }
+        }
+        ColumnArray::VarChar { data, .. } => {
+            let value = data.value(row);
+            match func {
+                PartitionFunction::Day | PartitionFunction::Month | PartitionFunction::Year => {
+                    temporal_key_from_parts(func, date_parts_from_str(value))
+                }
+                PartitionFunction::Hash(_) => func.apply_str(value).to_string(),
+                PartitionFunction::Mod(divisor) => {
+                    if *divisor > 0 {
+                        value
+                            .trim()
+                            .parse::<i64>()
+                            .map(|v| v.rem_euclid(*divisor as i64))
+                            .unwrap_or(0)
+                            .to_string()
+                    } else {
+                        "0".to_string()
+                    }
+                }
+                PartitionFunction::Value => value.to_string(),
+            }
+        }
+        _ => compute_partition_key_from_scalar(func, &column.scalar(row)),
+    }
+}
+
+/// Mirror of `ScalarValue::to_text` for the value at `row` (NULL becomes an
+/// empty string, matching `to_text().unwrap_or_default()`).
+pub fn value_text_at(column: &ColumnArray, row: usize) -> String {
+    if column.bitmap().is_null(row) {
+        return String::new();
+    }
+    match column {
+        ColumnArray::Selected { .. } | ColumnArray::Rle { .. } => {
+            value_text_at(column.flattened(), row)
+        }
+        ColumnArray::Dictionary {
+            ids, dict, bitmap, ..
+        } => {
+            if bitmap.is_null(row) {
+                String::new()
+            } else {
+                dict.get(ids[row] as usize).unwrap_or("").to_string()
+            }
+        }
+        ColumnArray::Bool { data, .. } => {
+            if data[row] != 0 {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        ColumnArray::Int8 { data, .. } => data[row].to_string(),
+        ColumnArray::Int16 { data, .. } => data[row].to_string(),
+        ColumnArray::Int32 { data, .. } | ColumnArray::Date { data, .. } => data[row].to_string(),
+        ColumnArray::Int64 { data, .. }
+        | ColumnArray::Decimal { data, .. }
+        | ColumnArray::Time { data, .. }
+        | ColumnArray::Timestamp { data, .. }
+        | ColumnArray::Interval { data, .. } => data[row].to_string(),
+        ColumnArray::UInt8 { data, .. } => data[row].to_string(),
+        ColumnArray::UInt16 { data, .. } => data[row].to_string(),
+        ColumnArray::UInt32 { data, .. } => data[row].to_string(),
+        ColumnArray::UInt64 { data, .. } => data[row].to_string(),
+        ColumnArray::Float32 { data, .. } => data[row].to_string(),
+        ColumnArray::Float64 { data, .. } => data[row].to_string(),
+        ColumnArray::VarChar { data, .. } => data.value(row).to_string(),
+        ColumnArray::Blob { data, .. } => format!("{:?}", &data[row]),
+        ColumnArray::Vector { data, .. } => format!("{:?}", &data[row]),
+    }
+}
+
+/// Which key derivation [`PartitionKeysAt`] applies.
+#[derive(Debug, Clone, Copy)]
+pub enum PartitionKeyKind {
+    /// A full `PartitionFunction` (Day/Year/Month/Hash/Mod/Value).
+    Strategy(PartitionFunction),
+    /// `PartitionType::Value`: the display text of the raw value.
+    ValueText,
+}
+
+/// Memoized partition-key computation over one column. Runs of rows sharing
+/// the same raw partition value (the common time-series case) reuse the last
+/// key instead of formatting a new `String` per row.
+pub struct PartitionKeysAt<'a> {
+    kind: PartitionKeyKind,
+    column: &'a ColumnArray,
+    memo_eligible: bool,
+    primed: bool,
+    cache_raw: Option<i64>,
+    cache_key: String,
+    /// Holds keys for rows that cannot refresh the memo (NULL rows), so the
+    /// memo-hit `cache_key` never gets overwritten with a foreign row's key.
+    scratch_key: String,
+}
+
+impl<'a> PartitionKeysAt<'a> {
+    pub fn new(kind: PartitionKeyKind, column: &'a ColumnArray) -> Self {
+        let memo_eligible = matches!(
+            column,
+            ColumnArray::Timestamp { .. }
+                | ColumnArray::Time { .. }
+                | ColumnArray::Int64 { .. }
+                | ColumnArray::Int32 { .. }
+                | ColumnArray::Date { .. }
+                | ColumnArray::UInt32 { .. }
+        );
+        Self {
+            kind,
+            column,
+            memo_eligible,
+            primed: false,
+            cache_raw: None,
+            cache_key: String::new(),
+            scratch_key: String::new(),
+        }
+    }
+
+    /// Key for `row`; the returned slice is valid until the next call.
+    pub fn key_at(&mut self, row: usize) -> &str {
+        if self.memo_eligible {
+            let raw = numeric_memo_value_at(self.column, row);
+            if self.primed && raw.is_some() && raw == self.cache_raw {
+                return &self.cache_key;
+            }
+            if raw.is_some() {
+                self.cache_raw = raw;
+                self.primed = true;
+                self.cache_key = self.compute_key(row);
+                return &self.cache_key;
+            }
+            // NULL row: the memo stays primed for the previous raw value, so
+            // the key must not land in `cache_key` (a later memo hit would
+            // return this NULL row's key).
+            self.scratch_key = self.compute_key(row);
+            return &self.scratch_key;
+        }
+        self.cache_key = self.compute_key(row);
+        &self.cache_key
+    }
+
+    fn compute_key(&self, row: usize) -> String {
+        match self.kind {
+            PartitionKeyKind::Strategy(func) => compute_partition_key_at(&func, self.column, row),
+            PartitionKeyKind::ValueText => value_text_at(self.column, row),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "partition_function_test.rs"]
+mod tests;

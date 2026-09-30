@@ -30,6 +30,12 @@ pub(crate) fn bulk_compression_level() -> i32 {
     crate::common::config::bulk_zstd_level()
 }
 
+/// Effective zstd level for a table: the per-table `COMPRESSION_LEVEL` DDL
+/// override when set, otherwise the global configured level.
+pub(crate) fn resolve_compression_level(override_level: Option<i32>) -> i32 {
+    override_level.unwrap_or_else(bulk_compression_level)
+}
+
 /// Reader/meta cache capacity, installed from `storage.reader_cache_capacity`
 /// in the config file during server startup.
 pub(super) fn reader_cache_capacity() -> usize {

@@ -70,7 +70,7 @@ fn full_memtables_flush_while_write_queue_stays_active() -> Result<()> {
     std::fs::create_dir_all(&table_dir)?;
     let schema = test_schema();
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-    let mut writer = BatchWriter::new(test_config(4), Arc::clone(&segment_mgr));
+    let mut writer = BatchWriter::new(test_config(4), Arc::clone(&segment_mgr), None);
 
     for batch_idx in 0..64 {
         writer.write_columns(
@@ -79,6 +79,7 @@ fn full_memtables_flush_while_write_queue_stays_active() -> Result<()> {
             "20251231",
             make_batch(&schema, batch_idx * 4, 4)?,
             schema.clone(),
+            true,
         )?;
     }
 
@@ -88,6 +89,10 @@ fn full_memtables_flush_while_write_queue_stays_active() -> Result<()> {
     {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+
+    // The write queue drains asynchronously; pull this table's remaining
+    // memtable buffers into segments synchronously before counting rows.
+    writer.flush_table(TEST_DB, TEST_TABLE)?;
 
     assert_eq!(
         crate::storage::core::durable_tail::generation_file_count(&table_dir)?,
@@ -105,7 +110,7 @@ fn tail_file_pressure_forces_table_flush() -> Result<()> {
     std::fs::create_dir_all(&table_dir)?;
     let schema = test_schema();
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
 
     for partition in 0..4 {
         writer.write_columns(
@@ -114,6 +119,7 @@ fn tail_file_pressure_forces_table_flush() -> Result<()> {
             &partition.to_string(),
             make_batch(&schema, partition, 1)?,
             schema.clone(),
+            true,
         )?;
     }
     assert_eq!(
@@ -125,6 +131,7 @@ fn tail_file_pressure_forces_table_flush() -> Result<()> {
         &segment_mgr,
         writer.memtable_manager(),
         &writer.tail_committer,
+        writer.flush_gate_for_test(),
         4,
     )?;
 
@@ -148,16 +155,16 @@ fn durable_flushes_share_one_active_segment() -> Result<()> {
 
     let schema = test_schema();
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-    let mut writer = BatchWriter::new(test_config(4), Arc::clone(&segment_mgr));
+    let mut writer = BatchWriter::new(test_config(4), Arc::clone(&segment_mgr), None);
 
     for batch_idx in 0..3 {
         let batch = make_batch(&schema, batch_idx * 4, 4)?;
-        writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+        writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone(), true)?;
         writer.flush_table(TEST_DB, TEST_TABLE)?;
     }
     // A final partial memtable also lands in the same active segment.
     let batch = make_batch(&schema, 12, 2)?;
-    writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+    writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone(), true)?;
     writer.flush_table(TEST_DB, TEST_TABLE)?;
     writer.stop();
 
@@ -183,9 +190,9 @@ fn crash_before_flush_replays_tail_exactly_once() -> Result<()> {
 
     {
         let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-        let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+        let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
         let batch = make_batch(&schema, 100, 5)?;
-        writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+        writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone(), true)?;
         // No flush: stop only halts the background threads, leaving the
         // group-committed tail behind like a crash would.
         writer.stop();
@@ -194,7 +201,7 @@ fn crash_before_flush_replays_tail_exactly_once() -> Result<()> {
     assert_eq!(total_segment_rows(&table_dir), 0);
 
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
     let recovered = crate::storage::core::durable_tail::recover(&table_dir, &schema)?;
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].batch.num_rows(), 5);
@@ -228,9 +235,9 @@ fn crash_after_segment_append_suppresses_tail_replay() -> Result<()> {
     let schema = test_schema();
 
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
     let batch = make_batch(&schema, 200, 6)?;
-    writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+    writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone(), true)?;
     writer.flush_table(TEST_DB, TEST_TABLE)?;
     writer.stop();
     assert_eq!(total_segment_rows(&table_dir), 6);
@@ -271,9 +278,9 @@ fn crash_mid_append_replays_tail() -> Result<()> {
     let schema = test_schema();
 
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
     let batch = make_batch(&schema, 300, 3)?;
-    writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+    writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone(), true)?;
     writer.flush_table(TEST_DB, TEST_TABLE)?;
     writer.stop();
     assert_eq!(total_segment_rows(&table_dir), 3);
@@ -308,10 +315,10 @@ fn memory_pressure_spills_memtable_then_flush_materializes() -> Result<()> {
     std::fs::create_dir_all(&table_dir)?;
     let schema = test_schema();
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
 
     let batch = make_batch(&schema, 0, 5)?;
-    writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+    writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone(), true)?;
     assert!(writer.memtable_manager().total_estimated_memory_bytes() > 0);
 
     // A 1-byte high-water mark forces the pass to spill everything.
@@ -351,7 +358,7 @@ fn spilled_memtable_serves_reads_and_new_inserts() -> Result<()> {
     std::fs::create_dir_all(&table_dir)?;
     let schema = test_schema();
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
 
     writer.write_columns(
         TEST_DB,
@@ -359,6 +366,7 @@ fn spilled_memtable_serves_reads_and_new_inserts() -> Result<()> {
         "",
         make_batch(&schema, 0, 3)?,
         schema.clone(),
+        true,
     )?;
     let spilled = BatchWriter::spill_pressure_pass(
         &segment_mgr,
@@ -377,12 +385,66 @@ fn spilled_memtable_serves_reads_and_new_inserts() -> Result<()> {
         .expect("spilled rows materialize");
     assert_eq!(snapshot.num_rows(), 3);
 
-    writer.write_columns(TEST_DB, TEST_TABLE, "", make_batch(&schema, 3, 2)?, schema)?;
+    writer.write_columns(
+        TEST_DB,
+        TEST_TABLE,
+        "",
+        make_batch(&schema, 3, 2)?,
+        schema,
+        true,
+    )?;
     let snapshot = writer.memtable_manager().get_by_table(TEST_DB, TEST_TABLE)[0]
         .read_snapshot()
         .unwrap();
     assert_eq!(snapshot.num_rows(), 5);
     drop(snapshot);
+    writer.stop();
+    Ok(())
+}
+
+/// Regression: `commit_txn` flips visibility (clearing each memtable's
+/// txn_id) before the durable-tail wait. A failed first attempt therefore
+/// made a plain `commit_txn(txn_id)` retry a no-op that reported success
+/// with the rows still only in memory. `redrive_commit_durability` must
+/// flush the committed memtables instead, and must leave uncommitted
+/// transactional memtables strictly alone.
+#[test]
+fn redrive_commit_durability_flushes_committed_txn_memtables() -> Result<()> {
+    let temp = tempfile::tempdir().unwrap();
+    let table_dir = temp.path().join(TEST_DB).join(TEST_TABLE);
+    std::fs::create_dir_all(&table_dir)?;
+    let schema = test_schema();
+    let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+    let mut writer = BatchWriter::new(test_config(64), Arc::clone(&segment_mgr), None);
+
+    // Rows written inside a transaction stay invisible and unpersisted.
+    writer.write_columns_with_txn(
+        TEST_DB,
+        TEST_TABLE,
+        "20251231",
+        make_batch(&schema, 1, 3)?,
+        schema.clone(),
+        7,
+        true,
+    )?;
+
+    // Redrive before the commit flip: nothing may be published or flushed.
+    writer.redrive_commit_durability()?;
+    assert_eq!(
+        total_segment_rows(&table_dir),
+        0,
+        "redrive must not flush uncommitted transactional memtables"
+    );
+
+    // Simulate the post-first-attempt state of a failed commit_txn: the
+    // visibility flip happened (txn_id cleared) but no tail frames landed.
+    let committed = writer.memtable_mgr.commit_txn(7);
+    assert_eq!(committed.len(), 1, "the transaction memtable must flip");
+
+    // A plain retry would now find nothing; redrive must persist the rows.
+    writer.redrive_commit_durability()?;
+    assert_eq!(total_segment_rows(&table_dir), 3);
+
     writer.stop();
     Ok(())
 }

@@ -8,10 +8,20 @@
   - [multi_insert](#multi_insert)
   - [prepare_test](#prepare_test)
   - [batch_import](#batch_import)
+  - [insert_csv](#insert_csv)
+  - [load_csv](#load_csv)
+  - [hot_insert](#hot_insert)
+- [导出工具](#导出工具)
+  - [export_csv](#export_csv)
+- [订阅示例](#订阅示例)
+  - [pubsub_demo](#pubsub_demo)
 - [调试工具](#调试工具)
   - [check_segment](#check_segment)
+  - [count_rows](#count_rows)
 - [性能测试](#性能测试)
   - [minimal_test](#minimal_test)
+  - [query_bench](#query_bench)
+  - [perf_verify](#perf_verify)
 - [性能对比](#性能对比)
 
 ---
@@ -169,6 +179,133 @@ batch_import <host> <csv_path> \
 
 ---
 
+### insert_csv
+
+**用途**: 通过普通 pipeline INSERT 语句导入 CSV（与 `export_csv` 配套），走 memtable + 热存镜像写路径。
+
+**特点**:
+- 读取 `export_csv` 导出的 CSV（表头 + 明文值），按列类型解析
+- 多值 INSERT 批量提交，pipeline 异步发送
+- 与 `hot_insert` 相同的写入路径，适合验证实时写入形态
+
+**编译**:
+```bash
+cargo build --release --package insert_csv
+```
+
+**使用**:
+```bash
+insert_csv <host> <database> <table> <csv_path> [batch_rows] [max_rows] [--no-header]
+# batch_rows 默认 2000
+```
+
+**说明**: CSV 需与目标表列结构一致（默认读取表头行）。演示三列形态（id, gmt_create, security_id 等）之外的表时需调整源码中的列映射。
+
+---
+
+### load_csv
+
+**用途**: 通过列式 bulk 二进制协议批量导入 CSV（与 `export_csv` 配套），走直写 segment 的高吞吐路径。
+
+**特点**:
+- 先 `SHOW COLUMNS` 拉取目标表结构，按实际类型解析 CSV
+- 使用 `encode_columnar_bulk_insert` 编码列式批量消息
+- 大批次（默认 200000 行/批）+ bulk 模式
+
+**编译**:
+```bash
+cargo build --release --package load_csv
+```
+
+**使用**:
+```bash
+load_csv <host> <database> <table> <csv_path> [batch_rows]
+# batch_rows 默认 200000
+```
+
+---
+
+### hot_insert
+
+**用途**: 将股票 tick CSV 持续写入常驻热存表（`HOT` 表），演示实时行情落库形态。
+
+**特点**:
+- 使用普通 INSERT 多值语句 + pipeline，多客户端并发（默认 8 连接 × 深度 8）
+- 建表自动带 `HOT` 属性与收盘时间（`--close-at`），当日分区点查走内存索引
+- 默认批次 20000 行，贴近 NVMe 组提交的最优吞吐形态
+
+**编译**:
+```bash
+cargo build --release --package hot_insert
+```
+
+**使用**:
+```bash
+hot_insert <host> <csv_path> \
+  [--batch-size=<n>] \      # 每批次行数，默认 20000
+  [--no-header] \           # 跳过 CSV 第一行
+  [--database=<db>] \       # 数据库名，默认 main
+  [--pipeline=<n>] \        # 每客户端 pipeline 深度，默认 8
+  [--clients=<n>] \         # 并发客户端数，默认 8
+  [--close-at=HH:MM] \      # HOT 表收盘时间，默认 15:30
+  [--drop] \                # 导入前删除表
+  [--max=<n>]               # 最大导入行数，0 为不限
+```
+
+**表结构**: `hot_tick` (34列股票行情数据，HOT 属性)
+
+---
+
+## 导出工具
+
+### export_csv
+
+**用途**: 把任意查询结果导出为 CSV 文件。
+
+**特点**:
+- 直接接收 SQL，输出带表头的明文 CSV
+- 流式写文件（BufWriter，默认每 200000 行刷一次盘）
+- 含逗号、引号、换行的值自动转义
+
+**编译**:
+```bash
+cargo build --release --package export_csv
+```
+
+**使用**:
+```bash
+export_csv <host> <database> "<sql>" <output.csv> [flush_every_rows]
+```
+
+**示例**:
+```bash
+export_csv 127.0.0.1:5151 main "SELECT * FROM stock_tick_multi" out.csv
+```
+
+导出的 CSV 可用 `insert_csv`（普通写入路径）或 `load_csv`（bulk 路径）重新导入。
+
+---
+
+## 订阅示例
+
+### pubsub_demo
+
+**用途**: 演示变更订阅：一个连接订阅表，另一个连接持续 INSERT，订阅端实时收到服务端推送。
+
+**编译**:
+```bash
+cargo build --release --package pubsub_demo
+```
+
+**使用**:
+```bash
+pubsub_demo [host:port]    # 默认 127.0.0.1:5151
+```
+
+示例自动建表 `demo_ticks`、订阅并写入 5 批数据，然后打印收到的通知。协议与权限细节见[变更订阅文档](../user-guide/pubsub.md)。
+
+---
+
 ## 调试工具
 
 ### check_segment
@@ -207,6 +344,19 @@ Version: 1
 
 ---
 
+### count_rows
+
+**用途**: 快速执行一条查询并打印结果行，常用于导入后核对行数。
+
+**使用**:
+```bash
+cargo run --release --example count_rows -- [host:port] ["sql"]
+# 默认查询 SELECT count(*) FROM stock_tick_multi
+# SQL 中的空格可用 + 代替
+```
+
+---
+
 ## 性能测试
 
 ### minimal_test
@@ -237,15 +387,43 @@ Benchmark complete!
 
 ---
 
+### query_bench
+
+**用途**: 对单条 SQL 反复执行并输出耗时统计，用于查询性能对比。
+
+**使用**:
+```bash
+cargo run --release --package query_bench -- [host] [database] [sql|@sql文件] [repeat] [--print-rows]
+# repeat 默认 2 次；@path 从文件读取 SQL；--print-rows 额外打印每行结果
+```
+
+**示例**:
+```bash
+query_bench 127.0.0.1:5151 main "SELECT count(*) FROM stock_tick_multi" 5
+```
+
+---
+
+### perf_verify
+
+**用途**: SQL INSERT 吞吐端到端实测工具，覆盖实时（100 行/批）、导入（10000 行/批）与 bulk 三种写入形态，是[性能对比报告](../reports/benchmark-vs-duckdb-kdb-2026-09.md)的数据来源。
+
+**使用**: 该工具运行在 Windows + PowerShell 环境，通过 `examples/perf_verify/perf_verify.bat [行数]` 启动，服务端配置由脚本生成到临时目录。详细说明见 [perf_verify README](../../examples/perf_verify/README.md)。
+
+---
+
 ## 性能对比
 
-三种导入工具的性能特点对比：
+各导入工具的性能特点对比：
 
 | 工具 | 协议 | 优点 | 适用场景 |
 |------|------|------|----------|
 | `multi_insert` | SQL 文本 | 简单易懂，兼容性好 | 小批量导入、调试 |
 | `prepare_test` | Prepared Statement | 参数绑定安全，减少解析开销 | 中等批量、参数化场景 |
 | `batch_import` | 列式二进制 | 最高性能，零拷贝优化 | 大批量生产导入 |
+| `insert_csv` | SQL 文本 | 与 `export_csv` 配套，走实时写路径 | 数据回放、验证 memtable/热存路径 |
+| `load_csv` | 列式二进制 | 与 `export_csv` 配套，直写 segment | 大批量 CSV 迁移 |
+| `hot_insert` | SQL 文本 | 多客户端并发，演示 HOT 表实时写入 | 实时行情落库形态验证 |
 
 **典型性能对比** (100万行 Tick 数据):
 
@@ -255,11 +433,15 @@ Benchmark complete!
 | `prepare_test` | ~5,000 rows/sec | - |
 | `batch_import` | ~40,000 rows/sec | - |
 
+以上数字来自历史测量环境，仅作量级参考；当前版本的实测数据见[性能对比报告](../reports/benchmark-vs-duckdb-kdb-2026-09.md)。
+
 **选择建议**:
 
 1. **开发调试**: 使用 `multi_insert`，SQL 可读性好
 2. **参数化导入**: 使用 `prepare_test`，适合需要动态参数的场景
-3. **生产大批量**: 使用 `batch_import`，性能最优
+3. **生产大批量**: 使用 `batch_import` 或 `load_csv`，性能最优
+4. **CSV 导出/回灌**: `export_csv` + `insert_csv`/`load_csv` 组合
+5. **实时写入验证**: 使用 `hot_insert`
 
 ---
 

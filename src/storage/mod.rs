@@ -5,6 +5,7 @@ pub mod column_encoding;
 pub mod core;
 pub mod index;
 pub mod partition;
+pub mod replication;
 pub mod segment;
 pub mod segment_manager;
 pub mod txn;

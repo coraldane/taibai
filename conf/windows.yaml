@@ -23,6 +23,7 @@ buffer:
 
 compression:
   enabled: true
+  # 全局默认 zstd 级别（1..=22）；建表时可用 COMPRESSION_LEVEL = n 按表覆盖
   bulk_zstd_level: 3
 
 log:

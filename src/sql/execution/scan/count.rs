@@ -64,7 +64,7 @@ pub fn count_star(
             stats,
         )?;
     } else {
-        count_no_predicate(&segment_files, segment_mgr, &mut total_rows, stats)?;
+        count_no_predicate(spec, &segment_files, segment_mgr, &mut total_rows, stats)?;
     }
 
     total_rows += super::memtable::count_memtable_rows(memtable_mgr, db, &spec.table_name, spec);
@@ -73,18 +73,26 @@ pub fn count_star(
 }
 
 fn count_no_predicate(
+    spec: &ScanSpec,
     segment_files: &[std::path::PathBuf],
     segment_mgr: &SegmentManager,
     total_rows: &mut u64,
     mut stats: Option<&mut HashMap<String, ScanStats>>,
 ) -> Result<()> {
     for seg_path in segment_files {
-        match segment_mgr.segment_meta(seg_path)? {
+        // Footer metadata cannot see this transaction's deferred tombstones;
+        // fall through to the overlay-aware reader for such segments.
+        let meta = if segment_mgr.txn_has_segment_overlay(seg_path, spec.reader_txn_id) {
+            None
+        } else {
+            segment_mgr.segment_meta(seg_path)?
+        };
+        match meta {
             Some(meta) => {
                 *total_rows += meta.row_count.saturating_sub(meta.deleted_row_count);
             }
             None => {
-                let reader = segment_mgr.open_reader_cached(seg_path)?;
+                let reader = segment_mgr.open_scan_reader(seg_path, spec.reader_txn_id)?;
                 *total_rows += reader
                     .row_count()
                     .saturating_sub(reader.deleted_row_count());
@@ -114,7 +122,7 @@ fn count_with_single_eq(
                 continue;
             }
         }
-        let reader = segment_mgr.open_reader_cached(seg_path)?;
+        let reader = segment_mgr.open_scan_reader(seg_path, spec.reader_txn_id)?;
 
         match reader.count_matching_rows_fast(col_idx, value) {
             Ok(count) => *total_rows += count,
@@ -144,10 +152,14 @@ fn count_with_predicates(
     let filter_columns = spec.all_predicate_columns();
 
     for seg_path in segment_files {
-        let meta = segment_mgr.segment_meta(seg_path)?;
-        if let Some(meta) = &meta {
+        // Meta-based row-group pruning is authoritative when the sidecar meta
+        // exists; re-running the same pruning through the reader footer (the
+        // old behavior) doubled the metadata walk for every segment. Keep the
+        // reader fallback only for segments without meta.
+        let meta_candidates = (|| {
+            let meta = segment_mgr.segment_meta(seg_path).ok()??;
             if !row_group::prune_segment_by_zone_map(pred, &meta.segment_zone_maps) {
-                continue;
+                return Some(Vec::new());
             }
             let prune_result = row_group::prune_row_group_meta(
                 &meta.row_groups,
@@ -157,22 +169,31 @@ fn count_with_predicates(
                 set_checks,
                 set_in_checks,
             );
-            if prune_result.candidate_indices.is_empty() {
+            Some(prune_result.candidate_indices)
+        })();
+
+        if let Some(candidates) = &meta_candidates {
+            if candidates.is_empty() {
                 continue;
             }
         }
 
-        let reader = segment_mgr.open_reader_cached(seg_path)?;
+        let reader = segment_mgr.open_scan_reader(seg_path, spec.reader_txn_id)?;
 
-        let prune_result = row_group::prune_row_groups(
-            &reader,
-            pred,
-            bloom_checks,
-            in_checks,
-            set_checks,
-            set_in_checks,
-            reader.segment_zone_maps(),
-        );
+        let prune_result = match meta_candidates {
+            Some(candidates) => super::row_group::RowGroupPruneResult {
+                candidate_indices: candidates,
+            },
+            None => row_group::prune_row_groups(
+                &reader,
+                pred,
+                bloom_checks,
+                in_checks,
+                set_checks,
+                set_in_checks,
+                reader.segment_zone_maps(),
+            ),
+        };
 
         for rg_idx in &prune_result.candidate_indices {
             let mut batch = if filter_columns.is_empty() {
@@ -182,12 +203,9 @@ fn count_with_predicates(
             };
             let bitmap_active = !reader.delete_bitmap().is_empty();
             if bitmap_active {
-                let rg_start_row: u64 = reader
-                    .footer_row_groups_info()
-                    .iter()
-                    .take(*rg_idx)
-                    .map(|r| r.row_count)
-                    .sum();
+                // O(1) prefix sum; the old clone-the-whole-footer sum was
+                // quadratic in the row-group count for bitmap segments.
+                let rg_start_row: u64 = reader.row_group_start_row(*rg_idx);
                 batch = delete_bitmap::filter_batch(&batch, rg_start_row, reader.delete_bitmap())?;
             }
 
@@ -224,9 +242,9 @@ pub fn build_count_star_result(count: u64) -> super::super::engine::ExecResult {
     let mut batch = RecordBatch::new(schema.clone());
     batch
         .column_mut(0)
-        .unwrap()
+        .expect("count(*) schema has exactly one column")
         .push(&ScalarValue::Int64(Some(count as i64)))
-        .unwrap();
+        .expect("Int64 push into a fresh column cannot fail");
     super::super::engine::ExecResult::Query {
         schema,
         batches: vec![batch],

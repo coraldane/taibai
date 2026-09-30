@@ -61,7 +61,7 @@ struct FastInsertPlan {
 }
 
 struct MaterializedInsert {
-    table_meta: crate::storage::catalog::schema::TableMeta,
+    table_meta: std::sync::Arc<crate::storage::catalog::schema::TableMeta>,
     schema: Schema,
     batch: RecordBatch,
     missing_auto_inc: Vec<usize>,

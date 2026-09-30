@@ -5,6 +5,18 @@ impl SegmentManager {
         FLUSH_TRANSITION_DELAY_MS.store(ms, Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub(crate) fn partition_lock_arc_for_tests(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+    ) -> Arc<std::sync::Mutex<()>> {
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        partition_mutation_lock_arc(&state, partition_key)
+    }
+
     pub(crate) fn flush_transition_delay() -> u64 {
         FLUSH_TRANSITION_DELAY_MS.load(Ordering::Acquire)
     }
@@ -53,6 +65,7 @@ impl SegmentManager {
                             }
                             let tbl_dir = tbl_entry.path();
                             cleanup_incomplete_compaction_files(&tbl_dir);
+                            recover_replace_journals(&tbl_dir);
                             let max_seq = discover_max_seq(&tbl_dir);
                             let partition_seq = discover_max_partition_seq(&tbl_dir);
                             let key = table_key(&db_name, &table_name);
@@ -78,12 +91,256 @@ impl SegmentManager {
             reader_cache: Mutex::new(ReaderCache::new(reader_cache_capacity())),
             segment_meta_cache: Mutex::new(SegmentMetaCache::new(reader_cache_capacity())),
             cluster_meta_cache: Mutex::new(ClusterMetaCache::new()),
+            mutable_reader_cache: Mutex::new(HashMap::new()),
             flush_epochs: RwLock::new(HashMap::new()),
             flush_stop,
             flush_paused,
             next_txn_id: AtomicU64::new(1),
             config,
+            pubsub: std::sync::OnceLock::new(),
+            txn_mutations: std::sync::OnceLock::new(),
+            rep_log: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Wire the replication log once at engine startup (primaries only).
+    pub fn set_rep_log(&self, log: std::sync::Arc<crate::storage::replication::RepLog>) {
+        let _ = self.rep_log.set(log);
+    }
+
+    pub fn rep_log(&self) -> Option<&std::sync::Arc<crate::storage::replication::RepLog>> {
+        self.rep_log.get()
+    }
+
+    /// Emit a `DeleteFooterRewrite` (derive db/table from the segment path).
+    pub(crate) fn emit_delete_footer_rewrite(
+        &self,
+        path: &Path,
+        bitmap: &[u8],
+        deleted_count: u64,
+    ) {
+        let Some(log) = self.rep_log() else {
+            return;
+        };
+        let Some((db, table)) = db_table_from_segment_path(path) else {
+            return;
+        };
+        let Some(segment) = path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        log.enqueue(
+            crate::storage::replication::ReplicationEvent::DeleteFooterRewrite {
+                db,
+                table,
+                segment: segment.to_string(),
+                bitmap: bitmap.to_vec(),
+                deleted_count,
+            },
+        );
+    }
+
+    /// Emit a `SegmentsReplaced` after a compaction/UPDATE replacement commit
+    /// (derive db/table from the final segment path).
+    pub(crate) fn emit_segments_replaced(&self, final_path: &Path, old_segments: &[PathBuf]) {
+        let Some(log) = self.rep_log() else {
+            return;
+        };
+        let Some((db, table)) = db_table_from_segment_path(final_path) else {
+            return;
+        };
+        let Some(new_name) = final_path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let retired = old_segments
+            .iter()
+            .filter(|old| old.as_path() != final_path)
+            .filter_map(|old| old.file_name().and_then(|name| name.to_str()))
+            .map(str::to_string)
+            .collect();
+        log.enqueue(
+            crate::storage::replication::ReplicationEvent::SegmentsReplaced {
+                db,
+                table,
+                new_segments: vec![new_name.to_string()],
+                retired,
+            },
+        );
+    }
+
+    /// Emit a `SegmentsRemoved` for a TTL/DROP purge batch (db/table derived
+    /// from the table dir).
+    pub(crate) fn emit_segments_removed(&self, table_dir: &Path, segments: &[String]) {
+        if segments.is_empty() {
+            return;
+        }
+        let Some(log) = self.rep_log() else {
+            return;
+        };
+        let Some(table) = table_dir.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let Some(db) = table_dir
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+        else {
+            return;
+        };
+        log.enqueue(
+            crate::storage::replication::ReplicationEvent::SegmentsRemoved {
+                db: db.to_string(),
+                table: table.to_string(),
+                segments: segments.to_vec(),
+            },
+        );
+    }
+
+    /// Current active segment file name for `(db, table, partition)`.
+    pub(crate) fn active_segment_name_for(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+    ) -> Option<String> {
+        let key = table_key(db, table);
+        let state = self.tables.read().unwrap().get(&key).cloned()?;
+        let guard = state.active_segments.lock().unwrap();
+        let seg = guard.get(partition_key)?;
+        Self::active_segment_file_name(&seg.path).ok()
+    }
+
+    /// Enqueue a `SegmentUpdate` for replication (no-op without a log).
+    /// `new_segment = Some(name)` marks a freshly written sealed segment
+    /// (`Final`); `None` marks the active segment's published prefix.
+    pub(crate) fn emit_segment_update(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        memtable_ids: Vec<uuid::Uuid>,
+        new_segment: Option<&str>,
+    ) {
+        let Some(log) = self.rep_log() else {
+            return;
+        };
+        let (segment, kind) = match new_segment {
+            Some(name) => (
+                name.to_string(),
+                crate::storage::replication::SegmentUpdateKind::Final,
+            ),
+            None => {
+                let Some(segment) = self.active_segment_name_for(db, table, partition_key) else {
+                    return;
+                };
+                (
+                    segment,
+                    crate::storage::replication::SegmentUpdateKind::Prefix,
+                )
+            }
+        };
+        log.enqueue(
+            crate::storage::replication::ReplicationEvent::SegmentUpdate {
+                db: db.to_string(),
+                table: table.to_string(),
+                segment,
+                kind,
+                memtable_ids,
+            },
+        );
+    }
+
+    /// Emit a `Final` update for a just-sealed active segment, deriving
+    /// db/table from the segment path (used by seal sites that only hold the
+    /// writer).
+    pub(crate) fn emit_segment_update_final_path(&self, segment_path: &std::path::Path) {
+        let Some(log) = self.rep_log() else {
+            return;
+        };
+        let Some(name) = segment_path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let Some(table_dir) = segment_path.parent() else {
+            return;
+        };
+        let (Some(table), Some(db)) = (
+            table_dir.file_name().and_then(|name| name.to_str()),
+            table_dir
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str()),
+        ) else {
+            return;
+        };
+        log.enqueue(
+            crate::storage::replication::ReplicationEvent::SegmentUpdate {
+                db: db.to_string(),
+                table: table.to_string(),
+                segment: name.to_string(),
+                kind: crate::storage::replication::SegmentUpdateKind::Final,
+                memtable_ids: Vec::new(),
+            },
+        );
+    }
+
+    /// Wire the pub/sub hub once at engine startup. Deferred bulk/RELAXED
+    /// writes publish their change notifications when the segment footer
+    /// makes their rows visible.
+    pub fn set_pubsub(&self, hub: std::sync::Arc<crate::pubsub::PubSubHub>) {
+        let _ = self.pubsub.set(hub);
+    }
+
+    /// Wire the deferred-DML registry once at engine startup.
+    pub fn set_txn_mutations(
+        &self,
+        registry: std::sync::Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>,
+    ) {
+        let _ = self.txn_mutations.set(registry);
+    }
+
+    pub fn txn_mutations(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>> {
+        self.txn_mutations.get()
+    }
+
+    /// Open a reader for a query. Transactions that ran deferred DELETE or
+    /// UPDATE read through a fresh instance carrying their composed
+    /// tombstone overlay; every other reader takes the shared cache. The
+    /// overlay composition is the single choke point that makes all scan
+    /// paths (strategy, row filter, count, metadata aggregates) honor the
+    /// transaction's uncommitted DML.
+    pub fn open_scan_reader(
+        &self,
+        path: &Path,
+        reader_txn_id: u64,
+    ) -> Result<std::sync::Arc<SegmentReader>> {
+        let cached = self.open_reader_cached(path)?;
+        if reader_txn_id == 0 {
+            return Ok(cached);
+        }
+        let Some(registry) = self.txn_mutations() else {
+            return Ok(cached);
+        };
+        let Some(overlay) = registry.segment_overlay(reader_txn_id, path) else {
+            return Ok(cached);
+        };
+        let mut reader = SegmentReader::open(path)?;
+        reader.set_txn_delete_overlay(overlay);
+        Ok(std::sync::Arc::new(reader))
+    }
+
+    /// True when this transaction carries deferred tombstones for the
+    /// segment. Metadata fast paths that answer from footer counts or sums
+    /// must fall back to the overlay-aware reader for such segments.
+    pub fn txn_has_segment_overlay(&self, path: &Path, reader_txn_id: u64) -> bool {
+        reader_txn_id != 0
+            && self
+                .txn_mutations()
+                .is_some_and(|registry| registry.segment_overlay(reader_txn_id, path).is_some())
+    }
+
+    fn pubsub(&self) -> Option<std::sync::Arc<crate::pubsub::PubSubHub>> {
+        self.pubsub.get().cloned()
     }
 
     fn min_segment_seal_size(&self) -> u64 {
@@ -152,11 +409,14 @@ impl SegmentManager {
     }
 
     fn flush_epoch_file_path(&self, db: &str, table: &str) -> PathBuf {
-        self.data_dir.join("meta").join("flush_epochs").join(format!(
-            "{}--{}.epoch",
-            sanitize_component(db),
-            sanitize_component(table)
-        ))
+        self.data_dir
+            .join("meta")
+            .join("flush_epochs")
+            .join(format!(
+                "{}--{}.epoch",
+                sanitize_component(db),
+                sanitize_component(table)
+            ))
     }
 
     /// Current memtable-flush epoch for a table. Lazily restored from the
@@ -171,19 +431,13 @@ impl SegmentManager {
         epoch
     }
 
-    /// Bump the segment-content epoch: rows were appended directly to
-    /// segments outside the memtable flush pipeline (bulk/direct writes).
-    /// Unique index snapshots stamped with the previous epoch are
-    /// potentially incomplete and must be refreshed before probing.
-    pub fn note_direct_segment_append(&self, db: &str, table: &str) {
-        self.note_memtable_flush(db, table)
-    }
-
     /// Bump the segment-content epoch: rows reached segments for this table
-    /// (memtable flush or direct append). Unique index snapshots stamped with
-    /// the previous epoch are potentially incomplete and must be refreshed
-    /// before probing.
-    pub fn note_memtable_flush(&self, db: &str, table: &str) {
+    /// outside a primitive that already bumps (`replace_segments_with_tmp`
+    /// and `rewrite_delete_footer` bump on their own; direct appends, flush
+    /// installs, and removal-only paths do not). Unique index snapshots
+    /// stamped with the previous epoch are potentially incomplete and must
+    /// be refreshed before probing.
+    pub fn note_segments_changed(&self, db: &str, table: &str) {
         let key = table_key(db, table);
         let path = self.flush_epoch_file_path(db, table);
         let mut epochs = self.flush_epochs.write().unwrap();
@@ -193,9 +447,15 @@ impl SegmentManager {
             .unwrap_or_else(|| read_flush_epoch_file(&path));
         let next = current.saturating_add(1);
         if let Some(parent) = path.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent)
-                .and_then(|_| std::fs::write(&path, next.to_string()))
-            {
+            // tmp+rename: a torn in-place overwrite of the epoch file made
+            // it fall back to 0 on read, wrongly marking index snapshots as
+            // stale (or fresh) after a crash.
+            let tmp = path.with_extension("epoch.tmp");
+            if let Err(error) = std::fs::create_dir_all(parent).and_then(|_| {
+                std::fs::write(&tmp, next.to_string())?;
+                std::fs::rename(&tmp, &path)
+            }) {
+                let _ = std::fs::remove_file(&tmp);
                 tracing::error!(
                     db,
                     table,
@@ -205,6 +465,49 @@ impl SegmentManager {
             }
         }
         epochs.insert(key, next);
+    }
+
+    /// Bump the content epoch for the table owning `path`, derived from the
+    /// `<data_dir>/<db>/<table>/` layout. Used by the segment-change
+    /// primitives so every content change bumps exactly where it lands; a
+    /// path outside a table dir (scratch files) logs and skips.
+    fn bump_flush_epoch_for_segment(&self, path: &Path) {
+        let Some(table_dir) = path.parent() else {
+            return;
+        };
+        let (db, table) = match self.db_table_for_segment_path(table_dir) {
+            Ok(names) => names,
+            Err(error) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %error,
+                    "cannot resolve table for content-epoch bump"
+                );
+                return;
+            }
+        };
+        self.note_segments_changed(&db, &table);
+    }
+
+    fn db_table_for_segment_path(&self, table_dir: &Path) -> Result<(String, String)> {
+        let relative = table_dir.strip_prefix(&self.data_dir).map_err(|_| {
+            TaibaiError::Storage(format!(
+                "table dir '{}' is outside data dir '{}'",
+                table_dir.display(),
+                self.data_dir.display()
+            ))
+        })?;
+        let mut components = relative.components();
+        let db = components
+            .next()
+            .ok_or_else(|| TaibaiError::Storage("table dir is missing database name".into()))?;
+        let table = components
+            .next()
+            .ok_or_else(|| TaibaiError::Storage("table dir is missing table name".into()))?;
+        Ok((
+            db.as_os_str().to_string_lossy().into_owned(),
+            table.as_os_str().to_string_lossy().into_owned(),
+        ))
     }
 
     /// Run `f` while holding the table's flush-visibility read lock. Scan and
@@ -252,6 +555,38 @@ impl SegmentManager {
             .clone()
     }
 
+    /// Refresh the per-table zstd level override used by storage-internal
+    /// writers (memtable flush, recovery, direct bulk). Called from DDL and
+    /// the engine write paths that hold fresh `TableMeta`.
+    pub fn set_table_compression_level(&self, db: &str, table: &str, level: Option<i32>) {
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        state.set_compression_level_override(level);
+    }
+
+    /// Effective level for the table right now: its DDL override, or the
+    /// global configured level when unset.
+    pub(crate) fn table_compression_level(&self, db: &str, table: &str) -> i32 {
+        let key = table_key(db, table);
+        let tables = self.tables.read().unwrap();
+        let override_level = tables
+            .get(&key)
+            .and_then(|state| state.compression_level_override());
+        crate::storage::segment_manager::config::resolve_compression_level(override_level)
+    }
+
+    /// Same resolution, keyed by any path inside the table directory (a
+    /// segment file or the dir itself). Used by writers that only carry a
+    /// path, e.g. recovery and standalone tail-flush segments.
+    fn table_compression_level_for_path(&self, path: &Path) -> Result<i32> {
+        let key = self.table_state_key_from_dir(path)?;
+        let tables = self.tables.read().unwrap();
+        let override_level = tables
+            .get(&key)
+            .and_then(|state| state.compression_level_override());
+        Ok(crate::storage::segment_manager::config::resolve_compression_level(override_level))
+    }
+
     fn table_state_key_from_dir(&self, table_dir: &Path) -> Result<String> {
         let relative = table_dir.strip_prefix(&self.data_dir).map_err(|_| {
             TaibaiError::Storage(format!(
@@ -295,27 +630,28 @@ impl SegmentManager {
     ) -> Result<Vec<PathBuf>> {
         let segments = Self::discover_segments(table_dir)?;
         let key = table_key(db, table);
-        let active_paths = {
+        let (active_paths, sealing_paths) = {
             let tables = self.tables.read().unwrap();
             tables
                 .get(&key)
                 .map(|state| {
                     let active_guard = state.active_segments.lock().unwrap();
-                    active_guard
+                    let active = active_guard
                         .values()
                         .map(|segment| segment.path.clone())
-                        .collect::<HashSet<_>>()
+                        .collect::<HashSet<_>>();
+                    (active, state.sealing_paths())
                 })
                 .unwrap_or_default()
         };
 
-        if active_paths.is_empty() {
+        if active_paths.is_empty() && sealing_paths.is_empty() {
             return Ok(segments);
         }
 
         Ok(segments
             .into_iter()
-            .filter(|path| !active_paths.contains(path))
+            .filter(|path| !active_paths.contains(path) && !sealing_paths.contains(path))
             .collect())
     }
 
@@ -341,10 +677,17 @@ impl SegmentManager {
     pub fn find_unsealed_segment(
         table_dir: &Path,
         min_seal_size: u64,
+        exclude: &HashSet<PathBuf>,
     ) -> Result<Option<(PathBuf, Schema, u64)>> {
         let segments = Self::discover_segments(table_dir)?;
 
         for seg_path in segments.iter().rev() {
+            // A path excluded here is mid-seal outside the locks: its footer
+            // is about to be finalized by its own seal, so it must never be
+            // resumed for append or reported as an append target.
+            if exclude.contains(seg_path) {
+                continue;
+            }
             let file_len = match std::fs::metadata(seg_path) {
                 Ok(m) => m.len(),
                 Err(_) => continue,
@@ -411,13 +754,28 @@ impl SegmentManager {
     }
 
     pub fn open_reader_cached(&self, path: &Path) -> Result<Arc<SegmentReader>> {
-        // Active writers can change their data and sidecar footer at any time, so
-        // readers for them must remain uncached snapshots. A small *inactive*
-        // segment may be resumed later, but is stable until that happens; cache an
-        // owned snapshot for it and let recovery invalidate the cache before append.
+        // Active writers can change their data and sidecar footer at any time,
+        // but between writes the published state is stable. Reopening a large
+        // active segment costs a full footer/sidecar parse per query, which
+        // dominated read latency on write-heavy tables, so reuse the last
+        // opened reader while the writer has nothing pending. Any append
+        // falls back to the reopen path, whose `open_mutable_reader_owned`
+        // also publishes a dirty footer first (preserving old semantics).
         if self.is_mutable_segment_path(path) {
+            let cached = self.mutable_reader_cache.lock().unwrap().get(path).cloned();
+            if let Some(reader) = cached {
+                if !self.mutable_segment_has_pending_writes(path) {
+                    return Ok(reader);
+                }
+            }
             self.invalidate_reader(path);
-            return Ok(Arc::new(self.open_mutable_reader_owned(path)?));
+            let reader = std::sync::Arc::new(self.open_mutable_reader_owned(path)?);
+            let mut cache = self.mutable_reader_cache.lock().unwrap();
+            if cache.len() >= reader_cache_capacity().max(1) * 4 {
+                cache.clear();
+            }
+            cache.insert(path.to_path_buf(), reader.clone());
+            return Ok(reader);
         }
 
         if let Some(reader) = self.reader_cache.lock().unwrap().get(path) {
@@ -440,13 +798,52 @@ impl SegmentManager {
             .put(path.to_path_buf(), reader))
     }
 
+    /// True when the active segment for `path` has appended rows that are not
+    /// part of its published footer yet (dirty meta, append buffer, or
+    /// row groups written without a footer publish). While this is false, a
+    /// cached mutable reader exposes exactly the state a fresh open would.
+    fn mutable_segment_has_pending_writes(&self, path: &Path) -> bool {
+        let Some(state) = self.state_for_segment_path(path) else {
+            return true;
+        };
+        let active_guard = state.active_segments.lock().unwrap();
+        for segment in active_guard.values() {
+            if same_segment_path(&segment.path, path) {
+                return segment.dirty_meta
+                    || segment.buffered_rows > 0
+                    || segment.unpublished_row_count() > 0;
+            }
+        }
+        true
+    }
+
+    /// Rows written to this table's active segments that a fresh reader
+    /// cannot see yet (footer not published / still in the append buffer).
+    /// Hot-store reclamation must not count these as persisted.
+    pub fn unpublished_active_rows(&self, db: &str, table: &str) -> u64 {
+        let state = {
+            let tables = self.tables.read().unwrap();
+            match tables.get(&table_key(db, table)) {
+                Some(state) => state.clone(),
+                None => return 0,
+            }
+        };
+        let guard = state.active_segments.lock().unwrap();
+        guard.values().map(|seg| seg.unpublished_row_count()).sum()
+    }
+
     pub fn invalidate_reader(&self, path: &Path) {
+        self.mutable_reader_cache.lock().unwrap().remove(path);
         self.reader_cache.lock().unwrap().invalidate(path);
         self.segment_meta_cache.lock().unwrap().invalidate(path);
         self.cluster_meta_cache.lock().unwrap().invalidate(path);
     }
 
     pub fn invalidate_readers_under(&self, dir: &Path) {
+        self.mutable_reader_cache
+            .lock()
+            .unwrap()
+            .retain(|path, _| !path.starts_with(dir));
         self.reader_cache.lock().unwrap().invalidate_under(dir);
         self.segment_meta_cache
             .lock()
@@ -555,15 +952,45 @@ impl SegmentManager {
         // footer before replacing any source segment; no sidecar is required.
         read_embedded_segment_meta(tmp_path)?;
 
-        std::fs::rename(tmp_path, final_path)?;
+        // Two-phase commit: the journal records which old segments the
+        // replacement must retire. A crash between the rename and the old
+        // file removals used to leave the new AND old segments on disk, and
+        // every scan then counted those rows twice. Startup recovery
+        // (`recover_replace_journals`) finishes the retirement.
+        let journal = replace_journal_path(final_path);
+        write_replace_journal(&journal, old_segments)?;
+
+        if let Err(error) = std::fs::rename(tmp_path, final_path) {
+            let _ = std::fs::remove_file(&journal);
+            return Err(error.into());
+        }
+        // From here on the replacement is in effect: keep removing the old
+        // segments even after an individual failure (the journal lets
+        // startup recovery finish), and report the first error.
+        let mut first_removal_error = None;
         for old_seg in old_segments {
             if old_seg != final_path {
-                self.remove_segment_file(old_seg)?;
+                if let Err(error) = self.remove_segment_file(old_seg) {
+                    tracing::warn!(
+                        old_segment = %old_seg.display(),
+                        error = %error,
+                        "old segment removal failed; startup recovery will retry"
+                    );
+                    first_removal_error = first_removal_error.or(Some(error));
+                }
             }
+        }
+        if first_removal_error.is_none() {
+            let _ = std::fs::remove_file(&journal);
         }
 
         remove_sidecar_meta(tmp_path)?;
         let _ = self.open_reader_cached(final_path);
+        // The replacement changed this table's on-disk content: bump the
+        // epoch here so no caller can forget (persisted unique-index
+        // snapshots pointing at the old segments must refresh).
+        self.bump_flush_epoch_for_segment(final_path);
+        self.emit_segments_replaced(final_path, old_segments);
         Ok(())
     }
 
@@ -573,17 +1000,54 @@ impl SegmentManager {
         bitmap: &[u8],
         deleted_count: u64,
     ) -> Result<()> {
+        let result = self.rewrite_delete_footer_inner(path, bitmap, deleted_count);
+        if result.is_ok() {
+            // Deleted rows changed this segment's visible content: bump the
+            // epoch here so no caller can forget (a crash between the
+            // rewrite and any later tombstone append left deleted keys
+            // "present" in stale unique-index snapshots).
+            self.bump_flush_epoch_for_segment(path);
+            self.emit_delete_footer_rewrite(path, bitmap, deleted_count);
+        }
+        result
+    }
+
+    fn rewrite_delete_footer_inner(
+        &self,
+        path: &Path,
+        bitmap: &[u8],
+        deleted_count: u64,
+    ) -> Result<()> {
         let mutable = self.is_mutable_segment_path(path);
         self.invalidate_reader(path);
-        SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
         if mutable {
+            // Hold the per-table active-segment lock across the whole
+            // truncate+rewrite: the background flush thread appends buffered
+            // rows and publishes footers under the same lock, so an
+            // unsynchronized set_len here could truncate freshly written
+            // rows before their footer was published. Flushing the target
+            // first also guarantees the embedded footer we rewrite from is
+            // current.
+            let Some(state) = self.state_for_segment_path(path) else {
+                SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
+                remove_sidecar_meta(path)?;
+                return Ok(());
+            };
+            let mut active_guard = state.active_segments.lock().unwrap();
+            for segment in active_guard.values_mut() {
+                if same_segment_path(&segment.path, path) {
+                    if segment.buffered_rows > 0 {
+                        segment.flush_buffer(&|p| self.invalidate_reader(p))?;
+                    }
+                    if segment.dirty_meta {
+                        segment.flush_meta(&|p| self.invalidate_reader(p))?;
+                    }
+                    break;
+                }
+            }
+            SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
             let footer = read_embedded_footer(path)?;
             append_sidecar_footer(path, footer.data_end, &footer.footer)?;
-        } else {
-            remove_sidecar_meta(path)?;
-        }
-        if let Some(state) = self.state_for_segment_path(path) {
-            let mut active_guard = state.active_segments.lock().unwrap();
             for segment in active_guard.values_mut() {
                 if same_segment_path(&segment.path, path) {
                     segment.delete_bitmap = bitmap.to_vec();
@@ -592,10 +1056,19 @@ impl SegmentManager {
                     break;
                 }
             }
+            return Ok(());
         }
+        SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
+        remove_sidecar_meta(path)?;
         Ok(())
     }
 
+    /// Run `f` while holding the table-wide mutation gate. The gate excludes
+    /// every other mutator of the table: other table-wide operations (via
+    /// `mutation_lock`) and all partition-scoped writers (via the frozen
+    /// `partition_locks` registry plus every partition mutex held for the
+    /// duration of `f`). Partition-scoped writers should prefer
+    /// `with_partition_mutation_lock` so unrelated partitions stay parallel.
     pub fn with_table_mutation_lock<T>(
         &self,
         db: &str,
@@ -604,8 +1077,40 @@ impl SegmentManager {
     ) -> Result<T> {
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
-        let _guard = acquire_mutation_lock(&state, &key)?;
-        ensure_state_not_retired(&state, db, table)?;
+        self.with_state_table_mutation_lock(&state, &key, || {
+            ensure_state_not_retired(&state, db, table)?;
+            f()
+        })
+    }
+
+    /// Acquire the wide mutation gate for an already-resolved table state.
+    /// Callers are responsible for the retired-state check.
+    ///
+    /// The gate freezes partition-scoped writers through `partition_gate`:
+    /// the registry write guard is only held for the partition-mutex
+    /// snapshot, then released while `f` runs so new partitions can still be
+    /// created (their writers will self-freeze on the gate flag).
+    fn with_state_table_mutation_lock<T>(
+        &self,
+        state: &Arc<TableSegmentState>,
+        key: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _mutation_guard = acquire_mutation_lock(state, key)?;
+        state.partition_gate.store(true, Ordering::Release);
+        let _gate_reset = PartitionGateReset(Arc::clone(state));
+        let registry = state.partition_locks.write().unwrap();
+        let (partition_keys, partition_locks) = sorted_partition_locks(&registry);
+        drop(registry);
+        let timeouts = crate::common::config::storage_timeouts();
+        let timeout = Duration::from_secs(timeouts.mutation_lock_timeout_secs.max(1));
+        let mut partition_guards = Vec::with_capacity(partition_locks.len());
+        for (partition, lock) in partition_keys.iter().zip(&partition_locks) {
+            partition_guards.push(acquire_partition_lock_for_wide_gate(
+                lock, key, partition, timeout,
+            )?);
+        }
+        state.wait_sealing_segments_drained(timeout)?;
         f()
     }
 
@@ -625,14 +1130,134 @@ impl SegmentManager {
             .iter()
             .map(|key| self.get_or_create_state(key))
             .collect::<Vec<_>>();
-        let mut guards = Vec::with_capacity(states.len());
+        let mut mutation_guards = Vec::with_capacity(states.len());
         for (key, state) in keys.iter().zip(states.iter()) {
-            guards.push(acquire_mutation_lock(state, key)?);
+            mutation_guards.push(acquire_mutation_lock(state, key)?);
         }
-        let _guards = guards;
+        for state in &states {
+            state.partition_gate.store(true, Ordering::Release);
+        }
+        let _gate_reset = DatabaseGatesReset(states.clone());
+        let mut registries = Vec::with_capacity(states.len());
+        let mut partition_arc_sets = Vec::with_capacity(states.len());
+        let mut partition_key_sets = Vec::with_capacity(states.len());
+        for state in &states {
+            let registry = state.partition_locks.write().unwrap();
+            let (partition_keys, arcs) = sorted_partition_locks(&registry);
+            partition_arc_sets.push(arcs);
+            partition_key_sets.push(partition_keys);
+            registries.push(registry);
+        }
+        drop(registries);
+        let timeouts = crate::common::config::storage_timeouts();
+        let timeout = Duration::from_secs(timeouts.mutation_lock_timeout_secs.max(1));
+        let mut partition_guard_sets = Vec::with_capacity(states.len());
+        for (table_idx, key) in keys.iter().enumerate() {
+            let mut guards = Vec::new();
+            let partitions = &partition_key_sets[table_idx];
+            for (partition, lock) in partitions.iter().zip(&partition_arc_sets[table_idx]) {
+                match acquire_partition_lock_for_wide_gate(lock, key, partition, timeout) {
+                    Ok(guard) => guards.push(guard),
+                    Err(error) => return Err(error),
+                }
+            }
+            partition_guard_sets.push(guards);
+        }
+        for state in &states {
+            state.wait_sealing_segments_drained(timeout)?;
+        }
         f()
     }
 
+    /// Run `f` while holding only one partition's mutation lock. Mutators of
+    /// other partitions of the same table proceed in parallel; table-wide
+    /// mutation operations still exclude this writer through the wide gate.
+    pub fn with_partition_mutation_lock<T>(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let lock = partition_mutation_lock_arc(&state, partition_key);
+        let _guard = acquire_partition_mutation_lock(&state, &lock, &key, partition_key)?;
+        ensure_state_not_retired(&state, db, table)?;
+        f()
+    }
+
+    /// Run `f` while holding the mutation locks of an explicit partition
+    /// subset. Locks are acquired in sorted order so overlapping subset
+    /// operations cannot deadlock; table-wide mutations exclude this caller
+    /// through the wide-gate re-check inside each partition acquisition, and
+    /// partitions outside the set stay fully parallel.
+    pub fn with_partition_set_mutation_lock<T>(
+        &self,
+        db: &str,
+        table: &str,
+        partition_keys: &[&str],
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if partition_keys.is_empty() {
+            return f();
+        }
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let mut sorted: Vec<&str> = partition_keys.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let locks = sorted
+            .iter()
+            .map(|partition| partition_mutation_lock_arc(&state, partition))
+            .collect::<Vec<_>>();
+        let mut guards = Vec::with_capacity(locks.len());
+        for (partition, lock) in sorted.iter().zip(&locks) {
+            guards.push(acquire_partition_mutation_lock(
+                &state, lock, &key, partition,
+            )?);
+        }
+        ensure_state_not_retired(&state, db, table)?;
+        f()
+    }
+
+    pub fn try_with_partition_mutation_lock<T>(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let lock = {
+            let registry = match state.partition_locks.try_read() {
+                Ok(registry) => registry,
+                Err(_) => return Ok(None),
+            };
+            match registry.get(partition_key) {
+                Some(lock) => Some(Arc::clone(lock)),
+                None => None,
+            }
+        };
+        let lock = match lock {
+            Some(lock) => lock,
+            None => partition_mutation_lock_arc(&state, partition_key),
+        };
+        let _guard = match try_lock_or_none(&lock, "partition mutation lock") {
+            Some(guard) if !state.partition_gate.load(Ordering::Acquire) => guard,
+            Some(_) => return Ok(None),
+            None => return Ok(None),
+        };
+        ensure_state_not_retired(&state, db, table)?;
+        f().map(Some)
+    }
+
+    /// Lock-free counterpart of [`Self::with_table_mutation_lock`]. The
+    /// freeze protocol differs from the blocking variant on purpose: the
+    /// wide gate flag is not set; instead the registry write guard stays
+    /// held through `f`, which blocks new partition creation for its
+    /// duration.
     pub fn try_with_table_mutation_lock<T>(
         &self,
         db: &str,
@@ -641,17 +1266,36 @@ impl SegmentManager {
     ) -> Result<Option<T>> {
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
-        let _guard = match state.mutation_lock.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                panic!("table mutation lock poisoned: {}", poisoned)
-            }
+        let _mutation_guard = match try_lock_or_none(&state.mutation_lock, "table mutation lock") {
+            Some(guard) => guard,
+            None => return Ok(None),
         };
+        let registry = match state.partition_locks.try_write() {
+            Ok(registry) => registry,
+            Err(_) => return Ok(None),
+        };
+        let (_partition_keys, partition_locks) = sorted_partition_locks(&registry);
+        let mut partition_guards = Vec::with_capacity(partition_locks.len());
+        for lock in &partition_locks {
+            match try_lock_or_none(lock, "partition mutation lock") {
+                Some(guard) => partition_guards.push(guard),
+                None => return Ok(None),
+            }
+        }
+        if state.has_sealing_segments() {
+            return Ok(None);
+        }
         ensure_state_not_retired(&state, db, table)?;
-        f().map(Some)
+        let result = f().map(Some);
+        drop(partition_guards);
+        drop(partition_locks);
+        drop(registry);
+        result
     }
 
+    /// Lock-free counterpart of [`Self::with_database_mutation_locks`],
+    /// with the same registry-held freeze protocol as
+    /// [`Self::try_with_table_mutation_lock`].
     pub fn try_with_database_mutation_locks<T>(
         &self,
         db: &str,
@@ -668,15 +1312,37 @@ impl SegmentManager {
             .iter()
             .map(|key| self.get_or_create_state(key))
             .collect::<Vec<_>>();
-        let mut guards = Vec::with_capacity(states.len());
-        for state in &states {
-            match state.mutation_lock.try_lock() {
-                Ok(guard) => guards.push(guard),
-                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                    panic!("table mutation lock poisoned: {}", poisoned)
+        let mut mutation_guards = Vec::with_capacity(states.len());
+        let mut registries = Vec::with_capacity(states.len());
+        let mut partition_arc_sets = Vec::with_capacity(states.len());
+        for (_key, state) in keys.iter().zip(states.iter()) {
+            let mutation_guard = match try_lock_or_none(&state.mutation_lock, "table mutation lock")
+            {
+                Some(guard) => guard,
+                None => return Ok(None),
+            };
+            let registry = match state.partition_locks.try_write() {
+                Ok(registry) => registry,
+                Err(_) => return Ok(None),
+            };
+            let (_partition_keys, arcs) = sorted_partition_locks(&registry);
+            mutation_guards.push(mutation_guard);
+            partition_arc_sets.push(arcs);
+            registries.push(registry);
+        }
+        let mut partition_guard_sets = Vec::with_capacity(states.len());
+        for partition_locks in &partition_arc_sets {
+            let mut guards = Vec::new();
+            for lock in partition_locks {
+                match try_lock_or_none(lock, "partition mutation lock") {
+                    Some(guard) => guards.push(guard),
+                    None => return Ok(None),
                 }
             }
+            partition_guard_sets.push(guards);
+        }
+        if states.iter().any(|state| state.has_sealing_segments()) {
+            return Ok(None);
         }
         f().map(Some)
     }
@@ -686,9 +1352,29 @@ impl SegmentManager {
             return SegmentReader::open_owned(path);
         };
 
+        // A segment removed from the active map is sealed outside every lock:
+        // its footer is published by the seal, so a reader that lands in that
+        // window waits for the seal instead of failing on a torn footer. The
+        // old in-lock seal blocked here on the active-segments mutex; the
+        // bounded wait preserves that serialization without stalling writers.
+        if state.sealing_paths().contains(path) {
+            let timeout = Duration::from_secs(
+                crate::common::config::storage_timeouts()
+                    .mutation_lock_timeout_secs
+                    .max(1),
+            );
+            state.wait_sealing_segments_drained(timeout)?;
+        }
+
         let mut active_guard = state.active_segments.lock().unwrap();
         for segment in active_guard.values_mut() {
             if same_segment_path(&segment.path, path) {
+                // Flush buffered rows as well, not just dirty metadata:
+                // rows sitting in the writer's buffer are invisible to a
+                // reader, which made DELETE skip them.
+                if segment.buffered_rows > 0 {
+                    segment.flush_buffer(&|path| self.invalidate_reader(path))?;
+                }
                 if segment.dirty_meta {
                     segment.flush_meta(&|path| self.invalidate_reader(path))?;
                 }
@@ -735,8 +1421,9 @@ impl SegmentManager {
         schema: Schema,
         row_group_size: usize,
         batch: &RecordBatch,
+        compression_level: i32,
     ) -> Result<()> {
-        let mut writer = SegmentWriter::create(path, schema, row_group_size)?;
+        let mut writer = SegmentWriter::create(path, schema, row_group_size, compression_level)?;
         writer.write_batch(batch)?;
         writer.seal()?;
         Ok(())
@@ -747,9 +1434,10 @@ impl SegmentManager {
         path: &Path,
         schema: Schema,
         row_group_size: usize,
-        batches: &[RecordBatch],
+        batches: &[std::sync::Arc<RecordBatch>],
+        compression_level: i32,
     ) -> Result<()> {
-        let total_rows = batches.iter().map(RecordBatch::num_rows).sum();
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
         let mut combined = RecordBatch::with_capacity(schema.clone(), total_rows);
         for batch in batches {
             if batch.num_columns() != combined.num_columns() {
@@ -770,7 +1458,7 @@ impl SegmentManager {
                     )?;
             }
         }
-        let mut writer = SegmentWriter::create(path, schema, row_group_size)?;
+        let mut writer = SegmentWriter::create(path, schema, row_group_size, compression_level)?;
         if combined.num_rows() > 0 {
             writer.write_batch(&combined)?;
         }
@@ -852,13 +1540,67 @@ impl SegmentManager {
 /// (slow fsync, durable-tail rewrite, compaction) must surface as an explicit
 /// timeout error instead of blocking the caller forever, and slow acquisitions
 /// are logged so lock queueing is visible in the server log.
+struct PartitionGateReset(Arc<TableSegmentState>);
+
+impl Drop for PartitionGateReset {
+    fn drop(&mut self) {
+        self.0.partition_gate.store(false, Ordering::Release);
+    }
+}
+
+struct DatabaseGatesReset(Vec<Arc<TableSegmentState>>);
+
+impl Drop for DatabaseGatesReset {
+    fn drop(&mut self) {
+        for state in &self.0 {
+            state.partition_gate.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Snapshot a state's partition locks as (sorted key, arc) pairs under a
+/// registry write guard the caller already holds. How long that guard is
+/// kept is the caller's freeze strategy: the blocking wide gate drops it
+/// before running `f` (the gate flag freezes new partitions instead),
+/// while the try variants keep it held through `f`.
+fn sorted_partition_locks(
+    registry: &std::sync::RwLockWriteGuard<
+        '_,
+        std::collections::HashMap<String, Arc<std::sync::Mutex<()>>>,
+    >,
+) -> (Vec<String>, Vec<Arc<std::sync::Mutex<()>>>) {
+    let mut partition_keys: Vec<String> = registry.keys().cloned().collect();
+    partition_keys.sort();
+    let partition_locks = partition_keys
+        .iter()
+        .map(|partition| Arc::clone(&registry[partition]))
+        .collect::<Vec<_>>();
+    (partition_keys, partition_locks)
+}
+
+/// Try-lock for the lock-free mutation attempts: `None` means busy (the
+/// caller reports "not now" and retries later); a poisoned lock still
+/// panics so the failure stays loud instead of being silently skipped.
+fn try_lock_or_none<'a, T>(
+    lock: &'a std::sync::Mutex<T>,
+    what: &str,
+) -> Option<std::sync::MutexGuard<'a, T>> {
+    match lock.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            panic!("{} poisoned: {}", what, poisoned)
+        }
+    }
+}
+
 fn acquire_mutation_lock<'a>(
     state: &'a TableSegmentState,
     key: &str,
 ) -> Result<std::sync::MutexGuard<'a, ()>> {
     let timeouts = crate::common::config::storage_timeouts();
-    let timeout = Duration::from_millis(timeouts.mutation_lock_timeout_ms.max(1));
-    let warn_after = Duration::from_millis(timeouts.mutation_lock_warn_ms.max(1));
+    let timeout = Duration::from_secs(timeouts.mutation_lock_timeout_secs.max(1));
+    let warn_after = Duration::from_secs(timeouts.mutation_lock_warn_secs.max(1));
     let start = Instant::now();
     let mut backoff = Duration::from_millis(1);
     loop {
@@ -890,4 +1632,286 @@ fn acquire_mutation_lock<'a>(
             }
         }
     }
+}
+
+/// Bounded acquisition of one partition mutex by a wide-gate holder. The
+/// caller has already set `partition_gate`, so the gate re-check loop of
+/// `acquire_partition_mutation_lock` must not be reused here (it would retry
+/// against our own gate until its timeout); this variant bounds only the
+/// wait. A long-held partition lock (slow partition-scoped mutation) must
+/// surface as an explicit timeout instead of freezing every partition
+/// writer behind the raised gate for the same duration.
+fn acquire_partition_lock_for_wide_gate<'a>(
+    lock: &'a std::sync::Mutex<()>,
+    key: &str,
+    partition_key: &str,
+    timeout: Duration,
+) -> Result<std::sync::MutexGuard<'a, ()>> {
+    let start = Instant::now();
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                panic!(
+                    "partition mutation lock poisoned on {} partition {}: {}",
+                    key, partition_key, poisoned
+                )
+            }
+        }
+        if start.elapsed() >= timeout {
+            return Err(TaibaiError::ResourceBusy(format!(
+                "table-wide mutation gate timed out after {}ms waiting on {} partition {}; a long partition mutation is in flight",
+                timeout.as_millis(),
+                key,
+                partition_key
+            )));
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(16));
+    }
+}
+
+/// Clone (or lazily create) the partition's mutation lock. The Arc is owned
+/// by the caller's scope so the subsequent `MutexGuard` borrows a stable
+/// local instead of registry internals.
+fn partition_mutation_lock_arc(
+    state: &TableSegmentState,
+    partition_key: &str,
+) -> Arc<std::sync::Mutex<()>> {
+    if let Some(lock) = state.partition_locks.read().unwrap().get(partition_key) {
+        return Arc::clone(lock);
+    }
+    let mut registry = state.partition_locks.write().unwrap();
+    Arc::clone(
+        registry
+            .entry(partition_key.to_string())
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(()))),
+    )
+}
+
+/// Acquire a partition mutation lock with the same bounded wait, slow-lock
+/// warning, and timeout error as the table-wide mutation lock, so partition
+/// lock queueing is equally visible in the server log. After acquiring the
+/// mutex the writer re-checks the table's wide-gate flag: a table-wide
+/// mutation operation that has already snapshotted this partition holds the
+/// mutex, so the writer releases and retries until the gate clears.
+fn acquire_partition_mutation_lock<'a>(
+    state: &TableSegmentState,
+    lock: &'a std::sync::Mutex<()>,
+    key: &str,
+    partition_key: &str,
+) -> Result<std::sync::MutexGuard<'a, ()>> {
+    let timeouts = crate::common::config::storage_timeouts();
+    let timeout = Duration::from_secs(timeouts.mutation_lock_timeout_secs.max(1));
+    let warn_after = Duration::from_secs(timeouts.mutation_lock_warn_secs.max(1));
+    let start = Instant::now();
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => {
+                if !state.partition_gate.load(Ordering::Acquire) {
+                    let waited = start.elapsed();
+                    if waited >= warn_after {
+                        tracing::warn!(
+                            table = key,
+                            partition = partition_key,
+                            wait_ms = waited.as_millis() as u64,
+                            "partition mutation lock acquisition was slow"
+                        );
+                    }
+                    return Ok(guard);
+                }
+                drop(guard);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                panic!("partition mutation lock poisoned: {}", poisoned)
+            }
+        }
+        if start.elapsed() >= timeout {
+            return Err(TaibaiError::ResourceBusy(format!(
+                "partition mutation lock timeout after {}ms waiting on {} partition {}",
+                timeout.as_millis(),
+                key,
+                partition_key
+            )));
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(16));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Segment replacement journal (`<final>.replace`)
+//
+// Records the old segments a `replace_segments_with_tmp` call must retire, so
+// a crash between the rename and the removals cannot leave the new and old
+// segments visible at the same time (double-counted rows).
+// Layout: magic(8) | old_count u32 | per old: len u32 + utf8 path | crc32 u32
+// ---------------------------------------------------------------------------
+
+const REPLACE_JOURNAL_MAGIC: &[u8; 8] = b"TBREPJ01";
+
+pub(crate) fn replace_journal_path(final_path: &Path) -> PathBuf {
+    let mut name = final_path.as_os_str().to_os_string();
+    name.push(".replace");
+    PathBuf::from(name)
+}
+
+pub(crate) fn write_replace_journal(journal: &Path, old_segments: &[PathBuf]) -> Result<()> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(old_segments.len() as u32).to_le_bytes());
+    for old in old_segments {
+        let text = old.to_string_lossy();
+        body.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        body.extend_from_slice(text.as_bytes());
+    }
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&body);
+    let crc = hasher.finalize();
+
+    let tmp = {
+        let mut name = journal.as_os_str().to_os_string();
+        name.push(".tmp");
+        PathBuf::from(name)
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    use std::io::Write as _;
+    file.write_all(REPLACE_JOURNAL_MAGIC)?;
+    file.write_all(&body)?;
+    file.write_all(&crc.to_le_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, journal)?;
+    Ok(())
+}
+
+/// Finish or discard interrupted segment replacements at startup. With the
+/// final segment present the rename had committed, so the retirement of the
+/// listed old segments is completed; without it the rename never happened.
+pub(crate) fn recover_replace_journals(table_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(table_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(final_name) = name.strip_suffix(".replace") else {
+            continue;
+        };
+        let final_path = table_dir.join(final_name);
+        let Some(olds) = read_replace_journal(&path) else {
+            if final_path.exists() {
+                // The journal is written BEFORE the rename, so a journal whose
+                // final segment exists means the replacement committed — but an
+                // unreadable journal (torn write / CRC mismatch) leaves the old
+                // segments it listed unretirable. Deleting the journal here
+                // would turn a crash-window double-count into a permanent,
+                // silent one: preserve it for inspection and keep alarming at
+                // every startup instead.
+                let corrupt = path.with_extension("replace.corrupt");
+                let preserved = std::fs::rename(&path, &corrupt).is_ok();
+                if !preserved {
+                    let _ = std::fs::remove_file(&path);
+                }
+                tracing::error!(
+                    journal = %path.display(),
+                    preserved_as = %corrupt.display(),
+                    preserved,
+                    final_segment = %final_path.display(),
+                    "replace journal is unreadable but the replacement had committed; the old \
+                     segments it listed cannot be retired automatically and scans may double-count \
+                     their rows until they are removed manually"
+                );
+            } else {
+                // No final segment: the rename never committed, so discarding
+                // the journal loses nothing.
+                tracing::debug!(
+                    journal = %path.display(),
+                    "discarding journal of a replacement whose rename never committed"
+                );
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        };
+        if final_path.exists() {
+            for old in &olds {
+                if old != &final_path && old.exists() {
+                    tracing::warn!(
+                        old_segment = %old.display(),
+                        "startup recovery: retiring old segment left by interrupted replacement"
+                    );
+                    let _ = std::fs::remove_file(old);
+                    let _ = remove_sidecar_meta(old);
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+fn read_replace_journal(journal: &Path) -> Option<Vec<PathBuf>> {
+    let bytes = std::fs::read(journal).ok()?;
+    if bytes.len() < 8 + 4 + 4 || !bytes.starts_with(REPLACE_JOURNAL_MAGIC) {
+        return None;
+    }
+    let body = &bytes[8..bytes.len() - 4];
+    let crc = u32::from_le_bytes(
+        bytes[bytes.len() - 4..]
+            .try_into()
+            .expect("crc slice has fixed length"),
+    );
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(body);
+    if hasher.finalize() != crc {
+        return None;
+    }
+    let count = u32::from_le_bytes(body[0..4].try_into().expect("u32 slice")) as usize;
+    let mut olds = Vec::with_capacity(count.min(4096));
+    let mut pos = 4usize;
+    for _ in 0..count {
+        if pos + 4 > body.len() {
+            return None;
+        }
+        let len = u32::from_le_bytes(body[pos..pos + 4].try_into().expect("u32 slice")) as usize;
+        pos += 4;
+        if pos + len > body.len() {
+            return None;
+        }
+        olds.push(PathBuf::from(
+            String::from_utf8_lossy(&body[pos..pos + len]).into_owned(),
+        ));
+        pos += len;
+    }
+    Some(olds)
+}
+
+/// Test-only re-exports of the replacement journal internals.
+#[cfg(test)]
+pub mod manager_core_test_support {
+    pub(crate) use super::{
+        recover_replace_journals as recover_replace_journals_for_test,
+        replace_journal_path as replace_journal_path_for_test,
+        write_replace_journal as write_replace_journal_for_test,
+    };
+}
+
+/// `<data>/<db>/<table>/<segment>` path -> `(db, table)`.
+fn db_table_from_segment_path(path: &Path) -> Option<(String, String)> {
+    let table = path.parent()?.file_name()?.to_string_lossy().to_string();
+    let db = path
+        .parent()?
+        .parent()?
+        .file_name()?
+        .to_string_lossy()
+        .to_string();
+    Some((db, table))
 }

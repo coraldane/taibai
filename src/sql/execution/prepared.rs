@@ -20,6 +20,11 @@ pub struct PreparedStatement {
     pub params: Vec<ScalarValue>,
     pub cached_plan: Option<LogicalPlan>,
     pub planned_database: Option<String>,
+    /// Fingerprint of every referenced table's schema at plan time. DROP +
+    /// re-CREATE (or ALTER) of a same-named table changes it, and a stale
+    /// cached plan (column indices) must be discarded instead of reading
+    /// wrong columns.
+    pub planned_schema_fingerprint: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +82,7 @@ impl PreparedStatementCache {
             params: Vec::new(),
             cached_plan: None,
             planned_database: None,
+            planned_schema_fingerprint: None,
         };
 
         self.statements.insert(id, prepared.clone());
@@ -203,6 +209,7 @@ pub fn bind_params(stmt: &mut Statement, params: &[ScalarValue]) -> Result<()> {
             }
         }
         Statement::ReplaceSelect { query, .. } => bind_params(query, params)?,
+        Statement::InsertSelect { query, .. } => bind_params(query, params)?,
         Statement::Update {
             where_clause,
             assignments,
@@ -453,6 +460,9 @@ pub fn count_placeholders(stmt: &Statement) -> usize {
         Statement::ReplaceSelect { query, .. } => {
             count += count_placeholders(query);
         }
+        Statement::InsertSelect { query, .. } => {
+            count += count_placeholders(query);
+        }
         Statement::Update {
             where_clause,
             assignments,
@@ -685,6 +695,9 @@ pub fn has_placeholders(stmt: &Statement) -> bool {
             }
         }
         Statement::ReplaceSelect { query, .. } => {
+            found |= has_placeholders(query);
+        }
+        Statement::InsertSelect { query, .. } => {
             found |= has_placeholders(query);
         }
         Statement::Update {

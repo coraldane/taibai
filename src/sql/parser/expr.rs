@@ -340,6 +340,7 @@ impl Parser {
                 match name.to_ascii_uppercase().as_str() {
                     "TRUE" => return Ok(Expr::Literal(ScalarValue::Bool(Some(true)))),
                     "FALSE" => return Ok(Expr::Literal(ScalarValue::Bool(Some(false)))),
+                    "CAST" if self.peek() == &Token::LeftParen => return self.parse_cast(),
                     _ => {}
                 }
                 if self.peek() == &Token::Dot {
@@ -459,9 +460,85 @@ impl Parser {
                 self.placeholder_count += 1;
                 Ok(Expr::Placeholder(idx))
             }
+            Token::NumberedPlaceholder(n) => {
+                self.advance();
+                // `$1` is the first parameter; a later `?` continues after the
+                // highest explicit index so the two styles can coexist.
+                self.placeholder_count = self.placeholder_count.max(n);
+                Ok(Expr::Placeholder(n - 1))
+            }
             ref other => Err(TaibaiError::Sql(format!(
                 "unexpected token in expression: {}",
                 other
+            ))),
+        }
+    }
+
+    /// Parse `CAST(expr AS type[(p[, s])])`. Desugared to a `cast` scalar
+    /// function call carrying the normalized type name and decimal scale, so
+    /// no planner or evaluator changes are needed.
+    fn parse_cast(&mut self) -> Result<Expr> {
+        self.expect(&Token::LeftParen)?;
+        let expr = self.parse_expr()?;
+        match self.peek() {
+            Token::As => {
+                self.advance();
+            }
+            other => {
+                return Err(TaibaiError::Sql(format!(
+                    "expected AS in CAST, got {}",
+                    other
+                )))
+            }
+        }
+        let type_name = self.expect_ident()?;
+        // Optional precision/scale, e.g. VARCHAR(100) or DECIMAL(10, 2).
+        // Only DECIMAL's scale is meaningful to the executor; VARCHAR's length
+        // is accepted and ignored for compatibility.
+        let mut scale: i64 = 0;
+        if self.peek() == &Token::LeftParen {
+            self.advance();
+            let p1 = self.parse_cast_number("CAST type parameters")?;
+            if self.peek() == &Token::Comma {
+                self.advance();
+                let p2 = self.parse_cast_number("CAST type parameters")?;
+                scale = p2;
+            } else if type_name.eq_ignore_ascii_case("DECIMAL") {
+                // DECIMAL(p) keeps scale 0 (the PG convention for precision-only).
+            } else if !type_name.eq_ignore_ascii_case("VARCHAR") {
+                return Err(TaibaiError::Sql(format!(
+                    "type parameters are only allowed for VARCHAR or DECIMAL in CAST, got {}({})",
+                    type_name, p1
+                )));
+            }
+            self.expect(&Token::RightParen)?;
+        }
+        let target = crate::sql::parser::parser::parse_data_type(&type_name)?;
+        self.expect(&Token::RightParen)?;
+        // Desugared shape: cast(value, NULL::<target>, scale). The second
+        // argument is a NULL literal of the target type, so both result-type
+        // inference (infer_scalar_function_type) and the runtime handler read
+        // the target from the argument's own DataType.
+        Ok(Expr::Function {
+            name: "cast".to_string(),
+            args: vec![
+                expr,
+                Expr::Literal(ScalarValue::null_for_type(target)),
+                Expr::Literal(ScalarValue::Int64(Some(scale))),
+            ],
+            distinct: false,
+        })
+    }
+
+    fn parse_cast_number(&mut self, context: &str) -> Result<i64> {
+        match self.peek().clone() {
+            Token::Integer(v) => {
+                self.advance();
+                Ok(v)
+            }
+            other => Err(TaibaiError::Sql(format!(
+                "expected integer in {}, got {}",
+                context, other
             ))),
         }
     }
@@ -526,7 +603,12 @@ impl Parser {
             {
                 self.advance();
                 let start = self.parse_frame_bound()?;
-                self.expect(&Token::Ident("AND".into()))?;
+                // AND is tokenized as the logical keyword, not an identifier.
+                if self.peek() == &Token::And {
+                    self.advance();
+                } else {
+                    self.expect(&Token::Ident("AND".into()))?;
+                }
                 let end = self.parse_frame_bound()?;
                 (start, end)
             } else {
@@ -549,38 +631,51 @@ impl Parser {
             "RANK" => WindowFunc::Rank,
             "DENSE_RANK" => WindowFunc::DenseRank,
             "LEAD" => {
-                let offset = if args.is_empty() {
-                    1
-                } else {
-                    match &args[0] {
-                        Expr::Literal(ScalarValue::Int64(Some(v))) => *v as usize,
-                        Expr::Literal(ScalarValue::Int32(Some(v))) => *v as usize,
-                        _ => 1,
+                // Standard form: LEAD(value[, offset[, default]]).
+                let Some(arg) = args.first() else {
+                    return Err(TaibaiError::Sql(
+                        "LEAD requires a value argument".to_string(),
+                    ));
+                };
+                let offset = match args.get(1) {
+                    Some(Expr::Literal(ScalarValue::Int64(Some(v)))) => *v as usize,
+                    Some(Expr::Literal(ScalarValue::Int32(Some(v)))) => *v as usize,
+                    None => 1,
+                    _ => {
+                        return Err(TaibaiError::Sql(
+                            "LEAD offset must be an integer literal".to_string(),
+                        ))
                     }
                 };
-                let default = if args.len() > 1 {
-                    Some(Box::new(args[1].clone()))
-                } else {
-                    None
-                };
-                WindowFunc::Lead { offset, default }
+                let default = args.get(2).map(|d| Box::new(d.clone()));
+                WindowFunc::Lead {
+                    arg: Box::new(arg.clone()),
+                    offset,
+                    default,
+                }
             }
             "LAG" => {
-                let offset = if args.is_empty() {
-                    1
-                } else {
-                    match &args[0] {
-                        Expr::Literal(ScalarValue::Int64(Some(v))) => *v as usize,
-                        Expr::Literal(ScalarValue::Int32(Some(v))) => *v as usize,
-                        _ => 1,
+                let Some(arg) = args.first() else {
+                    return Err(TaibaiError::Sql(
+                        "LAG requires a value argument".to_string(),
+                    ));
+                };
+                let offset = match args.get(1) {
+                    Some(Expr::Literal(ScalarValue::Int64(Some(v)))) => *v as usize,
+                    Some(Expr::Literal(ScalarValue::Int32(Some(v)))) => *v as usize,
+                    None => 1,
+                    _ => {
+                        return Err(TaibaiError::Sql(
+                            "LAG offset must be an integer literal".to_string(),
+                        ))
                     }
                 };
-                let default = if args.len() > 1 {
-                    Some(Box::new(args[1].clone()))
-                } else {
-                    None
-                };
-                WindowFunc::Lag { offset, default }
+                let default = args.get(2).map(|d| Box::new(d.clone()));
+                WindowFunc::Lag {
+                    arg: Box::new(arg.clone()),
+                    offset,
+                    default,
+                }
             }
             _ => WindowFunc::Aggregate {
                 func: name,
@@ -600,10 +695,18 @@ impl Parser {
     fn parse_frame_bound(&mut self) -> Result<FrameBound> {
         if self.peek() == &Token::Unbounded {
             self.advance();
-            if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "PRECEDING") {
+            // The lexer may emit dedicated keyword tokens (Token::Preceding)
+            // or plain identifiers depending on context; accept both, like
+            // the numeric-bound branch does. `BETWEEN UNBOUNDED PRECEDING`
+            // used to be unparseable.
+            let is_preceding = self.peek() == &Token::Preceding
+                || matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "PRECEDING");
+            let is_following = self.peek() == &Token::Following
+                || matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "FOLLOWING");
+            if is_preceding {
                 self.advance();
                 Ok(FrameBound::UnboundedPreceding)
-            } else if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "FOLLOWING") {
+            } else if is_following {
                 self.advance();
                 Ok(FrameBound::UnboundedFollowing)
             } else {
@@ -611,9 +714,17 @@ impl Parser {
                     "expected PRECEDING or FOLLOWING after UNBOUNDED".into(),
                 ))
             }
-        } else if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "CURRENT") {
+        } else if self.peek() == &Token::Current
+            || matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "CURRENT")
+        {
             self.advance();
-            self.expect(&Token::Ident("ROW".into()))?;
+            // ROW may arrive as the plural keyword token (shared with
+            // ROWS) or a plain identifier.
+            if self.peek() == &Token::Rows {
+                self.advance();
+            } else {
+                self.expect(&Token::Ident("ROW".into()))?;
+            }
             Ok(FrameBound::CurrentRow)
         } else if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "PRECEDING") {
             self.advance();
@@ -627,10 +738,14 @@ impl Parser {
                 _ => unreachable!(),
             };
             self.advance();
-            if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "PRECEDING") {
+            let is_preceding = self.peek() == &Token::Preceding
+                || matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "PRECEDING");
+            let is_following = self.peek() == &Token::Following
+                || matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "FOLLOWING");
+            if is_preceding {
                 self.advance();
                 Ok(FrameBound::Preceding(n))
-            } else if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "FOLLOWING") {
+            } else if is_following {
                 self.advance();
                 Ok(FrameBound::Following(n))
             } else {

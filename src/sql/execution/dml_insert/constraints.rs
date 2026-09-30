@@ -41,9 +41,12 @@ fn validate_unique_constraints_in_batch(
             let Some(key) = unique_key_for_row(batch, row_idx, indices, schema) else {
                 continue;
             };
-            if !keys.insert(key.clone()) {
+            // Probe first and move on success: hashing twice is cheaper than
+            // cloning every key cell (a String copy for VarChar) per row.
+            if keys.contains(&key) {
                 return Err(duplicate_unique_key_error(table, name, &key));
             }
+            keys.insert(key);
         }
     }
     Ok(())
@@ -64,9 +67,10 @@ pub fn validate_unique_key_uniqueness(
             let Some(key) = unique_key_for_row(batch, row_idx, indices, schema) else {
                 continue;
             };
-            if !keys.insert(key.clone()) {
+            if keys.contains(&key) {
                 return Err(duplicate_unique_key_error(table, index_name, &key));
             }
+            keys.insert(key);
         }
     }
     if new_batch.is_some() {
@@ -79,14 +83,13 @@ pub fn validate_unique_key_uniqueness(
                 .map(|idx| schema.columns[*idx].name.clone())
                 .collect::<Vec<_>>();
             if columns == index_columns {
-                let key_vec = keys.iter().cloned().collect::<Vec<_>>();
-                match engine
-                    .index_manager()
-                    .unique_keys_exist(db, table, index_name, &key_vec)?
-                {
+                // Pass the set directly: the lookup is generic over the key
+                // iteration, so the whole key set need not be re-cloned per
+                // INSERT.
+                match engine.index_manager().unique_keys_exist(db, table, index_name, &keys)? {
                     Some(false) => return Ok(()),
                     Some(true) => {
-                        for key in &key_vec {
+                        for key in &keys {
                             if engine
                                 .index_manager()
                                 .unique_key_exists(db, table, index_name, key)?
@@ -222,7 +225,9 @@ fn load_existing_unique_keys(
         }
     }
     for memtable in engine.memtable_manager().get_by_table(db, table) {
-        if let Some(batch) = memtable.read() {
+        // Arc-shared snapshot: `read()` deep-clones the whole batch (up to
+        // 500k rows × all columns) just to probe a few key columns.
+        if let Some(batch) = memtable.read_snapshot_arc() {
             check_existing_unique_batch_with_indices(table, index_name, &batch, indices, new_keys)?;
         }
     }
@@ -282,7 +287,7 @@ pub fn validate_unique_indexes_in_batches(
     table: &str,
     schema: &Schema,
     unique_indexes: &[crate::storage::catalog::schema::UniqueIndexMeta],
-    batches: &[RecordBatch],
+    batches: &[std::sync::Arc<RecordBatch>],
 ) -> Result<()> {
     for index in unique_indexes {
         let mut indices = Vec::with_capacity(index.columns.len());
@@ -297,9 +302,10 @@ pub fn validate_unique_indexes_in_batches(
                 let Some(key) = unique_key_for_row(batch, row_idx, &indices, schema) else {
                     continue;
                 };
-                if !keys.insert(key.clone()) {
+                if keys.contains(&key) {
                     return Err(duplicate_unique_key_error(table, &index.name, &key));
                 }
+                keys.insert(key);
             }
         }
     }
@@ -434,9 +440,10 @@ fn validate_primary_key_uniqueness_in_batch(
     let mut keys = HashSet::new();
     for row_idx in 0..batch.num_rows() {
         let key = primary_key_for_row(batch, row_idx, primary_key_indices, schema)?;
-        if !keys.insert(key.clone()) {
+        if keys.contains(&key) {
             return Err(duplicate_primary_key_error(table, &key));
         }
+        keys.insert(key);
     }
     Ok(())
 }
@@ -511,28 +518,4 @@ fn duplicate_primary_key_error(table: &str, key: &[ScalarValue]) -> TaibaiError 
         "duplicate primary key for table '{}': ({})",
         table, key_text
     ))
-}
-
-fn compute_partition_key_for_value(
-    table_meta: &crate::storage::catalog::schema::TableMeta,
-    val: &ScalarValue,
-) -> String {
-    if table_meta.partition_key.is_empty() {
-        return String::new();
-    }
-    use crate::storage::catalog::schema::PartitionType;
-    match table_meta.partition_type {
-        PartitionType::Day
-        | PartitionType::Year
-        | PartitionType::Month
-        | PartitionType::Hash
-        | PartitionType::Mod => {
-            crate::storage::partition::partition_function::compute_partition_key_from_scalar(
-                &table_meta.partition_strategy(),
-                val,
-            )
-        }
-        PartitionType::Value => val.to_text().unwrap_or_default(),
-        PartitionType::None => String::new(),
-    }
 }

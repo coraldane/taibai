@@ -18,8 +18,13 @@ use crate::types::scalar::ScalarValue;
 use super::constants::{FOOTER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
 use super::meta::remove_sidecar_meta;
 
-pub(crate) const VALUE_SET_EXTENSION_MAGIC: u32 = 0x5354_4958; // STIX
 pub(crate) const VALUE_SET_MAX_DISTINCT: usize = 1024;
+// Extension-block magics live in `footer_ext`, the single source of
+// truth for every optional footer block.
+pub(crate) use super::footer_ext::{
+    COLUMN_CRC_EXTENSION_MAGIC, COL_SUM_EXTENSION_MAGIC, FOOTER_CRC_EXTENSION_MAGIC,
+    VALUE_SET_EXTENSION_MAGIC,
+};
 
 struct BuildingRowGroup {
     columns: Vec<Vec<u8>>,
@@ -30,6 +35,7 @@ struct BuildingRowGroup {
     null_counts: Vec<u64>,
     bloom_filters: Vec<Option<BloomFilter>>,
     value_sets: Vec<Option<HashSet<ScalarValue>>>,
+    col_sums: Vec<i64>,
 }
 
 struct ColumnMetadata {
@@ -54,6 +60,7 @@ impl BuildingRowGroup {
                 .map(|enabled| enabled.then(BloomFilter::with_defaults))
                 .collect(),
             value_sets: vec![Some(HashSet::new()); num_columns],
+            col_sums: vec![0; num_columns],
         }
     }
 }
@@ -67,12 +74,24 @@ pub struct SegmentWriter {
     current_group: Option<BuildingRowGroup>,
     total_rows: u64,
     bloom_columns: Vec<bool>,
+    compression_level: i32,
 }
 
 impl SegmentWriter {
-    pub fn create(path: &Path, schema: Schema, row_group_size: usize) -> Result<Self> {
+    pub fn create(
+        path: &Path,
+        schema: Schema,
+        row_group_size: usize,
+        compression_level: i32,
+    ) -> Result<Self> {
         let bloom_columns: Vec<usize> = (0..schema.num_columns()).collect();
-        Self::create_with_bloom_columns(path, schema, row_group_size, &bloom_columns)
+        Self::create_with_bloom_columns(
+            path,
+            schema,
+            row_group_size,
+            &bloom_columns,
+            compression_level,
+        )
     }
 
     pub fn create_with_bloom_columns(
@@ -80,6 +99,7 @@ impl SegmentWriter {
         schema: Schema,
         row_group_size: usize,
         bloom_column_indices: &[usize],
+        compression_level: i32,
     ) -> Result<Self> {
         remove_sidecar_meta(path)?;
         let mut file = fs::OpenOptions::new()
@@ -107,6 +127,7 @@ impl SegmentWriter {
             current_group: None,
             total_rows: 0,
             bloom_columns,
+            compression_level,
         })
     }
 
@@ -142,6 +163,7 @@ impl SegmentWriter {
                 let metadata =
                     build_column_metadata(col, offset, to_write, self.bloom_columns[col_idx]);
                 merge_column_metadata(group, col_idx, metadata);
+                accumulate_column_sum(&mut group.col_sums[col_idx], col, offset, to_write);
 
                 let single_block = group.columns[col_idx].is_empty() && to_write == can_fit;
 
@@ -149,7 +171,7 @@ impl SegmentWriter {
                     col,
                     offset,
                     to_write,
-                    crate::storage::segment_manager::bulk_compression_level(),
+                    self.compression_level,
                     single_block,
                 )?;
 
@@ -207,6 +229,7 @@ impl SegmentWriter {
             zone_map: ZoneMap,
             bloom_filter: Option<BloomFilter>,
             value_set: Option<Vec<ScalarValue>>,
+            col_sum: i64,
         }
 
         let encoded_columns = (0..self.schema.num_columns())
@@ -223,13 +246,15 @@ impl SegmentWriter {
                     col,
                     row_offset,
                     row_count,
-                    crate::storage::segment_manager::bulk_compression_level(),
+                    self.compression_level,
                     true,
                 )?;
                 let value_set = metadata.value_set.map(|mut values| {
                     values.sort_by(crate::storage::index::sort_key::compare_scalars_for_sort);
                     values
                 });
+                let mut col_sum = 0i64;
+                accumulate_column_sum(&mut col_sum, col, row_offset, row_count);
 
                 Ok(EncodedColumn {
                     compressed: stored.data,
@@ -242,6 +267,7 @@ impl SegmentWriter {
                     },
                     bloom_filter: metadata.bloom_filter.filter(|filter| !filter.is_empty()),
                     value_set,
+                    col_sum,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -252,14 +278,18 @@ impl SegmentWriter {
         let mut zone_maps = Vec::with_capacity(encoded_columns.len());
         let mut bloom_filters = Vec::with_capacity(encoded_columns.len());
         let mut value_sets = Vec::with_capacity(encoded_columns.len());
+        let mut col_sums = Vec::with_capacity(encoded_columns.len());
+        let mut column_crcs = Vec::with_capacity(encoded_columns.len());
         for encoded in encoded_columns {
             let compressed_size = encoded.compressed.len() as u64;
+            column_crcs.push(crc32fast::hash(&encoded.compressed));
             self.file.write_all(&encoded.compressed)?;
             compressed_sizes.push(compressed_size);
             uncompressed_sizes.push(encoded.uncompressed_size);
             zone_maps.push(encoded.zone_map);
             bloom_filters.push(encoded.bloom_filter);
             value_sets.push(encoded.value_set);
+            col_sums.push(encoded.col_sum);
         }
 
         self.row_groups.push(crate::storage::segment::RowGroupMeta {
@@ -272,6 +302,8 @@ impl SegmentWriter {
             uncompressed_sizes,
             bloom_filters,
             value_sets,
+            col_sums,
+            column_crcs,
         });
         Ok(())
     }
@@ -311,11 +343,13 @@ impl SegmentWriter {
 
         let mut compressed_sizes = Vec::with_capacity(group.columns.len());
         let mut column_compressed_sizes = Vec::with_capacity(group.columns.len());
+        let mut column_crcs = Vec::with_capacity(group.columns.len());
 
         for col_data in &group.columns {
             let n = col_data.len() as u64;
             compressed_sizes.push(n);
             column_compressed_sizes.push(n);
+            column_crcs.push(crc32fast::hash(col_data));
             self.file.write_all(col_data)?;
         }
 
@@ -362,6 +396,8 @@ impl SegmentWriter {
             zone_maps,
             bloom_filters,
             value_sets,
+            col_sums: group.col_sums,
+            column_crcs,
         });
 
         Ok(())
@@ -494,6 +530,26 @@ pub fn encode_segment_footer(
                 buf.push(0);
             }
         }
+
+        // Per-row-group column sums: present exactly when the writer
+        // computed them, so re-encoding footers parsed from old segments
+        // keeps omitting the extension.
+        if rg.col_sums.len() == schema.columns.len() {
+            buf.extend_from_slice(&COL_SUM_EXTENSION_MAGIC.to_le_bytes());
+            buf.extend_from_slice(&(rg.col_sums.len() as u32).to_le_bytes());
+            for &sum in &rg.col_sums {
+                buf.extend_from_slice(&sum.to_le_bytes());
+            }
+        }
+
+        // Per-row-group column block checksums, same presence rule.
+        if rg.column_crcs.len() == schema.columns.len() {
+            buf.extend_from_slice(&COLUMN_CRC_EXTENSION_MAGIC.to_le_bytes());
+            buf.extend_from_slice(&(rg.column_crcs.len() as u32).to_le_bytes());
+            for &crc in &rg.column_crcs {
+                buf.extend_from_slice(&crc.to_le_bytes());
+            }
+        }
     }
 
     buf.extend_from_slice(&deleted_row_count.to_le_bytes());
@@ -502,7 +558,26 @@ pub fn encode_segment_footer(
         buf.extend_from_slice(delete_bitmap);
     }
 
+    // Whole-footer checksum: a flipped footer byte used to surface as
+    // garbage zone maps or silently-skipped blocks instead of an error.
+    let footer_crc = crc32fast::hash(&buf);
+    buf.extend_from_slice(&FOOTER_CRC_EXTENSION_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&footer_crc.to_le_bytes());
+
     buf
+}
+
+/// Accumulate the footer-persisted running sum for one column slice.
+/// Wrapping i64, non-null values only, types outside
+/// [`crate::storage::segment::column_sum_supported`] stay at 0 (readers
+/// never consult them).
+fn accumulate_column_sum(slot: &mut i64, col: &ColumnArray, offset: usize, count: usize) {
+    if !crate::storage::segment::column_sum_supported(col.data_type()) {
+        return;
+    }
+    if let Some(part) = col.col_sum_i64_range(offset, count) {
+        *slot = slot.wrapping_add(part);
+    }
 }
 
 fn merge_column_metadata(group: &mut BuildingRowGroup, col_idx: usize, metadata: ColumnMetadata) {
@@ -559,7 +634,11 @@ fn build_column_metadata(
     count: usize,
     bloom_enabled: bool,
 ) -> ColumnMetadata {
+    let col = col.flattened();
     match col {
+        ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => {
+            unreachable!("materialized above")
+        }
         ColumnArray::Bool { data, bitmap } => {
             let mut min_value = None;
             let mut max_value = None;

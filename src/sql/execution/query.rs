@@ -122,6 +122,7 @@ pub fn exec_union_with_txn(
     let Statement::Union {
         left,
         right,
+        op,
         all,
         order_by,
         limit,
@@ -134,8 +135,8 @@ pub fn exec_union_with_txn(
     };
 
     let (left_result, right_result) = (
-        exec_select_with_txn(engine, db, left, reader_txn_id)?,
-        exec_select_with_txn(engine, db, right, reader_txn_id)?,
+        exec_set_operand(engine, db, left, reader_txn_id)?,
+        exec_set_operand(engine, db, right, reader_txn_id)?,
     );
     let (
         ExecResult::Query {
@@ -180,16 +181,36 @@ pub fn exec_union_with_txn(
         }
     }
 
-    if !*all {
-        let mut seen = std::collections::HashSet::new();
-        rows.retain(|row| {
-            let key = row
-                .iter()
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-                .join("\u{1f}");
-            seen.insert(key)
-        });
+    match op {
+        crate::sql::parser::ast::SetOp::Union => {
+            if !*all {
+                // Typed keys: the old to_string-joined key could collide when a
+                // value contained the separator, silently dropping distinct rows.
+                let mut seen = std::collections::HashSet::new();
+                rows.retain(|row| seen.insert(row.clone()));
+            }
+        }
+        // INTERSECT / EXCEPT apply set semantics: both operands are
+        // deduplicated and the result keeps first-appearance order of the
+        // (deduplicated) left rows.
+        crate::sql::parser::ast::SetOp::Intersect | crate::sql::parser::ast::SetOp::Except => {
+            let mut right_keys = std::collections::HashSet::new();
+            let right_row_start = left_rows_count(&left_batches);
+            for row in rows.iter().skip(right_row_start) {
+                right_keys.insert(row.clone());
+            }
+            rows.truncate(right_row_start);
+            let mut seen = std::collections::HashSet::new();
+            let keep = matches!(op, crate::sql::parser::ast::SetOp::Intersect);
+            rows.retain(|row| {
+                seen.insert(row.clone())
+                    && if keep {
+                        right_keys.contains(row)
+                    } else {
+                        !right_keys.contains(row)
+                    }
+            });
+        }
     }
 
     if !order_by.is_empty() {
@@ -263,11 +284,32 @@ pub fn exec_union_with_txn(
     })
 }
 
+/// Execute one operand of a set operation. Operands may themselves be set
+/// operations (e.g. `(a UNION b) EXCEPT c` folds left-associatively), so a
+/// nested Union recurses instead of hitting the SELECT-only path.
+fn exec_set_operand(
+    engine: &Engine,
+    db: &str,
+    stmt: &Statement,
+    reader_txn_id: u64,
+) -> Result<ExecResult> {
+    match stmt {
+        Statement::Union { .. } => exec_union_with_txn(engine, db, stmt, reader_txn_id),
+        _ => exec_select_with_txn(engine, db, stmt, reader_txn_id),
+    }
+}
+
 fn right_schema_col_count(result: &ExecResult) -> usize {
     match result {
         ExecResult::Query { schema, .. } => schema.columns.len(),
         ExecResult::Ok { .. } => 0,
     }
+}
+
+/// Number of rows the left operand contributed to `rows` (they were appended
+/// first, so this is also the index where the right operand's rows start).
+fn left_rows_count(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(|b| b.num_rows()).sum()
 }
 
 fn union_scalar_cmp(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
@@ -417,7 +459,8 @@ fn exec_table_select(
     let resolved;
     let resolved_stmt;
     let derived_tables;
-    let mut decorrelated_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+    let mut decorrelated_batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>> =
+        HashMap::new();
     let subquery_registry;
     let has_correlated;
     let (stmt, from_clause) = if let Some(pre) = pre_resolved {
@@ -518,8 +561,19 @@ fn exec_table_select(
         && !has_correlated
         && table_names.len() == 1
         && detect_simple_metadata_aggregate(stmt, &table_names)
-    {
-        extract_simple_metadata_aggregates(&plan)
+        && !where_pins_leading_cluster_column(
+            stmt,
+            &table_metas
+                .get(&table_names[0])
+                .map(|meta| meta.cluster_key.clone())
+                .unwrap_or_default(),
+        ) {
+        extract_simple_metadata_aggregates(
+            &plan,
+            table_schemas
+                .get(&table_names[0])
+                .unwrap_or(&crate::types::batch::Schema::empty()),
+        )
     } else {
         None
     };
@@ -584,10 +638,10 @@ fn exec_table_select_materialized(
     reader_txn_id: u64,
     profile: Option<&QueryProfile>,
     derived_batches: HashMap<String, (Schema, Vec<RecordBatch>)>,
-    decorrelated_batches: HashMap<String, Vec<RecordBatch>>,
+    decorrelated_batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
     subqueries: Option<&super::subquery_runtime::SubqueryRegistry>,
 ) -> Result<ExecResult> {
-    let mut table_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+    let mut table_batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>> = HashMap::new();
     let mut fully_applied_scan_filters: HashMap<String, bool> = HashMap::new();
     let mut scan_seeds: HashMap<String, ScanProfileSeed> = HashMap::new();
 
@@ -617,6 +671,7 @@ fn exec_table_select_materialized(
 
         let scan_start = std::time::Instant::now();
         let batches = executor.execute()?;
+        let metadata_answered = executor.metadata_answered();
         scan_seeds.insert(
             table_name.clone(),
             ScanProfileSeed {
@@ -640,9 +695,12 @@ fn exec_table_select_materialized(
                 batches,
             });
         }
-        if spec.simple_metadata_aggregates.is_some() {
-            // The scan executor already produced the single aggregate result row
-            // via the metadata fast path; do not feed it through the pipeline.
+        if spec.simple_metadata_aggregates.is_some() && metadata_answered {
+            // The scan executor produced the single aggregate result row via
+            // the metadata fast path; do not feed it through the pipeline.
+            // When the path declined (metadata_answered == false), the
+            // batches are raw scanned rows and the pipeline below must apply
+            // the aggregate operator as usual.
             let result_schema = if let Some(b) = batches.first() {
                 b.schema.clone()
             } else {
@@ -654,7 +712,10 @@ fn exec_table_select_materialized(
             });
         }
 
-        table_batches.insert(table_name.clone(), batches);
+        table_batches.insert(
+            table_name.clone(),
+            batches.into_iter().map(std::sync::Arc::new).collect(),
+        );
     }
 
     let plan = if profile.is_none()
@@ -676,7 +737,7 @@ fn exec_table_select_materialized(
     };
 
     for (key, (_, batches)) in derived_batches {
-        table_batches.insert(key, batches);
+        table_batches.insert(key, batches.into_iter().map(std::sync::Arc::new).collect());
     }
     for (key, batches) in decorrelated_batches {
         table_batches.entry(key).or_insert(batches);
@@ -745,6 +806,20 @@ pub(crate) fn resolve_in_subqueries(
     let mut stmt = stmt.clone();
     resolve_stmt_in_subqueries(engine, db, &mut stmt)?;
     Ok(stmt)
+}
+
+/// Resolve subqueries inside a DML WHERE clause into literals — the
+/// `Option<Expr>` counterpart of [`resolve_in_subqueries`]. Shared by the
+/// DELETE, UPDATE, and transactional DML paths.
+pub(crate) fn resolve_where_in_subqueries(
+    engine: &Engine,
+    db: &str,
+    where_clause: &Option<Expr>,
+) -> Result<Option<Expr>> {
+    where_clause
+        .as_ref()
+        .map(|expr| resolve_expr_in_subqueries_clone(engine, db, expr))
+        .transpose()
 }
 
 fn resolve_stmt_in_subqueries(engine: &Engine, db: &str, stmt: &mut Statement) -> Result<()> {
@@ -903,20 +978,102 @@ fn execute_in_subquery(
     db: &str,
     subquery: &Statement,
 ) -> Result<Vec<ScalarValue>> {
-    let ExecResult::Query { batches, .. } = exec_select(engine, db, subquery)? else {
+    // Resolve nested subqueries up front: `exec_select` would resolve them
+    // again and find nothing left, so the total work is unchanged.
+    let mut resolved = subquery.clone();
+    resolve_stmt_in_subqueries(engine, db, &mut resolved)?;
+    if let Some(values) = execute_simple_derived_subquery(engine, db, &resolved)? {
+        return Ok(values);
+    }
+    let ExecResult::Query { batches, .. } = exec_select(engine, db, &resolved)? else {
         return Err(TaibaiError::Sql("IN subquery must be a SELECT".into()));
     };
+    Ok(first_column_values(&batches, 0))
+}
 
+/// Fast path for `IN (SELECT c FROM (SELECT ...) AS alias)`: the derived
+/// table is executed directly and the single projected column picked out of
+/// its result, skipping the outer select pipeline. Only shapes whose
+/// projection is provably a pass-through of one inner column take the fast
+/// path — anything else returns `None` for the general pipeline.
+fn execute_simple_derived_subquery(
+    engine: &Engine,
+    db: &str,
+    stmt: &Statement,
+) -> Result<Option<Vec<ScalarValue>>> {
+    let Statement::Select {
+        select_list,
+        from: Some(FromClause::Table(TableRef::Subquery { query, alias })),
+        where_clause: None,
+        group_by,
+        having: None,
+        order_by: _,
+        limit: None,
+        offset: None,
+        ..
+    } = stmt
+    else {
+        return Ok(None);
+    };
+
+    if !group_by.is_empty() || select_list.len() != 1 {
+        return Ok(None);
+    }
+
+    let mut inner = query.clone();
+    resolve_stmt_in_subqueries(engine, db, &mut inner)?;
+    let ExecResult::Query { schema, batches } = exec_select(engine, db, &inner)? else {
+        return Err(TaibaiError::Sql(
+            "derived IN subquery must be a SELECT".into(),
+        ));
+    };
+
+    let col_idx = match &select_list[0] {
+        SelectItem::Star => Some(0),
+        SelectItem::Expr(Expr::Column(name), _) => schema.index_of(name),
+        SelectItem::Expr(Expr::QualifiedColumn { table, column }, _)
+            if table.eq_ignore_ascii_case(alias) =>
+        {
+            schema.index_of(column)
+        }
+        // A computed projection (e.g. `alias.col + 1`) — or a column the
+        // inner query does not expose — is not a pass-through; the general
+        // pipeline must evaluate (or reject) it.
+        SelectItem::Expr(_, _) => None,
+    };
+    let Some(col_idx) = col_idx else {
+        return Ok(None);
+    };
+    Ok(Some(first_column_values(&batches, col_idx)))
+}
+
+fn first_column_values(batches: &[RecordBatch], col_idx: usize) -> Vec<ScalarValue> {
     let mut values = Vec::new();
     for batch in batches {
-        if batch.num_columns() == 0 {
+        if batch.num_columns() <= col_idx {
             continue;
         }
         for row_idx in 0..batch.num_rows() {
-            values.push(batch.scalar(row_idx, 0).unwrap_or(ScalarValue::Int64(None)));
+            values.push(
+                batch
+                    .scalar(row_idx, col_idx)
+                    .unwrap_or(ScalarValue::Int64(None)),
+            );
         }
     }
-    Ok(values)
+    values
+}
+
+/// Clone-and-resolve form used by the DML paths, which keep the original
+/// expression for permission checks and undo and need a rewritten copy.
+pub(crate) fn resolve_expr_in_subqueries_clone(
+    engine: &Engine,
+    db: &str,
+    expr: &Expr,
+) -> Result<Expr> {
+    let mut resolved = expr.clone();
+    resolve_expr_in_subqueries(engine, db, &mut resolved)?;
+    Ok(resolved)
 }
 
 pub(crate) fn execute_scalar_subquery(
@@ -1037,9 +1194,57 @@ fn detect_count_star(stmt: &Statement, table_names: &[String]) -> bool {
     }
 }
 
+/// Equality on the leading cluster column (e.g. `WHERE symbol = ?` on
+/// `CLUSTER BY (symbol, ...)`) turns the scan into a sorted-key binary
+/// search on the streaming pipeline. The metadata aggregate path would
+/// instead fold every zone-map-surviving row group, so keep such queries
+/// unrouted.
+fn where_pins_leading_cluster_column(stmt: &Statement, cluster_key: &[String]) -> bool {
+    let Some(leading) = cluster_key.first() else {
+        return false;
+    };
+    let Statement::Select {
+        where_clause: Some(expr),
+        ..
+    } = stmt
+    else {
+        return false;
+    };
+    expr_pins_column_eq(expr, leading)
+}
+
+fn expr_pins_column_eq(expr: &crate::sql::parser::ast::Expr, column: &str) -> bool {
+    use crate::sql::parser::ast::{BinOp, Expr};
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => expr_pins_column_eq(left, column) || expr_pins_column_eq(right, column),
+        Expr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => {
+            bare_column_name(left).is_some_and(|name| name.eq_ignore_ascii_case(column))
+                || bare_column_name(right).is_some_and(|name| name.eq_ignore_ascii_case(column))
+        }
+        _ => false,
+    }
+}
+
+fn bare_column_name(expr: &crate::sql::parser::ast::Expr) -> Option<&str> {
+    use crate::sql::parser::ast::Expr;
+    match expr {
+        Expr::Column(name) => Some(name),
+        Expr::QualifiedColumn { column, .. } => Some(column),
+        _ => None,
+    }
+}
+
 /// Detect a "simple" aggregate query answerable from row-group metadata:
 /// single table, no GROUP BY/HAVING, and every select item is a non-distinct
-/// `COUNT(*)` / `COUNT(col)` / `MIN(col)` / `MAX(col)`.
+/// `COUNT(*)` / `COUNT(col)` / `MIN(col)` / `MAX(col)` / `SUM(col)` / `AVG(col)`.
 fn detect_simple_metadata_aggregate(stmt: &Statement, table_names: &[String]) -> bool {
     let (select_list, group_by, having) = match stmt {
         Statement::Select {
@@ -1067,7 +1272,9 @@ fn detect_simple_metadata_aggregate(stmt: &Statement, table_names: &[String]) ->
         ) => {
             let ok_func = name.eq_ignore_ascii_case("count")
                 || name.eq_ignore_ascii_case("min")
-                || name.eq_ignore_ascii_case("max");
+                || name.eq_ignore_ascii_case("max")
+                || name.eq_ignore_ascii_case("sum")
+                || name.eq_ignore_ascii_case("avg");
             ok_func
                 && args.len() == 1
                 && match &args[0] {
@@ -1085,18 +1292,70 @@ fn detect_simple_metadata_aggregate(stmt: &Statement, table_names: &[String]) ->
 /// caller falls back to the normal path.
 fn extract_simple_metadata_aggregates(
     plan: &LogicalPlan,
+    schema: &crate::types::batch::Schema,
 ) -> Option<Vec<crate::sql::planner::AggregateExpr>> {
+    // The optimizer may wrap the aggregate in a projection; unwrap one level.
+    let plan = match plan {
+        LogicalPlan::Project(plan) => plan.input.as_ref(),
+        other => other,
+    };
     match plan {
         LogicalPlan::Aggregate(agg) if agg.group_by.is_empty() && !agg.distinct => {
-            // Restrict to COUNT/MIN/MAX to match detect_simple_metadata_aggregate.
+            // Restrict to COUNT/MIN/MAX/SUM/AVG to match
+            // detect_simple_metadata_aggregate. SUM additionally requires a
+            // numeric argument column: the metadata path answers it with the
+            // argument's integer/float representation, and a routed query
+            // never reaches the aggregate pipeline, so unanswerable shapes
+            // must stay unrouted. AVG also needs a numeric argument (the
+            // answer is always sum/count as Float64, so Decimal is fine —
+            // the fold sums the raw i64 view like the regular pipeline's
+            // col_sum_i64 does).
             let all_supported = agg.aggregates.iter().all(|a| {
-                !a.distinct
-                    && matches!(
-                        a.func,
-                        crate::sql::planner::AggFunc::Count
-                            | crate::sql::planner::AggFunc::Min
-                            | crate::sql::planner::AggFunc::Max
-                    )
+                if a.distinct {
+                    return false;
+                }
+                match a.func {
+                    crate::sql::planner::AggFunc::Count
+                    | crate::sql::planner::AggFunc::Min
+                    | crate::sql::planner::AggFunc::Max => true,
+                    crate::sql::planner::AggFunc::Sum => match &*a.arg {
+                        crate::sql::planner::LogicalExpr::Column(idx) => schema
+                            .columns
+                            .get(*idx)
+                            .map(|c| {
+                                matches!(
+                                    c.data_type,
+                                    crate::protocol::types::DataType::Int64
+                                        | crate::protocol::types::DataType::Int32
+                                        | crate::protocol::types::DataType::Int16
+                                        | crate::protocol::types::DataType::Int8
+                                        | crate::protocol::types::DataType::Float64
+                                        | crate::protocol::types::DataType::Float32
+                                )
+                            })
+                            .unwrap_or(false),
+                        _ => false,
+                    },
+                    crate::sql::planner::AggFunc::Avg => match &*a.arg {
+                        crate::sql::planner::LogicalExpr::Column(idx) => schema
+                            .columns
+                            .get(*idx)
+                            .map(|c| {
+                                matches!(
+                                    c.data_type,
+                                    crate::protocol::types::DataType::Int64
+                                        | crate::protocol::types::DataType::Int32
+                                        | crate::protocol::types::DataType::Int16
+                                        | crate::protocol::types::DataType::Int8
+                                        | crate::protocol::types::DataType::Float64
+                                        | crate::protocol::types::DataType::Float32
+                                        | crate::protocol::types::DataType::Decimal
+                                )
+                            })
+                            .unwrap_or(false),
+                        _ => false,
+                    },
+                }
             });
             if all_supported {
                 Some(agg.aggregates.clone())
@@ -1110,7 +1369,7 @@ fn extract_simple_metadata_aggregates(
 
 fn try_skip_sort_for_cluster_key(
     plan: LogicalPlan,
-    table_batches: &HashMap<String, Vec<RecordBatch>>,
+    table_batches: &HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
     table_cluster_keys: &HashMap<String, Vec<String>>,
     table_schemas: &HashMap<String, Schema>,
 ) -> LogicalPlan {
@@ -1210,6 +1469,206 @@ fn collect_table_refs_from_join(
     }
 }
 
+/// Collect every table a statement reads: FROM tables (recursing into
+/// derived tables), plus any table referenced inside a subquery in the
+/// select list, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET, join ON
+/// conditions, or — for UPDATE — the SET assignments. The engine's
+/// statement-level permission gate walks this collection, so a subquery can
+/// never read a table that a FROM-only check would miss.
+pub(crate) fn collect_read_tables(
+    stmt: &Statement,
+    default_db: &str,
+    out: &mut Vec<ResolvedTableRef>,
+) {
+    match stmt {
+        Statement::Select {
+            select_list,
+            from,
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            if let Some(from) = from {
+                collect_from_tables(from, default_db, out);
+            }
+            for item in select_list {
+                if let SelectItem::Expr(expr, _) = item {
+                    collect_expr_tables(expr, default_db, out);
+                }
+            }
+            if let Some(expr) = where_clause {
+                collect_expr_tables(expr, default_db, out);
+            }
+            for expr in group_by {
+                collect_expr_tables(expr, default_db, out);
+            }
+            if let Some(expr) = having {
+                collect_expr_tables(expr, default_db, out);
+            }
+            for item in order_by {
+                collect_expr_tables(&item.expr, default_db, out);
+            }
+            if let Some(expr) = limit {
+                collect_expr_tables(expr, default_db, out);
+            }
+            if let Some(expr) = offset {
+                collect_expr_tables(expr, default_db, out);
+            }
+        }
+        Statement::Union {
+            left,
+            right,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            collect_read_tables(left, default_db, out);
+            collect_read_tables(right, default_db, out);
+            for item in order_by {
+                collect_expr_tables(&item.expr, default_db, out);
+            }
+            if let Some(expr) = limit {
+                collect_expr_tables(expr, default_db, out);
+            }
+            if let Some(expr) = offset {
+                collect_expr_tables(expr, default_db, out);
+            }
+        }
+        Statement::Update {
+            assignments,
+            where_clause,
+            ..
+        } => {
+            for assignment in assignments {
+                collect_expr_tables(&assignment.value, default_db, out);
+            }
+            if let Some(expr) = where_clause {
+                collect_expr_tables(expr, default_db, out);
+            }
+        }
+        Statement::Delete { where_clause, .. } => {
+            if let Some(expr) = where_clause {
+                collect_expr_tables(expr, default_db, out);
+            }
+        }
+        Statement::Insert { values, .. } | Statement::Replace { values, .. } => {
+            for row in values {
+                for expr in row {
+                    collect_expr_tables(expr, default_db, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_from_tables(from: &FromClause, default_db: &str, out: &mut Vec<ResolvedTableRef>) {
+    match from {
+        FromClause::Table(TableRef::Table { name, .. }) => {
+            out.push(ResolvedTableRef::new(name, default_db));
+        }
+        FromClause::Table(TableRef::Subquery { query, .. }) => {
+            collect_read_tables(query, default_db, out);
+        }
+        FromClause::Join(join_expr) => {
+            collect_from_tables(&join_expr.left, default_db, out);
+            for join in &join_expr.joins {
+                match &join.right {
+                    TableRef::Table { name, .. } => {
+                        out.push(ResolvedTableRef::new(name, default_db));
+                    }
+                    TableRef::Subquery { query, .. } => {
+                        collect_read_tables(query, default_db, out);
+                    }
+                }
+                if let Some(condition) = &join.condition {
+                    collect_expr_tables(condition, default_db, out);
+                }
+            }
+        }
+    }
+}
+
+fn collect_expr_tables(expr: &Expr, default_db: &str, out: &mut Vec<ResolvedTableRef>) {
+    match expr {
+        Expr::Subquery(stmt) => collect_read_tables(stmt, default_db, out),
+        Expr::Correlated(correlated) => {
+            if let Some(lhs) = &correlated.lhs {
+                collect_expr_tables(lhs, default_db, out);
+            }
+            collect_read_tables(&correlated.stmt, default_db, out);
+            for conjunct in &correlated.conjuncts {
+                collect_expr_tables(conjunct, default_db, out);
+            }
+        }
+        Expr::Exists(inner) => collect_expr_tables(inner, default_db, out),
+        Expr::UnaryNot(inner)
+        | Expr::UnaryMinus(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner) => collect_expr_tables(inner, default_db, out),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_tables(left, default_db, out);
+            collect_expr_tables(right, default_db, out);
+        }
+        Expr::In { expr, values, .. } => {
+            collect_expr_tables(expr, default_db, out);
+            for value in values {
+                collect_expr_tables(value, default_db, out);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_tables(expr, default_db, out);
+            collect_expr_tables(low, default_db, out);
+            collect_expr_tables(high, default_db, out);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_expr_tables(expr, default_db, out);
+            collect_expr_tables(pattern, default_db, out);
+        }
+        Expr::Function { args, .. } => {
+            for arg in args {
+                collect_expr_tables(arg, default_db, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(operand) = operand {
+                collect_expr_tables(operand, default_db, out);
+            }
+            for (when, then) in when_clauses {
+                collect_expr_tables(when, default_db, out);
+                collect_expr_tables(then, default_db, out);
+            }
+            if let Some(else_expr) = else_clause {
+                collect_expr_tables(else_expr, default_db, out);
+            }
+        }
+        Expr::WindowFunction {
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for expr in partition_by {
+                collect_expr_tables(expr, default_db, out);
+            }
+            for item in order_by {
+                collect_expr_tables(&item.expr, default_db, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 // ============================================================================
 // Derived tables and correlated subqueries
 // ============================================================================
@@ -1244,7 +1703,7 @@ pub(crate) struct PreResolvedExec<'a> {
     pub resolved: &'a ResolvedQuery,
     /// Decorrelated right-side pseudo-table batches produced alongside the
     /// cached plan.
-    pub extra_batches: &'a HashMap<String, Vec<RecordBatch>>,
+    pub extra_batches: &'a HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
 }
 
 /// Resolve a SELECT statement for execution or planning (also used by
@@ -1715,7 +2174,7 @@ fn bind_correlated_subquery(
         _ => None,
     };
     let mut snapshot_schemas: HashMap<String, Schema> = HashMap::new();
-    let mut snapshot_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+    let mut snapshot_batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>> = HashMap::new();
     if let Some(from) = &inner_from {
         for table_ref in extract_table_refs(from, db) {
             if table_ref.database == DERIVED_DB {
@@ -1726,11 +2185,23 @@ fn bind_correlated_subquery(
                     ))
                 })?;
                 snapshot_schemas.insert(table_ref.key.clone(), schema.clone());
-                snapshot_batches.insert(table_ref.key.clone(), batches.clone());
+                snapshot_batches.insert(
+                    table_ref.key.clone(),
+                    batches
+                        .iter()
+                        .map(|b| std::sync::Arc::new(b.clone()))
+                        .collect::<Vec<_>>(),
+                );
             } else {
                 let (schema, batches) = snapshot_table(engine, &table_ref)?;
                 snapshot_schemas.insert(table_ref.key.clone(), schema);
-                snapshot_batches.insert(table_ref.key.clone(), batches);
+                snapshot_batches.insert(
+                    table_ref.key.clone(),
+                    batches
+                        .into_iter()
+                        .map(std::sync::Arc::new)
+                        .collect::<Vec<_>>(),
+                );
             }
         }
     }

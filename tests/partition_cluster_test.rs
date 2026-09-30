@@ -103,7 +103,7 @@ fn make_two_i32_batch(schema: &Schema, rows: &[(i32, i32)]) -> RecordBatch {
 
 fn write_two_i32_segment(path: &Path, schema: &Schema, rows: &[(i32, i32)]) {
     let batch = make_two_i32_batch(schema, rows);
-    let mut writer = SegmentWriter::create(path, schema.clone(), 8192).expect("create segment");
+    let mut writer = SegmentWriter::create(path, schema.clone(), 8192, 3).expect("create segment");
     writer.write_batch(&batch).expect("write segment");
     writer.seal().expect("seal segment");
 }

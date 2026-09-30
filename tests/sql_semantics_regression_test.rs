@@ -997,19 +997,31 @@ fn scalar_functions_in_projection_and_where() {
 }
 
 #[test]
-fn window_function_fails_loudly() {
+fn window_functions_fail_loudly_with_group_by() {
     let (_temp_dir, engine, mut session) = create_engine();
     seed_quote_tables(&engine, &mut session);
+
+    // Window functions over aggregated inputs are not supported yet; they
+    // must fail loudly instead of silently returning wrong data.
+    let message = query_err(
+        &engine,
+        &mut session,
+        "SELECT security_id, COUNT(*), ROW_NUMBER() OVER (PARTITION BY security_id) rn
+         FROM t_quote GROUP BY security_id",
+    );
+    assert!(
+        !message.is_empty(),
+        "window functions combined with GROUP BY must fail loudly"
+    );
 
     let message = query_err(
         &engine,
         &mut session,
-        "SELECT security_id, ROW_NUMBER() OVER (PARTITION BY security_id ORDER BY deal_time) rn
-         FROM t_quote",
+        "SELECT security_id + ROW_NUMBER() OVER (ORDER BY deal_time) FROM t_quote",
     );
     assert!(
         !message.is_empty(),
-        "window functions must not silently return wrong data"
+        "nested window expressions must fail loudly"
     );
 }
 
@@ -1036,5 +1048,42 @@ fn two_sums_on_different_columns() {
         rows,
         vec![vec![f64v(151.75), i64(7300)]],
         "two SUM aggregates"
+    );
+}
+
+#[test]
+fn sum_returns_null_for_empty_input_via_metadata_path() {
+    let (_dir, engine, mut session) = create_engine();
+    engine
+        .execute(&mut session, "CREATE TABLE t (v INT64)")
+        .expect("create t");
+    engine
+        .execute(&mut session, "INSERT INTO t VALUES (1),(2),(3)")
+        .expect("insert t");
+
+    // SQL semantics: SUM over an empty set is NULL, not 0. The metadata
+    // aggregate fast path must match the generic accumulator here.
+    assert_eq!(
+        query(&engine, &mut session, "SELECT SUM(v) FROM t WHERE v > 1000"),
+        vec![vec![ScalarValue::Int64(None)]]
+    );
+
+    engine
+        .execute(&mut session, "CREATE TABLE n (v INT64)")
+        .expect("create n");
+    engine
+        .execute(&mut session, "INSERT INTO n VALUES (NULL),(NULL)")
+        .expect("insert n");
+    assert_eq!(
+        query(&engine, &mut session, "SELECT SUM(v) FROM n"),
+        vec![vec![ScalarValue::Int64(None)]]
+    );
+
+    engine
+        .execute(&mut session, "CREATE TABLE e (v INT64)")
+        .expect("create e");
+    assert_eq!(
+        query(&engine, &mut session, "SELECT SUM(v) FROM e"),
+        vec![vec![ScalarValue::Int64(None)]]
     );
 }

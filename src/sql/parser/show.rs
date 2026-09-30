@@ -188,6 +188,37 @@ impl Parser {
         }
     }
 
+    /// `KILL QUERY <id>` — QUERY is matched as a soft keyword so existing
+    /// columns named `query` keep parsing.
+    pub fn parse_kill(&mut self) -> Result<Statement> {
+        self.expect(&Token::Kill)?;
+        match self.peek() {
+            Token::Ident(word) if word.eq_ignore_ascii_case("QUERY") => {
+                self.advance();
+            }
+            other => {
+                return Err(TaibaiError::Sql(format!(
+                    "expected QUERY after KILL, got {}",
+                    other
+                )))
+            }
+        }
+        let query_id = match self.peek() {
+            Token::Integer(value) if *value >= 0 => {
+                let value = *value as u64;
+                self.advance();
+                value
+            }
+            other => {
+                return Err(TaibaiError::Sql(format!(
+                    "expected query id after KILL QUERY, got {}",
+                    other
+                )))
+            }
+        };
+        Ok(Statement::KillQuery { query_id })
+    }
+
     pub fn parse_optimize(&mut self) -> Result<Statement> {
         self.expect(&Token::Optimize)?;
         self.expect(&Token::Table)?;

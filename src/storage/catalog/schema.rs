@@ -152,6 +152,23 @@ pub struct TableMeta {
     pub hot_close_time: Option<String>,
     #[serde(default)]
     pub hot_last_close_date: Option<String>,
+    /// Epoch millis of the moment the last close-of-day flush completed
+    /// (after seal, resident eviction and optimize). Startup warmup uses it
+    /// as the recency cutoff: only segments modified after this instant are
+    /// reloaded into the hot store, because older ones were archived by that
+    /// close and a continuously-running server would not hold them resident.
+    #[serde(default)]
+    pub hot_last_close_at: Option<i64>,
+    /// Partition-column raw value bound establishing the partial-residency
+    /// invariant: the hot mirror holds every row whose partition-column value
+    /// is strictly greater than this bound. Established at close-of-day as the
+    /// max over archived segment zone maps (the mirror is empty at that
+    /// instant, so only post-close writes — all mirrored — can exceed it) and
+    /// re-established by restart warmup when every post-close segment was
+    /// fully loaded. Any mirror bypass (`hot_unfed_rows`) invalidates the
+    /// claim at query time via `hot_partition_mirrored`.
+    #[serde(default)]
+    pub hot_mirror_covers_from: Option<i64>,
     #[serde(default)]
     pub hot_index_column: Option<String>,
     #[serde(default = "default_row_group_size")]
@@ -184,6 +201,10 @@ pub struct TableMeta {
     pub statistics: Option<TableStatisticsMeta>,
     #[serde(default)]
     pub durability: TableDurability,
+    /// Per-table zstd compression level override (1..=22) applied to segment
+    /// writes; `None` follows the global `compression.bulk_zstd_level` config.
+    #[serde(default)]
+    pub compression_level: Option<i32>,
 }
 
 impl TableMeta {
@@ -203,6 +224,8 @@ impl TableMeta {
             hot_time_column: None,
             hot_close_time: None,
             hot_last_close_date: None,
+            hot_last_close_at: None,
+            hot_mirror_covers_from: None,
             hot_index_column: None,
             row_group_size: 8192,
             partition_key: String::new(),
@@ -219,6 +242,7 @@ impl TableMeta {
             dropped_columns: Vec::new(),
             statistics: None,
             durability: TableDurability::Strict,
+            compression_level: None,
         };
         meta.ensure_column_ids();
         meta
@@ -493,7 +517,7 @@ impl TableMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseCatalog {
     pub name: String,
-    pub tables: HashMap<String, TableMeta>,
+    pub tables: HashMap<String, std::sync::Arc<TableMeta>>,
     pub created_at: i64,
 }
 
@@ -519,6 +543,9 @@ impl DatabaseCatalog {
                 .map_err(|e| TaibaiError::Storage(format!("failed to parse catalog: {}", e)))?;
             catalog.name = db_name.to_string();
             for table in catalog.tables.values_mut() {
+                // Freshly loaded maps hold unique Arcs, so make_mut is a
+                // no-copy unwrap here.
+                let table = std::sync::Arc::make_mut(table);
                 table.database = db_name.to_string();
                 table.update_partition_key_idx();
                 table.update_ttl_column_idx();
@@ -563,7 +590,8 @@ impl DatabaseCatalog {
             return Err(TaibaiError::Sql(format!("table '{}' already exists", name)));
         }
         let meta = TableMeta::new(&self.name, name, columns);
-        self.tables.insert(name.to_string(), meta);
+        self.tables
+            .insert(name.to_string(), std::sync::Arc::new(meta));
         Ok(())
     }
 
@@ -575,11 +603,20 @@ impl DatabaseCatalog {
     }
 
     pub fn get_table(&self, name: &str) -> Option<&TableMeta> {
+        self.tables.get(name).map(|table| table.as_ref())
+    }
+
+    /// Shared handle for hot paths that only read metadata: cloning the Arc
+    /// escapes the catalog lock without copying the table definition.
+    pub fn get_table_shared(&self, name: &str) -> Option<&std::sync::Arc<TableMeta>> {
         self.tables.get(name)
     }
 
     pub fn get_table_mut(&mut self, name: &str) -> Option<&mut TableMeta> {
-        self.tables.get_mut(name)
+        // Copy-on-write: DDL under the catalog write lock pays a TableMeta
+        // copy only when an in-flight reader still shares the old snapshot.
+        let table = self.tables.get_mut(name)?;
+        Some(std::sync::Arc::make_mut(table))
     }
 
     pub fn table_names(&self) -> Vec<&str> {
@@ -600,15 +637,16 @@ impl DatabaseCatalog {
             )));
         }
         let mut meta = self.tables.remove(old_name).unwrap();
+        let meta = std::sync::Arc::make_mut(&mut meta);
         meta.name = new_name.to_string();
-        self.tables.insert(new_name.to_string(), meta);
+        self.tables
+            .insert(new_name.to_string(), std::sync::Arc::new(meta.clone()));
         Ok(())
     }
 
     pub fn add_column(&mut self, table_name: &str, mut column: ColumnDef) -> Result<()> {
         let table = self
-            .tables
-            .get_mut(table_name)
+            .get_table_mut(table_name)
             .ok_or_else(|| TaibaiError::Sql(format!("table '{}' does not exist", table_name)))?;
         if table.columns.iter().any(|c| c.name == column.name) {
             return Err(TaibaiError::Sql(format!(
@@ -624,8 +662,7 @@ impl DatabaseCatalog {
 
     pub fn drop_column(&mut self, table_name: &str, column_name: &str) -> Result<()> {
         let table = self
-            .tables
-            .get_mut(table_name)
+            .get_table_mut(table_name)
             .ok_or_else(|| TaibaiError::Sql(format!("table '{}' does not exist", table_name)))?;
         let idx = table
             .columns
@@ -665,8 +702,7 @@ impl DatabaseCatalog {
         new_name: &str,
     ) -> Result<()> {
         let table = self
-            .tables
-            .get_mut(table_name)
+            .get_table_mut(table_name)
             .ok_or_else(|| TaibaiError::Sql(format!("table '{}' does not exist", table_name)))?;
         if table.columns.iter().any(|c| c.name == new_name) {
             return Err(TaibaiError::Sql(format!(
@@ -706,8 +742,7 @@ impl DatabaseCatalog {
         precision: i32,
     ) -> Result<()> {
         let table = self
-            .tables
-            .get_mut(table_name)
+            .get_table_mut(table_name)
             .ok_or_else(|| TaibaiError::Sql(format!("table '{}' does not exist", table_name)))?;
         let col = table
             .columns

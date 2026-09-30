@@ -2,6 +2,7 @@ use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;
+use std::sync::OnceLock;
 
 /// Arrow-compatible variable-width UTF-8 storage. `offsets` always contains
 /// one more entry than there are values and `data` owns all string bytes in a
@@ -68,6 +69,14 @@ impl Utf8Buffer {
         self.offsets.push(self.data.len() as u32);
     }
 
+    /// Reserve room for `values` more entries totalling `bytes` payload bytes.
+    /// Gathers that know their output size up front use this to keep the
+    /// append loop allocation-free.
+    pub fn reserve_values(&mut self, values: usize, bytes: usize) {
+        self.offsets.reserve(values.saturating_add(1));
+        self.data.reserve(bytes);
+    }
+
     pub fn append(&mut self, other: &mut Self) {
         let base = self.data.len() as u32;
         self.data.append(&mut other.data);
@@ -81,6 +90,29 @@ impl Utf8Buffer {
         for value in other.iter() {
             self.push_str(value);
         }
+    }
+
+    /// Bulk-append `other[start..end]`: one data memcpy plus an offsets pass
+    /// with a base adjustment — no per-value iteration.
+    pub fn extend_from_bulk(&mut self, other: &Self, start: usize, end: usize) {
+        if end <= start {
+            return;
+        }
+        let src_base = other.offsets[start] as usize;
+        let src_end = other.offsets[end] as usize;
+        let old_data_len = self.data.len();
+        self.offsets.reserve(end - start);
+        self.data.extend_from_slice(&other.data[src_base..src_end]);
+        // Rebased offset = old_data_len + (o - src_base), computed modulo
+        // 2^32: appending a middle slice into a shorter destination makes
+        // `o - src_base` dominate `old_data_len`, so plain subtraction of
+        // the usize lengths would underflow before the u32 wrap rescues it.
+        let adjust = (old_data_len as u32).wrapping_sub(other.offsets[start]);
+        self.offsets.extend(
+            other.offsets[start + 1..=end]
+                .iter()
+                .map(|o| o.wrapping_add(adjust)),
+        );
     }
 
     /// Used only by compaction's position gatherer. Query execution builds
@@ -206,6 +238,12 @@ impl BinaryBuffer {
         self.data.extend_from_slice(value);
         self.offsets.push(self.data.len() as u32);
     }
+
+    /// See [`Utf8Buffer::reserve_values`].
+    pub fn reserve_values(&mut self, values: usize, bytes: usize) {
+        self.offsets.reserve(values.saturating_add(1));
+        self.data.reserve(bytes);
+    }
     pub fn append(&mut self, other: &mut Self) {
         let base = self.data.len() as u32;
         self.data.append(&mut other.data);
@@ -284,8 +322,26 @@ impl<'a> IntoIterator for &'a BinaryBuffer {
 /// Data is stored in typed vectors for cache efficiency; null values are
 /// marked in the bitmap but still occupy space in the data vector (simpler
 /// than taibai's "skip nulls" approach for in-memory representation).
+///
+/// The `Selected` variant is a zero-copy view: row indices into one or more
+/// shared immutable source columns. Reads (`scalar`, `compare_scalar_at`,
+/// `len`, ...) resolve through the indices directly; anything that needs
+/// owned buffers (bitmap slices, mutation) materializes the gathered column
+/// once into `flat` and then operates on it.
+/// (source column, ascending selected indices) for one zero-copy part.
+pub type SelectedPart = (std::sync::Arc<ColumnArray>, std::sync::Arc<[u32]>);
+pub type SelectedParts = std::sync::Arc<[SelectedPart]>;
+
 #[derive(Debug, Clone)]
 pub enum ColumnArray {
+    /// Zero-copy gather view. `parts` are (source column, ascending indices).
+    Selected {
+        parts: SelectedParts,
+        data_type: DataType,
+        len: usize,
+        /// Lazily materialized identical owned column (never `Selected`).
+        flat: OnceLock<Box<ColumnArray>>,
+    },
     Bool {
         data: Vec<u8>,
         bitmap: NullBitmap,
@@ -354,6 +410,30 @@ pub enum ColumnArray {
         data: Utf8Buffer,
         bitmap: NullBitmap,
     },
+    /// Dictionary-encoded varchar: dense u32 ids into a shared value arena.
+    /// Produced by decoding dictionary-encoded segments; consumers that do
+    /// not understand it expand via [`ColumnArray::materialize_varchar`].
+    Dictionary {
+        ids: Vec<u32>,
+        dict: Utf8Buffer,
+        bitmap: NullBitmap,
+        /// Lazily materialized identical owned column (never `Dictionary`).
+        flat: OnceLock<Box<ColumnArray>>,
+    },
+    /// Run-length encoded i64-backed column: `(value, row_count)` runs over
+    /// the non-null rows in order. Produced by decoding Rle/DeltaRle
+    /// segments when the consumer opted into run passthrough; anything that
+    /// needs per-row values expands lazily via [`ColumnArray::flattened`].
+    /// Clustered tick data collapses thousands of rows into a handful of
+    /// runs, which is what makes run-aware aggregation cheap.
+    Rle {
+        runs: std::sync::Arc<[(i64, u32)]>,
+        data_type: DataType,
+        bitmap: NullBitmap,
+        len: usize,
+        /// Lazily materialized identical owned column (never `Rle`).
+        flat: OnceLock<Box<ColumnArray>>,
+    },
     Blob {
         data: BinaryBuffer,
         bitmap: NullBitmap,
@@ -390,6 +470,9 @@ impl ColumnArray {
             };
         }
         match self {
+            ColumnArray::Selected { .. }
+            | ColumnArray::Dictionary { .. }
+            | ColumnArray::Rle { .. } => self.flattened().compare_at(left, right),
             ColumnArray::Bool { data, .. } | ColumnArray::UInt8 { data, .. } => cmp_ord!(data),
             ColumnArray::Int8 { data, .. } => cmp_ord!(data),
             ColumnArray::Int16 { data, .. } => cmp_ord!(data),
@@ -414,6 +497,14 @@ impl ColumnArray {
 
     /// Typed comparison against a literal, used by filter/range kernels.
     pub fn compare_scalar_at(&self, row: usize, value: &ScalarValue) -> Option<std::cmp::Ordering> {
+        // Zero-copy views / dictionary encodings compare through their
+        // materialized form; row indexes are preserved by `flattened`.
+        if matches!(
+            self,
+            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. }
+        ) {
+            return self.flattened().compare_scalar_at(row, value);
+        }
         if self.bitmap().is_null(row) || value.is_null() {
             return None;
         }
@@ -475,6 +566,17 @@ impl ColumnArray {
             };
         }
         match self {
+            ColumnArray::Selected { .. } | ColumnArray::Rle { .. } => {
+                self.flattened().encode_key_at(row, out)
+            }
+            // Dictionary values must encode byte-identically to plain
+            // VarChar: `data_type()` already pushed the VarChar tag above,
+            // and decoders / GROUP BY keys rely on the two forms agreeing.
+            ColumnArray::Dictionary { ids, dict, .. } => {
+                let value = dict.get(ids[row] as usize).unwrap_or("");
+                out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                out.extend_from_slice(value.as_bytes());
+            }
             ColumnArray::Bool { data, .. } | ColumnArray::UInt8 { data, .. } => out.push(data[row]),
             ColumnArray::Int8 { data, .. } => out.push(data[row] as u8),
             ColumnArray::Int16 { data, .. } => bytes!(data),
@@ -513,6 +615,10 @@ impl ColumnArray {
     }
 
     pub fn numeric_i64_at(&self, row: usize) -> Option<i64> {
+        // Zero-copy views read through their materialized form.
+        if let ColumnArray::Selected { .. } = self {
+            return self.flattened().numeric_i64_at(row);
+        }
         if self.bitmap().is_null(row) {
             return None;
         }
@@ -536,6 +642,10 @@ impl ColumnArray {
     }
 
     pub fn numeric_f64_at(&self, row: usize) -> Option<f64> {
+        // Zero-copy views read through their materialized form.
+        if let ColumnArray::Selected { .. } = self {
+            return self.flattened().numeric_f64_at(row);
+        }
         if self.bitmap().is_null(row) {
             return None;
         }
@@ -544,6 +654,144 @@ impl ColumnArray {
             ColumnArray::Float64 { data, .. } => Some(data[row]),
             _ => self.numeric_i64_at(row).map(|value| value as f64),
         }
+    }
+
+    /// Build a zero-copy view over gathered rows of shared source columns.
+    /// `parts` are (source, ascending indices); `len` is the total selected
+    /// row count.
+    pub fn selected(parts: SelectedParts, data_type: DataType, len: usize) -> Self {
+        ColumnArray::Selected {
+            parts,
+            data_type,
+            len,
+            flat: OnceLock::new(),
+        }
+    }
+
+    /// The owned materialization of this column. `Selected` columns gather
+    /// their parts on first call and cache the result; other variants return
+    /// themselves.
+    pub fn flattened(&self) -> &ColumnArray {
+        match self {
+            ColumnArray::Selected {
+                parts,
+                data_type,
+                flat,
+                ..
+            } => flat.get_or_init(|| {
+                let mut out = ColumnArray::empty(*data_type);
+                for (source, indices) in parts.iter() {
+                    source
+                        .gather_into(indices, &mut out)
+                        .expect("selected parts share the column data type");
+                }
+                Box::new(out)
+            }),
+            ColumnArray::Dictionary { flat, .. } => {
+                flat.get_or_init(|| Box::new(Self::expand_dictionary(self)))
+            }
+            ColumnArray::Rle { flat, .. } => flat.get_or_init(|| Box::new(Self::expand_runs(self))),
+            other => other,
+        }
+    }
+
+    /// Expand run-length values into the plain typed column. Run values are
+    /// exact i64 views of every run-decodable type (narrow ints round-trip
+    /// through the wider stored value by construction).
+    fn expand_runs(&self) -> ColumnArray {
+        let ColumnArray::Rle {
+            runs,
+            data_type,
+            bitmap,
+            len,
+            ..
+        } = self
+        else {
+            return self.clone();
+        };
+        macro_rules! build {
+            ($variant:ident, $ty:ty) => {{
+                let mut data = Vec::with_capacity(*len);
+                for &(value, count) in runs.iter() {
+                    data.extend(std::iter::repeat_n(value as $ty, count as usize));
+                }
+                ColumnArray::$variant {
+                    data,
+                    bitmap: bitmap.clone(),
+                }
+            }};
+        }
+        match data_type {
+            DataType::Int64 => build!(Int64, i64),
+            DataType::Decimal => build!(Decimal, i64),
+            DataType::Time => build!(Time, i64),
+            DataType::Timestamp => build!(Timestamp, i64),
+            DataType::Interval => build!(Interval, i64),
+            DataType::Int8 => build!(Int8, i8),
+            DataType::Int16 => build!(Int16, i16),
+            DataType::Int32 => build!(Int32, i32),
+            DataType::UInt8 => build!(UInt8, u8),
+            DataType::UInt16 => build!(UInt16, u16),
+            DataType::UInt32 => build!(UInt32, u32),
+            DataType::Date => build!(Date, i32),
+            other => unreachable!("run-length decode never produces {}", other.display_name()),
+        }
+    }
+
+    /// Build a run-length column from decoded `(value, row_count)` runs over
+    /// the non-null rows. `row_count` is the full row count; the caller
+    /// guarantees that the run lengths sum to `row_count - null_count`.
+    pub fn rle(
+        runs: Vec<(i64, u32)>,
+        data_type: DataType,
+        bitmap: NullBitmap,
+        row_count: usize,
+    ) -> Self {
+        Self::Rle {
+            runs: runs.into(),
+            data_type,
+            bitmap,
+            len: row_count,
+            flat: OnceLock::new(),
+        }
+    }
+
+    /// Expand dictionary ids into plain per-row varchar values. Identity
+    /// (clone) for every other variant.
+    fn expand_dictionary(&self) -> ColumnArray {
+        if let ColumnArray::Dictionary {
+            ids, dict, bitmap, ..
+        } = self
+        {
+            let mut buffer = Utf8Buffer::with_capacity(ids.len());
+            for (row, id) in ids.iter().enumerate() {
+                if bitmap.is_null(row) {
+                    buffer.push_str("");
+                } else {
+                    buffer.push_str(dict.get(*id as usize).unwrap_or(""));
+                }
+            }
+            return ColumnArray::VarChar {
+                data: buffer,
+                bitmap: bitmap.clone(),
+            };
+        }
+        self.clone()
+    }
+
+    /// Materialize in place so `&mut` operations can proceed on owned data.
+    pub fn flatten_in_place(&mut self) {
+        if matches!(
+            self,
+            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. }
+        ) {
+            *self = self.flattened().clone();
+        }
+    }
+
+    /// True for the zero-copy view variant.
+    pub fn is_selected(&self) -> bool {
+        matches!(self, ColumnArray::Selected { .. })
     }
 
     /// Create an empty ColumnArray for the given DataType.
@@ -711,8 +959,24 @@ impl ColumnArray {
     }
 
     /// Returns the DataType of this column.
+    /// Expand a dictionary column into a plain VarChar column (identity for
+    /// every other variant). Fallback for consumers that do not understand
+    /// the dictionary representation.
+    /// The owned, plain-varchar form of this column. Dictionary expansion is
+    /// cached by [`Self::flattened`], so repeated calls (e.g. per-row key
+    /// encoding against the same column) expand the dictionary once instead
+    /// of once per call.
+    pub fn materialize_varchar(&self) -> ColumnArray {
+        match self {
+            ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => self.flattened().clone(),
+            other => other.clone(),
+        }
+    }
+
     pub fn data_type(&self) -> DataType {
         match self {
+            ColumnArray::Selected { data_type, .. } => *data_type,
+            ColumnArray::Rle { data_type, .. } => *data_type,
             ColumnArray::Bool { .. } => DataType::Bool,
             ColumnArray::Int8 { .. } => DataType::Int8,
             ColumnArray::Int16 { .. } => DataType::Int16,
@@ -729,7 +993,7 @@ impl ColumnArray {
             ColumnArray::Time { .. } => DataType::Time,
             ColumnArray::Timestamp { .. } => DataType::Timestamp,
             ColumnArray::Interval { .. } => DataType::Interval,
-            ColumnArray::VarChar { .. } => DataType::VarChar,
+            ColumnArray::VarChar { .. } | ColumnArray::Dictionary { .. } => DataType::VarChar,
             ColumnArray::Blob { .. } => DataType::Blob,
             ColumnArray::Vector { .. } => DataType::Vector,
         }
@@ -738,6 +1002,9 @@ impl ColumnArray {
     /// Returns the number of rows in this column.
     pub fn len(&self) -> usize {
         match self {
+            ColumnArray::Selected { len, .. } => *len,
+            ColumnArray::Dictionary { ids, .. } => ids.len(),
+            ColumnArray::Rle { len, .. } => *len,
             ColumnArray::Bool { data, .. } => data.len(),
             ColumnArray::Int8 { data, .. } => data.len(),
             ColumnArray::Int16 { data, .. } => data.len(),
@@ -769,8 +1036,33 @@ impl ColumnArray {
     /// This deliberately favours a cheap, deterministic estimate over an
     /// allocator-specific exact value and is used for query spill decisions.
     pub fn estimated_size_bytes(&self) -> usize {
+        if let ColumnArray::Selected { parts, .. } = self {
+            return parts
+                .iter()
+                .map(|(source, indices)| {
+                    let width = source.data_type().fixed_size().unwrap_or(24);
+                    indices.len() * width + indices.len().div_ceil(8)
+                })
+                .sum();
+        }
+        if let ColumnArray::Dictionary {
+            ids, dict, bitmap, ..
+        } = self
+        {
+            return ids.capacity() * 4
+                + dict.data_capacity()
+                + dict.offsets().len() * 4
+                + bitmap.estimated_size_bytes();
+        }
         let bitmap = self.bitmap().estimated_size_bytes();
         match self {
+            ColumnArray::Selected { .. } => unreachable!("handled above"),
+            ColumnArray::Rle { runs, .. } => {
+                bitmap + runs.len() * (std::mem::size_of::<i64>() + std::mem::size_of::<u32>())
+            }
+            ColumnArray::Dictionary { ids, dict, .. } => {
+                ids.capacity() * 4 + dict.data_capacity() + dict.offsets().len() * 4 + bitmap
+            }
             ColumnArray::Bool { data, .. } | ColumnArray::UInt8 { data, .. } => {
                 bitmap + data.capacity()
             }
@@ -820,9 +1112,13 @@ impl ColumnArray {
         }
     }
 
-    /// Returns a reference to the null bitmap.
+    /// Returns a reference to the null bitmap. Materializes a `Selected`
+    /// view on first call (the bitmap is cached with the flattened column).
     pub fn bitmap(&self) -> &NullBitmap {
         match self {
+            ColumnArray::Dictionary { bitmap, .. } => bitmap,
+            ColumnArray::Rle { bitmap, .. } => bitmap,
+            ColumnArray::Selected { .. } => self.flattened().bitmap(),
             ColumnArray::Bool { bitmap, .. } => bitmap,
             ColumnArray::Int8 { bitmap, .. } => bitmap,
             ColumnArray::Int16 { bitmap, .. } => bitmap,
@@ -847,7 +1143,13 @@ impl ColumnArray {
 
     /// Returns a mutable reference to the null bitmap.
     pub fn bitmap_mut(&mut self) -> &mut NullBitmap {
+        self.flatten_in_place();
         match self {
+            ColumnArray::Selected { .. }
+            | ColumnArray::Dictionary { .. }
+            | ColumnArray::Rle { .. } => {
+                unreachable!("flattened above")
+            }
             ColumnArray::Bool { bitmap, .. } => bitmap,
             ColumnArray::Int8 { bitmap, .. } => bitmap,
             ColumnArray::Int16 { bitmap, .. } => bitmap,
@@ -872,7 +1174,30 @@ impl ColumnArray {
 
     /// Get the scalar value at the given index.
     pub fn scalar(&self, idx: usize) -> ScalarValue {
+        if let ColumnArray::Selected { parts, .. } = self {
+            let mut offset = 0usize;
+            for (source, indices) in parts.iter() {
+                if idx < offset + indices.len() {
+                    return source.scalar(indices[idx - offset] as usize);
+                }
+                offset += indices.len();
+            }
+            panic!("ColumnArray::scalar: index {idx} out of bounds");
+        }
         match self {
+            ColumnArray::Selected { .. } => unreachable!("handled above"),
+            ColumnArray::Rle { .. } => self.flattened().scalar(idx),
+            ColumnArray::Dictionary {
+                ids, dict, bitmap, ..
+            } => {
+                if bitmap.is_null(idx) {
+                    ScalarValue::VarChar(None)
+                } else {
+                    ScalarValue::VarChar(Some(
+                        dict.get(ids[idx] as usize).unwrap_or("").to_string(),
+                    ))
+                }
+            }
             ColumnArray::Bool { data, bitmap } => {
                 if bitmap.is_null(idx) {
                     ScalarValue::Bool(None)
@@ -1011,6 +1336,7 @@ impl ColumnArray {
 
     /// Push a scalar value into this column array.
     pub fn push(&mut self, value: &ScalarValue) -> Result<()> {
+        self.flatten_in_place();
         let is_null = value.is_null();
         match (self, value) {
             (ColumnArray::Bool { data, bitmap }, ScalarValue::Bool(v)) => {
@@ -1177,7 +1503,13 @@ impl ColumnArray {
     }
 
     pub fn push_null_value(&mut self) {
+        self.flatten_in_place();
         match self {
+            ColumnArray::Selected { .. }
+            | ColumnArray::Dictionary { .. }
+            | ColumnArray::Rle { .. } => {
+                unreachable!("flattened above")
+            }
             ColumnArray::Bool { data, bitmap } => {
                 data.push(0);
                 bitmap.push_null();
@@ -1269,6 +1601,17 @@ impl ColumnArray {
 
     /// Append another ColumnArray of the same type.
     pub fn extend(&mut self, other: &ColumnArray) -> Result<()> {
+        self.flatten_in_place();
+        // A view argument is materialized on extend: its rows are consumed
+        // exactly like an owned column's.
+        let owned_other;
+        let other = match other {
+            ColumnArray::Selected { .. } => {
+                owned_other = other.flattened().clone();
+                &owned_other
+            }
+            other => other,
+        };
         if self.data_type() != other.data_type() {
             return Err(TaibaiError::Internal(format!(
                 "cannot extend {} with {}",
@@ -1435,10 +1778,129 @@ impl ColumnArray {
         }
     }
 
+    /// Append `other[start..end]` without materializing a slice: fixed-width
+    /// columns bulk-copy their data window and rebuild the bitmap range,
+    /// VarChar bulk-copies arena + offsets. View/Rle/Dictionary sources fall
+    /// back to `slice_fast` + `extend`. The hot store's append loop pays this
+    /// once per batch per column, so the per-row `slice_fast` paths (bitmap
+    /// pushes and per-value string clones) only run for view sources.
+    pub fn extend_range(&mut self, other: &ColumnArray, start: usize, end: usize) -> Result<()> {
+        self.flatten_in_place();
+        let owned_other;
+        let other = match other {
+            ColumnArray::Selected { .. } => {
+                owned_other = other.flattened().clone();
+                &owned_other
+            }
+            other => other,
+        };
+        if end <= start {
+            return Ok(());
+        }
+        if self.data_type() != other.data_type() {
+            return Err(TaibaiError::Internal(format!(
+                "cannot extend {} with {}",
+                self.data_type().display_name(),
+                other.data_type().display_name(),
+            )));
+        }
+
+        macro_rules! extend_range_column {
+            ($variant:ident) => {{
+                match (self, other) {
+                    (
+                        ColumnArray::$variant { data, bitmap },
+                        ColumnArray::$variant {
+                            data: src_data,
+                            bitmap: src_bitmap,
+                        },
+                    ) => {
+                        // Typed vecs index in ELEMENTS — no width math.
+                        data.extend_from_slice(&src_data[start..end]);
+                        for i in start..end {
+                            if src_bitmap.is_null(i) {
+                                bitmap.push_null();
+                            } else {
+                                bitmap.push_valid();
+                            }
+                        }
+                        return Ok(());
+                    }
+                    _ => unreachable!("column type checked before extend_range"),
+                }
+            }};
+        }
+
+        match (&mut *self, &*other) {
+            (ColumnArray::Bool { .. }, ColumnArray::Bool { .. }) => {
+                extend_range_column!(Bool)
+            }
+            (ColumnArray::Int8 { .. }, ColumnArray::Int8 { .. }) => extend_range_column!(Int8),
+            (ColumnArray::Int16 { .. }, ColumnArray::Int16 { .. }) => {
+                extend_range_column!(Int16)
+            }
+            (ColumnArray::Int32 { .. }, ColumnArray::Int32 { .. }) => {
+                extend_range_column!(Int32)
+            }
+            (ColumnArray::Int64 { .. }, ColumnArray::Int64 { .. }) => {
+                extend_range_column!(Int64)
+            }
+            (ColumnArray::UInt8 { .. }, ColumnArray::UInt8 { .. }) => extend_range_column!(UInt8),
+            (ColumnArray::UInt16 { .. }, ColumnArray::UInt16 { .. }) => {
+                extend_range_column!(UInt16)
+            }
+            (ColumnArray::UInt32 { .. }, ColumnArray::UInt32 { .. }) => {
+                extend_range_column!(UInt32)
+            }
+            (ColumnArray::UInt64 { .. }, ColumnArray::UInt64 { .. }) => {
+                extend_range_column!(UInt64)
+            }
+            (ColumnArray::Float32 { .. }, ColumnArray::Float32 { .. }) => {
+                extend_range_column!(Float32)
+            }
+            (ColumnArray::Float64 { .. }, ColumnArray::Float64 { .. }) => {
+                extend_range_column!(Float64)
+            }
+            (ColumnArray::Decimal { .. }, ColumnArray::Decimal { .. }) => {
+                extend_range_column!(Decimal)
+            }
+            (ColumnArray::Date { .. }, ColumnArray::Date { .. }) => extend_range_column!(Date),
+            (ColumnArray::Time { .. }, ColumnArray::Time { .. }) => extend_range_column!(Time),
+            (ColumnArray::Timestamp { .. }, ColumnArray::Timestamp { .. }) => {
+                extend_range_column!(Timestamp)
+            }
+            (ColumnArray::Interval { .. }, ColumnArray::Interval { .. }) => {
+                extend_range_column!(Interval)
+            }
+            (
+                ColumnArray::VarChar { data, bitmap },
+                ColumnArray::VarChar {
+                    data: src_data,
+                    bitmap: src_bitmap,
+                },
+            ) => {
+                data.extend_from_bulk(src_data, start, end);
+                for i in start..end {
+                    if src_bitmap.is_null(i) {
+                        bitmap.push_null();
+                    } else {
+                        bitmap.push_valid();
+                    }
+                }
+                Ok(())
+            }
+            _ => {
+                let sliced = other.slice_fast(start, end);
+                self.extend(&sliced)
+            }
+        }
+    }
+
     /// Append an owned column. Variable-width buffers are moved instead of
     /// cloned, which is important when compaction concatenates many decoded
     /// row groups into one global column.
     pub fn append_owned(&mut self, other: ColumnArray) -> Result<()> {
+        self.flatten_in_place();
         match other {
             ColumnArray::VarChar {
                 mut data,
@@ -1487,5 +1949,9 @@ impl ColumnArray {
 #[cfg(test)]
 #[path = "array_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "array/vec_kernel_test.rs"]
+mod vec_kernel_tests;
 
 include!("array/analytics.rs");

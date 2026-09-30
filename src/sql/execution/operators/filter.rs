@@ -9,6 +9,13 @@ use crate::types::scalar::ScalarValue;
 use super::{ExecutionOp, RuntimeInFilter};
 use crate::sql::execution::subquery_runtime::SubqueryRegistry;
 
+thread_local! {
+    /// Shared per-thread fallback registry. Scalar function execution is only
+    /// reached for shapes without typed kernels, but rebuilding the registry
+    /// for every batch showed up in profiles.
+    static FALLBACK_FUNCTION_REGISTRY: FunctionRegistry = FunctionRegistry::default();
+}
+
 pub struct FilterExec {
     pub predicate: LogicalExpr,
     pub input: Box<dyn ExecutionOp>,
@@ -16,13 +23,50 @@ pub struct FilterExec {
     /// Snapshot registry for correlated subqueries, when the query contains
     /// any. `None` makes evaluation of such nodes fail loudly.
     pub subqueries: Option<SubqueryRegistry>,
+    /// Remapped predicate cache: `remap_expr_for_batch` is only needed when
+    /// the physical batch layout differs from the logical schema, and is
+    /// deterministic per batch schema, so cache it instead of re-cloning the
+    /// expression tree for every batch.
+    remapped: Option<(Schema, LogicalExpr)>,
+}
+
+impl FilterExec {
+    pub fn new(
+        predicate: LogicalExpr,
+        input: Box<dyn ExecutionOp>,
+        schema: Schema,
+        subqueries: Option<SubqueryRegistry>,
+    ) -> Self {
+        Self {
+            predicate,
+            input,
+            schema,
+            subqueries,
+            remapped: None,
+        }
+    }
 }
 
 impl ExecutionOp for FilterExec {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         while let Some(batch) = self.input.next_batch()? {
-            let predicate = remap_expr_for_batch(&self.predicate, &self.schema, &batch.schema);
-            let mask = eval_filter_with(&predicate, &batch, self.subqueries.as_ref())?;
+            let predicate = if batch.schema == self.schema {
+                &self.predicate
+            } else {
+                if !self
+                    .remapped
+                    .as_ref()
+                    .is_some_and(|(schema, _)| *schema == batch.schema)
+                {
+                    let expr = remap_expr_for_batch(&self.predicate, &self.schema, &batch.schema);
+                    self.remapped = Some((batch.schema.clone(), expr));
+                }
+                self.remapped
+                    .as_ref()
+                    .map(|(_, expr)| expr)
+                    .unwrap_or(&self.predicate)
+            };
+            let mask = eval_filter_with(predicate, &batch, self.subqueries.as_ref())?;
             let filtered = super::apply_filter_mask(&batch, &mask);
             if filtered.num_rows() > 0 {
                 return Ok(Some(filtered));
@@ -245,6 +289,11 @@ pub fn eval_filter_with(
                 if let Some(vector_mask) = eval_column_literal_comparison(left, op, right, batch) {
                     return Ok(vector_mask);
                 }
+                if let Some(typed_mask) =
+                    crate::sql::execution::expr_vec::eval_comparison_mask(left, *op, right, batch)?
+                {
+                    return Ok(typed_mask);
+                }
                 let left_vals = eval_expr_column_with(left, batch, subqueries)?;
                 let right_vals = eval_expr_column_with(right, batch, subqueries)?;
                 for i in 0..num_rows {
@@ -286,11 +335,36 @@ pub fn eval_filter_with(
             negated,
         } => {
             let vals = eval_expr_column_with(expr, batch, subqueries)?;
-            for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
-                let found = values
+            // Three-valued IN: a NULL operand makes the predicate UNKNOWN
+            // (row excluded for both IN and NOT IN), and NOT IN over a list
+            // containing NULL matches nothing.
+            let has_null_candidate = values.iter().any(|candidate| candidate.is_null());
+            // Hash-set prefilter for wide lists; the linear scan stays as
+            // the fallback for cross-type equality the exact-match set
+            // cannot see.
+            let fast_set = (values.len() >= 8).then(|| {
+                values
                     .iter()
-                    .any(|candidate| eval_comparison(&vals[i], &BinOp::Eq, candidate));
-                *m = if *negated { !found } else { found };
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>()
+            });
+            for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
+                if vals[i].is_null() {
+                    *m = false;
+                    continue;
+                }
+                let found = if fast_set.as_ref().is_some_and(|set| set.contains(&vals[i])) {
+                    true
+                } else {
+                    values
+                        .iter()
+                        .any(|candidate| eval_comparison(&vals[i], &BinOp::Eq, candidate))
+                };
+                *m = if *negated {
+                    !found && !has_null_candidate
+                } else {
+                    found
+                };
             }
         }
         LogicalExpr::Like {
@@ -310,11 +384,19 @@ pub fn eval_filter_with(
             }
         }
         LogicalExpr::Literal(v) => {
+            // MySQL truthiness, matching the DML evaluator: booleans pass
+            // through, nonzero numerics are TRUE, zero/NULL are FALSE.
+            // (`WHERE 0` used to return every row here.)
+            let keep = match v {
+                ScalarValue::Bool(Some(value)) => *value,
+                other if other.is_null() => false,
+                other => {
+                    other.integer_i128().is_some_and(|i| i != 0)
+                        || other.numeric_f64().is_some_and(|f| f != 0.0)
+                }
+            };
             for m in mask.iter_mut().take(num_rows) {
-                *m = match v {
-                    ScalarValue::Bool(Some(value)) => *value,
-                    _ => !v.is_null(),
-                };
+                *m = keep;
             }
         }
         _ => {
@@ -349,20 +431,7 @@ fn eval_column_literal_comparison(
         _ => return None,
     };
     let column = batch.column(column_idx)?;
-    Some(match op {
-        BinOp::Eq => column.eq_vec(literal),
-        BinOp::Neq => column
-            .eq_vec(literal)
-            .into_iter()
-            .enumerate()
-            .map(|(idx, matched)| column.bitmap().is_valid(idx) && !matched)
-            .collect(),
-        BinOp::Lt => column.lt_vec(literal),
-        BinOp::Lte => column.le_vec(literal),
-        BinOp::Gt => column.gt_vec(literal),
-        BinOp::Gte => column.ge_vec(literal),
-        _ => return None,
-    })
+    crate::sql::execution::expr_vec::column_literal_mask(column, op, literal)
 }
 
 fn eval_comparison(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> bool {
@@ -611,14 +680,16 @@ pub fn eval_expr_column_with(
                 .iter()
                 .map(|arg| eval_expr_column_with(arg, batch, subqueries))
                 .collect::<Result<Vec<_>>>()?;
-            let registry = FunctionRegistry::default();
             let mut result = Vec::with_capacity(num_rows);
             for row_idx in 0..num_rows {
                 let row_args = arg_columns
                     .iter()
                     .map(|values| values[row_idx].clone())
                     .collect::<Vec<_>>();
-                result.push(registry.execute(name, &row_args)?);
+                result.push(
+                    FALLBACK_FUNCTION_REGISTRY
+                        .with(|registry| registry.execute(name, &row_args))?,
+                );
             }
             Ok(result)
         }

@@ -36,18 +36,46 @@ impl ObjectName {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterOperation {
-    AddColumn { column: ColumnDefAst },
-    DropColumn { name: String },
-    AddUniqueKey { key: UniqueKeyDef },
-    DropIndex { name: String },
-    RenameColumn { old_name: String, new_name: String },
-    ModifyColumn { column: ColumnDefAst },
-    RenameTable { new_name: String },
-    DropPartition { partition_key: String },
-    TruncatePartition { partition_key: String },
-    SetHot { hot: HotDef },
-    SetTtl { ttl: TtlDef },
+    AddColumn {
+        column: ColumnDefAst,
+    },
+    DropColumn {
+        name: String,
+    },
+    AddUniqueKey {
+        key: UniqueKeyDef,
+    },
+    DropIndex {
+        name: String,
+    },
+    RenameColumn {
+        old_name: String,
+        new_name: String,
+    },
+    ModifyColumn {
+        column: ColumnDefAst,
+    },
+    RenameTable {
+        new_name: String,
+    },
+    DropPartition {
+        partition_key: String,
+    },
+    TruncatePartition {
+        partition_key: String,
+    },
+    SetHot {
+        hot: HotDef,
+    },
+    SetTtl {
+        ttl: TtlDef,
+    },
     DropTtl,
+    /// `SET COMPRESSION_LEVEL = n`; `None` means `DEFAULT`, resetting the
+    /// table to follow the global compression level again.
+    SetCompressionLevel {
+        level: Option<i32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,6 +129,9 @@ pub enum Statement {
         ttl: Option<TtlDef>,
         hot: Option<HotDef>,
         durability: Option<DurabilityLevel>,
+        /// Per-table zstd compression level (1..=22); `None` follows the
+        /// global `compression.bulk_zstd_level` config.
+        compression_level: Option<i32>,
     },
     DropTable {
         name: ObjectName,
@@ -170,13 +201,26 @@ pub enum Statement {
         columns: Vec<String>,
         query: Box<Statement>,
     },
+    /// `INSERT INTO t [(cols)] SELECT ...`: rows come from a SELECT executed
+    /// against the current snapshot, then go through the normal INSERT path.
+    InsertSelect {
+        table: ObjectName,
+        columns: Vec<String>,
+        query: Box<Statement>,
+    },
     Update {
         table: ObjectName,
+        /// Optional `UPDATE t [AS] alias` table alias; usable as the column
+        /// qualifier in SET targets and the WHERE clause.
+        alias: Option<String>,
         assignments: Vec<Assignment>,
         where_clause: Option<Expr>,
     },
     Delete {
         table: ObjectName,
+        /// Optional `DELETE FROM t [AS] alias` table alias; usable as the
+        /// column qualifier in the WHERE clause.
+        alias: Option<String>,
         where_clause: Option<Expr>,
     },
     Select {
@@ -193,6 +237,7 @@ pub enum Statement {
     Union {
         left: Box<Statement>,
         right: Box<Statement>,
+        op: SetOp,
         all: bool,
         order_by: Vec<OrderByItem>,
         limit: Option<Expr>,
@@ -253,6 +298,19 @@ pub enum Statement {
     PauseFlush,
     ResumeFlush,
     ResetPerformanceBaselines,
+    KillQuery {
+        query_id: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOp {
+    /// `UNION` / `UNION ALL`.
+    Union,
+    /// `INTERSECT`: distinct rows present in both operands.
+    Intersect,
+    /// `EXCEPT`: distinct rows of the left operand missing from the right.
+    Except,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -348,6 +406,9 @@ pub enum JoinType {
     Semi,
     Anti,
     Asof,
+    /// `LEFT ASOF JOIN`: asof matching that preserves unmatched left rows
+    /// with NULL right-side columns (the kdb `aj` convention).
+    LeftAsof,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -493,10 +554,12 @@ pub enum WindowFunc {
     Rank,
     DenseRank,
     Lead {
+        arg: Box<Expr>,
         offset: usize,
         default: Option<Box<Expr>>,
     },
     Lag {
+        arg: Box<Expr>,
         offset: usize,
         default: Option<Box<Expr>>,
     },

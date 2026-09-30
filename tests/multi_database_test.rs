@@ -381,3 +381,144 @@ fn non_admin_users_follow_database_table_permissions() {
 
     engine.segment_mgr().shutdown();
 }
+
+#[test]
+fn subquery_tables_require_select_permission_on_every_read_path() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut root = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(&mut root, "CREATE TABLE t (id INT64, v INT64)")
+        .expect("create t");
+    engine
+        .execute(&mut root, "INSERT INTO t VALUES (1, 10), (2, 20)")
+        .expect("seed t");
+    engine
+        .execute(&mut root, "CREATE TABLE secret (id INT64)")
+        .expect("create secret");
+    engine
+        .execute(&mut root, "INSERT INTO secret VALUES (1)")
+        .expect("seed secret");
+    engine
+        .execute(&mut root, "CREATE USER alice IDENTIFIED BY 'pw'")
+        .expect("create alice");
+    engine
+        .execute(&mut root, "GRANT SELECT ON TABLE main.t TO alice")
+        .expect("grant select on t only");
+    engine
+        .execute(&mut root, "GRANT UPDATE ON TABLE main.t TO alice")
+        .expect("grant update on t only");
+    engine
+        .execute(&mut root, "GRANT DELETE ON TABLE main.t TO alice")
+        .expect("grant delete on t only");
+
+    let mut alice = Session::new("alice".to_string(), "main".to_string());
+
+    // WHERE IN (SELECT ...): the subquery table must be denied even though
+    // every FROM table is granted.
+    assert!(
+        engine
+            .execute(
+                &mut alice,
+                "SELECT id FROM t WHERE id IN (SELECT id FROM secret)"
+            )
+            .is_err(),
+        "IN-subquery on a non-granted table must be denied"
+    );
+    assert!(
+        engine
+            .execute(
+                &mut alice,
+                "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM secret)"
+            )
+            .is_err(),
+        "EXISTS-subquery on a non-granted table must be denied"
+    );
+    // Scalar subquery in the select list.
+    assert!(
+        engine
+            .execute(&mut alice, "SELECT (SELECT max(id) FROM secret) FROM t")
+            .is_err(),
+        "scalar subquery in the select list must be denied"
+    );
+    // Derived table in FROM.
+    assert!(
+        engine
+            .execute(&mut alice, "SELECT * FROM (SELECT id FROM secret) d")
+            .is_err(),
+        "derived table over a non-granted table must be denied"
+    );
+    // UPDATE reading a non-granted table through WHERE and SET.
+    assert!(
+        engine
+            .execute(
+                &mut alice,
+                "UPDATE t SET v = 1 WHERE id IN (SELECT id FROM secret)"
+            )
+            .is_err(),
+        "UPDATE WHERE-subquery on a non-granted table must be denied"
+    );
+    assert!(
+        engine
+            .execute(&mut alice, "UPDATE t SET v = (SELECT max(id) FROM secret)")
+            .is_err(),
+        "UPDATE SET-subquery on a non-granted table must be denied"
+    );
+    // DELETE reading a non-granted table.
+    assert!(
+        engine
+            .execute(
+                &mut alice,
+                "DELETE FROM t WHERE id IN (SELECT id FROM secret)"
+            )
+            .is_err(),
+        "DELETE WHERE-subquery on a non-granted table must be denied"
+    );
+
+    // Granting SELECT on the subquery table unblocks every path; the data
+    // must still be correct afterwards.
+    engine
+        .execute(&mut root, "GRANT SELECT ON TABLE main.secret TO alice")
+        .expect("grant select on secret");
+    engine
+        .execute(
+            &mut alice,
+            "SELECT id FROM t WHERE id IN (SELECT id FROM secret)",
+        )
+        .expect("IN-subquery allowed once the subquery table is granted");
+    engine
+        .execute(&mut alice, "SELECT * FROM (SELECT id FROM secret) d")
+        .expect("derived table allowed once granted");
+    engine
+        .execute(&mut alice, "UPDATE t SET v = (SELECT max(id) FROM secret)")
+        .expect("UPDATE SET-subquery allowed once granted");
+    engine
+        .execute(
+            &mut alice,
+            "UPDATE t SET v = 99 WHERE id IN (SELECT id FROM secret)",
+        )
+        .expect("UPDATE WHERE-subquery allowed once granted");
+    engine
+        .execute(
+            &mut alice,
+            "DELETE FROM t WHERE id IN (SELECT id FROM secret)",
+        )
+        .expect("DELETE WHERE-subquery allowed once granted");
+
+    let result = engine
+        .execute(&mut root, "SELECT v FROM t")
+        .expect("root reads t");
+    match result {
+        ExecResult::Query { batches, .. } => {
+            // The SET-subquery update wrote max(secret.id)=1 to both rows;
+            // the WHERE-scoped update then set v=99 on the one row matching
+            // secret (id=1) and the DELETE removed it, leaving (2, 1).
+            assert_eq!(batches[0].num_rows(), 1);
+            assert_eq!(batches[0].scalar(0, 0), Some(ScalarValue::Int64(Some(1))));
+        }
+        other => panic!("expected query result, got {:?}", other),
+    }
+
+    engine.segment_mgr().shutdown();
+}

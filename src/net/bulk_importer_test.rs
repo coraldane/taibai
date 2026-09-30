@@ -67,8 +67,14 @@ fn encoded_bulk_payload_preserves_null_bitmap_and_dense_value_slots() {
     let payload = encode_columnar_bulk_insert("metrics", &batch).unwrap();
     let parsed = parse_direct_bulk_payload(&payload).unwrap();
 
-    assert_eq!(parsed.columns[0].nulls, 2u64.to_le_bytes());
-    assert_eq!(parsed.columns[1].nulls, 1u64.to_le_bytes());
+    assert_eq!(
+        parsed.columns[0].nulls.as_ref(),
+        2u64.to_le_bytes().as_slice()
+    );
+    assert_eq!(
+        parsed.columns[1].nulls.as_ref(),
+        1u64.to_le_bytes().as_slice()
+    );
     assert_eq!(parsed.columns[0].data.len(), 8);
     assert_eq!(
         parsed.columns[1].variable_ranges.as_deref(),

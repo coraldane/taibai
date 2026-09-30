@@ -59,8 +59,12 @@ pub enum ScalarValueHashable {
 }
 
 impl ScalarValueHashable {
-    fn from_column(column: &ColumnArray, row: usize) -> Self {
+    pub fn from_column(column: &ColumnArray, row: usize) -> Self {
         match column {
+            ColumnArray::Selected { .. } | ColumnArray::Rle { .. } => {
+                Self::from_column(column.flattened(), row)
+            }
+            ColumnArray::Dictionary { .. } => Self::from_column(&column.materialize_varchar(), row),
             ColumnArray::Bool { data, .. } => Self::Bool(Some(data[row] != 0)),
             ColumnArray::Int8 { data, .. } => Self::Int8(Some(data[row])),
             ColumnArray::Int16 { data, .. } => Self::Int16(Some(data[row])),
@@ -151,6 +155,10 @@ pub struct JoinHashTable {
     pub matched: Vec<bool>,
     /// Total row count across all build batches.
     total_rows: usize,
+    /// Prefix sum of build-batch row counts. `row_offset` is called per
+    /// matched row during LEFT/RIGHT/FULL probes; the old re-summing made
+    /// marking O(matched × batches).
+    batch_offsets: Vec<usize>,
 }
 
 impl JoinHashTable {
@@ -161,6 +169,7 @@ impl JoinHashTable {
             key_columns,
             matched: Vec::new(),
             total_rows: 0,
+            batch_offsets: vec![0],
         }
     }
 
@@ -182,6 +191,8 @@ impl JoinHashTable {
         }
 
         self.build_data.push(batch);
+        let last = self.batch_offsets.last().copied().unwrap_or(0);
+        self.batch_offsets.push(last + num_rows);
     }
 
     /// Finalize the build phase: initialize matched tracking.
@@ -196,12 +207,32 @@ impl JoinHashTable {
         self.table.get(&key).cloned().unwrap_or_default()
     }
 
+    /// Probe one row of a probe batch directly from column storage, without
+    /// materializing the row as scalars. The typed key is built from the key
+    /// columns only. Returns `None` when the row has a NULL join key (NULL
+    /// keys never match, mirroring `insert_batch`) or when there is no match.
+    pub fn probe_batch_row<'a>(
+        &'a self,
+        batch: &RecordBatch,
+        row: usize,
+        key_columns: &[usize],
+    ) -> Option<&'a [RowPointer]> {
+        let key = JoinKey::from_batch(batch, row, key_columns)?;
+        self.table.get(&key).map(Vec::as_slice)
+    }
+
     /// Mark a build row as matched.
     pub fn mark_matched(&mut self, ptr: &RowPointer) {
         let offset = self.row_offset(ptr.batch_idx, ptr.row_idx);
         if offset < self.matched.len() {
             self.matched[offset] = true;
         }
+    }
+
+    /// Whether a build row is already marked matched (semi-join dedup).
+    pub fn is_marked(&self, ptr: &RowPointer) -> bool {
+        let offset = self.row_offset(ptr.batch_idx, ptr.row_idx);
+        offset < self.matched.len() && self.matched[offset]
     }
 
     /// Get all unmatched build row pointers (for LEFT/FULL JOIN).
@@ -236,19 +267,36 @@ impl JoinHashTable {
     }
 
     fn row_offset(&self, batch_idx: usize, row_idx: usize) -> usize {
-        let mut offset = 0;
-        for i in 0..batch_idx {
-            offset += self.build_data[i].num_rows();
-        }
-        offset + row_idx
+        // `batch_offsets` holds the prefix sum (len = batches + 1); the old
+        // re-sum over build batches ran once per matched row.
+        self.batch_offsets.get(batch_idx).copied().unwrap_or(0) + row_idx
     }
 }
 
-/// Asof Join uses ordered matching: for each probe row, find the closest
-/// build row by timestamp (binary search).
+/// Time-key match direction for ASOF joins, derived from the ON-clause
+/// inequality. `l.ts >= r.ts` means "most recent right row at or before the
+/// left timestamp" (the kdb `aj` flavor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsofOp {
+    /// `l.ts >= r.ts` — rightmost entry with `entry_ts <= probe_ts`.
+    AtOrBefore,
+    /// `l.ts > r.ts` — rightmost entry with `entry_ts < probe_ts`.
+    Before,
+    /// `l.ts <= r.ts` — leftmost entry with `entry_ts >= probe_ts`.
+    AtOrAfter,
+    /// `l.ts < r.ts` — leftmost entry with `entry_ts > probe_ts`.
+    After,
+}
+
+/// Asof Join index: per equality-key partition, the right-side rows sorted by
+/// the time key, plus the stored right-side batches so matched rows can be
+/// fetched. Rows with a NULL equality key or NULL time value never match.
 pub struct AsofJoinIndex {
-    /// Sorted list of (timestamp_value, RowPointer).
-    entries: Vec<(ScalarValue, RowPointer)>,
+    /// equality key -> entries sorted ascending by time key.
+    partitions: HashMap<JoinKey, Vec<(ScalarValue, RowPointer)>>,
+    /// The stored right-side data (collected from all input batches).
+    pub build_data: Vec<RecordBatch>,
+    total_rows: usize,
 }
 
 impl Default for AsofJoinIndex {
@@ -260,45 +308,115 @@ impl Default for AsofJoinIndex {
 impl AsofJoinIndex {
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            partitions: HashMap::new(),
+            build_data: Vec::new(),
+            total_rows: 0,
         }
     }
 
-    /// Build the index from batches, extracting the timestamp column.
-    pub fn build(&mut self, batches: Vec<RecordBatch>, ts_col_idx: usize) {
-        for (batch_idx, batch) in batches.iter().enumerate() {
+    /// Build the partitioned index from the right-side batches.
+    pub fn build(&mut self, batches: Vec<RecordBatch>, eq_key_cols: &[usize], ts_col: usize) {
+        for (batch_idx, batch) in batches.into_iter().enumerate() {
             for row_idx in 0..batch.num_rows() {
+                self.total_rows += 1;
+                let Some(key) = JoinKey::from_batch(&batch, row_idx, eq_key_cols) else {
+                    continue;
+                };
                 let ts = batch
-                    .scalar(row_idx, ts_col_idx)
+                    .scalar(row_idx, ts_col)
                     .unwrap_or(ScalarValue::Int64(None));
-                self.entries.push((ts, RowPointer { batch_idx, row_idx }));
+                if ts.is_null() {
+                    continue;
+                }
+                self.partitions
+                    .entry(key)
+                    .or_default()
+                    .push((ts, RowPointer { batch_idx, row_idx }));
             }
+            self.build_data.push(batch);
         }
-        // Sort by timestamp
-        self.entries.sort_by(|a, b| compare_timestamps(&a.0, &b.0));
+        for entries in self.partitions.values_mut() {
+            entries.sort_by(|a, b| compare_timestamps(&a.0, &b.0));
+        }
     }
 
-    /// Find the most recent build row whose timestamp <= the probe timestamp.
-    /// Uses binary search for O(log n) lookup.
-    pub fn find_asof(&self, probe_ts: &ScalarValue) -> Option<RowPointer> {
-        if self.entries.is_empty() {
+    /// Find the matching build row for `probe_ts` inside one partition
+    /// (obtained from `partition`), honoring the match direction.
+    pub fn find_asof(
+        &self,
+        entries: &[(ScalarValue, RowPointer)],
+        probe_ts: &ScalarValue,
+        op: AsofOp,
+    ) -> Option<RowPointer> {
+        if entries.is_empty() {
             return None;
         }
-        // Binary search for the rightmost entry <= probe_ts
-        let mut lo = 0;
-        let mut hi = self.entries.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if compare_timestamps(&self.entries[mid].0, probe_ts) != std::cmp::Ordering::Greater {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+        match op {
+            AsofOp::AtOrBefore | AsofOp::Before => {
+                // Rightmost entry with entry_ts <= (or <) probe_ts.
+                let mut lo = 0usize;
+                let mut hi = entries.len();
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let ord = compare_timestamps(&entries[mid].0, probe_ts);
+                    let go_right = match op {
+                        AsofOp::AtOrBefore => ord != std::cmp::Ordering::Greater,
+                        _ => ord == std::cmp::Ordering::Less,
+                    };
+                    if go_right {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo.checked_sub(1).map(|idx| entries[idx].1)
+            }
+            AsofOp::AtOrAfter | AsofOp::After => {
+                // Leftmost entry with entry_ts >= (or >) probe_ts.
+                let mut lo = 0usize;
+                let mut hi = entries.len();
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let ord = compare_timestamps(&entries[mid].0, probe_ts);
+                    let go_right = match op {
+                        AsofOp::AtOrAfter => ord == std::cmp::Ordering::Less,
+                        _ => ord != std::cmp::Ordering::Greater,
+                    };
+                    if go_right {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                entries.get(lo).map(|(_, ptr)| *ptr)
             }
         }
-        if lo == 0 {
-            return None;
+    }
+
+    /// Look up the partition from already-materialized probe row values,
+    /// indexed by the same equality-key columns used at build time. A NULL
+    /// equality value yields `None` (no match).
+    pub fn partition_for_scalars(
+        &self,
+        values: &[ScalarValue],
+        eq_key_cols: &[usize],
+    ) -> Option<&[(ScalarValue, RowPointer)]> {
+        let mut hashable = Vec::with_capacity(eq_key_cols.len());
+        for &col in eq_key_cols {
+            let value = values.get(col)?;
+            if value.is_null() {
+                return None;
+            }
+            hashable.push(ScalarValueHashable::from_scalar(value));
         }
-        Some(self.entries[lo - 1].1)
+        self.partitions.get(&JoinKey(hashable)).map(Vec::as_slice)
+    }
+
+    /// Get a scalar value from a stored right-side row.
+    pub fn get_scalar(&self, ptr: &RowPointer, col_idx: usize) -> ScalarValue {
+        self.build_data[ptr.batch_idx]
+            .scalar(ptr.row_idx, col_idx)
+            .unwrap_or(ScalarValue::Int64(None))
     }
 }
 

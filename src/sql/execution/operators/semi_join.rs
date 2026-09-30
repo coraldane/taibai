@@ -35,6 +35,10 @@ pub struct SemiJoinExec {
     right_collected: bool,
     left_batch_idx: usize,
     left_row_idx: usize,
+    /// Global row offset of `left_batches[left_batch_idx]`'s first row;
+    /// maintained incrementally instead of re-summing every prior batch's
+    /// row count per output row (which was O(rows x batches)).
+    left_global_offset: usize,
     matched_left_rows: Vec<bool>,
     /// Reusable 1-row batch layout for residual evaluation.
     residual_schema: Schema,
@@ -70,6 +74,7 @@ impl SemiJoinExec {
             right_collected: false,
             left_batch_idx: 0,
             left_row_idx: 0,
+            left_global_offset: 0,
             matched_left_rows: Vec::new(),
             residual_schema: Schema::new(residual_columns),
         }
@@ -78,6 +83,7 @@ impl SemiJoinExec {
     fn collect_right(&mut self) -> Result<()> {
         let has_keys = !self.right_key_cols.is_empty();
         while let Some(batch) = self.right.next_batch()? {
+            crate::common::query_cancel::check()?;
             for row in 0..batch.num_rows() {
                 let values: Vec<ScalarValue> = (0..batch.num_columns())
                     .map(|c| batch.scalar(row, c).unwrap_or(ScalarValue::Int64(None)))
@@ -105,6 +111,7 @@ impl SemiJoinExec {
     fn collect_left(&mut self) -> Result<()> {
         let has_keys = !self.left_key_cols.is_empty();
         while let Some(batch) = self.left.next_batch()? {
+            crate::common::query_cancel::check()?;
             let batch_start = self.matched_left_rows.len();
             self.matched_left_rows.extend(vec![false; batch.num_rows()]);
             for row in 0..batch.num_rows() {
@@ -126,18 +133,24 @@ impl SemiJoinExec {
                     None // placeholder; handled below via right_all_rows
                 };
 
-                let matched = if has_keys {
-                    match candidates {
-                        Some(rows) => rows
-                            .iter()
-                            .any(|right_values| self.residual_matches(&left_values, right_values)),
-                        None => false,
+                let mut matched = false;
+                if has_keys {
+                    if let Some(rows) = candidates {
+                        for right_values in rows {
+                            if self.residual_matches(&left_values, right_values)? {
+                                matched = true;
+                                break;
+                            }
+                        }
                     }
                 } else {
-                    self.right_all_rows
-                        .iter()
-                        .any(|right_values| self.residual_matches(&left_values, right_values))
-                };
+                    for right_values in &self.right_all_rows {
+                        if self.residual_matches(&left_values, right_values)? {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
                 self.matched_left_rows[batch_start + row] = matched;
             }
             self.left_batches.push(batch);
@@ -145,34 +158,30 @@ impl SemiJoinExec {
         Ok(())
     }
 
-    fn residual_matches(&self, left_values: &[ScalarValue], right_values: &[ScalarValue]) -> bool {
+    fn residual_matches(
+        &self,
+        left_values: &[ScalarValue],
+        right_values: &[ScalarValue],
+    ) -> Result<bool> {
         let Some(residual) = &self.residual else {
-            return true;
+            return Ok(true);
         };
+        // Errors propagate: treating a failed residual evaluation as "no
+        // match" silently dropped rows from semi joins (and leaked rows
+        // into anti joins).
         let mut columns = Vec::with_capacity(self.residual_schema.columns.len());
         for def in &self.residual_schema.columns {
             columns.push(crate::types::array::ColumnArray::empty(def.data_type));
         }
         for (i, value) in left_values.iter().enumerate() {
-            if columns[i].push(value).is_err() {
-                return false;
-            }
+            columns[i].push(value)?;
         }
         for (i, value) in right_values.iter().enumerate() {
-            if columns[self.left_schema.columns.len() + i]
-                .push(value)
-                .is_err()
-            {
-                return false;
-            }
+            columns[self.left_schema.columns.len() + i].push(value)?;
         }
-        let Ok(batch) = RecordBatch::try_new(self.residual_schema.clone(), columns) else {
-            return false;
-        };
-        matches!(
-            super::filter::eval_filter_with(residual, &batch, None),
-            Ok(mask) if mask.first() == Some(&true)
-        )
+        let batch = RecordBatch::try_new(self.residual_schema.clone(), columns)?;
+        let mask = super::filter::eval_filter_with(residual, &batch, None)?;
+        Ok(mask.first() == Some(&true))
     }
 }
 
@@ -192,11 +201,7 @@ impl ExecutionOp for SemiJoinExec {
             }
             let batch = &self.left_batches[self.left_batch_idx];
             while self.left_row_idx < batch.num_rows() && output_rows.len() < BATCH_SIZE {
-                let global_idx = self.left_batches[..self.left_batch_idx]
-                    .iter()
-                    .map(|b| b.num_rows())
-                    .sum::<usize>()
-                    + self.left_row_idx;
+                let global_idx = self.left_global_offset + self.left_row_idx;
                 let should_emit = if self.is_anti {
                     !self.matched_left_rows[global_idx]
                 } else {
@@ -215,6 +220,7 @@ impl ExecutionOp for SemiJoinExec {
                 self.left_row_idx += 1;
             }
             if self.left_row_idx >= batch.num_rows() {
+                self.left_global_offset += batch.num_rows();
                 self.left_batch_idx += 1;
                 self.left_row_idx = 0;
             }

@@ -4,7 +4,9 @@ use crate::protocol::types::DataType;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::scalar::ScalarValue;
 
+mod aggregate_cache;
 mod bulk_payload;
+mod cancellation;
 mod dml;
 mod durability;
 mod lifecycle;

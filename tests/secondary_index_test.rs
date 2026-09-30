@@ -52,7 +52,7 @@ fn seed_two_row_group_segment(engine: &Engine, db: &str, table: &str) {
     let table_meta = engine
         .get_table_meta(db, table)
         .expect("table metadata should exist");
-    let schema = Schema::new(table_meta.columns);
+    let schema = Schema::new(table_meta.columns.clone());
     let mut batch = RecordBatch::with_capacity(schema.clone(), 8300);
     for id in 0..8192 {
         let symbol = if id % 2 == 0 { "a" } else { "z" };
@@ -83,7 +83,7 @@ fn seed_two_row_group_segment(engine: &Engine, db: &str, table: &str) {
     let segment_path = engine.data_dir().join(db).join(table).join("seg_00001.dat");
     engine
         .segment_mgr()
-        .write_new_segment(&segment_path, schema, 8192, &batch)
+        .write_new_segment(&segment_path, schema, 8192, &batch, 3)
         .expect("write segment");
 }
 

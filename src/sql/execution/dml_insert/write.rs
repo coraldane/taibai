@@ -1,3 +1,14 @@
+/// The single condition under which an INSERT's rows are mirrored into the
+/// hot store at statement time: auto-commit regular-path writes only.
+/// Transactional rows are mirrored at COMMIT (or accounted as unfed), and
+/// bulk/relaxed writes feed through the bulk tails. The feed guard, the
+/// pubsub payload capture, and the `hot_fed` failure accounting all derive
+/// from this one predicate so the three can no longer drift apart by
+/// comment.
+fn hot_mirror_eligible(txn_id: u64, bulk_import_mode: bool, relaxed_direct_insert: bool) -> bool {
+    txn_id == 0 && !bulk_import_mode && !relaxed_direct_insert
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn exec_replace(
     engine: &Engine,
@@ -13,6 +24,16 @@ pub fn exec_replace(
         return Err(TaibaiError::Sql(
             "REPLACE is not supported inside an explicit transaction".to_string(),
         ));
+    }
+
+    // Same pin-exclusion as auto-commit DELETE/UPDATE: REPLACE physically
+    // removes conflicting memtable rows (shifting positions), which would
+    // make an open transaction's COMMIT delete the wrong rows.
+    if engine.txn_mutations().table_has_pins(db, table) {
+        return Err(TaibaiError::ResourceBusy(format!(
+            "table '{}.{}' is pinned by an open transaction; retry after it commits or rolls back",
+            db, table
+        )));
     }
 
     let _unique_guard = constraint_insert_lock(db, table).lock().unwrap();
@@ -60,94 +81,80 @@ pub fn exec_replace(
     // place below. The delete and the staged insert run under one lock, so
     // DELETE/UPDATE cannot interleave.
     let lock_start = Instant::now();
-    let (deleted, undo, pending_commits) = engine
-        .segment_mgr()
-        .with_table_mutation_lock(db, table, || {
-            ensure_replace_location_indexes(
-                engine,
-                db,
-                table,
-                &materialized.table_meta,
-                &location_schema,
-                &key_sets,
-            )?;
-            let memtable_plans =
-                super::dml_delete::plan_replace_memtable_conflicts(engine, db, table, &key_sets)?;
-            let mut undo = super::dml_delete::delete_replace_conflicts_under_table_lock(
-                engine,
-                db,
-                table,
-                &materialized.table_meta,
-                &key_sets,
-            )?;
-            // The resident hot store is append-only and cannot remove the rows
-            // replaced below. Drop it before filtering so subsequent reads
-            // rebuild from the authoritative segments plus memtables.
-            engine.hot_store_manager().remove(db, table);
-            match super::dml_delete::apply_replace_memtable_conflicts(
-                engine,
-                db,
-                table,
-                memtable_plans,
-            ) {
-                Ok(memtable_undo) => undo.merge(memtable_undo),
-                Err(error) => {
-                    let _ =
-                        super::dml_delete::restore_replace_delete_under_table_lock(engine, &undo);
-                    return Err(error);
+    let (deleted, undo, pending_commits) =
+        engine
+            .segment_mgr()
+            .with_table_mutation_lock(db, table, || {
+                ensure_replace_location_indexes(
+                    engine,
+                    db,
+                    table,
+                    &materialized.table_meta,
+                    &location_schema,
+                    &key_sets,
+                )?;
+                let memtable_plans = super::dml_delete::plan_replace_memtable_conflicts(
+                    engine, db, table, &key_sets,
+                )?;
+                let mut undo = super::dml_delete::delete_replace_conflicts_under_table_lock(
+                    engine,
+                    db,
+                    table,
+                    &materialized.table_meta,
+                    &key_sets,
+                )?;
+                // The resident hot store is append-only and cannot remove the rows
+                // replaced below. Drop it before filtering so subsequent reads
+                // rebuild from the authoritative segments plus memtables.
+                engine.hot_store_manager().remove(db, table);
+                match super::dml_delete::apply_replace_memtable_conflicts(
+                    engine,
+                    db,
+                    table,
+                    memtable_plans,
+                ) {
+                    Ok(memtable_undo) => undo.merge(memtable_undo),
+                    Err(error) => {
+                        let _ = super::dml_delete::restore_replace_delete_under_table_lock(
+                            engine, &undo,
+                        );
+                        return Err(error);
+                    }
                 }
-            }
-            let deleted = undo.deleted_rows();
+                let deleted = undo.deleted_rows();
 
-            #[cfg(test)]
-            if FORCE_REPLACE_INSERT_FAILURE.with(|force| force.replace(false)) {
-                rollback_replace_under_table_lock(
+                #[cfg(test)]
+                if FORCE_REPLACE_INSERT_FAILURE.with(|force| force.replace(false)) {
+                    rollback_replace_under_table_lock(
+                        engine,
+                        db,
+                        table,
+                        &materialized.table_meta,
+                        internal_txn_id,
+                        &undo,
+                    )?;
+                    return Err(TaibaiError::Internal(
+                        "forced REPLACE insert failure".to_string(),
+                    ));
+                }
+
+                let insert_result = exec_materialized_insert_batch(
                     engine,
                     db,
                     table,
                     &materialized.table_meta,
+                    materialized.schema,
+                    survivors,
                     internal_txn_id,
-                    &undo,
-                )?;
-                return Err(TaibaiError::Internal(
-                    "forced REPLACE insert failure".to_string(),
-                ));
-            }
-
-            let insert_result = exec_materialized_insert_batch(
-                engine,
-                db,
-                table,
-                &materialized.table_meta,
-                materialized.schema,
-                survivors,
-                internal_txn_id,
-                false,
-                false,
-                false,
-                true,
-                materialized.missing_auto_inc,
-                false,
-                false,
-            );
-            if let Err(error) = insert_result {
-                rollback_replace_under_table_lock(
-                    engine,
-                    db,
-                    table,
-                    &materialized.table_meta,
-                    internal_txn_id,
-                    &undo,
-                )?;
-                return Err(error);
-            }
-
-            let finalize_result = engine
-                .batch_writer()
-                .commit_txn_submit_under_table_lock(internal_txn_id);
-            let pending_commits = match finalize_result {
-                Ok(pending_commits) => pending_commits,
-                Err(error) => {
+                    false,
+                    false,
+                    false,
+                    true,
+                    materialized.missing_auto_inc,
+                    false,
+                    false,
+                );
+                if let Err(error) = insert_result {
                     rollback_replace_under_table_lock(
                         engine,
                         db,
@@ -158,38 +165,58 @@ pub fn exec_replace(
                     )?;
                     return Err(error);
                 }
-            };
 
-            // Publish existence markers for the committed replacement rows.
-            // Failure only downgrades later validation to a full scan; the
-            // statement is already committed and must not fail here.
-            if let Err(error) =
-                append_unique_index_entries_after_insert(engine, db, table, replace_unique_entries)
-            {
-                tracing::warn!(
+                let finalize_result = engine
+                    .batch_writer()
+                    .commit_txn_submit_under_table_lock(internal_txn_id);
+                let pending_commits = match finalize_result {
+                    Ok(pending_commits) => pending_commits,
+                    Err(error) => {
+                        rollback_replace_under_table_lock(
+                            engine,
+                            db,
+                            table,
+                            &materialized.table_meta,
+                            internal_txn_id,
+                            &undo,
+                        )?;
+                        return Err(error);
+                    }
+                };
+
+                // Publish existence markers for the committed replacement rows.
+                // Failure only downgrades later validation to a full scan; the
+                // statement is already committed and must not fail here.
+                if let Err(error) = append_unique_index_entries_after_insert(
+                    engine,
                     db,
                     table,
-                    error = %error,
-                    "failed to publish REPLACE unique-index entries; invalidating indexes"
-                );
-                let index_names = materialized
-                    .table_meta
-                    .unique_indexes
-                    .iter()
-                    .map(|index| index.name.clone())
-                    .collect::<Vec<_>>();
-                engine
-                    .index_manager()
-                    .invalidate_table_unique_index_snapshots(db, table, &index_names);
-            }
+                    replace_unique_entries,
+                ) {
+                    tracing::warn!(
+                        db,
+                        table,
+                        error = %error,
+                        "failed to publish REPLACE unique-index entries; invalidating indexes"
+                    );
+                    let index_names = materialized
+                        .table_meta
+                        .unique_indexes
+                        .iter()
+                        .map(|index| index.name.clone())
+                        .collect::<Vec<_>>();
+                    engine
+                        .index_manager()
+                        .invalidate_table_unique_index_snapshots(db, table, &index_names);
+                }
 
-            Ok((deleted, undo, pending_commits))
-        })?;
+                Ok((deleted, undo, pending_commits))
+            })?;
 
     let lock_elapsed = lock_start.elapsed();
-    let lock_warn_after = std::time::Duration::from_millis(
+    let lock_warn_after = std::time::Duration::from_secs(
         crate::common::config::storage_timeouts()
-            .mutation_lock_warn_ms
+            .mutation_lock_warn_secs
             .max(1),
     );
     if lock_elapsed >= lock_warn_after {
@@ -206,16 +233,18 @@ pub fn exec_replace(
         .batch_writer()
         .wait_pending_tail_commits(pending_commits)
     {
-        let rollback_result = engine.segment_mgr().with_table_mutation_lock(db, table, || {
-            rollback_replace_under_table_lock(
-                engine,
-                db,
-                table,
-                &materialized.table_meta,
-                internal_txn_id,
-                &undo,
-            )
-        });
+        let rollback_result = engine
+            .segment_mgr()
+            .with_table_mutation_lock(db, table, || {
+                rollback_replace_under_table_lock(
+                    engine,
+                    db,
+                    table,
+                    &materialized.table_meta,
+                    internal_txn_id,
+                    &undo,
+                )
+            });
         if let Err(rollback_error) = rollback_result {
             tracing::warn!(
                 db,
@@ -237,6 +266,10 @@ pub fn exec_replace(
     {
         engine.persist_auto_increment_next_value(db, table, false)?;
     }
+    // REPLACE deletes and re-inserts through its own internal transaction and
+    // never mirrors into the hot store; retire the resident fast path rather
+    // than risk stale rows surviving in the mirror.
+    engine.invalidate_hot_store(db, table);
 
     Ok(ExecResult::Ok {
         rows_affected: deleted + affected_insert_rows + replaced_inside_batch,
@@ -313,10 +346,18 @@ fn materialize_insert_values(
         .get(db)
         .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
 
+    // Shared snapshot: escapes the catalog lock as an Arc clone instead of a
+    // full TableMeta copy (all column defs, indexes and keys re-allocated).
     let table_meta = catalog
-        .get_table(table)
+        .get_table_shared(table)
         .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
         .clone();
+
+    // Keep the storage-side per-table zstd level override in sync with the
+    // catalog before any append/flush can create a writer.
+    engine
+        .segment_mgr()
+        .set_table_compression_level(db, table, table_meta.compression_level);
 
     let schema = Schema::new(table_meta.columns.clone());
 
@@ -350,6 +391,13 @@ fn materialize_insert_values(
     } else {
         None
     };
+
+    // Everything below works on the Arc-shared table_meta snapshot and the
+    // engine handles; release the catalogs read guard before the per-row
+    // materialization. Holding it here serialized every INSERT against DDL,
+    // catalog saves and other databases' inserts for the whole (potentially
+    // huge) row loop — the fast path already released before this point.
+    drop(catalogs);
 
     let mut batch = RecordBatch::with_capacity(schema.clone(), values.len());
 
@@ -400,8 +448,6 @@ fn materialize_insert_values(
         }
     }
 
-    drop(catalogs);
-
     Ok(MaterializedInsert {
         table_meta,
         schema,
@@ -427,6 +473,9 @@ fn exec_materialized_insert_batch(
     publish_unique_index_entries: bool,
     publish_catalog: bool,
 ) -> Result<ExecResult> {
+    // Values are materialized; from here on the statement installs rows into
+    // memtables and indexes, which cannot be undone by cancellation.
+    crate::common::query_cancel::enter_committing_phase();
     let auto_inc_cols: Vec<usize> = schema
         .columns
         .iter()
@@ -476,10 +525,20 @@ fn exec_materialized_insert_batch(
             Some(constraint_insert_lock(db, table).lock().unwrap())
         };
 
-    if validate_existing_constraints {
-        validate_unique_constraints(engine, db, table, &batch, &schema, &unique_constraints)?;
-    } else {
+    // The bulk/relaxed branch re-runs the full existing-data validation
+    // inside `exec_bulk_insert_partitioned`; probing the index here too
+    // doubled the constraint cost of every bulk SQL insert.
+    let bulk_branch = bulk_import_mode || relaxed_direct_insert;
+    if bulk_branch && crate::common::config::replication_settings().role_is_primary() {
+        return Err(TaibaiError::Sql(
+            "bulk/RELAXED inserts are not allowed on a replication primary;              use regular DURABLE INSERTs"
+                .into(),
+        ));
+    }
+    if bulk_branch || !validate_existing_constraints {
         validate_unique_constraints_in_batch(table, &batch, &schema, &unique_constraints)?;
+    } else {
+        validate_unique_constraints(engine, db, table, &batch, &schema, &unique_constraints)?;
     }
 
     if !primary_key_indices.is_empty() {
@@ -488,7 +547,9 @@ fn exec_materialized_insert_batch(
             &is_missing_auto_inc,
         ) {
             validate_primary_key_values_present(&batch, &schema, &primary_key_indices)?;
-        } else if validate_existing_constraints {
+        } else if bulk_branch || !validate_existing_constraints {
+            validate_primary_key_uniqueness_in_batch(table, &batch, &schema, &primary_key_indices)?;
+        } else {
             validate_primary_key_uniqueness(
                 engine,
                 db,
@@ -497,8 +558,6 @@ fn exec_materialized_insert_batch(
                 &schema,
                 &primary_key_indices,
             )?;
-        } else {
-            validate_primary_key_uniqueness_in_batch(table, &batch, &schema, &primary_key_indices)?;
         }
     }
     advance_explicit_auto_increment_counters(
@@ -515,7 +574,6 @@ fn exec_materialized_insert_batch(
     } else {
         primary_keys_for_batch(&batch, &schema, &primary_key_indices)?
     };
-    let auto_increment_touched = !auto_inc_cols.is_empty();
     let mut unique_index_entries = if publish_unique_index_entries {
         build_unique_index_entries_for_batch(table_meta, &schema, &batch, &unique_constraints)?
     } else {
@@ -533,8 +591,16 @@ fn exec_materialized_insert_batch(
         constraint_start.elapsed(),
     );
 
-    if txn_id == 0 && !bulk_import_mode && !relaxed_direct_insert {
-        match engine.feed_hot_store(db, table, table_meta, &batch) {
+    // Hold the feed guard at function scope so the in-flight accounting
+    // spans the hot append and the memtable staging below: a concurrent
+    // backpressure reclaim must not mistake these rows for persisted prefix.
+    let hot_feed_guard = if hot_mirror_eligible(txn_id, bulk_import_mode, relaxed_direct_insert) {
+        Some(engine.begin_hot_feed(db, table))
+    } else {
+        None
+    };
+    if let Some(feed) = hot_feed_guard.as_ref() {
+        match engine.feed_hot_store(db, table, table_meta, &batch, feed) {
             Ok(()) => {
                 if engine
                     .hot_store_manager()
@@ -545,16 +611,32 @@ fn exec_materialized_insert_batch(
             }
             Err(crate::common::error::TaibaiError::ResourceBusy(_)) => {
                 engine.reclaim_hot_store_pressure(db, table);
-                engine.feed_hot_store(db, table, table_meta, &batch)?
+                engine.feed_hot_store(db, table, table_meta, &batch, feed)?
             }
             Err(e) => return Err(e),
         }
     }
+    // Capture the change-notification payload before the batch moves into
+    // the writer. Only immediately visible writes are published here:
+    // transactional deltas are published at COMMIT by the batch writer, and
+    // deferred bulk/relaxed writes become visible at flush time. The clone is
+    // skipped entirely while no client is subscribed.
+    let pubsub_batch = if hot_mirror_eligible(txn_id, bulk_import_mode, relaxed_direct_insert)
+        && engine.pubsub().has_any_subscribers()
+    {
+        Some(batch.clone())
+    } else {
+        None
+    };
     let write_start = Instant::now();
     if bulk_import_mode || relaxed_direct_insert {
         engine.exec_bulk_insert_partitioned(db, table, table_meta, batch, relaxed_direct_insert)?;
     } else {
-        write_batch_by_partition(
+        // Inside this else-branch bulk/relaxed are false, so the predicate
+        // reduces to auto-commit: when it holds, every row of the batch is
+        // mirrored into the hot store.
+        let hot_fed = hot_mirror_eligible(txn_id, bulk_import_mode, relaxed_direct_insert);
+        if let Err(error) = write_batch_by_partition(
             engine,
             db,
             table,
@@ -563,11 +645,49 @@ fn exec_materialized_insert_batch(
             schema,
             txn_id,
             table_lock_held,
-        )?;
+            hot_fed,
+        ) {
+            if hot_fed {
+                // The hot mirror already holds this batch but the
+                // memtable/durable-tail write failed: the watermark
+                // arithmetic would treat the unfed rows as committed
+                // prefix-adjacent rows and the resident fast path would
+                // serve ghosts the client was told were never inserted.
+                // Drop the mirror entirely — it is a rebuildable
+                // optimization, and UPDATE/DELETE already disable its
+                // rebuild on invalidation.
+                engine.invalidate_hot_store(db, table);
+            }
+            return Err(error);
+        }
+    }
+    if let Some(batch) = pubsub_batch {
+        engine.pubsub().publish(db, table, batch);
     }
     log_insert_profile("write", row_count as usize, write_start.elapsed());
 
     let catalog_start = Instant::now();
+    // Snapshot the published keys before the append consumes the entries, so
+    // an explicit-transaction ROLLBACK can retract exactly these keys. The
+    // record is taken before the append attempt: a half-failed publish (some
+    // indexes appended, one errored) must still be retractable.
+    if txn_id > 0 {
+        for (index_name, entries) in &unique_index_entries {
+            let keys = entries.iter().map(|entry| entry.key.clone()).collect();
+            engine
+                .index_manager()
+                .record_txn_published_keys(txn_id, db, table, index_name, keys);
+        }
+        if !primary_keys.is_empty() {
+            engine.index_manager().record_txn_published_keys(
+                txn_id,
+                db,
+                table,
+                crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+                primary_keys.clone(),
+            );
+        }
+    }
     if publish_unique_index_entries {
         append_unique_index_entries_after_insert(engine, db, table, unique_index_entries)?;
     }
@@ -585,9 +705,11 @@ fn exec_materialized_insert_batch(
             !bulk_import_mode && txn_id > 0,
             !bulk_import_mode && txn_id == 0,
         )?;
-        if auto_increment_touched {
-            engine.persist_auto_increment_next_value(db, table, !bulk_import_mode && txn_id > 0)?;
-        }
+        // No follow-up persist_auto_increment_next_value call here:
+        // record_inserted_rows already writes the counter into the table
+        // meta under the same catalog lock (and saves under the same
+        // condition), so a second lock acquisition was pure serialization
+        // overhead on every INSERT.
     }
     log_insert_profile("catalog", row_count as usize, catalog_start.elapsed());
     log_insert_profile("total_exec", row_count as usize, total_start.elapsed());
@@ -704,7 +826,11 @@ pub(crate) fn location_indexes_for_table(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok((index.name.as_str().to_string(), index.columns.clone(), indices))
+            Ok((
+                index.name.as_str().to_string(),
+                index.columns.clone(),
+                indices,
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
     let primary_indices = primary_key_indices(schema);
@@ -800,16 +926,24 @@ fn ensure_replace_location_indexes(
 ) -> Result<()> {
     let indexes = location_indexes_for_table(table_meta, schema)?;
     for (index_name, columns, indices) in indexes {
-        let keys = key_sets
+        let key_set = key_sets
             .iter()
             .find(|(key_indices, _)| *key_indices == indices)
-            .map(|(_, keys)| keys.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        if engine
-            .index_manager()
-            .unique_key_locations(db, table, &index_name, &keys)?
-            .is_some()
-        {
+            .map(|(_, keys)| keys);
+        let locations = match key_set {
+            Some(keys) => {
+                engine
+                    .index_manager()
+                    .unique_key_locations(db, table, &index_name, keys)?
+            }
+            None => engine.index_manager().unique_key_locations(
+                db,
+                table,
+                &index_name,
+                std::iter::empty::<&Vec<ScalarValue>>(),
+            )?,
+        };
+        if locations.is_some() {
             continue;
         }
         let entries = collect_unique_index_entries(
@@ -975,6 +1109,7 @@ fn write_batch_by_partition(
     schema: Schema,
     txn_id: u64,
     table_lock_held: bool,
+    hot_fed: bool,
 ) -> Result<()> {
     if table_meta.partition_key.is_empty() || batch.num_rows() == 0 {
         write_partition_batch(
@@ -987,6 +1122,7 @@ fn write_batch_by_partition(
             schema,
             txn_id,
             table_lock_held,
+            hot_fed,
         )?;
         return Ok(());
     }
@@ -1009,6 +1145,7 @@ fn write_batch_by_partition(
             schema,
             txn_id,
             table_lock_held,
+            hot_fed,
         )?;
         return Ok(());
     }
@@ -1026,6 +1163,7 @@ fn write_batch_by_partition(
                 schema.clone(),
                 txn_id,
                 table_lock_held,
+                hot_fed,
             )?;
         }
         return Ok(());
@@ -1047,6 +1185,7 @@ fn write_batch_by_partition(
             schema,
             txn_id,
             table_lock_held,
+            hot_fed,
         )?;
         return Ok(());
     }
@@ -1063,6 +1202,7 @@ fn write_batch_by_partition(
             schema.clone(),
             txn_id,
             table_lock_held,
+            hot_fed,
         )?;
     }
     Ok(())
@@ -1079,6 +1219,7 @@ fn write_partition_batch(
     schema: Schema,
     txn_id: u64,
     table_lock_held: bool,
+    hot_fed: bool,
 ) -> Result<()> {
     let batch = sort_batch_for_cluster_key(table_meta, batch)?;
     if table_lock_held {
@@ -1091,6 +1232,7 @@ fn write_partition_batch(
                 batch,
                 schema,
                 txn_id,
+                hot_fed,
             )?;
     } else {
         engine.batch_writer().write_columns_with_txn(
@@ -1100,6 +1242,7 @@ fn write_partition_batch(
             batch,
             schema,
             txn_id,
+            hot_fed,
         )?;
     }
     Ok(())
@@ -1128,21 +1271,35 @@ fn sort_batch_for_cluster_key(
     sort_batch_by_key(&batch, &inserter)
 }
 
+/// Build the typed, memoized partition-key computer for `table_meta` over
+/// `batch`. `None` when the table has no partition column, mirroring
+/// `get_partition_column_index_cached`.
+fn partition_keys_computer<'a>(
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    batch: &'a RecordBatch,
+) -> Option<crate::storage::partition::partition_function::PartitionKeysAt<'a>> {
+    use crate::storage::partition::partition_function::{PartitionKeyKind, PartitionKeysAt};
+    if table_meta.partition_key.is_empty() {
+        return None;
+    }
+    let column = batch.column(table_meta.get_partition_column_index_cached()?)?;
+    let kind = match table_meta.partition_type {
+        crate::storage::catalog::schema::PartitionType::Value => PartitionKeyKind::ValueText,
+        crate::storage::catalog::schema::PartitionType::None => return None,
+        _ => PartitionKeyKind::Strategy(table_meta.partition_strategy()),
+    };
+    Some(PartitionKeysAt::new(kind, column))
+}
+
 fn single_partition_key(
     table_meta: &crate::storage::catalog::schema::TableMeta,
     batch: &RecordBatch,
 ) -> Option<String> {
-    let col_idx = table_meta.get_partition_column_index_cached()?;
-    let first = batch
-        .scalar(0, col_idx)
-        .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-    let first_key = compute_partition_key_for_value(table_meta, &first);
+    let mut keys = partition_keys_computer(table_meta, batch)?;
+    let first_key = keys.key_at(0).to_string();
 
     for row_idx in 1..batch.num_rows() {
-        let val = batch
-            .scalar(row_idx, col_idx)
-            .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-        if compute_partition_key_for_value(table_meta, &val) != first_key {
+        if keys.key_at(row_idx) != first_key {
             return None;
         }
     }
@@ -1157,29 +1314,23 @@ fn partition_ranges_if_contiguous(
     if table_meta.partition_key.is_empty() || batch.num_rows() == 0 {
         return Some(vec![(String::new(), 0, batch.num_rows())]);
     }
-    let col_idx = table_meta.get_partition_column_index_cached()?;
-    let first = batch
-        .scalar(0, col_idx)
-        .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-    let mut current_key = compute_partition_key_for_value(table_meta, &first);
+    let mut keys = partition_keys_computer(table_meta, batch)?;
+    let mut current_key = keys.key_at(0).to_string();
     let mut current_start = 0usize;
     let mut closed = HashSet::new();
     let mut ranges = Vec::new();
 
     for row_idx in 1..batch.num_rows() {
-        let val = batch
-            .scalar(row_idx, col_idx)
-            .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-        let key = compute_partition_key_for_value(table_meta, &val);
+        let key = keys.key_at(row_idx);
         if key != current_key {
             if !closed.insert(current_key.clone()) {
                 return None;
             }
             ranges.push((current_key, current_start, row_idx));
-            if closed.contains(&key) {
+            if closed.contains(key) {
                 return None;
             }
-            current_key = key;
+            current_key = key.to_string();
             current_start = row_idx;
         }
     }
@@ -1206,21 +1357,19 @@ fn partition_row_indices(
     if table_meta.partition_key.is_empty() || batch.num_rows() == 0 {
         return vec![(String::new(), (0..batch.num_rows() as u32).collect())];
     }
-    let col_idx = match table_meta.get_partition_column_index_cached() {
-        Some(idx) => idx,
+    let mut keys = match partition_keys_computer(table_meta, batch) {
+        Some(computer) => computer,
         None => return vec![(String::new(), (0..batch.num_rows() as u32).collect())],
     };
     let mut key_order = Vec::new();
     let mut groups: HashMap<String, Vec<u32>> = HashMap::new();
     for row_idx in 0..batch.num_rows() {
-        let val = batch
-            .scalar(row_idx, col_idx)
-            .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-        let key = compute_partition_key_for_value(table_meta, &val);
-        if !groups.contains_key(&key) {
-            key_order.push(key.clone());
+        let key = keys.key_at(row_idx);
+        if !groups.contains_key(key) {
+            key_order.push(key.to_string());
+            groups.insert(key.to_string(), Vec::new());
         }
-        groups.entry(key).or_default().push(row_idx as u32);
+        groups.get_mut(key).unwrap().push(row_idx as u32);
     }
     key_order
         .into_iter()
@@ -1329,7 +1478,9 @@ fn push_literal_fast(
             Ok(())
         }
         (ColumnArray::VarChar { data, bitmap }, ScalarValue::VarChar(Some(v))) => {
-            data.push(v.clone());
+            // Copy the bytes straight into the buffer; cloning into a fresh
+            // String would add a heap allocation per row.
+            data.push_str(v);
             bitmap.push_valid();
             Ok(())
         }

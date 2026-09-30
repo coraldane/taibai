@@ -1,8 +1,9 @@
 # 普通 INSERT 持久化路径磁盘 I/O 优化方案
 
 > 计划文档。状态：**提案，未实施**。
-> 前置分析见 `memtable-tail-spill-layer-plan.md`（Phase 1+2 已实施：tail 文件堆积问题已由
-> 三道防线消除，本方案只针对**残余的磁盘 I/O 开销**）。
+> 背景：tail 文件堆积问题已由三道防线消除（Flush 即时 drain / 周期转储 / 每表 256
+> 文件高水位），memtable spill 与重启惰性恢复已实施（见 `../design/TAIBAI_DESIGN_ZH.md`
+> MemTable 一节）；本方案只针对**残余的磁盘 I/O 开销**。
 
 ## 1. 现状与开销定位
 
@@ -29,7 +30,7 @@ ActiveSegmentWriter 行组缓冲，攒满 `row_group_target_rows` 切组并 sync
 | C1 | **双写**：每行先 tail 后 segment，字节数 2×，两套 zstd | 与导入量成正比 | `write_batch_by_partition` vs `exec_bulk_insert_partitioned_with_wal_control` |
 | C2 | **双 barrier**：tail group-commit fsync + 行组 sync_all | fsync 次数 ≈ 2× 批次数/聚合比 | `durable_tail.rs:283`、`active_writer.rs:315,321` |
 | C3 | **小行组**：`row_group_target_rows` 默认/示例均 8192（≈1MB，zstd-1） | 元数据占比、扫描放大 | `config.rs:22`、`example.yaml:14` |
-| C4 | flush 时 解码→重编码（tail 帧 ≠ 行组编码） | CPU，非磁盘 | 设计文档 §4.5 已列为 Phase 3 候选 |
+| C4 | flush 时 解码→重编码（tail 帧 ≠ 行组编码） | CPU，非磁盘 | 本方案 P1 提案消除 |
 
 已确认**不是**问题的：tail 文件数（三道防线：Flush 即时 drain / 30s 周期 / 每表 256
 文件高水位，`batch_writer.rs:680,197,782`）；小行组碎片（ActiveSegmentWriter 会把

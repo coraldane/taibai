@@ -25,7 +25,7 @@ pub struct ScanExec {
 
 #[allow(clippy::large_enum_variant)]
 enum ScanSource {
-    Batches(VecDeque<RecordBatch>),
+    Batches(VecDeque<std::sync::Arc<RecordBatch>>),
     Cursor(ScanCursor),
     Deferred {
         spec: ScanSpec,
@@ -33,12 +33,25 @@ enum ScanSource {
         schema: Schema,
         meta: TableMeta,
         db: String,
-        batches: Option<VecDeque<RecordBatch>>,
+        batches: Option<VecDeque<std::sync::Arc<RecordBatch>>>,
     },
 }
 
 impl ScanExec {
     pub fn new(batches: Vec<RecordBatch>, projection: Option<Vec<usize>>) -> Self {
+        Self {
+            source: ScanSource::Batches(batches.into_iter().map(std::sync::Arc::new).collect()),
+            projection,
+            table_schema: None,
+        }
+    }
+
+    /// Zero-copy variant for materialized pipelines: batches are already
+    /// shared. A uniquely-owned Arc yields without any column copy.
+    pub fn new_shared(
+        batches: Vec<std::sync::Arc<RecordBatch>>,
+        projection: Option<Vec<usize>>,
+    ) -> Self {
         Self {
             source: ScanSource::Batches(VecDeque::from(batches)),
             projection,
@@ -86,7 +99,7 @@ impl ScanExec {
         self
     }
 
-    fn batches(&mut self) -> Result<&mut VecDeque<RecordBatch>> {
+    fn batches(&mut self) -> Result<&mut VecDeque<std::sync::Arc<RecordBatch>>> {
         match &mut self.source {
             ScanSource::Batches(batches) => Ok(batches),
             ScanSource::Cursor(_) => unreachable!(),
@@ -106,7 +119,13 @@ impl ScanExec {
                         meta.clone(),
                         db,
                     );
-                    *batches = Some(VecDeque::from(executor.execute()?));
+                    *batches = Some(
+                        executor
+                            .execute()?
+                            .into_iter()
+                            .map(std::sync::Arc::new)
+                            .collect(),
+                    );
                 }
                 Ok(batches.as_mut().unwrap())
             }
@@ -126,7 +145,11 @@ impl ExecutionOp for ScanExec {
             let Some(batch) = batches.pop_front() else {
                 return Ok(None);
             };
-            batch
+            // A uniquely-owned batch (the materialized pipeline moved it in)
+            // yields without copying a single column; a shared one — the
+            // same table scanned twice — falls back to the deep clone the
+            // old code always paid.
+            std::sync::Arc::try_unwrap(batch).unwrap_or_else(|shared| (*shared).clone())
         };
 
         match &self.projection {

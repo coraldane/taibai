@@ -12,16 +12,15 @@ use crate::storage::partition::{
     parse_partition_key, partition_function::compute_partition_key_from_scalar,
 };
 use crate::storage::segment::delete_bitmap;
-use crate::storage::segment::{RangeOp, SegmentReader};
+use crate::storage::segment::RangeOp;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
-use super::helpers::{
-    build_row_group_predicate, collect_expr_column_indices, eval_expr_to_scalar,
-    eval_where_clause_batch,
-};
+use super::helpers::{eval_expr_to_scalar, eval_where_clause_batch};
+use super::scan::cluster_prune;
+use super::scan::row_filter::ClusterKeyBounds;
 use crate::sql::parser::ast::{BinOp, Expr};
 
 #[derive(Default)]
@@ -31,7 +30,7 @@ pub(crate) struct ReplaceDeleteUndo {
     deleted_locations: Vec<UniqueRowLocation>,
     /// Original batches of memtables whose conflicting rows were filtered out,
     /// restored verbatim on rollback.
-    memtable_backups: Vec<(Arc<MemTable>, RecordBatch)>,
+    memtable_backups: Vec<(Arc<MemTable>, Arc<RecordBatch>)>,
 }
 
 impl ReplaceDeleteUndo {
@@ -53,10 +52,10 @@ impl ReplaceDeleteUndo {
 /// apply). Positions let the apply step compact the REPLACE key index instead
 /// of invalidating it.
 pub(crate) struct ReplaceMemtableConflictPlan {
-    memtable: Arc<MemTable>,
-    original: RecordBatch,
-    filtered: RecordBatch,
-    removed_positions: Vec<u32>,
+    pub(crate) memtable: Arc<MemTable>,
+    pub(crate) original: Arc<RecordBatch>,
+    pub(crate) filtered: Arc<RecordBatch>,
+    pub(crate) removed_positions: Vec<u32>,
 }
 
 fn filter_batch_keep(batch: &RecordBatch, keep: &[bool], keep_count: usize) -> Result<RecordBatch> {
@@ -88,26 +87,27 @@ pub(crate) fn plan_replace_memtable_conflicts(
         if memtable.is_transactional() || memtable.visibility() != TxnVisibility::Committed {
             continue;
         }
-        let planned = memtable
-            .read_with(|batch| {
-                if batch.num_rows() == 0 {
-                    return None;
-                }
-                let positions = engine
-                    .memtable_manager()
-                    .replace_key_conflicts(&memtable, key_sets, batch);
-                if positions.is_empty() {
-                    return None;
-                }
-                let removed = positions.len();
-                let mut keep = vec![true; batch.num_rows()];
-                for &row_idx in &positions {
-                    keep[row_idx as usize] = false;
-                }
-                let filtered = filter_batch_keep(batch, &keep, batch.num_rows() - removed).ok()?;
-                Some((batch.clone(), filtered, positions))
-            })
-            .flatten();
+        // Share the memtable's own Arc as the undo backup instead of
+        // deep-copying the batch; the table mutation lock is held, so the
+        // resident batch cannot change between the read and the swap.
+        let planned = memtable.read_snapshot_arc().and_then(|batch| {
+            if batch.num_rows() == 0 {
+                return None;
+            }
+            let positions = engine
+                .memtable_manager()
+                .replace_key_conflicts(&memtable, key_sets, &batch);
+            if positions.is_empty() {
+                return None;
+            }
+            let removed = positions.len();
+            let mut keep = vec![true; batch.num_rows()];
+            for &row_idx in &positions {
+                keep[row_idx as usize] = false;
+            }
+            let filtered = filter_batch_keep(&batch, &keep, batch.num_rows() - removed).ok()?;
+            Some((batch, Arc::new(filtered), positions))
+        });
         if let Some((original, filtered, removed_positions)) = planned {
             plans.push(ReplaceMemtableConflictPlan {
                 memtable,
@@ -123,57 +123,219 @@ pub(crate) fn plan_replace_memtable_conflicts(
 /// Scan the table's committed, non-transactional pending memtables for rows
 /// matching the DELETE predicate. Reuses the REPLACE two-phase plan/apply
 /// machinery so the physical removal and durable-tail rewrite are identical.
+/// The single walk over a table's visible memtables shared by the DELETE
+/// planner, auto-commit UPDATE, and transactional UPDATE: memtables visible
+/// to the statement's transaction, optionally narrowed to one partition,
+/// each yielded with
+/// - its original snapshot (positions in plans, tombstone registrations and
+///   events are absolute against this batch), and
+/// - the registry's transaction-tombstone view of it (`live_positions`
+///   maps view coordinates back to original ones; an identity view when
+///   nothing is tombstoned — including every auto-commit statement).
+///
+/// The walk-and-view they used to re-derive per caller is
+/// `TxnMutationRegistry::memtable_batch_visible_to_txn`; new memtable-side
+/// consumers must iterate through here so the visibility rules stay in one
+/// place.
+
+/// One segment's DELETE match result (auto-commit and deferred transactional
+/// paths share the walk).
+pub(crate) struct SegmentDeleteMatch {
+    /// The segment's tombstone bitmap as it was before this statement —
+    /// deferred-DML registration needs the pre-statement state.
+    pub footer_bitmap: Vec<u8>,
+    /// The working bitmap: footer tombstones + `seed_tombstones` + every
+    /// newly matched row marked.
+    pub new_bitmap: Vec<u8>,
+    /// Absolute row ids newly matched by this statement, in row order.
+    pub matched_ids: Vec<u64>,
+}
+
+/// The shared per-segment DELETE match walk: seed the working bitmap from
+/// the segment's footer tombstones plus `seed_tombstones` (tombstones
+/// recorded by earlier statements of the same transaction), then walk row
+/// groups — skipping fully-deleted ranges and zone-map-pruned groups —
+/// marking every row the WHERE clause selects.
+///
+/// `need_batches` reads each candidate row group even without a WHERE
+/// clause so batch-granularity consumers can run; the auto-commit path sets
+/// it for change events and index maintenance, the transactional path leaves
+/// it off for WHERE-less deletes (which today publish no events — nothing
+/// was read to publish). `read_row_group` picks full vs projected reads;
+/// `on_row_group` observes each candidate group's matches as
+/// (in-group index, absolute row id) pairs against the read batch.
+pub(crate) fn match_segment_for_delete(
+    reader: &crate::storage::segment::SegmentReader,
+    predicate: Option<&crate::storage::segment::RowGroupPredicate>,
+    where_clause: Option<&Expr>,
+    seed_tombstones: &[u64],
+    need_batches: bool,
+    read_row_group: impl Fn(&crate::storage::segment::SegmentReader, usize) -> Result<RecordBatch>,
+    mut on_row_group: impl FnMut(&RecordBatch, &[(u32, u64)]) -> Result<()>,
+) -> Result<SegmentDeleteMatch> {
+    let total_rows = reader.row_count();
+    let bitmap_bytes = total_rows.div_ceil(8) as usize;
+    let footer_bitmap = reader.delete_bitmap().to_vec();
+    let mut new_bitmap = vec![0u8; bitmap_bytes];
+    let copy_len = footer_bitmap.len().min(bitmap_bytes);
+    new_bitmap[..copy_len].copy_from_slice(&footer_bitmap[..copy_len]);
+    for row_id in seed_tombstones {
+        delete_bitmap::mark_deleted(&mut new_bitmap, *row_id);
+    }
+
+    let mut matched_ids = Vec::new();
+    let mut row_id: u64 = 0;
+    for rg_idx in 0..reader.num_row_groups() {
+        let rg_rows = reader.row_group_rows(rg_idx);
+        if delete_bitmap::row_range_all_deleted(&new_bitmap, row_id, rg_rows) {
+            row_id += rg_rows;
+            continue;
+        }
+        if let Some(pred) = predicate {
+            if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
+                row_id += rg_rows;
+                continue;
+            }
+        }
+        if !where_clause.is_some() && !need_batches {
+            // Delete-everything-in-the-group fast path: no batch is read, so
+            // there is nothing for batch-granularity consumers to observe.
+            for i in 0..rg_rows {
+                if delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i) {
+                    matched_ids.push(row_id + i);
+                }
+            }
+            row_id += rg_rows;
+            continue;
+        }
+        let batch = read_row_group(reader, rg_idx)?;
+        let mask = match where_clause {
+            Some(where_expr) => eval_where_clause_batch(where_expr, &batch, &batch.schema)?,
+            None => vec![true; batch.num_rows()],
+        };
+        let mut matched: Vec<(u32, u64)> = Vec::new();
+        for (i, matches) in mask.into_iter().enumerate() {
+            if matches && delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64) {
+                matched.push((i as u32, row_id + i as u64));
+            }
+        }
+        if !matched.is_empty() {
+            on_row_group(&batch, &matched)?;
+            matched_ids.extend(matched.iter().map(|(_, absolute)| *absolute));
+        }
+        row_id += batch.num_rows() as u64;
+    }
+    Ok(SegmentDeleteMatch {
+        footer_bitmap,
+        new_bitmap,
+        matched_ids,
+    })
+}
+
+pub(crate) fn for_each_visible_memtable(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    reader_txn_id: u64,
+    narrowed_partition: Option<&str>,
+    mut consume: impl FnMut(
+        Arc<crate::storage::core::memtable::MemTable>,
+        Arc<RecordBatch>,
+        Arc<RecordBatch>,
+        Option<Vec<u32>>,
+    ) -> Result<()>,
+) -> Result<()> {
+    // Visible-to-this-transaction memtables: committed rows plus this
+    // transaction's own uncommitted INSERTs (so a DELETE/UPDATE inside a
+    // transaction reaches rows the same transaction just wrote). Rows of
+    // other still-open transactions stay untouched.
+    for memtable in engine
+        .memtable_manager()
+        .get_visible_to(db, table, reader_txn_id)
+    {
+        if let Some(key) = narrowed_partition {
+            if memtable.partition_key() != key {
+                continue;
+            }
+        }
+        let Some(original) = memtable.read_snapshot_arc() else {
+            continue;
+        };
+        if original.num_rows() == 0 {
+            continue;
+        }
+        let (view, live_positions) = engine.txn_mutations().memtable_batch_visible_to_txn(
+            reader_txn_id,
+            &memtable,
+            &original,
+        )?;
+        consume(memtable, original, view, live_positions)?;
+    }
+    Ok(())
+}
+
 /// The caller holds the table mutation lock.
-fn plan_delete_memtable_rows(
+pub(crate) fn plan_delete_memtable_rows(
     engine: &Engine,
     db: &str,
     table: &str,
     where_clause: &Option<Expr>,
     table_schema: &Schema,
     target_partition_key: Option<&str>,
+    reader_txn_id: u64,
 ) -> Result<Vec<ReplaceMemtableConflictPlan>> {
     let mut plans = Vec::new();
-    for memtable in engine.memtable_manager().get_by_table(db, table) {
-        if memtable.is_transactional() || memtable.visibility() != TxnVisibility::Committed {
-            continue;
-        }
-        if let Some(key) = target_partition_key {
-            if memtable.partition_key() != key {
-                continue;
+    for_each_visible_memtable(
+        engine,
+        db,
+        table,
+        reader_txn_id,
+        target_partition_key,
+        |memtable, original, view, live_positions| {
+            if view.num_rows() == 0 {
+                return Ok(());
             }
-        }
-        let planned = memtable
-            .read_with(|batch| {
-                if batch.num_rows() == 0 {
-                    return None;
+            // Propagate evaluation errors: swallowing them here used to make the
+            // memtable look "no match", deleting segment rows while leaving the
+            // memtable rows alive.
+            let mask = match where_clause.as_ref() {
+                Some(expr) => eval_where_clause_batch(expr, &view, table_schema)?,
+                None => vec![true; view.num_rows()],
+            };
+            // Lift the matches back to absolute positions in the original batch
+            // so plans, tombstone registrations and delete events all speak the
+            // same coordinate system.
+            let mut absolute_mask = vec![false; original.num_rows()];
+            for (filtered_idx, &matches) in mask.iter().enumerate() {
+                if matches {
+                    let absolute = live_positions
+                        .as_ref()
+                        .map_or(filtered_idx as u32, |map| map[filtered_idx]);
+                    absolute_mask[absolute as usize] = true;
                 }
-                let mask = match where_clause.as_ref() {
-                    Some(expr) => eval_where_clause_batch(expr, batch, table_schema).ok()?,
-                    None => vec![true; batch.num_rows()],
-                };
-                let removed = mask.iter().filter(|matches| **matches).count();
-                if removed == 0 {
-                    return None;
-                }
-                let keep = mask.iter().map(|matches| !matches).collect::<Vec<_>>();
-                let filtered = filter_batch_keep(batch, &keep, batch.num_rows() - removed).ok()?;
-                let removed_positions = mask
+            }
+            let removed = absolute_mask.iter().filter(|matches| **matches).count();
+            if removed > 0 {
+                let keep = absolute_mask
+                    .iter()
+                    .map(|matches| !matches)
+                    .collect::<Vec<_>>();
+                let filtered = filter_batch_keep(&original, &keep, original.num_rows() - removed)?;
+                let removed_positions = absolute_mask
                     .iter()
                     .enumerate()
                     .filter_map(|(row_idx, matches)| matches.then_some(row_idx as u32))
                     .collect::<Vec<_>>();
-                Some((batch.clone(), filtered, removed_positions))
-            })
-            .flatten();
-        if let Some((original, filtered, removed_positions)) = planned {
-            plans.push(ReplaceMemtableConflictPlan {
-                memtable,
-                original,
-                filtered,
-                removed_positions,
-            });
-        }
-    }
+                plans.push(ReplaceMemtableConflictPlan {
+                    memtable,
+                    original,
+                    filtered: Arc::new(filtered),
+                    removed_positions,
+                });
+            }
+            Ok(())
+        },
+    )?;
     Ok(plans)
 }
 
@@ -208,19 +370,47 @@ pub(crate) fn apply_replace_memtable_conflicts(
             &plan.removed_positions,
             plan.original.num_rows(),
         );
-        if let Err(error) = crate::storage::core::durable_tail::persist(
-            &table_dir,
-            plan.memtable.id(),
-            plan.memtable.partition_key(),
-            &plan.filtered,
-        ) {
-            let _ = plan.memtable.replace_pending_batch(plan.original.clone());
-            let _ = crate::storage::core::durable_tail::persist(
+        // A transactional memtable has no durable tail yet — its rows only
+        // reach the tail at COMMIT — so only committed memtables rewrite
+        // the tail here. The in-memory batch swap above is exactly what
+        // ROLLBACK needs to undo.
+        let tail_result = if plan.memtable.is_transactional() {
+            Ok(())
+        } else if plan.filtered.num_rows() == 0 {
+            // Nothing survived the delete: a clear tombstone (fail-closed)
+            // replaces the memtable's tail instead of persisting an empty
+            // snapshot generation.
+            crate::storage::core::durable_tail::clear(&table_dir, plan.memtable.id())
+        } else {
+            // Incremental first: a delete sidecar costs O(affected rows)
+            // instead of rewriting the whole tail snapshot (quadratic for
+            // repeated small deletes on a large memtable). Falls back to a
+            // full persist when no live tail exists to hang the sidecar on.
+            match crate::storage::core::durable_tail::delete_rows(
                 &table_dir,
                 plan.memtable.id(),
-                plan.memtable.partition_key(),
-                &plan.original,
-            );
+                &plan.removed_positions,
+            ) {
+                Ok(true) => Ok(()),
+                Ok(false) => crate::storage::core::durable_tail::persist(
+                    &table_dir,
+                    plan.memtable.id(),
+                    plan.memtable.partition_key(),
+                    &plan.filtered,
+                ),
+                Err(error) => Err(error),
+            }
+        };
+        if let Err(error) = tail_result {
+            let _ = plan.memtable.replace_pending_batch(plan.original.clone());
+            if !plan.memtable.is_transactional() {
+                let _ = crate::storage::core::durable_tail::persist(
+                    &table_dir,
+                    plan.memtable.id(),
+                    plan.memtable.partition_key(),
+                    &plan.original,
+                );
+            }
             let _ = restore_replace_memtable_undo(engine, &undo);
             return Err(error);
         }
@@ -314,12 +504,11 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
             .enumerate()
             .find(|(_, (indices, _))| *indices == primary_key_indices)
         {
-            let keys = keys.iter().cloned().collect::<Vec<_>>();
             match engine.index_manager().unique_key_locations(
                 db,
                 table,
                 crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
-                &keys,
+                keys,
             )? {
                 Some(locations) => direct_locations.extend(locations),
                 None => fallback[key_set_offset] = true,
@@ -343,10 +532,9 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
         else {
             continue;
         };
-        let keys = keys.iter().cloned().collect::<Vec<_>>();
         match engine
             .index_manager()
-            .unique_key_locations(db, table, &index.name, &keys)?
+            .unique_key_locations(db, table, &index.name, keys)?
         {
             Some(locations) => direct_locations.extend(locations),
             None => fallback[key_set_offset] = true,
@@ -949,39 +1137,54 @@ pub fn exec_delete(
     db: &str,
     table: &str,
     where_clause: &Option<Expr>,
+    reader_txn_id: u64,
 ) -> Result<ExecResult> {
-    let (table_schema, table_meta) = {
-        let catalogs = engine.catalogs().read().unwrap();
-        let catalog = catalogs
-            .get(db)
-            .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-        let meta = catalog
-            .get_table(table)
-            .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
-            .clone();
-        (Schema::new(meta.columns.clone()), meta)
-    };
+    if reader_txn_id > 0 {
+        return super::txn_dml::exec_delete_in_txn(engine, db, table, where_clause, reader_txn_id);
+    }
 
-    let resolved_where_clause = resolve_in_subqueries(engine, db, where_clause)?;
+    let ctx = super::txn_dml::DmlStatementContext::plan(engine, db, table, where_clause)?;
+    let resolved_where_clause = &ctx.resolved_where;
+    let table_schema = &ctx.table_schema;
+    let table_meta = &ctx.table_meta;
+    let target_partition_key = ctx.narrowed_partition();
+    let predicate = ctx.predicate.as_ref();
+    let predicate_projection = &ctx.predicate_projection;
 
-    let target_partition_key =
-        delete_partition_eq_key(&resolved_where_clause, &table_schema, &table_meta);
+    super::txn_dml::refuse_auto_commit_dml_while_pinned(engine, db, table)?;
+
+    // Join the INSERT/REPLACE writer protocol: the probe→publish window on
+    // the INSERT side is guarded by this striped lock, so row-rewriting
+    // statements must hold it too (index maintenance, footer rewrites, and
+    // snapshot invalidation below are invisible to a concurrent INSERT probe
+    // otherwise). Acquired before any table/partition mutation lock to keep
+    // the global order constraint_insert_lock → mutation lock identical to
+    // the INSERT path; REPLACE holds the same lock across its own body and
+    // never re-enters exec_delete, so the mutex stays acquirable.
+    let _constraint_guard = super::dml_insert::constraint_insert_lock(db, table)
+        .lock()
+        .unwrap();
+
     let table_dir = engine.data_dir().join(db).join(table);
     let mgr = engine.segment_mgr();
     let mut total_deleted: u64 = 0;
-    let predicate = build_row_group_predicate(&resolved_where_clause, &table_schema);
-    let predicate_projection = resolved_where_clause
-        .as_ref()
-        .map(|expr| collect_expr_column_indices(expr, &table_schema))
-        .unwrap_or_default();
+    // Segments whose delete footer was successfully rewritten by this
+    // statement (0 for memtable-only deletes).
+    let mut footers_rewritten: u64 = 0;
 
     engine
         .batch_writer()
         .checkpoint_before_rewrite(db, table, 1)?;
 
+    // From here the statement rewrites memtables and segment tails; the work
+    // is no longer safely abortable, so cancellation checks stop firing.
+    crate::common::query_cancel::enter_committing_phase();
+
     let mut index_maintenance = DeleteIndexMaintenance::plan(&table_meta, &table_schema);
 
-    let indexes_maintained = mgr.with_table_mutation_lock(db, table, || {
+    let mut delete_body = || -> Result<bool> {
+        // Deleted-row batches for the change feed (segments + memtables).
+        let mut deleted_events = super::helpers::ChangeEventBuffer::new("delete", db, table);
         // Memtable-resident rows are removed in place (no forced flush),
         // mirroring the REPLACE conflict path; durable tails are rewritten
         // so crash recovery cannot resurrect deleted rows.
@@ -994,9 +1197,17 @@ pub fn exec_delete(
             target_partition_key
                 .as_deref()
                 .filter(|key| !key.is_empty()),
+            reader_txn_id,
         )?;
         if !memtable_plans.is_empty() {
             index_maintenance.record_memtable_rows(&memtable_plans);
+            // Collect memtable-resident deleted rows for the change feed
+            // before the plans are consumed.
+            if engine.pubsub().has_subscribers() {
+                for plan in &memtable_plans {
+                    deleted_events.push(&plan.original, &plan.removed_positions);
+                }
+            }
             let undo = apply_replace_memtable_conflicts(engine, db, table, memtable_plans)?;
             total_deleted += undo.deleted_rows();
         }
@@ -1020,8 +1231,23 @@ pub fn exec_delete(
                 pred,
             )?;
         }
-        let key_projection = index_maintenance.projection(&predicate_projection);
-        let projected_key_positions = index_maintenance.projected_key_positions(&key_projection);
+        // When change subscribers exist the deleted rows themselves must
+        // be published, so row groups are read with every column instead of
+        // the key-only projection; index key positions then map to the full
+        // schema directly.
+        let publish_deletes = engine.pubsub().has_subscribers();
+        let key_projection = if publish_deletes {
+            Vec::new()
+        } else {
+            index_maintenance.projection(&predicate_projection)
+        };
+        let projected_key_positions =
+            index_maintenance.projected_key_positions(&if key_projection.is_empty() {
+                (0..table_schema.columns.len()).collect::<Vec<_>>()
+            } else {
+                key_projection.clone()
+            });
+        let mut first_rewrite_error: Option<crate::common::error::TaibaiError> = None;
         for seg_path in segment_files {
             let (new_bitmap, new_deleted_count, prev_deleted) = {
                 let reader = mgr.open_reader_cached(&seg_path)?;
@@ -1030,111 +1256,144 @@ pub fn exec_delete(
                     continue;
                 }
                 if let Some(ref pred) = predicate {
-                    if !segment_may_match(&reader, pred) {
+                    if !super::helpers::segment_may_match(&reader, Some(pred)) {
                         continue;
                     }
                 }
                 let segment_path_string = index_maintenance
                     .still_maintaining()
                     .then(|| seg_path.to_string_lossy().to_string());
-                let prev_bitmap = reader.delete_bitmap().to_vec();
                 let prev_deleted = reader.deleted_row_count();
-                let bitmap_bytes = total_rows.div_ceil(8) as usize;
-                let mut new_bitmap = vec![0u8; bitmap_bytes];
-                if !prev_bitmap.is_empty() {
-                    let copy_len = prev_bitmap.len().min(bitmap_bytes);
-                    new_bitmap[..copy_len].copy_from_slice(&prev_bitmap[..copy_len]);
-                }
-
-                let mut newly_deleted: u64 = 0;
-                let mut row_id: u64 = 0;
-                for rg_idx in 0..reader.num_row_groups() {
-                    let rg_rows = reader.row_group_rows(rg_idx);
-                    if delete_bitmap::row_range_all_deleted(&new_bitmap, row_id, rg_rows) {
-                        row_id += rg_rows;
-                        continue;
-                    }
-
-                    if let Some(ref pred) = predicate {
-                        if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
-                            row_id += rg_rows;
-                            continue;
-                        }
-                    }
-
-                    if let Some(ref where_expr) = resolved_where_clause {
-                        let batch = if key_projection.is_empty() {
-                            reader.read_row_group(rg_idx)?
+                let maintaining = index_maintenance.still_maintaining();
+                let outcome = match_segment_for_delete(
+                    &reader,
+                    predicate,
+                    resolved_where_clause.as_ref(),
+                    &[],
+                    publish_deletes || maintaining,
+                    |reader, rg_idx| {
+                        if key_projection.is_empty() {
+                            reader.read_row_group(rg_idx)
                         } else {
-                            reader.read_row_group_with_projection(rg_idx, &key_projection)?
-                        };
-                        let mask = eval_where_clause_batch(where_expr, &batch, &batch.schema)?;
-                        for (i, matches) in mask.into_iter().enumerate() {
-                            if matches
-                                && delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64)
-                            {
-                                newly_deleted += 1;
-                                if let Some(segment_path) = segment_path_string.as_deref() {
-                                    index_maintenance.record_segment_row(
-                                        segment_path,
-                                        row_id + i as u64,
-                                        &batch,
-                                        i,
-                                        &projected_key_positions,
-                                    );
-                                }
-                            }
+                            reader.read_row_group_with_projection(rg_idx, &key_projection)
                         }
-                        row_id += batch.num_rows() as u64;
-                    } else if let Some(segment_path) = segment_path_string.as_deref() {
-                        let batch = if key_projection.is_empty() {
-                            reader.read_row_group(rg_idx)?
-                        } else {
-                            reader.read_row_group_with_projection(rg_idx, &key_projection)?
-                        };
-                        for i in 0..batch.num_rows() {
-                            if delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64) {
-                                newly_deleted += 1;
+                    },
+                    |batch, matched| {
+                        if publish_deletes {
+                            let deleted_rows: Vec<u32> =
+                                matched.iter().map(|(idx, _)| *idx).collect();
+                            deleted_events.push(batch, &deleted_rows);
+                        }
+                        if let Some(segment_path) = segment_path_string.as_deref() {
+                            for (idx, absolute) in matched {
                                 index_maintenance.record_segment_row(
                                     segment_path,
-                                    row_id + i as u64,
-                                    &batch,
-                                    i,
+                                    *absolute,
+                                    batch,
+                                    *idx as usize,
                                     &projected_key_positions,
                                 );
                             }
                         }
-                        row_id += rg_rows;
-                    } else {
-                        for i in 0..rg_rows {
-                            if delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i) {
-                                newly_deleted += 1;
-                            }
-                        }
-                        row_id += rg_rows;
-                    }
-                }
-
-                let new_deleted_count = prev_deleted + newly_deleted;
-                total_deleted += newly_deleted;
-                (new_bitmap, new_deleted_count, prev_deleted)
+                        Ok(())
+                    },
+                )?;
+                let new_deleted_count = prev_deleted + outcome.matched_ids.len() as u64;
+                total_deleted += outcome.matched_ids.len() as u64;
+                (outcome.new_bitmap, new_deleted_count, prev_deleted)
             };
 
             if new_deleted_count == prev_deleted {
                 continue;
             }
 
-            mgr.rewrite_delete_footer(&seg_path, &new_bitmap, new_deleted_count)?;
+            // A failed footer rewrite must not abort the remaining segments:
+            // rows already tombstoned elsewhere stay deleted either way, and
+            // continuing maximizes how much of the statement is applied. The
+            // error is reported after the loop.
+            if let Err(error) = mgr.rewrite_delete_footer(&seg_path, &new_bitmap, new_deleted_count)
+            {
+                tracing::warn!(
+                    file = %seg_path.display(),
+                    error = %error,
+                    "DELETE footer rewrite failed; continuing with remaining segments"
+                );
+                // This segment's rows were not tombstoned after all.
+                total_deleted -= new_deleted_count - prev_deleted;
+                first_rewrite_error = first_rewrite_error.or(Some(error));
+            } else {
+                footers_rewritten += 1;
+            }
+        }
+
+        if let Some(error) = first_rewrite_error {
+            // Partial application: stale index snapshots could still point at
+            // rows deleted in the successfully rewritten segments.
+            engine
+                .index_manager()
+                .invalidate_primary_key_index(db, table);
+            let unique_index_names = table_meta
+                .unique_indexes
+                .iter()
+                .map(|index| index.name.clone())
+                .collect::<Vec<_>>();
+            engine
+                .index_manager()
+                .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
+            if total_deleted > 0 {
+                // The successfully rewritten segments and the memtable removal
+                // are durable even though the statement reports an error; the
+                // catalog must reflect them or row_count drifts upward forever
+                // (the success-path decrement below is skipped on Err).
+                engine.invalidate_hot_store(db, table);
+                let mut catalogs = engine.catalogs().write().unwrap();
+                if let Some(catalog) = catalogs.get_mut(db) {
+                    if let Some(meta) = catalog.get_table_mut(table) {
+                        meta.row_count = (meta.row_count - total_deleted as i64).max(0);
+                        let meta_dir = engine.data_dir().join("meta");
+                        let _ = catalog.save(&meta_dir);
+                    }
+                }
+            }
+            return Err(error);
         }
 
         if total_deleted > 0 {
-            engine.hot_store_manager().invalidate(db, table);
+            engine.invalidate_hot_store(db, table);
+        }
+
+        // Publish the deleted rows as change events only after every footer
+        // rewrite succeeded (errors return above), so subscribers never see
+        // deletions that did not physically happen. Each batch is a separate
+        // event: batches from different sources may carry different schemas
+        // (ALTER TABLE ADD COLUMN is metadata-only), and merging them by
+        // column index would panic or mix columns.
+        if publish_deletes && total_deleted > 0 {
+            for batch in deleted_events.batches {
+                engine
+                    .pubsub()
+                    .publish_change(crate::pubsub::ChangeKind::Delete, db, table, batch);
+            }
         }
 
         Ok(index_maintenance.apply(engine, db, table))
-    })?;
+    };
+
+    let indexes_maintained = match target_partition_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+    {
+        Some(partition) => {
+            mgr.with_partition_set_mutation_lock(db, table, &[partition], &mut delete_body)?
+        }
+        None => mgr.with_table_mutation_lock(db, table, &mut delete_body)?,
+    };
 
     if total_deleted > 0 {
+        // Footer rewrites bump the content epoch inside the
+        // `rewrite_delete_footer` primitive itself, so the transactional
+        // COMMIT path (which rewrites the same footers) gets identical
+        // freshness without remembering to call anything.
         if !indexes_maintained {
             tracing::warn!(
                 db,
@@ -1174,294 +1433,6 @@ pub fn exec_delete(
     })
 }
 
-fn resolve_in_subqueries(
-    engine: &Engine,
-    db: &str,
-    where_clause: &Option<Expr>,
-) -> Result<Option<Expr>> {
-    where_clause
-        .as_ref()
-        .map(|expr| resolve_expr_in_subqueries(engine, db, expr))
-        .transpose()
-}
-
-fn resolve_expr_in_subqueries(engine: &Engine, db: &str, expr: &Expr) -> Result<Expr> {
-    Ok(match expr {
-        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(resolve_expr_in_subqueries(engine, db, left)?),
-            op: *op,
-            right: Box::new(resolve_expr_in_subqueries(engine, db, right)?),
-        },
-        Expr::UnaryNot(inner) => {
-            Expr::UnaryNot(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
-        }
-        Expr::UnaryMinus(inner) => {
-            Expr::UnaryMinus(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
-        }
-        Expr::IsNull(inner) => {
-            Expr::IsNull(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
-        }
-        Expr::IsNotNull(inner) => {
-            Expr::IsNotNull(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
-        }
-        Expr::Exists(inner) => {
-            if let Expr::Subquery(subquery) = inner.as_ref() {
-                let exists = super::query::execute_exists_subquery(engine, db, subquery)?;
-                Expr::Literal(ScalarValue::Bool(Some(exists)))
-            } else {
-                Expr::Exists(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
-            }
-        }
-        Expr::In {
-            expr: inner,
-            values,
-            negated,
-        } => {
-            let resolved_inner = resolve_expr_in_subqueries(engine, db, inner)?;
-            let resolved_values = if let [Expr::Subquery(subquery)] = values.as_slice() {
-                execute_in_subquery(engine, db, subquery)?
-                    .into_iter()
-                    .map(Expr::Literal)
-                    .collect()
-            } else {
-                values
-                    .iter()
-                    .map(|value| resolve_expr_in_subqueries(engine, db, value))
-                    .collect::<Result<Vec<_>>>()?
-            };
-            Expr::In {
-                expr: Box::new(resolved_inner),
-                values: resolved_values,
-                negated: *negated,
-            }
-        }
-        Expr::Between {
-            expr: inner,
-            low,
-            high,
-            negated,
-        } => Expr::Between {
-            expr: Box::new(resolve_expr_in_subqueries(engine, db, inner)?),
-            low: Box::new(resolve_expr_in_subqueries(engine, db, low)?),
-            high: Box::new(resolve_expr_in_subqueries(engine, db, high)?),
-            negated: *negated,
-        },
-        Expr::Case {
-            operand,
-            when_clauses,
-            else_clause,
-        } => Expr::Case {
-            operand: operand
-                .as_ref()
-                .map(|expr| resolve_expr_in_subqueries(engine, db, expr).map(Box::new))
-                .transpose()?,
-            when_clauses: when_clauses
-                .iter()
-                .map(|(when_expr, then_expr)| {
-                    Ok((
-                        resolve_expr_in_subqueries(engine, db, when_expr)?,
-                        resolve_expr_in_subqueries(engine, db, then_expr)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?,
-            else_clause: else_clause
-                .as_ref()
-                .map(|expr| resolve_expr_in_subqueries(engine, db, expr).map(Box::new))
-                .transpose()?,
-        },
-        Expr::Like {
-            expr: inner,
-            pattern,
-            negated,
-        } => Expr::Like {
-            expr: Box::new(resolve_expr_in_subqueries(engine, db, inner)?),
-            pattern: Box::new(resolve_expr_in_subqueries(engine, db, pattern)?),
-            negated: *negated,
-        },
-        Expr::Function {
-            name,
-            args,
-            distinct,
-        } => Expr::Function {
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|arg| resolve_expr_in_subqueries(engine, db, arg))
-                .collect::<Result<Vec<_>>>()?,
-            distinct: *distinct,
-        },
-        Expr::Subquery(subquery) => {
-            let value = super::query::execute_scalar_subquery(engine, db, subquery)?;
-            Expr::Literal(value)
-        }
-        Expr::WindowFunction {
-            func,
-            partition_by,
-            order_by,
-            frame,
-        } => Expr::WindowFunction {
-            func: func.clone(),
-            partition_by: partition_by
-                .iter()
-                .map(|arg| resolve_expr_in_subqueries(engine, db, arg))
-                .collect::<Result<Vec<_>>>()?,
-            order_by: order_by
-                .iter()
-                .map(|item| {
-                    Ok(crate::sql::parser::ast::OrderByItem {
-                        expr: resolve_expr_in_subqueries(engine, db, &item.expr)?,
-                        desc: item.desc,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-            frame: frame.clone(),
-        },
-        Expr::Correlated(_) => expr.clone(),
-        Expr::Literal(_)
-        | Expr::Placeholder(_)
-        | Expr::Column(_)
-        | Expr::QualifiedColumn { .. } => expr.clone(),
-    })
-}
-
-fn resolve_stmt_in_subqueries(
-    engine: &Engine,
-    db: &str,
-    stmt: &crate::sql::parser::ast::Statement,
-) -> Result<crate::sql::parser::ast::Statement> {
-    let mut stmt = stmt.clone();
-    if let crate::sql::parser::ast::Statement::Select {
-        select_list,
-        where_clause,
-        group_by,
-        having,
-        order_by,
-        limit,
-        offset,
-        ..
-    } = &mut stmt
-    {
-        for item in select_list {
-            if let crate::sql::parser::ast::SelectItem::Expr(expr, _) = item {
-                *expr = resolve_expr_in_subqueries(engine, db, expr)?;
-            }
-        }
-        if let Some(expr) = where_clause {
-            *expr = resolve_expr_in_subqueries(engine, db, expr)?;
-        }
-        for expr in group_by {
-            *expr = resolve_expr_in_subqueries(engine, db, expr)?;
-        }
-        if let Some(expr) = having {
-            *expr = resolve_expr_in_subqueries(engine, db, expr)?;
-        }
-        for item in order_by {
-            item.expr = resolve_expr_in_subqueries(engine, db, &item.expr)?;
-        }
-        if let Some(expr) = limit {
-            *expr = resolve_expr_in_subqueries(engine, db, expr)?;
-        }
-        if let Some(expr) = offset {
-            *expr = resolve_expr_in_subqueries(engine, db, expr)?;
-        }
-    }
-    Ok(stmt)
-}
-
-fn execute_in_subquery(
-    engine: &Engine,
-    db: &str,
-    subquery: &crate::sql::parser::ast::Statement,
-) -> Result<Vec<ScalarValue>> {
-    let subquery = resolve_stmt_in_subqueries(engine, db, subquery)?;
-    if let Some(values) = execute_simple_derived_subquery(engine, db, &subquery)? {
-        return Ok(values);
-    }
-    let ExecResult::Query { batches, .. } = super::query::exec_select(engine, db, &subquery)?
-    else {
-        return Err(TaibaiError::Sql("IN subquery must be a SELECT".into()));
-    };
-    Ok(first_column_values(&batches, 0))
-}
-
-fn execute_simple_derived_subquery(
-    engine: &Engine,
-    db: &str,
-    stmt: &crate::sql::parser::ast::Statement,
-) -> Result<Option<Vec<ScalarValue>>> {
-    use crate::sql::parser::ast::{FromClause, SelectItem, Statement, TableRef};
-
-    let Statement::Select {
-        select_list,
-        from: Some(FromClause::Table(TableRef::Subquery { query, alias })),
-        where_clause: None,
-        group_by,
-        having: None,
-        order_by: _,
-        limit: None,
-        offset: None,
-        ..
-    } = stmt
-    else {
-        return Ok(None);
-    };
-
-    if !group_by.is_empty() || select_list.len() != 1 {
-        return Ok(None);
-    }
-
-    let inner = resolve_stmt_in_subqueries(engine, db, query)?;
-    let ExecResult::Query { schema, batches } = super::query::exec_select(engine, db, &inner)?
-    else {
-        return Err(TaibaiError::Sql(
-            "derived IN subquery must be a SELECT".into(),
-        ));
-    };
-
-    let col_idx = match &select_list[0] {
-        SelectItem::Star => 0,
-        SelectItem::Expr(Expr::Column(name), _) => schema.index_of(name).unwrap_or(0),
-        SelectItem::Expr(Expr::QualifiedColumn { table, column }, _)
-            if table.eq_ignore_ascii_case(alias) =>
-        {
-            schema.index_of(column).unwrap_or(0)
-        }
-        SelectItem::Expr(_, _) => 0,
-    };
-    Ok(Some(first_column_values(&batches, col_idx)))
-}
-
-fn first_column_values(
-    batches: &[crate::types::batch::RecordBatch],
-    col_idx: usize,
-) -> Vec<ScalarValue> {
-    let mut values = Vec::new();
-    for batch in batches {
-        if batch.num_columns() <= col_idx {
-            continue;
-        }
-        for row_idx in 0..batch.num_rows() {
-            values.push(
-                batch
-                    .scalar(row_idx, col_idx)
-                    .unwrap_or(ScalarValue::Int64(None)),
-            );
-        }
-    }
-    values
-}
-
-fn segment_may_match(
-    reader: &SegmentReader,
-    predicate: &crate::storage::segment::RowGroupPredicate,
-) -> bool {
-    let segment_zone_maps = reader.segment_zone_maps();
-    if !segment_zone_maps.is_empty() {
-        return predicate.matches_row_group(segment_zone_maps);
-    }
-    (0..reader.num_row_groups()).any(|rg_idx| predicate.matches_row_group(reader.zone_maps(rg_idx)))
-}
-
 pub(crate) fn prune_segments_by_partition(
     segment_files: Vec<PathBuf>,
     where_clause: &Option<Expr>,
@@ -1492,14 +1463,7 @@ pub(crate) fn prune_segments_by_partition(
         .collect()
 }
 
-#[derive(Debug, Clone)]
-struct ClusterKeyBounds {
-    column_index: usize,
-    lower: Option<(ScalarValue, bool)>,
-    upper: Option<(ScalarValue, bool)>,
-}
-
-fn prune_segments_by_cluster_key(
+pub(crate) fn prune_segments_by_cluster_key(
     segment_files: Vec<PathBuf>,
     mgr: &SegmentManager,
     schema: &Schema,
@@ -1512,7 +1476,8 @@ fn prune_segments_by_cluster_key(
     let Some(bounds) = cluster_key_bounds(schema, table_meta, predicate) else {
         return Ok(segment_files);
     };
-    let Some((start, end)) = cluster_segment_range(&segment_files, mgr, &bounds)? else {
+    let Some((start, end)) = cluster_prune::cluster_segment_range(&segment_files, mgr, &bounds)
+    else {
         return Ok(segment_files);
     };
     if start > end {
@@ -1537,11 +1502,11 @@ fn cluster_key_bounds(
         }
         match clause.op {
             RangeOp::Eq => {
-                return Some(ClusterKeyBounds {
-                    column_index: key_col_idx,
-                    lower: Some((clause.value.clone(), true)),
-                    upper: Some((clause.value.clone(), true)),
-                });
+                return Some(ClusterKeyBounds::single(
+                    key_col_idx,
+                    Some((clause.value.clone(), true)),
+                    Some((clause.value.clone(), true)),
+                ));
             }
             RangeOp::Gt => set_tighter_lower(&mut lower, clause.value.clone(), false),
             RangeOp::Ge => set_tighter_lower(&mut lower, clause.value.clone(), true),
@@ -1551,156 +1516,10 @@ fn cluster_key_bounds(
     }
 
     if lower.is_some() || upper.is_some() {
-        Some(ClusterKeyBounds {
-            column_index: key_col_idx,
-            lower,
-            upper,
-        })
+        Some(ClusterKeyBounds::single(key_col_idx, lower, upper))
     } else {
         None
     }
-}
-
-fn cluster_segment_range(
-    segments: &[PathBuf],
-    mgr: &SegmentManager,
-    bounds: &ClusterKeyBounds,
-) -> Result<Option<(usize, usize)>> {
-    if !cluster_segment_zone_maps_are_ordered(segments, mgr, bounds.column_index)? {
-        return Ok(None);
-    }
-    let start = match &bounds.lower {
-        Some((value, inclusive)) => {
-            let Some(start) = first_segment_with_max_at_least(
-                segments,
-                mgr,
-                bounds.column_index,
-                value,
-                *inclusive,
-            )?
-            else {
-                return Ok(None);
-            };
-            start
-        }
-        None => 0,
-    };
-    let end = match &bounds.upper {
-        Some((value, inclusive)) => {
-            let Some(end) = last_segment_with_min_at_most(
-                segments,
-                mgr,
-                bounds.column_index,
-                value,
-                *inclusive,
-            )?
-            else {
-                return Ok(None);
-            };
-            if end < 0 {
-                return Ok(Some((1, 0)));
-            }
-            end as usize
-        }
-        None => segments.len().saturating_sub(1),
-    };
-    Ok(Some((start, end)))
-}
-
-fn cluster_segment_zone_maps_are_ordered(
-    segments: &[PathBuf],
-    mgr: &SegmentManager,
-    col_idx: usize,
-) -> Result<bool> {
-    let mut previous_max: Option<ScalarValue> = None;
-    for segment in segments {
-        let Some(zm) = segment_cluster_zone_map(mgr, segment, col_idx)? else {
-            return Ok(false);
-        };
-        if compare_scalars_for_sort(&zm.min_value, &zm.max_value) == std::cmp::Ordering::Greater {
-            return Ok(false);
-        }
-        if let Some(prev) = &previous_max {
-            if compare_scalars_for_sort(prev, &zm.min_value) == std::cmp::Ordering::Greater {
-                return Ok(false);
-            }
-        }
-        previous_max = Some(zm.max_value);
-    }
-    Ok(true)
-}
-
-fn first_segment_with_max_at_least(
-    segments: &[PathBuf],
-    mgr: &SegmentManager,
-    col_idx: usize,
-    value: &ScalarValue,
-    inclusive: bool,
-) -> Result<Option<usize>> {
-    let mut lo = 0usize;
-    let mut hi = segments.len();
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let Some(zm) = segment_cluster_zone_map(mgr, &segments[mid], col_idx)? else {
-            return Ok(None);
-        };
-        let cmp = compare_scalars_for_sort(&zm.max_value, value);
-        let before = if inclusive {
-            cmp == std::cmp::Ordering::Less
-        } else {
-            cmp != std::cmp::Ordering::Greater
-        };
-        if before {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    Ok(Some(lo))
-}
-
-fn last_segment_with_min_at_most(
-    segments: &[PathBuf],
-    mgr: &SegmentManager,
-    col_idx: usize,
-    value: &ScalarValue,
-    inclusive: bool,
-) -> Result<Option<isize>> {
-    let mut lo = 0usize;
-    let mut hi = segments.len();
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let Some(zm) = segment_cluster_zone_map(mgr, &segments[mid], col_idx)? else {
-            return Ok(None);
-        };
-        let cmp = compare_scalars_for_sort(&zm.min_value, value);
-        let at_or_before = if inclusive {
-            cmp != std::cmp::Ordering::Greater
-        } else {
-            cmp == std::cmp::Ordering::Less
-        };
-        if at_or_before {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    Ok(Some(lo as isize - 1))
-}
-
-fn segment_cluster_zone_map(
-    mgr: &SegmentManager,
-    segment: &std::path::Path,
-    col_idx: usize,
-) -> Result<Option<ZoneMap>> {
-    let reader = mgr.open_reader_cached(segment)?;
-    let Some(zm) = reader.segment_zone_maps().get(col_idx) else {
-        return Ok(None);
-    };
-    if zm.row_count == 0 || zm.min_value.is_null() || zm.max_value.is_null() {
-        return Ok(None);
-    }
-    Ok(Some(zm.clone()))
 }
 
 fn set_tighter_lower(

@@ -52,10 +52,15 @@ pub fn prune_segments_by_partition(
         return segment_files;
     }
 
-    let (lower_bound, upper_bound) = if let Some(tr) = &pi.time_range {
-        (tr.start.as_ref(), tr.end.as_ref())
-    } else {
-        (None, None)
+    // Only a range on the partition key column itself bounds partitions. A
+    // time range extracted from any other column (e.g. `deal_time <= N` on a
+    // table partitioned by `deal_date`) says nothing about which partitions
+    // can match and must not prune them.
+    let (lower_bound, upper_bound) = match &pi.time_range {
+        Some(tr) if tr.column.eq_ignore_ascii_case(&meta.partition_key) => {
+            (tr.start.as_ref(), tr.end.as_ref())
+        }
+        _ => (None, None),
     };
 
     if lower_bound.is_none() && upper_bound.is_none() {

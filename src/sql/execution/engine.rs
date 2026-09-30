@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use crate::storage::core::batch_writer::{BatchWriter, BatchWriterConfig};
 use crate::storage::core::compactor::Compactor;
 use crate::storage::core::memtable::MemTableManager;
 use crate::storage::index::index_manager::IndexManager;
-use crate::storage::partition::{parse_partition_key, PartitionStrategy};
+use crate::storage::partition::parse_partition_key;
 use crate::storage::segment_manager::{SegmentConfig, SegmentManager};
 
 use crate::sql::parser::ast::Statement;
@@ -79,6 +79,8 @@ pub struct Engine {
     catalog_save_state: Mutex<CatalogSaveState>,
     segment_mgr: Arc<SegmentManager>,
     batch_writer: BatchWriter,
+    pubsub: Arc<crate::pubsub::PubSubHub>,
+    pubsub_manager: Arc<crate::storage::core::pubsub::PubSubManager>,
     bulk_mode_sessions: AtomicUsize,
     bulk_dirty_tables: Mutex<HashSet<(String, String)>>,
     in_flight_operations: AtomicUsize,
@@ -87,6 +89,44 @@ pub struct Engine {
     index_manager: Arc<IndexManager>,
     hot_store_mgr: Arc<crate::storage::core::hot_store::HotStoreManager>,
     performance_baselines: Arc<crate::common::performance_baseline::PerformanceBaselineStore>,
+    /// Per-table directories: partitions already known to have at least one
+    /// segment. Feeds the hot-store resident decision so a busy partitioned
+    /// INSERT path does not re-run `read_dir` per statement. Positive-only
+    /// entries (never invalidated by time) keep the filter conservative.
+    hot_partition_segments: Mutex<HashMap<std::path::PathBuf, HashSet<String>>>,
+    /// Running queries as seen by `SHOW PROCESSLIST` / `KILL QUERY`.
+    query_registry: Arc<crate::sql::execution::query_registry::QueryRegistry>,
+    /// Deferred DELETE/UPDATE mutations of explicit transactions. Shared
+    /// with the segment manager (scan overlay) and memtable manager
+    /// (flush pin); statements and commit/rollback reach it via this handle.
+    txn_mutations: Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>,
+    /// Replication log when this engine runs as a replication primary.
+    rep_log: Option<Arc<crate::storage::replication::RepLog>>,
+    /// Standby engines reject every write (the applier is the only writer).
+    read_only: AtomicBool,
+}
+
+impl Engine {
+    pub fn txn_mutations(&self) -> &Arc<crate::storage::core::txn_mutations::TxnMutationRegistry> {
+        &self.txn_mutations
+    }
+
+    /// Replication log when running as a replication primary.
+    pub fn rep_log(&self) -> Option<&Arc<crate::storage::replication::RepLog>> {
+        self.rep_log.as_ref()
+    }
+
+    /// Mark the engine read-only (standby role). Writes fail with a clear
+    /// error; reads are unaffected.
+    pub fn set_read_only(&self) {
+        use std::sync::atomic::Ordering;
+        self.read_only.store(true, Ordering::Release);
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.read_only.load(Ordering::Acquire)
+    }
 }
 
 enum HotResidentMark {
@@ -178,36 +218,34 @@ impl TablePhysicalHealth {
 
 fn table_physical_health(
     segment_mgr: &SegmentManager,
-    db: &str,
-    table: &str,
+    _db: &str,
+    _table: &str,
     table_dir: &Path,
     target_row_group_rows: u64,
     collect_fragmentation: bool,
 ) -> Result<TablePhysicalHealth> {
-    segment_mgr.with_table_mutation_lock(db, table, || {
-        let mut health = TablePhysicalHealth::default();
-        let small_limit = target_row_group_rows.max(1).div_ceil(4);
-        for path in SegmentManager::discover_segments(table_dir)? {
-            let reader = segment_mgr.open_reader_cached(&path)?;
-            health.deleted_rows = health
-                .deleted_rows
-                .saturating_add(reader.deleted_row_count());
-            health.live_rows = health.live_rows.saturating_add(
-                reader
-                    .row_count()
-                    .saturating_sub(reader.deleted_row_count()),
-            );
-            if collect_fragmentation {
-                health.row_groups = health.row_groups.saturating_add(reader.num_row_groups());
-                for row_group_idx in 0..reader.num_row_groups() {
-                    if reader.row_group_rows(row_group_idx) <= small_limit {
-                        health.small_row_groups = health.small_row_groups.saturating_add(1);
-                    }
+    let mut health = TablePhysicalHealth::default();
+    let small_limit = target_row_group_rows.max(1).div_ceil(4);
+    for path in SegmentManager::discover_segments(table_dir)? {
+        let reader = segment_mgr.open_reader_cached(&path)?;
+        health.deleted_rows = health
+            .deleted_rows
+            .saturating_add(reader.deleted_row_count());
+        health.live_rows = health.live_rows.saturating_add(
+            reader
+                .row_count()
+                .saturating_sub(reader.deleted_row_count()),
+        );
+        if collect_fragmentation {
+            health.row_groups = health.row_groups.saturating_add(reader.num_row_groups());
+            for row_group_idx in 0..reader.num_row_groups() {
+                if reader.row_group_rows(row_group_idx) <= small_limit {
+                    health.small_row_groups = health.small_row_groups.saturating_add(1);
                 }
             }
         }
-        Ok(health)
-    })
+    }
+    Ok(health)
 }
 
 fn rebuild_compacted_location_indexes(
@@ -252,6 +290,29 @@ fn rebuild_compacted_location_indexes(
     }
 }
 
+fn adjust_row_count_for_ttl_drops(
+    catalogs: &RwLock<HashMap<String, DatabaseCatalog>>,
+    data_dir: &Path,
+    db: &str,
+    table: &str,
+    rows_dropped_ttl: u64,
+) {
+    if rows_dropped_ttl == 0 {
+        return;
+    }
+    // TTL-expired rows physically removed by compaction were never
+    // subtracted by a DELETE; without this the catalog row_count drifts
+    // upward forever.
+    let mut catalogs = catalogs.write().unwrap();
+    if let Some(catalog) = catalogs.get_mut(db) {
+        if let Some(meta) = catalog.get_table_mut(table) {
+            meta.row_count = (meta.row_count - rows_dropped_ttl as i64).max(0);
+            let meta_dir = data_dir.join("meta");
+            let _ = catalog.save(&meta_dir);
+        }
+    }
+}
+
 fn start_auto_compaction_thread(
     segment_mgr: Arc<SegmentManager>,
     data_dir: PathBuf,
@@ -272,6 +333,14 @@ fn start_auto_compaction_thread(
                 && last_fragmentation_scan
                     .is_none_or(|last| last.elapsed() >= config.fragmentation_scan_interval);
             let compactor = Compactor::new(Arc::clone(&segment_mgr), data_dir.clone());
+            // A bulk import holds the unique-index compaction pause: segment
+            // rewrites here would rebuild location-index base snapshots
+            // mid-import (the delta-compaction dispatcher is paused, but this
+            // pass reaches the same files from a different subsystem). Defer
+            // the whole pass to the next tick instead.
+            if index_manager.unique_index_compaction_paused() {
+                continue;
+            }
             let table_metas = {
                 let catalogs = catalogs.read().unwrap();
                 catalogs
@@ -312,6 +381,13 @@ fn start_auto_compaction_thread(
                             };
                         match compact_result {
                             Ok(stats) => {
+                                adjust_row_count_for_ttl_drops(
+                                    &catalogs,
+                                    &data_dir,
+                                    &db,
+                                    &table,
+                                    stats.rows_dropped_ttl,
+                                );
                                 if stats.rows_dropped > 0 || stats.segments_written > 0 {
                                     rebuild_compacted_location_indexes(
                                         &index_manager,
@@ -349,6 +425,13 @@ fn start_auto_compaction_thread(
                     {
                         match compactor.compact_table_for_fragmentation(&db, &table, &table_meta) {
                             Ok(stats) => {
+                                adjust_row_count_for_ttl_drops(
+                                    &catalogs,
+                                    &data_dir,
+                                    &db,
+                                    &table,
+                                    stats.rows_dropped_ttl,
+                                );
                                 if stats.segments_written > 0 {
                                     rebuild_compacted_location_indexes(
                                         &index_manager,
@@ -445,6 +528,7 @@ pub fn start_close_of_day_scheduler(engine: Arc<Engine>) -> std::thread::JoinHan
         .name("taibai-close-of-day".into())
         .spawn(move || {
             let mut last_fired: HashSet<(String, String, chrono::NaiveDate)> = HashSet::new();
+            let mut last_ttl_purge = std::time::Instant::now();
             loop {
                 std::thread::sleep(Duration::from_secs(30));
                 let now = Local::now();
@@ -470,8 +554,27 @@ pub fn start_close_of_day_scheduler(engine: Arc<Engine>) -> std::thread::JoinHan
                     }
                     tables
                 };
+                // Partition-level TTL purge, at most once per minute: drop
+                // fully-expired temporal partitions instead of leaving them
+                // to the read-time row filter forever.
+                if last_ttl_purge.elapsed() >= Duration::from_secs(60) {
+                    last_ttl_purge = std::time::Instant::now();
+                    if let Err(error) = engine.run_ttl_partition_purge() {
+                        tracing::warn!(error = %error, "ttl purge: run failed");
+                    }
+                }
+
                 for (db, table, close_time, last_close_date) in hot_tables {
-                    let Some((target_h, target_m)) = parse_hh_mm(&close_time).or(Some((15, 30))) else {
+                    // CLOSE AT is validated at DDL time; an unparseable value
+                    // here means corrupt or legacy catalog state — skip the
+                    // table rather than guessing a default firing time.
+                    let Some((target_h, target_m)) = parse_hh_mm(&close_time) else {
+                        tracing::warn!(
+                            db,
+                            table,
+                            close_time,
+                            "close-of-day scheduler: unparseable HOT CLOSE AT, skipping table"
+                        );
                         continue;
                     };
                     let key = (db.clone(), table.clone(), today);

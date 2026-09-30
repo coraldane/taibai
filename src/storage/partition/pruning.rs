@@ -18,6 +18,17 @@ impl ZoneMap {
         }
     }
 
+    /// Whether this map carries computed statistics. Writers that skip zone
+    /// map computation (bulk direct writes outside the key columns) emit
+    /// [`ZoneMap::null`]-shaped defaults: a NULL min and a zero null_count.
+    /// A computed map always has a non-NULL min or a non-zero null_count —
+    /// a computed all-null group records null_count == row_count > 0. A
+    /// computed zero-row group is indistinguishable from an uncomputed one;
+    /// folding either from data is a no-op, so the ambiguity is harmless.
+    pub fn is_computed(&self) -> bool {
+        !self.min_value.is_null() || self.null_count > 0
+    }
+
     pub fn contains(&self, value: &ScalarValue) -> bool {
         if self.min_value.is_null() || value.is_null() {
             return true;
@@ -91,6 +102,9 @@ pub struct ScanStats {
     pub rows_scanned: u64,
     pub rows_filtered_by_delete_bitmap: u64,
     pub bytes_read_compressed: u64,
+    /// Rows served by the hybrid hot-mirror leg (partial residency) instead
+    /// of being decoded from segments.
+    pub hot_mirror_rows: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -132,7 +146,10 @@ impl RowGroupPredicate {
     }
 }
 
-fn classify_clause(clause: &RangeClause, zone_map: &ZoneMap) -> PredicateMatch {
+/// Classify one clause against a zone map. `All` means every row of the
+/// group satisfies the clause (null_count == 0 is part of that contract:
+/// NULLs never satisfy a comparison), `None` means no row can.
+pub(crate) fn classify_clause(clause: &RangeClause, zone_map: &ZoneMap) -> PredicateMatch {
     if zone_map.row_count > 0 && zone_map.null_count == zone_map.row_count {
         return PredicateMatch::None;
     }

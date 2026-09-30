@@ -127,7 +127,7 @@ fn selected_eq_rows_adaptive(
             selected_eq_rows_varchar_dictionary(payload, row_count, bitmap, target)
         }
         _ => {
-            let decoded = decode_adaptive_column(data, row_count, col_def, bitmap.clone())?;
+            let decoded = decode_adaptive_column(data, row_count, col_def, bitmap.clone(), false)?;
             Ok((0..decoded.len())
                 .filter(|&row| scalar_values_equal(&decoded.scalar(row), value))
                 .collect())
@@ -467,6 +467,17 @@ fn count_eq_adaptive(
             let values = crate::storage::codec::column_codec::decode_i64_delta_payload(payload)?;
             count_eq_numeric_from_i64(&values, row_count, col_def, bitmap, value)
         }
+        crate::storage::codec::encoding::EncodingType::DeltaRle => {
+            let values = crate::storage::codec::column_codec::decode_i64_delta_rle_payload(
+                payload, row_count,
+            )?;
+            count_eq_numeric_from_i64(&values, row_count, col_def, bitmap, value)
+        }
+        crate::storage::codec::encoding::EncodingType::BitPacked => {
+            let values =
+                crate::storage::codec::column_codec::decode_i64_bitpacked_payload(payload)?;
+            count_eq_numeric_from_i64(&values, row_count, col_def, bitmap, value)
+        }
         crate::storage::codec::encoding::EncodingType::Dictionary
             if col_def.data_type == DataType::VarChar =>
         {
@@ -666,6 +677,17 @@ fn extract_i64_from_scalar(value: &ScalarValue) -> Option<i64> {
     }
 }
 
+/// Raw i64 payload of temporal scalars, the domain run values compare in.
+fn extract_temporal_raw_i64(value: &ScalarValue) -> Option<i64> {
+    match value {
+        ScalarValue::Date(Some(v)) => Some(*v as i64),
+        ScalarValue::Time(Some(v)) => Some(*v),
+        ScalarValue::Timestamp(Some(v)) => Some(*v),
+        ScalarValue::Interval(Some(v)) => Some(*v),
+        _ => None,
+    }
+}
+
 fn is_numeric_type(dt: &DataType) -> bool {
     matches!(
         dt,
@@ -683,4 +705,421 @@ fn is_numeric_type(dt: &DataType) -> bool {
             | DataType::Time
             | DataType::Interval
     )
+}
+
+// ---------------------------------------------------------------------------
+// Run-level predicate folding for Rle/DeltaRle columns.
+//
+// Every run of an Rle/DeltaRle payload carries a single value, so a run
+// either fully satisfies an eq/range predicate or fully fails it, and a
+// no-GROUP-BY aggregate over the surviving rows only needs how many rows
+// each matching run covers and its value — never where those rows sit.
+// NULL rows never satisfy a predicate on the column, and runs only encode
+// non-null values, so the null bitmap is not consulted at all.
+// ---------------------------------------------------------------------------
+
+use crate::storage::codec::io_util::{read_varint, zigzag_decode};
+use crate::storage::partition::pruning::RangeOp;
+
+/// One predicate evaluated against a run value, expressed in the column's
+/// raw numeric domain — the same domain `numeric_cmp`/`compare_scalar_at`
+/// compare in (no decimal rescaling anywhere in the pipeline).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RunPredicate {
+    Int {
+        op: RangeOp,
+        value: i128,
+    },
+    Float {
+        op: RangeOp,
+        value: f64,
+    },
+    /// The predicate value cannot order against a raw i64 run value (NULL or
+    /// a non-numeric scalar): it matches no row, mirroring the row kernels'
+    /// `vec![false; n]` fallback.
+    Never,
+}
+
+impl RunPredicate {
+    pub fn new(op: RangeOp, value: &ScalarValue) -> Self {
+        if let Some(i) = value.integer_i128() {
+            return Self::Int { op, value: i };
+        }
+        // Temporal literals (Date/Time/Timestamp/Interval) carry raw i64
+        // payloads in the same domain the run values live in; without this
+        // they fell through to `Never`, silently dropping every matching row
+        // of Partial row groups during run-fold aggregation.
+        if let Some(i) = extract_temporal_raw_i64(value) {
+            return Self::Int {
+                op,
+                value: i as i128,
+            };
+        }
+        if let Some(f) = value.numeric_f64() {
+            return Self::Float { op, value: f };
+        }
+        Self::Never
+    }
+
+    fn matches(&self, run_value: i64) -> bool {
+        match self {
+            Self::Int { op, value } => range_op_holds(*op, (run_value as i128).cmp(value)),
+            // A NaN threshold orders against nothing, matching the per-row
+            // kernels (`partial_cmp` -> None -> predicate false).
+            Self::Float { op, value } => (run_value as f64)
+                .partial_cmp(value)
+                .is_some_and(|ord| range_op_holds(*op, ord)),
+            Self::Never => false,
+        }
+    }
+}
+
+fn range_op_holds(op: RangeOp, ord: std::cmp::Ordering) -> bool {
+    match op {
+        RangeOp::Eq => ord == std::cmp::Ordering::Equal,
+        RangeOp::Lt => ord == std::cmp::Ordering::Less,
+        RangeOp::Le => ord != std::cmp::Ordering::Greater,
+        RangeOp::Gt => ord == std::cmp::Ordering::Greater,
+        RangeOp::Ge => ord != std::cmp::Ordering::Less,
+    }
+}
+
+/// Aggregate state folded from matching runs.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct RunFold {
+    /// Rows covered by matching runs. All of them are non-null (runs only
+    /// encode non-null values) and satisfy every predicate.
+    pub matched_rows: u64,
+    /// Σ value×len over matching runs. Wrapping arithmetic, identical to
+    /// `col_sum_i64`'s per-element wrapping fold over the same rows.
+    pub sum_i: i64,
+    pub any: bool,
+    pub min: i64,
+    pub max: i64,
+}
+
+impl RunFold {
+    fn add_run(&mut self, value: i64, len: u64) {
+        if !self.any {
+            self.min = value;
+            self.max = value;
+            self.any = true;
+        } else {
+            if value < self.min {
+                self.min = value;
+            }
+            if value > self.max {
+                self.max = value;
+            }
+        }
+        self.matched_rows += len;
+        self.sum_i = self.sum_i.wrapping_add(value.wrapping_mul(len as i64));
+    }
+}
+
+/// Walk the runs of an Rle/DeltaRle column straight from its raw (decompressed)
+/// block and fold count/sum/min/max over the runs whose value satisfies every
+/// predicate. `data` is the full column block: `[bitmap_len][bitmap][values]`
+/// where `values` starts with the adaptive encoding magic.
+///
+/// Returns `None` when the block is not Rle/DeltaRle-adaptive (the caller
+/// falls back to the regular decode+mask path); malformed payloads surface as
+/// `Some(Err(..))` exactly like the decoder would report them.
+pub fn fold_runs_from_raw(data: &[u8], predicates: &[RunPredicate]) -> Option<Result<RunFold>> {
+    if data.len() < 4 {
+        return None;
+    }
+    let bitmap_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    if data.len() < 4 + bitmap_len {
+        return None;
+    }
+    let values = &data[4 + bitmap_len..];
+    if values.len() < COLUMN_ENCODING_MAGIC.len() + 1 || !values.starts_with(COLUMN_ENCODING_MAGIC)
+    {
+        return None;
+    }
+    let tag = values[COLUMN_ENCODING_MAGIC.len()];
+    let encoding = match crate::storage::codec::encoding::EncodingType::from_u8(tag) {
+        Ok(encoding) => encoding,
+        Err(_) => return None,
+    };
+    let payload = &values[COLUMN_ENCODING_MAGIC.len() + 1..];
+    match encoding {
+        crate::storage::codec::encoding::EncodingType::Rle => {
+            Some(fold_plain_rle_runs(payload, predicates))
+        }
+        crate::storage::codec::encoding::EncodingType::DeltaRle => {
+            Some(fold_delta_rle_runs(payload, predicates))
+        }
+        _ => None,
+    }
+}
+
+fn fold_plain_rle_runs(payload: &[u8], predicates: &[RunPredicate]) -> Result<RunFold> {
+    let mut cursor = Cursor::new(payload);
+    let run_count = read_u32_le(&mut cursor)? as usize;
+    let mut fold = RunFold::default();
+    for _ in 0..run_count {
+        let mut value_buf = [0u8; 8];
+        cursor.read_exact(&mut value_buf)?;
+        let value = i64::from_le_bytes(value_buf);
+        let len = read_u32_le(&mut cursor)? as u64;
+        if predicates.iter().all(|p| p.matches(value)) {
+            fold.add_run(value, len);
+        }
+    }
+    Ok(fold)
+}
+
+fn fold_delta_rle_runs(payload: &[u8], predicates: &[RunPredicate]) -> Result<RunFold> {
+    let mut cursor = Cursor::new(payload);
+    let run_count = read_u32_le(&mut cursor)? as usize;
+    let mut fold = RunFold::default();
+    let mut prev = 0i64;
+    for _ in 0..run_count {
+        let delta = zigzag_decode(read_varint(&mut cursor)?);
+        prev = prev.wrapping_add(delta);
+        let len = read_varint(&mut cursor)? as u64;
+        if predicates.iter().all(|p| p.matches(prev)) {
+            fold.add_run(prev, len);
+        }
+    }
+    Ok(fold)
+}
+
+#[cfg(test)]
+mod run_fold_tests {
+    use super::*;
+    use crate::storage::codec::column_codec::{
+        decode_i64_delta_rle_payload, decode_i64_rle_payload, encode_i64_delta_rle_payload,
+    };
+
+    /// Reference fold: expand the payload, filter per value, aggregate.
+    fn reference_fold(values: &[i64], predicates: &[RunPredicate]) -> RunFold {
+        let mut out = RunFold::default();
+        for &value in values {
+            if predicates.iter().all(|p| p.matches(value)) {
+                if !out.any {
+                    out.min = value;
+                    out.max = value;
+                    out.any = true;
+                } else {
+                    out.min = out.min.min(value);
+                    out.max = out.max.max(value);
+                }
+                out.matched_rows += 1;
+                out.sum_i = out.sum_i.wrapping_add(value);
+            }
+        }
+        out
+    }
+
+    fn raw_column(payload: &[u8], tag: u8, null_rows: usize, non_null: usize) -> Vec<u8> {
+        // bitmap_len = 0 + [magic][tag][payload] — a null-free column (the
+        // fold never consults the bitmap; runs cover only non-null values).
+        let bitmap = crate::types::bitmap::NullBitmap::new_valid(non_null + null_rows);
+        let bitmap_bytes = bitmap.to_bytes();
+        let mut raw = Vec::with_capacity(4 + bitmap_bytes.len() + 6 + payload.len());
+        raw.extend_from_slice(&(bitmap_bytes.len() as u32).to_le_bytes());
+        raw.extend_from_slice(&bitmap_bytes);
+        raw.extend_from_slice(COLUMN_ENCODING_MAGIC);
+        raw.push(tag);
+        raw.extend_from_slice(payload);
+        raw
+    }
+
+    fn sample_values() -> Vec<i64> {
+        // Long runs, negatives, zeros, repeated extremes.
+        let mut values = Vec::new();
+        for &(value, len) in &[
+            (10i64, 40usize),
+            (-5, 30),
+            (0, 25),
+            (100, 20),
+            (7, 35),
+            (-100, 10),
+            (10, 20),
+        ] {
+            values.extend(std::iter::repeat_n(value, len));
+        }
+        values
+    }
+
+    fn int_pred(op: RangeOp, value: i128) -> RunPredicate {
+        RunPredicate::Int { op, value }
+    }
+
+    #[test]
+    fn delta_rle_run_fold_matches_reference_across_predicates() {
+        let values = sample_values();
+        let payload = encode_i64_delta_rle_payload(&values);
+        assert_eq!(
+            decode_i64_delta_rle_payload(&payload, values.len()).unwrap(),
+            values,
+            "fixture must round-trip"
+        );
+        let raw = raw_column(
+            &payload,
+            crate::storage::codec::encoding::EncodingType::DeltaRle.to_u8(),
+            0,
+            values.len(),
+        );
+
+        let cases: Vec<Vec<RunPredicate>> = vec![
+            vec![],
+            vec![int_pred(RangeOp::Gt, 7)],
+            vec![int_pred(RangeOp::Ge, 0)],
+            vec![int_pred(RangeOp::Lt, 50)],
+            vec![int_pred(RangeOp::Le, 10)],
+            vec![int_pred(RangeOp::Eq, 10)],
+            vec![int_pred(RangeOp::Gt, -100), int_pred(RangeOp::Lt, 100)],
+            vec![int_pred(RangeOp::Gt, 1000)],
+        ];
+        for predicates in cases {
+            let folded = fold_runs_from_raw(&raw, &predicates)
+                .expect("adaptive column")
+                .expect("fold ok");
+            let reference = reference_fold(&values, &predicates);
+            assert_eq!(
+                folded, reference,
+                "mismatch for predicates {:?}",
+                predicates
+            );
+        }
+    }
+
+    #[test]
+    fn plain_rle_run_fold_matches_reference() {
+        let values = sample_values();
+        // Re-encode as plain Rle (value + u32 len per run).
+        let mut runs: Vec<(i64, u32)> = Vec::new();
+        for &value in &values {
+            match runs.last_mut() {
+                Some((last, len)) if *last == value => *len += 1,
+                _ => runs.push((value, 1)),
+            }
+        }
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+        for (value, len) in runs {
+            payload.extend_from_slice(&value.to_le_bytes());
+            payload.extend_from_slice(&len.to_le_bytes());
+        }
+        assert_eq!(
+            decode_i64_rle_payload(&payload, values.len()).unwrap(),
+            values
+        );
+        let raw = raw_column(
+            &payload,
+            crate::storage::codec::encoding::EncodingType::Rle.to_u8(),
+            0,
+            values.len(),
+        );
+
+        let predicates = vec![int_pred(RangeOp::Ge, 7)];
+        let folded = fold_runs_from_raw(&raw, &predicates)
+            .expect("adaptive column")
+            .expect("fold ok");
+        assert_eq!(folded, reference_fold(&values, &predicates));
+    }
+
+    #[test]
+    fn non_run_encodings_decline_and_never_predicates_fold_nothing() {
+        // BitPacked tag: fold must decline (None).
+        let raw = raw_column(
+            &[],
+            crate::storage::codec::encoding::EncodingType::BitPacked.to_u8(),
+            0,
+            0,
+        );
+        assert!(fold_runs_from_raw(&raw, &[]).is_none());
+        // No magic at all (plain column): decline.
+        assert!(fold_runs_from_raw(&[0, 0, 0, 0, 1, 2, 3], &[]).is_none());
+
+        // A NULL / varchar threshold never matches, mirroring the row
+        // kernels' all-false fallback.
+        let values = vec![1i64, 2, 3];
+        let payload = encode_i64_delta_rle_payload(&values);
+        let raw = raw_column(
+            &payload,
+            crate::storage::codec::encoding::EncodingType::DeltaRle.to_u8(),
+            0,
+            values.len(),
+        );
+        let never = RunPredicate::new(RangeOp::Gt, &ScalarValue::VarChar(Some("x".into())));
+        assert_eq!(never, RunPredicate::Never);
+        let folded = fold_runs_from_raw(&raw, &[never])
+            .expect("adaptive column")
+            .expect("fold ok");
+        assert_eq!(folded.matched_rows, 0);
+        assert!(!folded.any);
+    }
+
+    #[test]
+    fn run_predicate_float_threshold_uses_f64_domain() {
+        // Float thresholds compare in the raw f64 domain (numeric_cmp
+        // semantics), so 10.5 excludes the run of 10 and includes 100.
+        let values = sample_values();
+        let payload = encode_i64_delta_rle_payload(&values);
+        let raw = raw_column(
+            &payload,
+            crate::storage::codec::encoding::EncodingType::DeltaRle.to_u8(),
+            0,
+            values.len(),
+        );
+        let pred = RunPredicate::Float {
+            op: RangeOp::Gt,
+            value: 10.5,
+        };
+        let folded = fold_runs_from_raw(&raw, &[pred])
+            .expect("adaptive column")
+            .expect("fold ok");
+        let reference = reference_fold(&values, &[pred]);
+        assert_eq!(folded, reference);
+    }
+}
+
+/// Diagnostic: `(runs, rows_covered)` of an Rle/DeltaRle column block, for
+/// run-length viability probes. `None` for any other encoding.
+pub fn debug_run_stats_from_raw(data: &[u8]) -> Option<(u64, u64)> {
+    if data.len() < 4 {
+        return None;
+    }
+    let bitmap_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    if data.len() < 4 + bitmap_len {
+        return None;
+    }
+    let values = &data[4 + bitmap_len..];
+    if values.len() < COLUMN_ENCODING_MAGIC.len() + 1 || !values.starts_with(COLUMN_ENCODING_MAGIC)
+    {
+        return None;
+    }
+    let tag = values[COLUMN_ENCODING_MAGIC.len()];
+    let encoding = match crate::storage::codec::encoding::EncodingType::from_u8(tag) {
+        Ok(encoding) => encoding,
+        Err(_) => return None,
+    };
+    let payload = &values[COLUMN_ENCODING_MAGIC.len() + 1..];
+    let mut cursor = Cursor::new(payload);
+    let run_count = read_u32_le(&mut cursor).ok()? as u64;
+    let mut rows = 0u64;
+    match encoding {
+        crate::storage::codec::encoding::EncodingType::Rle => {
+            for _ in 0..run_count {
+                let mut value_buf = [0u8; 8];
+                cursor.read_exact(&mut value_buf).ok()?;
+                let len = read_u32_le(&mut cursor).ok()? as u64;
+                rows += len;
+            }
+        }
+        crate::storage::codec::encoding::EncodingType::DeltaRle => {
+            for _ in 0..run_count {
+                let _ = read_varint(&mut cursor).ok()?;
+                let len = read_varint(&mut cursor).ok()? as u64;
+                rows += len;
+            }
+        }
+        _ => return None,
+    }
+    Some((run_count, rows))
 }

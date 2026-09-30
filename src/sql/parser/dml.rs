@@ -44,11 +44,20 @@ impl Parser {
             Vec::new()
         };
 
-        if replace && self.peek() == &Token::Select {
-            return Ok(Statement::ReplaceSelect {
-                table,
-                columns,
-                query: Box::new(self.parse_select()?),
+        if self.peek() == &Token::Select {
+            let query = Box::new(self.parse_select()?);
+            return Ok(if replace {
+                Statement::ReplaceSelect {
+                    table,
+                    columns,
+                    query,
+                }
+            } else {
+                Statement::InsertSelect {
+                    table,
+                    columns,
+                    query,
+                }
             });
         }
 
@@ -95,11 +104,31 @@ impl Parser {
         self.expect(&Token::Update)?;
         let table = self.parse_object_name()?;
 
+        // MySQL-style optional table alias: `UPDATE t [AS] a SET ...`. SET is
+        // a keyword token, so a bare identifier here can only be an implicit
+        // alias.
+        let alias = if self.peek() == &Token::As {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else if matches!(self.peek(), Token::Ident(_)) {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+
         self.expect(&Token::Set)?;
 
         let mut assignments = Vec::new();
         loop {
-            let column = self.expect_ident()?;
+            // SET targets may carry a table/alias qualifier (`SET a.salary`).
+            // Column resolution is qualifier-agnostic, so keep only the last
+            // dotted segment; the partition-key and schema lookups downstream
+            // compare bare column names.
+            let mut column = self.expect_ident()?;
+            while self.peek() == &Token::Dot {
+                self.advance();
+                column = self.expect_ident()?;
+            }
             self.expect(&Token::Eq)?;
             let value = self.parse_expr()?;
             assignments.push(Assignment { column, value });
@@ -119,6 +148,7 @@ impl Parser {
 
         Ok(Statement::Update {
             table,
+            alias,
             assignments,
             where_clause,
         })
@@ -129,6 +159,18 @@ impl Parser {
         self.expect(&Token::From)?;
         let table = self.parse_object_name()?;
 
+        // MySQL-style optional table alias: `DELETE FROM t [AS] a WHERE a.id = 1`.
+        // WHERE is a keyword token, so a bare identifier here can only be an
+        // implicit alias.
+        let alias = if self.peek() == &Token::As {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else if matches!(self.peek(), Token::Ident(_)) {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+
         let where_clause = if self.peek() == &Token::Where {
             self.advance();
             Some(self.parse_expr()?)
@@ -138,6 +180,7 @@ impl Parser {
 
         Ok(Statement::Delete {
             table,
+            alias,
             where_clause,
         })
     }

@@ -80,6 +80,12 @@ pub fn compare_scalars_for_sort(a: &ScalarValue, b: &ScalarValue) -> std::cmp::O
         // Timestamp as i64 comparison
         (ScalarValue::Timestamp(Some(l)), ScalarValue::Timestamp(Some(r))) => l.cmp(r),
         (ScalarValue::Date(Some(l)), ScalarValue::Date(Some(r))) => l.cmp(r),
+        // Temporal i64 payloads: without these arms every Time/Interval
+        // pair compared Equal, silently breaking order-sensitive consumers
+        // (clustered-compaction merge heads, zone-map sorting).
+        (ScalarValue::Time(Some(l)), ScalarValue::Time(Some(r))) => l.cmp(r),
+        (ScalarValue::Interval(Some(l)), ScalarValue::Interval(Some(r))) => l.cmp(r),
+        (ScalarValue::Blob(Some(l)), ScalarValue::Blob(Some(r))) => l.cmp(r),
         _ => std::cmp::Ordering::Equal,
     }
 }

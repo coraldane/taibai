@@ -19,9 +19,23 @@ pub fn encode_binary_result(batch: &RecordBatch) -> Vec<u8> {
 }
 
 pub fn encode_binary_result_batches(schema: &Schema, batches: &[RecordBatch]) -> Vec<u8> {
-    let mut buf = Vec::new();
     let num_cols = schema.num_columns();
+    // Heterogeneous batches (mixed column counts) would desynchronize the
+    // stream layout — the bitmap section pads missing columns but the data
+    // section does not. Reject loudly instead of emitting a corrupt frame.
+    debug_assert!(
+        batches.iter().all(|b| b.num_columns() == num_cols),
+        "heterogeneous result batches"
+    );
     let num_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+    // Rough size estimate so the payload builds with at most one realloc
+    // instead of doubling through a multi-MB result.
+    let mut estimated = 8 + num_rows * (num_cols + 4 * num_cols + 8 * num_cols);
+    for col_def in &schema.columns {
+        estimated += 4 + col_def.name.len() + 3;
+    }
+    let mut buf = Vec::with_capacity(estimated);
 
     // Number of columns
     buf.extend_from_slice(&(num_cols as u32).to_le_bytes());
@@ -39,45 +53,45 @@ pub fn encode_binary_result_batches(schema: &Schema, batches: &[RecordBatch]) ->
     // Number of rows
     buf.extend_from_slice(&(num_rows as u32).to_le_bytes());
 
-    // Column data
+    // Column data. Sections are appended in place and their u32 length is
+    // patched afterwards, so column bytes are copied once instead of being
+    // materialized in a temporary Vec and copied again.
     for col_idx in 0..num_cols {
-        let mut null_bitmap = Vec::with_capacity(num_rows);
+        let bitmap_len_pos = buf.len();
+        buf.extend_from_slice(&[0u8; 4]);
+        let bitmap_start = buf.len();
         for batch in batches {
             match batch.column(col_idx) {
                 Some(col) => {
-                    null_bitmap.extend_from_slice(&col.bitmap().null_flag_bytes());
+                    buf.extend_from_slice(&col.bitmap().null_flag_bytes());
                 }
                 None => {
-                    null_bitmap.extend(std::iter::repeat_n(0u8, batch.num_rows()));
+                    buf.extend(std::iter::repeat_n(0u8, batch.num_rows()));
                 }
             }
         }
+        let bitmap_len = (buf.len() - bitmap_start) as u32;
+        buf[bitmap_len_pos..bitmap_len_pos + 4].copy_from_slice(&bitmap_len.to_le_bytes());
 
-        buf.extend_from_slice(&(null_bitmap.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&null_bitmap);
-
-        // Data payload
-        let data = encode_column_data_batches(col_idx, batches);
-        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&data);
+        let data_len_pos = buf.len();
+        buf.extend_from_slice(&[0u8; 4]);
+        let data_start = buf.len();
+        for batch in batches {
+            if let Some(col) = batch.column(col_idx) {
+                append_column_data(col, &mut buf);
+            }
+        }
+        let data_len = (buf.len() - data_start) as u32;
+        buf[data_len_pos..data_len_pos + 4].copy_from_slice(&data_len.to_le_bytes());
     }
 
     buf
 }
 
-/// Encode column data as fixed-width little-endian values.
-fn encode_column_data_batches(col_idx: usize, batches: &[RecordBatch]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    for batch in batches {
-        let Some(col) = batch.column(col_idx) else {
-            continue;
-        };
-        append_column_data(col, &mut buf);
-    }
-    buf
-}
-
-fn append_column_data(col: &ColumnArray, buf: &mut Vec<u8>) {
+/// Append one column's little-endian data bytes (variable-width values are
+/// u32-length-prefixed). Shared with the bulk-import wire encoder, which
+/// wraps it with its own null-bitmap section.
+pub(crate) fn append_column_data(col: &ColumnArray, buf: &mut Vec<u8>) {
     macro_rules! append_fixed {
         ($data:expr) => {{
             if $data.is_empty() {
@@ -94,6 +108,10 @@ fn append_column_data(col: &ColumnArray, buf: &mut Vec<u8>) {
     }
 
     match col {
+        ColumnArray::Selected { .. } | ColumnArray::Rle { .. } => {
+            append_column_data(col.flattened(), buf)
+        }
+        ColumnArray::Dictionary { .. } => append_column_data(&col.materialize_varchar(), buf),
         ColumnArray::Bool { data, .. } => buf.extend_from_slice(data),
         ColumnArray::Int8 { data, .. } => {
             let bytes =

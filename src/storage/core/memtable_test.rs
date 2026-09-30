@@ -2,6 +2,7 @@ use super::*;
 use crate::protocol::types::DataType;
 use crate::types::batch::ColumnDef;
 use crate::types::scalar::ScalarValue;
+use std::sync::Arc;
 
 fn batch(schema: &Schema, values: &[i64]) -> RecordBatch {
     let mut batch = RecordBatch::new(schema.clone());
@@ -59,7 +60,7 @@ fn replace_key_conflicts_rebuilds_after_batch_replacement() {
     memtable.append(&batch(&schema, &[1, 2, 3])).unwrap();
     let version_before = memtable.content_version();
 
-    assert!(memtable.replace_pending_batch(batch(&schema, &[7, 8])));
+    assert!(memtable.replace_pending_batch(Arc::new(batch(&schema, &[7, 8]))));
     assert!(memtable.content_version() > version_before);
     assert_eq!(
         manager.replace_key_conflicts(
@@ -104,7 +105,7 @@ fn compact_replace_key_index_shifts_and_verifies() {
     );
 
     // Remove rows 0 and 3 (keys 1 and 4): filtered batch is [2, 3, 5].
-    assert!(memtable.replace_pending_batch(batch(&schema, &[2, 3, 5])));
+    assert!(memtable.replace_pending_batch(Arc::new(batch(&schema, &[2, 3, 5]))));
     manager.compact_replace_key_index(&memtable, &[0, 3], 5);
 
     let filtered = memtable.read().unwrap();
@@ -127,8 +128,8 @@ fn compact_replace_key_index_drops_entry_on_state_mismatch() {
 
     // A second replacement (rollback restore) bumps the version again, so
     // the compaction guard must refuse to shift positions.
-    assert!(memtable.replace_pending_batch(batch(&schema, &[1, 2, 9])));
-    assert!(memtable.replace_pending_batch(batch(&schema, &[1, 2])));
+    assert!(memtable.replace_pending_batch(Arc::new(batch(&schema, &[1, 2, 9]))));
+    assert!(memtable.replace_pending_batch(Arc::new(batch(&schema, &[1, 2]))));
     manager.compact_replace_key_index(&memtable, &[0], 3);
 
     assert_eq!(
@@ -244,4 +245,34 @@ fn spill_rejects_empty_or_flushed_memtables() {
     memtable.append(&batch(&schema, &[1])).unwrap();
     memtable.set_state(MemTableState::Flushing);
     assert!(!memtable.spill_to_tail(temp.path().join("none.tail")));
+}
+
+/// After a hot-store prefix reclamation the table's mirror coverage must be
+/// retracted table-wide: both claim paths stand down until the store is
+/// invalidated. (The previous encoding flipped accounted counters from 0 to
+/// 1, but counters only ever hold values >= 1, so the retraction never
+/// fired.)
+#[test]
+fn retract_hot_mirror_coverage_stands_down_both_claims() {
+    let manager = MemTableManager::new(10_000, 60, 2, 3600);
+    assert!(manager.hot_partition_mirrored("main", "t", ""));
+    assert!(manager.hot_table_fully_mirrored("main", "t"));
+
+    manager.retract_hot_mirror_coverage("main", "t");
+    assert!(
+        !manager.hot_partition_mirrored("main", "t", ""),
+        "retraction must disable the partition claim"
+    );
+    assert!(
+        !manager.hot_table_fully_mirrored("main", "t"),
+        "retraction must disable the watermark shortcut claim"
+    );
+    // Unrelated tables are untouched.
+    assert!(manager.hot_partition_mirrored("main", "other", ""));
+
+    // Invalidation (table rebuild / UPDATE / DELETE) clears the marker and
+    // the fast path can be re-established.
+    manager.clear_hot_unfed("main", "t");
+    assert!(manager.hot_partition_mirrored("main", "t", ""));
+    assert!(manager.hot_table_fully_mirrored("main", "t"));
 }

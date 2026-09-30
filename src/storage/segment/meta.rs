@@ -8,7 +8,9 @@ use crate::common::error::{Result, TaibaiError};
 use crate::storage::partition::pruning::{compute_segment_zone_maps_from_row_groups, ZoneMap};
 use crate::storage::segment::footer::parse_segment_footer;
 use crate::storage::segment::writer::encode_segment_footer;
-use crate::storage::segment::{RowGroupMeta, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
+use crate::storage::segment::{
+    is_supported_segment_version, RowGroupMeta, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC,
+};
 use crate::types::batch::Schema;
 
 const SIDECAR_MAGIC: u32 = 0x4D58_4D54;
@@ -62,7 +64,7 @@ pub fn read_embedded_footer(segment_path: &Path) -> Result<SidecarFooter> {
     file.read_exact(&mut header)?;
     let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
     let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
-    if magic != SEGMENT_MAGIC || version != SEGMENT_VERSION {
+    if magic != SEGMENT_MAGIC || !is_supported_segment_version(version) {
         return Err(TaibaiError::Storage(format!(
             "invalid segment header for {}",
             segment_path.display()
@@ -138,16 +140,31 @@ fn read_latest_sidecar_footer_from(meta_path: &Path) -> Result<Option<SidecarFoo
             break;
         };
 
-        let record_end =
-            offset + header.header_len + header.name_len + header.footer_len + RECORD_CRC_SIZE;
+        // All lengths come from disk; checked arithmetic prevents a
+        // corrupted sidecar from wrapping around the bounds check and
+        // panicking on the slice below.
+        let Some(record_end) = offset
+            .checked_add(header.header_len)
+            .and_then(|v| v.checked_add(header.name_len))
+            .and_then(|v| v.checked_add(header.footer_len))
+            .and_then(|v| v.checked_add(RECORD_CRC_SIZE))
+        else {
+            break;
+        };
         if record_end > buf.len() {
             break;
         }
 
-        let name_start = offset + header.header_len;
-        let name_end = name_start + header.name_len;
+        let Some(name_start) = offset.checked_add(header.header_len) else {
+            break;
+        };
+        let Some(name_end) = name_start.checked_add(header.name_len) else {
+            break;
+        };
         let footer_start = name_end;
-        let footer_end = footer_start + header.footer_len;
+        let Some(footer_end) = footer_start.checked_add(header.footer_len) else {
+            break;
+        };
         let stored_crc = u32::from_le_bytes(buf[footer_end..record_end].try_into().unwrap());
         let computed_crc = compute_crc(&buf[offset..footer_end]);
         if stored_crc != computed_crc {
@@ -336,7 +353,7 @@ fn valid_record_count(path: &Path) -> Result<usize> {
 }
 
 #[cfg(windows)]
-fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
@@ -366,7 +383,7 @@ fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
     fs::rename(src, dst)?;
     Ok(())
 }

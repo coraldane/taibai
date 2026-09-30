@@ -98,3 +98,95 @@ fn test_txn_keyword() {
     assert_eq!(tokens[0], Token::Begin);
     assert_eq!(tokens[1], Token::Transaction);
 }
+
+#[test]
+fn test_line_comment() {
+    let mut lexer = Lexer::new("SELECT 1 -- trailing comment\n, 2 -- another\n");
+    let tokens = lexer.tokenize().unwrap();
+    assert_eq!(tokens[0], Token::Select);
+    assert_eq!(tokens[1], Token::Integer(1));
+    assert_eq!(tokens[2], Token::Comma);
+    assert_eq!(tokens[3], Token::Integer(2));
+    assert_eq!(tokens[4], Token::Eof);
+}
+
+#[test]
+fn test_block_comment() {
+    let mut lexer = Lexer::new("SELECT /* inline * comment */ 1");
+    let tokens = lexer.tokenize().unwrap();
+    assert_eq!(tokens[0], Token::Select);
+    assert_eq!(tokens[1], Token::Integer(1));
+}
+
+#[test]
+fn test_multiline_block_comment() {
+    let mut lexer = Lexer::new("SELECT 1 /* spans\nmultiple\nlines */ , 2");
+    let tokens = lexer.tokenize().unwrap();
+    assert_eq!(tokens[2], Token::Comma);
+    assert_eq!(tokens[3], Token::Integer(2));
+}
+
+#[test]
+fn test_unterminated_block_comment() {
+    let mut lexer = Lexer::new("SELECT 1 /* never closed");
+    assert!(lexer.tokenize().is_err());
+}
+
+#[test]
+fn test_division_still_works_after_comment_support() {
+    let mut lexer = Lexer::new("a / b");
+    let tokens = lexer.tokenize().unwrap();
+    assert_eq!(tokens[1], Token::Ident("/".into()));
+}
+
+#[test]
+fn test_double_quoted_ident_not_keyword() {
+    let mut lexer = Lexer::new("SELECT \"select\" FROM t");
+    let tokens = lexer.tokenize().unwrap();
+    assert_eq!(tokens[0], Token::Select);
+    assert_eq!(tokens[1], Token::Ident("select".into()));
+}
+
+#[test]
+fn test_double_quoted_ident_with_space_and_escape() {
+    let mut lexer = Lexer::new("SELECT \"total \"\"amount\"\"\" FROM t");
+    let tokens = lexer.tokenize().unwrap();
+    assert_eq!(tokens[1], Token::Ident("total \"amount\"".into()));
+}
+
+#[test]
+fn test_backtick_ident() {
+    let mut lexer = Lexer::new("SELECT `group by` FROM `order`");
+    let tokens = lexer.tokenize().unwrap();
+    assert_eq!(tokens[0], Token::Select);
+    assert_eq!(tokens[1], Token::Ident("group by".into()));
+    assert_eq!(tokens[2], Token::From);
+    assert_eq!(tokens[3], Token::Ident("order".into()));
+}
+
+#[test]
+fn test_unterminated_quoted_ident() {
+    let mut lexer = Lexer::new("SELECT \"oops FROM t");
+    assert!(lexer.tokenize().is_err());
+}
+
+#[test]
+fn test_dollar_numbered_placeholders() {
+    let mut lexer = Lexer::new("INSERT INTO t VALUES ($1, $2, $10)");
+    let tokens = lexer.tokenize().unwrap();
+    assert_eq!(tokens[5], Token::NumberedPlaceholder(1));
+    assert_eq!(tokens[7], Token::NumberedPlaceholder(2));
+    assert_eq!(tokens[9], Token::NumberedPlaceholder(10));
+}
+
+#[test]
+fn test_dollar_zero_rejected() {
+    let mut lexer = Lexer::new("SELECT $0");
+    assert!(lexer.tokenize().is_err());
+}
+
+#[test]
+fn test_bare_dollar_rejected() {
+    let mut lexer = Lexer::new("SELECT $ FROM t");
+    assert!(lexer.tokenize().is_err());
+}

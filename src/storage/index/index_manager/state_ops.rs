@@ -1,117 +1,171 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::Path;
 
 use super::codec::{
-    decode_unique_index_delta, encode_unique_key, UniqueIndexDelta, UniqueIndexDeltaRecord,
+    decode_unique_index_delta, encode_unique_key, UniqueIndexBaseWriter, UniqueIndexDeltaRecord,
     UNIQUE_INDEX_BLOCK_SIZE,
 };
 use super::types::{
-    UniqueIndexBlock, UniqueIndexData, UniqueIndexEntry, UniqueIndexState, UniqueRowLocation,
+    UniqueIndexBase, UniqueIndexBlock, UniqueIndexData, UniqueIndexState, UniqueRowLocation,
 };
 use crate::common::error::Result;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::RecordBatch;
 use crate::types::scalar::ScalarValue;
-/// Merges a base snapshot with serialized delta records and a set of
-/// in-memory tombstones into one materialized `UniqueIndexData`. Progress
-/// fields are copied from the base; callers override them as needed.
-///
-/// Records replay strictly in file order: a removed key only erases entries
-/// recorded before the removal, so a later re-insert of the same key in the
-/// same delta file survives (mirrors the in-memory mutation order).
-pub(super) fn materialize_unique_index_state_parts(
-    state_base: &UniqueIndexData,
+
+/// Delta records replayed to their final per-key state before a streaming
+/// merge. Replay preserves record order semantics: a removed key erases
+/// additions recorded before the removal, so a later re-insert of the same
+/// key in the same delta file survives (mirrors the in-memory mutation
+/// order).
+pub(super) struct ReplayedDelta {
+    /// Surviving additions keyed by encoded key, in replay order.
+    pub(super) additions: HashMap<Vec<u8>, Vec<UniqueRowLocation>>,
+    /// Keys whose base rows die. Includes the snapshot's in-memory removals
+    /// plus every removed-key record seen during replay.
+    pub(super) removed_keys: HashSet<Vec<u8>>,
+    pub(super) tombstones: HashSet<UniqueRowLocation>,
+}
+
+pub(super) fn replay_unique_index_delta(
     delta_bytes: &[u8],
-    tombstones: &HashSet<UniqueRowLocation>,
-    removed_keys: &HashSet<Vec<u8>>,
-) -> Result<UniqueIndexData> {
-    let decoded = if delta_bytes.is_empty() {
-        UniqueIndexDelta::default()
-    } else {
-        decode_unique_index_delta(delta_bytes)?
-    };
-    let mut data = UniqueIndexData {
-        db: state_base.db.clone(),
-        table: state_base.table.clone(),
-        index_name: state_base.index_name.clone(),
-        columns: state_base.columns.clone(),
-        entries: state_base
-            .entries
-            .iter()
-            .map(|entry| UniqueIndexEntry {
-                key: if entry.location.segment_path.is_empty() {
-                    entry.key.clone()
-                } else {
-                    Vec::new()
-                },
-                location: entry.location.clone(),
-            })
-            .collect(),
-        flush_epoch: state_base.flush_epoch,
-        segment_watermarks: state_base.segment_watermarks.clone(),
-        tombstones: state_base.tombstones.clone(),
-        encoded_keys: state_base.encoded_keys.clone(),
-        blocks: Vec::new(),
-    };
-    data.tombstones.extend(tombstones.iter().cloned());
-    let mut rows: Vec<(Vec<u8>, UniqueIndexEntry)> = data
-        .encoded_keys
-        .iter()
-        .cloned()
-        .zip(data.entries.iter().cloned())
-        .collect();
-    let mut dead: Vec<bool> = vec![false; rows.len()];
-    let mut positions_by_key: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
-    for (idx, (encoded, _)) in rows.iter().enumerate() {
-        positions_by_key
-            .entry(encoded.clone())
-            .or_default()
-            .push(idx);
-    }
-    let kill_key_rows =
-        |key: &[u8],
-         rows: &mut Vec<(Vec<u8>, UniqueIndexEntry)>,
-         dead: &mut Vec<bool>,
-         positions_by_key: &mut HashMap<Vec<u8>, Vec<usize>>| {
-            if let Some(positions) = positions_by_key.remove(key) {
-                for position in positions {
-                    rows[position].0 = Vec::new();
-                    dead[position] = true;
+    removed_keys: HashSet<Vec<u8>>,
+    tombstones: HashSet<UniqueRowLocation>,
+) -> Result<ReplayedDelta> {
+    let mut additions: HashMap<Vec<u8>, Vec<UniqueRowLocation>> = HashMap::new();
+    let mut removed_keys = removed_keys;
+    let mut tombstones = tombstones;
+    if !delta_bytes.is_empty() {
+        for record in decode_unique_index_delta(delta_bytes)?.records {
+            match record {
+                UniqueIndexDeltaRecord::Entry(addition) => {
+                    additions
+                        .entry(addition.encoded_key)
+                        .or_default()
+                        .push(addition.entry.location);
+                }
+                UniqueIndexDeltaRecord::Tombstone(location) => {
+                    tombstones.insert(location);
+                }
+                UniqueIndexDeltaRecord::RemovedKey(encoded) => {
+                    additions.remove(&encoded);
+                    removed_keys.insert(encoded);
                 }
             }
-        };
-    for removed in removed_keys {
-        kill_key_rows(removed, &mut rows, &mut dead, &mut positions_by_key);
+        }
     }
-    for record in decoded.records {
-        match record {
-            UniqueIndexDeltaRecord::Entry(addition) => {
-                positions_by_key
-                    .entry(addition.encoded_key.clone())
-                    .or_default()
-                    .push(rows.len());
-                rows.push((addition.encoded_key, addition.entry));
-                dead.push(false);
+    Ok(ReplayedDelta {
+        additions,
+        removed_keys,
+        tombstones,
+    })
+}
+
+/// Merge the (sorted, file-backed) base with the replayed delta into `writer`
+/// in one streaming pass. Base blocks are decoded one at a time; the only
+/// unbounded-memory structures are the delta additions themselves, which the
+/// compaction threshold already caps. Output order matches the old in-memory
+/// materialization: ascending encoded key, base locations before delta
+/// additions within a key, one memtable placeholder per key, tombstoned
+/// locations dropped.
+pub(super) fn stream_merge_unique_index_base<W: Write>(
+    base: &UniqueIndexBase,
+    replayed: ReplayedDelta,
+    writer: &mut UniqueIndexBaseWriter<W>,
+) -> Result<()> {
+    let ReplayedDelta {
+        additions,
+        removed_keys,
+        tombstones,
+    } = replayed;
+    let mut delta_keys: Vec<(Vec<u8>, Vec<UniqueRowLocation>)> = additions.into_iter().collect();
+    delta_keys.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut delta_pos = 0usize;
+    let mut placeholder_seen: HashSet<Vec<u8>> = HashSet::new();
+
+    // Emit one location unless a tombstone kills it or a placeholder for the
+    // key was already written (placeholders collapse to one per key).
+    fn emit<W: Write>(
+        writer: &mut UniqueIndexBaseWriter<W>,
+        key: &[u8],
+        location: &UniqueRowLocation,
+        tombstones: &HashSet<UniqueRowLocation>,
+        placeholder_seen: &mut HashSet<Vec<u8>>,
+    ) -> Result<()> {
+        if unique_index_tombstones_contains(tombstones, location) {
+            return Ok(());
+        }
+        if location.segment_path.is_empty() && !placeholder_seen.insert(key.to_vec()) {
+            return Ok(());
+        }
+        writer.push_entry(key, location)
+    }
+
+    for block_idx in 0..base.blocks.len() {
+        let block = base.block(block_idx)?;
+        for entry_idx in 0..block.keys.len() {
+            let key = &block.keys[entry_idx];
+            // Delta-only keys that sort before this base key are emitted
+            // first so the output stays globally sorted.
+            while delta_pos < delta_keys.len()
+                && delta_keys[delta_pos].0.as_slice() < key.as_slice()
+            {
+                let (delta_key, delta_locations) = &delta_keys[delta_pos];
+                for location in delta_locations {
+                    emit(
+                        writer,
+                        delta_key,
+                        location,
+                        &tombstones,
+                        &mut placeholder_seen,
+                    )?;
+                }
+                delta_pos += 1;
             }
-            UniqueIndexDeltaRecord::Tombstone(location) => {
-                data.tombstones.insert(location);
+            let delta_key_is_current = delta_pos < delta_keys.len()
+                && delta_keys[delta_pos].0.as_slice() == key.as_slice();
+            if removed_keys.contains(key.as_slice()) {
+                // Base rows of a removed key die; surviving delta additions
+                // for the same key still merge in.
+                if delta_key_is_current {
+                    for location in &delta_keys[delta_pos].1 {
+                        emit(writer, key, location, &tombstones, &mut placeholder_seen)?;
+                    }
+                    delta_pos += 1;
+                }
+                continue;
             }
-            UniqueIndexDeltaRecord::RemovedKey(encoded) => {
-                kill_key_rows(&encoded, &mut rows, &mut dead, &mut positions_by_key);
+            emit(
+                writer,
+                key,
+                &block.locations[entry_idx],
+                &tombstones,
+                &mut placeholder_seen,
+            )?;
+            if delta_key_is_current {
+                for location in &delta_keys[delta_pos].1 {
+                    emit(writer, key, location, &tombstones, &mut placeholder_seen)?;
+                }
+                delta_pos += 1;
             }
         }
     }
-    let mut kept: Vec<(Vec<u8>, UniqueIndexEntry)> = Vec::with_capacity(rows.len());
-    for (idx, row) in rows.into_iter().enumerate() {
-        if !dead[idx] {
-            kept.push(row);
+    // Remaining delta-only keys sort after every base key.
+    while delta_pos < delta_keys.len() {
+        let (delta_key, delta_locations) = &delta_keys[delta_pos];
+        for location in delta_locations {
+            emit(
+                writer,
+                delta_key,
+                location,
+                &tombstones,
+                &mut placeholder_seen,
+            )?;
         }
+        delta_pos += 1;
     }
-    kept.sort_by(|left, right| left.0.cmp(&right.0));
-    data.encoded_keys = kept.iter().map(|(encoded, _)| encoded.clone()).collect();
-    data.entries = kept.into_iter().map(|(_, entry)| entry).collect();
-    data.blocks = build_unique_index_blocks(&data.encoded_keys);
-    Ok(data)
+    Ok(())
 }
 
 pub(super) fn unique_index_key(db: &str, table: &str, index_name: &str) -> String {
@@ -161,23 +215,12 @@ pub(super) fn unique_index_state_contains_any_key(
         if delta.removed_keys.contains(encoded.as_slice()) {
             continue;
         }
-        let Ok(mut idx) = base
-            .encoded_keys
-            .binary_search_by(|key| key.as_slice().cmp(encoded.as_slice()))
-        else {
-            continue;
-        };
-        while idx > 0 && base.encoded_keys[idx - 1] == *encoded {
-            idx -= 1;
-        }
-        while idx < base.encoded_keys.len() && base.encoded_keys[idx] == *encoded {
-            let location = &base.entries[idx].location;
-            if !unique_index_tombstones_contains(tombstones, location)
-                && unique_index_entry_location_is_live(segment_mgr, location)?
+        for location in base.find_locations(encoded)? {
+            if !unique_index_tombstones_contains(tombstones, &location)
+                && unique_index_entry_location_is_live(segment_mgr, &location)?
             {
                 return Ok(true);
             }
-            idx += 1;
         }
     }
     Ok(false)
@@ -202,24 +245,12 @@ pub(super) fn unique_index_state_contains_key(
         return Ok(false);
     }
     let tombstones = &delta.tombstones;
-    let base = &state.base;
-    let Ok(mut idx) = base
-        .encoded_keys
-        .binary_search_by(|key| key.as_slice().cmp(encoded_key))
-    else {
-        return Ok(false);
-    };
-    while idx > 0 && base.encoded_keys[idx - 1].as_slice() == encoded_key {
-        idx -= 1;
-    }
-    while idx < base.encoded_keys.len() && base.encoded_keys[idx].as_slice() == encoded_key {
-        let location = &base.entries[idx].location;
-        if !unique_index_tombstones_contains(tombstones, location)
-            && unique_index_entry_location_is_live(segment_mgr, location)?
+    for location in state.base.find_locations(encoded_key)? {
+        if !unique_index_tombstones_contains(tombstones, &location)
+            && unique_index_entry_location_is_live(segment_mgr, &location)?
         {
             return Ok(true);
         }
-        idx += 1;
     }
     Ok(false)
 }
@@ -256,43 +287,6 @@ pub(super) fn build_unique_index_blocks(encoded_keys: &[Vec<u8>]) -> Vec<UniqueI
         start += len;
     }
     blocks
-}
-
-/// In-place snapshot compaction for prepared data (entries aligned with
-/// encoded_keys): drops tombstoned locations and collapses duplicate
-/// memtable-resident placeholders (empty segment path) to one entry per key.
-///
-/// Placeholder dedup is semantics-preserving: placeholders are never
-/// tombstoned (tombstones only reference segment locations), so a key probes
-/// as existing before the compaction if and only if it still probes as
-/// existing afterwards. Without it, high-frequency upserts of the same key
-/// accumulate one placeholder per write and the snapshot grows with total
-/// upsert count instead of table cardinality.
-pub(super) fn compact_prepared_unique_index_entries(data: &mut UniqueIndexData) {
-    let mut keep = Vec::with_capacity(data.entries.len());
-    let mut seen_memtable_keys: HashSet<Vec<u8>> = HashSet::new();
-    for idx in 0..data.entries.len() {
-        let location = &data.entries[idx].location;
-        let entry_keep = if data.tombstones.contains(location) {
-            false
-        } else if location.segment_path.is_empty() {
-            seen_memtable_keys.insert(data.encoded_keys[idx].clone())
-        } else {
-            true
-        };
-        keep.push(entry_keep);
-    }
-    let mut write = 0usize;
-    for (read, entry_keep) in keep.iter().enumerate() {
-        if *entry_keep {
-            data.entries.swap(read, write);
-            data.encoded_keys.swap(read, write);
-            write += 1;
-        }
-    }
-    data.entries.truncate(write);
-    data.encoded_keys.truncate(write);
-    data.blocks = build_unique_index_blocks(&data.encoded_keys);
 }
 
 pub(super) fn unique_index_tombstones_contains(

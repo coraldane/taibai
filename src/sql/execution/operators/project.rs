@@ -18,6 +18,10 @@ pub struct ProjectExec {
     /// Snapshot registry for correlated subqueries, when the query contains
     /// any.
     pub subqueries: Option<SubqueryRegistry>,
+    /// Remapped-expression cache: `remap_expr_for_batch` is deterministic
+    /// per batch schema, so cloning the expression tree per batch (and per
+    /// expression) is wasted work once the layout is stable.
+    pub remapped: Option<(Schema, Vec<LogicalExpr>)>,
 }
 
 impl ExecutionOp for ProjectExec {
@@ -37,17 +41,25 @@ impl ExecutionOp for ProjectExec {
                 let mut columns = Vec::with_capacity(self.expressions.len());
                 let mut col_defs = Vec::with_capacity(self.expressions.len());
 
-                for (i, expr) in self.expressions.iter().enumerate() {
-                    let expr = remap_expr_for_batch(expr, &self.input_schema, &batch.schema);
-                    let vals = eval_expr_column_with(&expr, &batch, self.subqueries.as_ref())?;
-                    let col_def =
-                        project_column_def(&expr, &batch.schema, self.aliases[i].as_deref());
-                    let mut col = ColumnArray::empty(col_def.data_type);
-                    for v in &vals {
-                        let coerced = coerce_project_value(v, &col_def)?;
-                        col.push(&coerced)?;
+                let exprs = match &self.remapped {
+                    Some((cached_schema, exprs)) if *cached_schema == batch.schema => exprs,
+                    _ => {
+                        let exprs: Vec<LogicalExpr> = self
+                            .expressions
+                            .iter()
+                            .map(|expr| {
+                                remap_expr_for_batch(expr, &self.input_schema, &batch.schema)
+                            })
+                            .collect();
+                        self.remapped = Some((batch.schema.clone(), exprs));
+                        self.remapped.as_ref().map(|(_, exprs)| exprs).unwrap()
                     }
-                    columns.push(col);
+                };
+                for (i, expr) in exprs.iter().enumerate() {
+                    let col_def =
+                        project_column_def(expr, &batch.schema, self.aliases[i].as_deref());
+                    let column = self.project_column(expr, &batch, &col_def)?;
+                    columns.push(column);
                     col_defs.push(col_def);
                 }
 
@@ -56,6 +68,32 @@ impl ExecutionOp for ProjectExec {
             }
             None => Ok(None),
         }
+    }
+}
+
+impl ProjectExec {
+    /// Evaluate one projection expression. Prefers the typed kernels and only
+    /// falls back to the per-value scalar path when the expression shape or
+    /// the target coercion is not covered, so both paths stay semantically
+    /// identical.
+    fn project_column(
+        &self,
+        expr: &LogicalExpr,
+        batch: &RecordBatch,
+        col_def: &ColumnDef,
+    ) -> Result<ColumnArray> {
+        if let Some(column) = crate::sql::execution::expr_vec::eval_expr_to_column(expr, batch)? {
+            if column.data_type() == col_def.data_type {
+                return Ok(column);
+            }
+        }
+        let vals = eval_expr_column_with(expr, batch, self.subqueries.as_ref())?;
+        let mut col = ColumnArray::empty(col_def.data_type);
+        for v in &vals {
+            let coerced = coerce_project_value(v, col_def)?;
+            col.push(&coerced)?;
+        }
+        Ok(col)
     }
 }
 

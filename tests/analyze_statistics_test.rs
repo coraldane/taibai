@@ -48,8 +48,10 @@ fn analyze_table_collects_persists_and_invalidates_statistics() {
         let category = statistics.columns.get("category").unwrap();
         assert!((2..=3).contains(&category.distinct_count));
         let score = statistics.columns.get("score").unwrap();
-        assert_eq!(score.null_count, 0);
-        assert_eq!(score.min_value, Some(ScalarValue::Int32(Some(0))));
+        // The (4, NULL, NULL) row stays NULL through the flush, so the null
+        // count is 1 and MIN covers {10, 20, 30}.
+        assert_eq!(score.null_count, 1);
+        assert_eq!(score.min_value, Some(ScalarValue::Int32(Some(10))));
 
         let explained = engine
             .execute(
@@ -70,7 +72,9 @@ fn analyze_table_collects_persists_and_invalidates_statistics() {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(plan.contains("estimated_rows=2"), "unexpected plan: {plan}");
+        // score < 15 matches {10} only (the NULL row no longer reads as 0),
+        // so the statistics-based estimate is 1 of 4 rows.
+        assert!(plan.contains("estimated_rows=1"), "unexpected plan: {plan}");
 
         let analyzed_plan = engine
             .execute(
@@ -93,11 +97,11 @@ fn analyze_table_collects_persists_and_invalidates_statistics() {
             .join("\n");
         assert!(plan.contains("=== OPERATOR METRICS ==="), "{plan}");
         assert!(
-            plan.contains("Project: estimated_rows=2, actual_rows=2"),
+            plan.contains("Project: estimated_rows=1, actual_rows=1"),
             "{plan}"
         );
         assert!(
-            plan.contains("Scan metrics: estimated_rows=2, actual_rows=2"),
+            plan.contains("Scan metrics: estimated_rows=1, actual_rows=1"),
             "{plan}"
         );
         assert!(plan.contains("row_ratio=1.00x"), "{plan}");

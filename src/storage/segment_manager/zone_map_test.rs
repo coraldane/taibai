@@ -27,7 +27,9 @@ fn typed_zone_maps_preserve_ranges_and_null_counts() {
         batch.column_mut(1).unwrap().push(&text).unwrap();
     }
 
-    let maps = compute_zone_maps_from_batch(&batch, 0, 4);
+    let maps: Vec<ZoneMap> = (0..batch.num_columns())
+        .map(|col_idx| compute_zone_map_from_column(batch.column(col_idx).unwrap(), 0, 4))
+        .collect();
     assert_eq!(maps[0].min_value, ScalarValue::Int32(Some(-4)));
     assert_eq!(maps[0].max_value, ScalarValue::Int32(Some(9)));
     assert_eq!(maps[0].null_count, 1);

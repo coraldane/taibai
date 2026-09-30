@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -45,6 +45,10 @@ pub struct MemTable {
     schema: Schema,
     batch: RwLock<Option<Arc<RecordBatch>>>,
     backing: RwLock<MemTableBacking>,
+    /// Tail file backing a spilled memtable (set by `MemTable::spilled`).
+    /// Kept outside `backing` so a resident memtable can be demoted back to
+    /// spilled when replication appends more frames to its tail.
+    tail_path: Mutex<Option<PathBuf>>,
     state: AtomicU8,
     row_count: AtomicU64,
     created_at: Instant,
@@ -55,6 +59,10 @@ pub struct MemTable {
     /// tail, so REPLACE conflict key indexes can refresh incrementally on a
     /// stable version and rebuild on a bump.
     content_version: AtomicU64,
+    /// Set when this memtable's durable-tail commit failed: the tail file
+    /// (if any was created) may be torn, so the next flush must take the
+    /// segment protocol instead of trusting the tail's presence on disk.
+    needs_segment_flush: AtomicBool,
 }
 
 impl MemTable {
@@ -67,12 +75,14 @@ impl MemTable {
             batch: RwLock::new(Some(Arc::new(RecordBatch::new(schema.clone())))),
             schema,
             backing: RwLock::new(MemTableBacking::Resident),
+            tail_path: Mutex::new(None),
             state: AtomicU8::new(MemTableState::Pending as u8),
             row_count: AtomicU64::new(0),
             created_at: Instant::now(),
             txn_id: AtomicU64::new(0),
             visibility: RwLock::new(TxnVisibility::Committed),
             content_version: AtomicU64::new(0),
+            needs_segment_flush: AtomicBool::new(false),
         }
     }
 
@@ -91,12 +101,14 @@ impl MemTable {
             batch: RwLock::new(Some(Arc::new(RecordBatch::new(schema.clone())))),
             schema,
             backing: RwLock::new(MemTableBacking::Resident),
+            tail_path: Mutex::new(None),
             state: AtomicU8::new(MemTableState::Pending as u8),
             row_count: AtomicU64::new(0),
             created_at: Instant::now(),
             txn_id: AtomicU64::new(txn_id),
             visibility: RwLock::new(TxnVisibility::Uncommitted(txn_id)),
             content_version: AtomicU64::new(0),
+            needs_segment_flush: AtomicBool::new(false),
         }
     }
 
@@ -128,6 +140,45 @@ impl MemTable {
 
     pub fn row_count(&self) -> u64 {
         self.row_count.load(Ordering::Acquire)
+    }
+
+    /// Standby replication apply: the tail now holds `total_rows` rows.
+    /// A spilled memtable just updates its count; a RESIDENT one (already
+    /// materialized before the append) is demoted back to spilled so the
+    /// next access re-materializes the whole tail - otherwise the newer
+    /// frames would stay invisible.
+    pub fn set_tail_rows(&self, total_rows: u64) {
+        let mut guard = self.backing.write().unwrap();
+        match &mut *guard {
+            MemTableBacking::Spilled { rows, .. } => {
+                *rows = total_rows;
+                drop(guard);
+                self.row_count.store(total_rows, Ordering::Release);
+            }
+            MemTableBacking::Resident => {
+                let tail_path = self.tail_path.lock().unwrap().clone();
+                drop(guard);
+                if let Some(tail_path) = tail_path {
+                    let mut guard = self.backing.write().unwrap();
+                    *guard = MemTableBacking::Spilled {
+                        tail_path,
+                        rows: total_rows,
+                    };
+                    self.batch.write().unwrap().take();
+                    self.row_count.store(total_rows, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    /// Whether this memtable's tail commit failed and its next flush must
+    /// take the segment protocol (see `needs_segment_flush`).
+    pub fn needs_segment_flush(&self) -> bool {
+        self.needs_segment_flush.load(Ordering::Acquire)
+    }
+
+    pub fn set_needs_segment_flush(&self, value: bool) {
+        self.needs_segment_flush.store(value, Ordering::Release);
     }
 
     pub fn txn_id(&self) -> u64 {
@@ -256,6 +307,15 @@ impl MemTable {
             .map(|batch| Arc::try_unwrap(batch).unwrap_or_else(|shared| shared.as_ref().clone()))
     }
 
+    /// Empty the memtable without materializing the batch. Unlike
+    /// `take_batch()`, this drops the shared `Arc` instead of deep-copying
+    /// the data when another holder (e.g. an in-flight pubsub event) still
+    /// references it. Use at every discard-only call site.
+    pub fn clear_batch(&self) {
+        let mut guard = self.batch.write().unwrap();
+        guard.take();
+    }
+
     /// Copy the current batch without moving it out. Used by the checkpoint
     /// flush path so the data stays resident (then the memtable is marked
     /// `Archived`), in contrast to `take_batch()` which empties the memtable.
@@ -265,6 +325,16 @@ impl MemTable {
         }
         let guard = self.batch.read().unwrap();
         guard.as_ref().map(|batch| batch.as_ref().clone())
+    }
+
+    /// Share the current batch without copying it. The pubsub commit hook
+    /// uses this so change notifications cost an `Arc` clone instead of a
+    /// full column copy on the transaction-commit path.
+    pub fn read_snapshot_arc(&self) -> Option<Arc<RecordBatch>> {
+        if self.ensure_resident().is_err() {
+            return None;
+        }
+        self.batch.read().unwrap().clone()
     }
 
     pub fn is_spilled(&self) -> bool {
@@ -348,6 +418,10 @@ impl MemTable {
         })?;
         let decoded_rows = batch.num_rows() as u64;
         if decoded_rows != expected_rows {
+            // The decoded content is authoritative and kept; the recorded
+            // count is rewritten to match. Counted so the aggregate is
+            // observable via `tail_damage_snapshot()`.
+            crate::storage::core::durable_tail::note_rowcount_mismatch();
             tracing::error!(
                 expected_rows,
                 decoded_rows,
@@ -393,12 +467,14 @@ impl MemTable {
             schema: batch.schema.clone(),
             batch: RwLock::new(Some(Arc::new(batch))),
             backing: RwLock::new(MemTableBacking::Resident),
+            tail_path: Mutex::new(None),
             state: AtomicU8::new(MemTableState::Pending as u8),
             row_count: AtomicU64::new(rows),
             created_at: Instant::now(),
             txn_id: AtomicU64::new(0),
             visibility: RwLock::new(TxnVisibility::Committed),
             content_version: AtomicU64::new(0),
+            needs_segment_flush: AtomicBool::new(false),
         }
     }
 
@@ -420,20 +496,25 @@ impl MemTable {
             partition_key,
             schema,
             batch: RwLock::new(None),
-            backing: RwLock::new(MemTableBacking::Spilled { tail_path, rows }),
+            backing: RwLock::new(MemTableBacking::Spilled {
+                tail_path: tail_path.clone(),
+                rows,
+            }),
+            tail_path: Mutex::new(Some(tail_path)),
             state: AtomicU8::new(MemTableState::Pending as u8),
             row_count: AtomicU64::new(rows),
             created_at: Instant::now(),
             txn_id: AtomicU64::new(0),
             visibility: RwLock::new(TxnVisibility::Committed),
             content_version: AtomicU64::new(0),
+            needs_segment_flush: AtomicBool::new(false),
         }
     }
 
     /// Replace a live memtable while the caller holds the table mutation lock.
     /// Returns `false` if a concurrent flush has already moved the memtable out
     /// of the pending state.
-    pub fn replace_pending_batch(&self, batch: RecordBatch) -> bool {
+    pub fn replace_pending_batch(&self, batch: Arc<RecordBatch>) -> bool {
         if self.state() != MemTableState::Pending {
             return false;
         }
@@ -445,7 +526,9 @@ impl MemTable {
         if self.state() != MemTableState::Pending {
             return false;
         }
-        *guard = Some(Arc::new(batch));
+        // Store the caller's Arc directly: undo backups and updated batches
+        // arrive pre-shared, so the swap costs no deep copy.
+        *guard = Some(batch);
         self.row_count.store(rows, Ordering::Release);
         self.content_version.fetch_add(1, Ordering::Release);
         true
@@ -519,6 +602,29 @@ pub struct MemTableManager {
     low_rate_max_rows: u64,
     low_rate_max_age_secs: u64,
     replace_key_indexes: RwLock<HashMap<Uuid, ReplaceKeyIndex>>,
+    /// Rows per `(db, table, partition)` that reached segments (or will)
+    /// without being mirrored into the hot store: non-fed auto-commit
+    /// appends, committed transaction deltas, bulk/relaxed bypass writes.
+    /// Zero/absent means every segment row of the partition is provably
+    /// mirrored, which is what lets a resident-partition scan answer from
+    /// the hot store alone even after the memtable has been flushed.
+    hot_unfed_rows: Mutex<HashMap<(String, String, HotUnfedScope), u64>>,
+    /// Deferred-DML registry (see `txn_mutations`). Set once by the engine
+    /// after construction; flush selection consults it to skip memtables
+    /// pinned by live transactions.
+    txn_mutations: RwLock<Option<Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>>>,
+}
+
+/// What one hot-unfed accounting entry scopes to. `Table` marks bypasses
+/// whose partitions could not be derived (e.g. raw bulk payloads) and
+/// disables the resident fast path for the whole table; `Partition`
+/// disables it for one partition only. (The previous encoding used a
+/// NUL-prefixed partition string as the table marker, which made the file
+/// read as binary to tooling.)
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum HotUnfedScope {
+    Table,
+    Partition(String),
 }
 
 impl MemTableManager {
@@ -536,7 +642,141 @@ impl MemTableManager {
             low_rate_max_rows,
             low_rate_max_age_secs: low_rate_max_age_secs.max(max_age_secs),
             replace_key_indexes: RwLock::new(HashMap::new()),
+            hot_unfed_rows: Mutex::new(HashMap::new()),
+            txn_mutations: RwLock::new(None),
         }
+    }
+
+    pub fn set_txn_mutations(
+        &self,
+        registry: Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>,
+    ) {
+        *self.txn_mutations.write().unwrap() = Some(registry);
+    }
+
+    pub fn txn_mutations(
+        &self,
+    ) -> Option<Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>> {
+        self.txn_mutations.read().unwrap().clone()
+    }
+
+    /// Standby replication: refresh a tail-backed memtable's total row count
+    /// after tail frames were appended (demotes a resident copy if needed).
+    pub fn set_tail_rows(&self, id: Uuid, rows: u64) {
+        let memtables = self.memtables.read().unwrap();
+        if let Some(mt) = memtables.iter().find(|mt| mt.id() == id) {
+            mt.set_tail_rows(rows);
+        }
+    }
+
+    /// Standby replication: the primary's segment now durably holds these
+    /// memtables' rows; retire the local spilled copies.
+    pub fn retire_replicated_memtables(&self, ids: &[Uuid]) {
+        let memtables = self.memtables.write().unwrap();
+        for mt in memtables.iter() {
+            if ids.contains(&mt.id()) {
+                mt.set_state(MemTableState::Flushed);
+                mt.clear_batch();
+            }
+        }
+    }
+
+    /// Record rows appended through a path that skipped the hot-store mirror.
+    pub fn note_hot_unfed_rows(&self, db: &str, table: &str, partition: &str, rows: u64) {
+        if rows == 0 {
+            return;
+        }
+        let mut unfed = self.hot_unfed_rows.lock().unwrap();
+        *unfed
+            .entry((
+                db.to_string(),
+                table.to_string(),
+                HotUnfedScope::Partition(partition.to_string()),
+            ))
+            .or_insert(0) += rows;
+    }
+
+    /// Unmirrored-row count for one partition. Test/introspection view of
+    /// the accounting; the production claim paths go through
+    /// [`Self::hot_partition_mirrored`] / [`Self::hot_table_fully_mirrored`].
+    pub fn hot_unfed_rows(&self, db: &str, table: &str, partition: &str) -> u64 {
+        let unfed = self.hot_unfed_rows.lock().unwrap();
+        unfed
+            .get(&(
+                db.to_string(),
+                table.to_string(),
+                HotUnfedScope::Partition(partition.to_string()),
+            ))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Table-level bypass marker: partitions cannot be derived for the rows
+    /// (e.g. raw bulk payloads), so the whole table loses the resident fast
+    /// path. Sticky until the table's hot store is invalidated.
+    pub fn note_hot_unfed_table(&self, db: &str, table: &str, rows: u64) {
+        if rows == 0 {
+            return;
+        }
+        let mut unfed = self.hot_unfed_rows.lock().unwrap();
+        *unfed
+            .entry((db.to_string(), table.to_string(), HotUnfedScope::Table))
+            .or_insert(0) += rows;
+    }
+
+    /// True when a resident-partition scan may answer from the hot store
+    /// alone: neither the table-level sentinel nor the partition carries
+    /// unmirrored rows.
+    pub fn hot_partition_mirrored(&self, db: &str, table: &str, partition: &str) -> bool {
+        let unfed = self.hot_unfed_rows.lock().unwrap();
+        if unfed
+            .get(&(db.to_string(), table.to_string(), HotUnfedScope::Table))
+            .copied()
+            .unwrap_or(0)
+            > 0
+        {
+            return false;
+        }
+        unfed
+            .get(&(
+                db.to_string(),
+                table.to_string(),
+                HotUnfedScope::Partition(partition.to_string()),
+            ))
+            .copied()
+            .unwrap_or(0)
+            == 0
+    }
+
+    /// True when no write of the table has ever bypassed the hot-store
+    /// mirror, so the hot-store watermark shortcut over live memtables is
+    /// exact (every live row is also a hot row above the watermark).
+    pub fn hot_table_fully_mirrored(&self, db: &str, table: &str) -> bool {
+        let unfed = self.hot_unfed_rows.lock().unwrap();
+        !unfed
+            .keys()
+            .any(|(k_db, k_table, _)| k_db == db && k_table == table)
+    }
+
+    /// Retract the table's mirror coverage after a hot-store prefix
+    /// reclamation: rows below the new front are gone from the store, so no
+    /// partition's residency is provable anymore. Raised as the sticky
+    /// table-level marker — the same encoding a bulk bypass uses — so both
+    /// claim paths (`hot_partition_mirrored`, `hot_table_fully_mirrored`)
+    /// stand down until the store is invalidated and rebuilt. (The previous
+    /// encoding tried to flip accounted partition counters from 0 to 1, but
+    /// counters only ever hold values >= 1, so the flip never fired and the
+    /// retraction was a no-op.)
+    pub fn retract_hot_mirror_coverage(&self, db: &str, table: &str) {
+        let mut unfed = self.hot_unfed_rows.lock().unwrap();
+        *unfed
+            .entry((db.to_string(), table.to_string(), HotUnfedScope::Table))
+            .or_insert(0) += 1;
+    }
+
+    pub fn clear_hot_unfed(&self, db: &str, table: &str) {
+        let mut unfed = self.hot_unfed_rows.lock().unwrap();
+        unfed.retain(|(k_db, k_table, _), _| k_db != db || k_table != table);
     }
 
     pub fn restore_committed_tail(
@@ -650,6 +890,11 @@ impl MemTableManager {
         }
 
         let mut writable = self.writable.write().unwrap();
+        // Dead entries for this key cannot linger: every retirement point
+        // (`remove_flushed`, `clear_table`, `clear_partition`,
+        // `rename_table`, `rollback_txn`) removes the writable entries of
+        // the memtables it retires, and a retired key's entry is only ever
+        // re-created by the insert below.
         if let Some(memtable) = writable.get(&key).and_then(Weak::upgrade) {
             if memtable.state() == MemTableState::Pending
                 && memtable.txn_id() == txn_id
@@ -869,6 +1114,17 @@ impl MemTableManager {
                 if mt.state() != MemTableState::Pending || mt.is_transactional() {
                     return false;
                 }
+                // A transaction with deferred DELETE/UPDATE plans still needs
+                // this memtable's batch positions stable until COMMIT.
+                if self
+                    .txn_mutations
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|registry| registry.is_memtable_pinned(mt.id()))
+                {
+                    return false;
+                }
                 let rows = mt.row_count();
                 // A spilled memtable holds no resident rows, so the extended
                 // low-rate age brings no memory benefit — it only keeps tail
@@ -888,32 +1144,77 @@ impl MemTableManager {
         let memtables = self.memtables.read().unwrap();
         memtables
             .iter()
-            .filter(|mt| mt.state() == MemTableState::Pending)
+            .filter(|mt| {
+                // FLUSH ALL (and shutdown) must never materialize another
+                // session's uncommitted rows into segments: transactional
+                // memtables only reach segments through COMMIT.
+                mt.state() == MemTableState::Pending && !mt.is_transactional()
+            })
             .cloned()
             .collect()
     }
 
+    /// Drop the writable entries of retired memtables. Retirement points
+    /// call this with the keys of the memtables they removed, so the map
+    /// never accumulates dead entries and the insertion path never needs a
+    /// full-map sweep.
+    fn remove_writable_keys(&self, keys: &[WritableTableKey]) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut writable = self.writable.write().unwrap();
+        for key in keys {
+            // Only drop the entry if it still points at a dead memtable: a
+            // live replacement for the same key (re-created after retirement)
+            // must survive.
+            if writable.get(key).and_then(Weak::upgrade).is_none() {
+                writable.remove(key);
+            }
+        }
+    }
+
     pub fn remove_flushed(&self) {
         let mut memtables = self.memtables.write().unwrap();
-        memtables.retain(|mt| mt.state() != MemTableState::Flushed);
+        let mut retired_keys: Vec<WritableTableKey> = Vec::new();
+        memtables.retain(|mt| {
+            if mt.state() != MemTableState::Flushed {
+                return true;
+            }
+            retired_keys.push((
+                mt.db().to_string(),
+                mt.table().to_string(),
+                mt.partition_key().to_string(),
+                mt.txn_id(),
+            ));
+            false
+        });
         drop(memtables);
+        self.remove_writable_keys(&retired_keys);
         self.prune_replace_key_indexes();
     }
 
     pub fn clear_table(&self, db: &str, table: &str) -> u64 {
         let mut memtables = self.memtables.write().unwrap();
         let mut cleared = 0u64;
+        let mut retired_keys: Vec<WritableTableKey> = Vec::new();
         memtables.retain(|mt| {
             if mt.db() == db && mt.table() == table {
                 cleared += mt.row_count();
+                retired_keys.push((
+                    mt.db().to_string(),
+                    mt.table().to_string(),
+                    mt.partition_key().to_string(),
+                    mt.txn_id(),
+                ));
                 mt.set_state(MemTableState::Flushed);
-                let _ = mt.take_batch();
+                mt.clear_batch();
                 false
             } else {
                 true
             }
         });
         drop(memtables);
+        self.remove_writable_keys(&retired_keys);
         self.prune_replace_key_indexes();
         cleared
     }
@@ -921,23 +1222,32 @@ impl MemTableManager {
     pub fn clear_partition(&self, db: &str, table: &str, partition_key: &str) -> u64 {
         let mut memtables = self.memtables.write().unwrap();
         let mut cleared = 0u64;
+        let mut retired_keys: Vec<WritableTableKey> = Vec::new();
         memtables.retain(|mt| {
             if mt.db() == db && mt.table() == table && mt.partition_key() == partition_key {
                 cleared += mt.row_count();
+                retired_keys.push((
+                    mt.db().to_string(),
+                    mt.table().to_string(),
+                    mt.partition_key().to_string(),
+                    mt.txn_id(),
+                ));
                 mt.set_state(MemTableState::Flushed);
-                let _ = mt.take_batch();
+                mt.clear_batch();
                 false
             } else {
                 true
             }
         });
         drop(memtables);
+        self.remove_writable_keys(&retired_keys);
         self.prune_replace_key_indexes();
         cleared
     }
 
     pub fn rename_table(&self, db: &str, old_table: &str, new_table: &str) -> u64 {
         let mut memtables = self.memtables.write().unwrap();
+        let mut retired_keys: Vec<WritableTableKey> = Vec::new();
         let mut replacements = Vec::new();
         let mut renamed_rows = 0u64;
         memtables.retain(|mt| {
@@ -945,6 +1255,12 @@ impl MemTableManager {
                 return true;
             }
 
+            retired_keys.push((
+                mt.db().to_string(),
+                mt.table().to_string(),
+                mt.partition_key().to_string(),
+                mt.txn_id(),
+            ));
             let old_state = mt.state();
             mt.set_state(MemTableState::Flushed);
             let Some(batch) = mt.take_batch() else {
@@ -982,6 +1298,7 @@ impl MemTableManager {
         });
         memtables.extend(replacements);
         drop(memtables);
+        self.remove_writable_keys(&retired_keys);
         self.prune_replace_key_indexes();
         renamed_rows
     }
@@ -990,8 +1307,15 @@ impl MemTableManager {
         let mut memtables = self.memtables.write().unwrap();
         let mut rolled_back = 0u64;
         let mut removed_any = false;
+        let mut retired_keys: Vec<WritableTableKey> = Vec::new();
         memtables.retain(|mt| {
             if mt.txn_id() == txn_id {
+                retired_keys.push((
+                    mt.db().to_string(),
+                    mt.table().to_string(),
+                    mt.partition_key().to_string(),
+                    mt.txn_id(),
+                ));
                 mt.mark_aborted();
                 rolled_back += mt.row_count();
                 removed_any = true;
@@ -1002,6 +1326,7 @@ impl MemTableManager {
         });
         drop(memtables);
         if removed_any {
+            self.remove_writable_keys(&retired_keys);
             self.prune_replace_key_indexes();
         }
         rolled_back
@@ -1014,10 +1339,36 @@ impl MemTableManager {
             .filter(|mt| mt.txn_id() == txn_id && mt.state() == MemTableState::Pending)
             .cloned()
             .collect();
+        // Transaction deltas never pass through the hot store, so committing
+        // them makes the touched partitions unprovable for the resident fast
+        // path until the store is rebuilt (invalidate / warmup).
+        for mt in &committed {
+            self.note_hot_unfed_rows(mt.db(), mt.table(), mt.partition_key(), mt.row_count());
+        }
         for mt in &committed {
             mt.mark_committed();
         }
         committed
+    }
+
+    /// Memtables that are already visible (`Committed`) and still awaiting
+    /// persistence. `commit_txn` flips visibility before the durable-tail
+    /// wait and the flip clears each memtable's txn_id, so a retried
+    /// `commit_txn(txn_id)` finds nothing; the COMMIT retry path drives
+    /// durability from this set instead. Uncommitted transactional
+    /// memtables (visibility `Uncommitted`) are never included — flushing
+    /// one would publish another session's rows.
+    pub fn committed_pending_memtables(&self) -> Vec<Arc<MemTable>> {
+        let memtables = self.memtables.read().unwrap();
+        memtables
+            .iter()
+            .filter(|mt| {
+                mt.txn_id() == 0
+                    && mt.state() == MemTableState::Pending
+                    && mt.visibility() == TxnVisibility::Committed
+            })
+            .cloned()
+            .collect()
     }
 
     /// Approximate resident bytes owned by pending memtables. Spilled

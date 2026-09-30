@@ -64,6 +64,7 @@ fn init_tracing(level: &str) {
         Ok(async_writer) => {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(env_filter(level))
+                .with_ansi(false)
                 .with_writer(move || async_writer.clone())
                 .try_init();
         }
@@ -71,6 +72,7 @@ fn init_tracing(level: &str) {
             eprintln!("failed to start asynchronous console logger: {error}");
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(env_filter(level))
+                .with_ansi(false)
                 .try_init();
         }
     }
@@ -187,22 +189,38 @@ where
         config.storage.reader_cache_capacity,
     );
     common::config::set_storage_timeouts(common::config::StorageTimeouts {
-        mutation_lock_timeout_ms: config.storage.mutation_lock_timeout_ms,
-        mutation_lock_warn_ms: config.storage.mutation_lock_warn_ms,
-        tail_commit_timeout_ms: config.storage.tail_commit_timeout_ms,
-        tail_commit_warn_ms: config.storage.tail_commit_warn_ms,
+        mutation_lock_timeout_secs: config.storage.mutation_lock_timeout_secs,
+        mutation_lock_warn_secs: config.storage.mutation_lock_warn_secs,
+        tail_commit_timeout_secs: config.storage.tail_commit_timeout_secs,
+        tail_commit_warn_secs: config.storage.tail_commit_warn_secs,
     });
 
+    let mut pubsub_settings = config.pubsub.clone();
+    if !config.compression.enabled {
+        pubsub_settings.compress_threshold = usize::MAX;
+    }
+    crate::common::config::set_tail_archive_enabled(config.storage.tail_archive);
+    crate::common::config::set_replication_settings(config.replication.clone());
+    let replication_standby = config.replication.role_is_standby();
+    let mut auto_compact = auto_compact_config_from_server_config(&config);
+    if replication_standby {
+        // The standby's data comes from the primary's stream; local
+        // compaction would diverge the physical layout the events assume.
+        auto_compact.enabled = false;
+        auto_compact.fragmentation_enabled = false;
+    }
     let engine = match Engine::new_with_storage_config_and_auto_compact(
         std::path::Path::new(&config.storage.data_dir),
         &config.storage.default_database,
         segment_config_from_server_config(&config),
-        auto_compact_config_from_server_config(&config),
+        auto_compact,
         config
             .storage
             .hot_store_memory_limit_mb
             .saturating_mul(1024 * 1024),
         config.storage.tail_async_fsync,
+        pubsub_settings,
+        config.storage.hot_warmup_enabled,
     ) {
         Ok(e) => e,
         Err(e) => {
@@ -226,14 +244,30 @@ where
         max_parallel_segments: config.buffer.max_parallel_segments.max(1),
         global_io_permits: config.buffer.global_io_permits.max(1),
         global_cpu_permits: config.buffer.global_cpu_permits.max(1),
+        hybrid_hot_scan_enabled: config.storage.hybrid_hot_scan_enabled,
     });
     let engine = Arc::new(engine);
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(config.buffer.execution_threads.max(1))
         .thread_name(|idx| format!("taibai-exec-{idx}"))
         .build_global();
-    sql::execution::engine::start_close_of_day_scheduler(engine.clone());
-    tracing::info!("close-of-day scheduler started");
+    if replication_standby {
+        engine.set_read_only();
+        let standby_config = crate::storage::replication::standby::StandbyConfig {
+            primary_addr: config.replication.primary_addr.clone(),
+            user: config.replication.user.clone(),
+            password: config.replication.password.clone(),
+            database: config.storage.default_database.clone(),
+        };
+        crate::storage::replication::standby::spawn(engine.clone(), standby_config);
+        tracing::info!(
+            primary = %config.replication.primary_addr,
+            "standby replication applier started; local schedulers disabled"
+        );
+    } else {
+        sql::execution::engine::start_close_of_day_scheduler(engine.clone());
+        tracing::info!("close-of-day scheduler started");
+    }
 
     let server = Server::new(config, engine.clone());
 
@@ -549,6 +583,12 @@ fn append_column_cell(line: &mut String, col: &types::array::ColumnArray, row: u
     }
 
     match col {
+        types::array::ColumnArray::Selected { .. } | types::array::ColumnArray::Rle { .. } => {
+            return append_column_cell(line, col.flattened(), row, scale);
+        }
+        types::array::ColumnArray::Dictionary { .. } => {
+            return append_column_cell(line, &col.materialize_varchar(), row, scale);
+        }
         types::array::ColumnArray::Bool { data, .. } => {
             line.push_str(if data[row] != 0 { "true" } else { "false" });
         }

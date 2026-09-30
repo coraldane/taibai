@@ -85,6 +85,14 @@ impl NullBitmap {
         self.data.iter().map(|w| w.count_ones() as usize).sum()
     }
 
+    /// Raw bitmap words (bit=1 means NULL) for word-at-a-time processing.
+    /// Only the first `len` bits are meaningful; trailing bits of the last
+    /// word are zero.
+    #[inline]
+    pub fn words(&self) -> &[u64] {
+        &self.data
+    }
+
     pub fn is_all_valid(&self) -> bool {
         for &word in &self.data {
             if word != 0 {
@@ -164,6 +172,20 @@ impl NullBitmap {
             if let Some(last) = self.data.last_mut() {
                 *last &= mask;
             }
+        }
+    }
+
+    /// Append `n` valid rows in one step. Gathers from null-free source
+    /// columns use this to keep the bitmap work O(n/64) instead of a branch
+    /// per row.
+    pub fn extend_valid(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.len += n;
+        let needed = Self::u64_count(self.len);
+        if self.data.len() < needed {
+            self.data.resize(needed, 0);
         }
     }
 

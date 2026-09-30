@@ -143,11 +143,17 @@ fn plan_complexity(plan: &LogicalPlan) -> usize {
         }
         LogicalPlan::Distinct(d) => 1 + plan_complexity(&d.input),
         LogicalPlan::Window(w) => {
-            1 + w.partition_by.iter().map(expr_complexity).sum::<usize>()
-                + w.order_by
-                    .iter()
-                    .map(|sk| expr_complexity(&sk.expr))
-                    .sum::<usize>()
+            1 + w
+                .funcs
+                .iter()
+                .map(|f| {
+                    f.partition_by.iter().map(expr_complexity).sum::<usize>()
+                        + f.order_by
+                            .iter()
+                            .map(|sk| expr_complexity(&sk.expr))
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
                 + plan_complexity(&w.input)
         }
     }

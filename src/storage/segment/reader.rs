@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 
 use crate::common::error::{Result, TaibaiError};
-use crate::storage::codec::column_codec::{decode_column, decode_column_selected};
+use crate::storage::codec::column_codec::{decode_column_selected, decode_column_with_runs};
 use crate::storage::index::bloomfilter::BloomFilter;
 use crate::storage::partition::pruning::{RowGroupPredicate, ScanStats, ZoneMap};
 use crate::storage::segment::delete_bitmap;
@@ -14,8 +14,9 @@ use crate::types::array::ColumnArray;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
-use super::constants::{SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
+use super::constants::{is_supported_segment_version, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC};
 use super::footer::{parse_segment_footer, reserved_section_offset, ParsedSegmentFooter};
+use super::footer_ext::{append_footer_crc, encode_footer_tail};
 use super::meta::{read_embedded_footer, read_latest_sidecar_footer};
 use super::RowGroupMeta;
 
@@ -48,6 +49,20 @@ pub struct SegmentReader {
     data: SegmentData,
     footer: SegmentFooter,
     data_end: u64,
+    /// Prefix sums of row-group row counts, built once at open:
+    /// `row_group_start_row` used to re-sum per call (O(row_groups^2) per
+    /// scan segment during delete-bitmap filtering).
+    row_group_starts: Vec<u64>,
+    /// Uncommitted-transaction delete view, set only on scan-side reader
+    /// instances opened for a transaction that ran deferred DML (never on
+    /// the shared cached readers). When present, every delete lookup answers
+    /// from this composed bitmap instead of the footer.
+    txn_delete_overlay: Option<TxnDeleteOverlay>,
+}
+
+struct TxnDeleteOverlay {
+    bitmap: std::sync::Arc<Vec<u8>>,
+    deleted_count: u64,
 }
 
 struct FooterSource {
@@ -103,11 +118,11 @@ impl SegmentReader {
                 path.display(),
             )));
         }
-        if hdr_version != SEGMENT_VERSION {
+        if !is_supported_segment_version(hdr_version) {
             return Err(TaibaiError::Storage(format!(
-                "unsupported segment version: {} (expected {}, file: {})",
+                "unsupported segment version: {} (supported: {:?}, file: {}) - run the migrate tool after upgrading",
                 hdr_version,
-                SEGMENT_VERSION,
+                super::constants::SUPPORTED_SEGMENT_VERSIONS,
                 path.display(),
             )));
         }
@@ -139,11 +154,21 @@ impl SegmentReader {
 
         let parsed = parse_segment_footer(&footer_source.footer)?;
 
+        let footer: SegmentFooter = parsed.into();
+        let mut row_group_starts = Vec::with_capacity(footer.row_groups.len() + 1);
+        let mut running = 0u64;
+        for rg in &footer.row_groups {
+            row_group_starts.push(running);
+            running = running.saturating_add(rg.row_count);
+        }
+        row_group_starts.push(running);
         Ok(Self {
             path: path.to_path_buf(),
             data,
-            footer: parsed.into(),
+            footer,
             data_end: footer_source.data_end,
+            row_group_starts,
+            txn_delete_overlay: None,
         })
     }
 
@@ -186,29 +211,57 @@ impl SegmentReader {
         self.footer.row_groups.clone()
     }
 
+    /// Borrowed footer row groups: metadata walks that only read zone maps
+    /// and sums must not pay the deep clone in
+    /// [`Self::footer_row_groups_info`] — value sets and bloom filters make
+    /// that expensive on wide clustered segments.
+    pub fn footer_row_groups(&self) -> &[RowGroupMeta] {
+        &self.footer.row_groups
+    }
+
     pub fn row_group_start_row(&self, row_group: usize) -> u64 {
-        self.footer
-            .row_groups
-            .iter()
-            .take(row_group)
-            .map(|r| r.row_count)
-            .sum()
+        // O(1) from the prefix built at open; the old re-summing made
+        // per-row-group delete filtering quadratic in the row-group count.
+        self.row_group_starts
+            .get(row_group)
+            .copied()
+            .unwrap_or_else(|| self.row_group_starts.last().copied().unwrap_or(0))
     }
 
     pub fn row_group_rows(&self, row_group: usize) -> u64 {
         self.footer.row_groups[row_group].row_count
     }
 
+    /// Attach a transaction's composed delete bitmap (footer ∪ deferred
+    /// tombstones of the owning transaction). Only fresh per-scan instances
+    /// receive this — the cached readers are shared across sessions.
+    pub fn set_txn_delete_overlay(&mut self, bitmap: std::sync::Arc<Vec<u8>>) {
+        let deleted_count = bitmap.iter().map(|byte| byte.count_ones() as u64).sum();
+        self.txn_delete_overlay = Some(TxnDeleteOverlay {
+            bitmap,
+            deleted_count,
+        });
+    }
+
     pub fn deleted_row_count(&self) -> u64 {
-        self.footer.deleted_row_count
+        match &self.txn_delete_overlay {
+            Some(overlay) => overlay.deleted_count,
+            None => self.footer.deleted_row_count,
+        }
     }
 
     pub fn delete_bitmap(&self) -> &[u8] {
-        &self.footer.delete_bitmap
+        match &self.txn_delete_overlay {
+            Some(overlay) => &overlay.bitmap,
+            None => &self.footer.delete_bitmap,
+        }
     }
 
     pub fn is_row_deleted(&self, row_id: u64) -> bool {
-        let bm = &self.footer.delete_bitmap;
+        let bm = match &self.txn_delete_overlay {
+            Some(overlay) => &overlay.bitmap,
+            None => &self.footer.delete_bitmap,
+        };
         if bm.is_empty() {
             return false;
         }
@@ -229,24 +282,115 @@ impl SegmentReader {
         // snapshot. SegmentManager refreshes the sidecar separately when this
         // is still an active segment.
         let source = Self::read_dat_footer_source(path, None)?;
+        // Validate the source footer with the full parser (footer checksum,
+        // extension structure) before copying any of it: a locally corrupt
+        // footer used to be copied verbatim and "laundered" by the freshly
+        // recomputed checksum.
+        let parsed = parse_segment_footer(&source.footer)?;
         let res_offset = reserved_section_offset(&source.footer)?;
 
-        let mut new_footer = Vec::with_capacity(res_offset + 12 + delete_bitmap.len());
+        // The rebuilt footer keeps the row-group prefix (including the
+        // per-row-group CRC extensions) verbatim — the column blocks are
+        // untouched — and replaces the delete section, so the whole-footer
+        // checksum must be recomputed, never copied.
+        let mut new_footer = Vec::with_capacity(res_offset + 20 + delete_bitmap.len());
         new_footer.extend_from_slice(&source.footer[..res_offset]);
         new_footer.extend_from_slice(&deleted_row_count.to_le_bytes());
         new_footer.extend_from_slice(&(delete_bitmap.len() as u32).to_le_bytes());
         if !delete_bitmap.is_empty() {
             new_footer.extend_from_slice(delete_bitmap);
         }
+        // Preserve footer tail TLV entries across the rewrite, then
+        // close with a fresh whole-footer checksum (always last).
+        new_footer.extend_from_slice(&encode_footer_tail(&parsed.tail));
+        append_footer_crc(&mut new_footer);
 
-        let mut file = fs::OpenOptions::new().write(true).open(path)?;
-        file.set_len(source.data_end)?;
-        file.seek(SeekFrom::Start(source.data_end))?;
-        file.write_all(&new_footer)?;
-        file.write_all(&source.data_end.to_le_bytes())?;
-        file.flush()?;
-        file.sync_all()?;
+        // The in-place truncate-and-rewrite below is not atomic: a crash
+        // between `set_len` and the new footer reaching disk would leave the
+        // segment with neither embedded footer nor sidecar, silently dropping
+        // its data from every scan. A journal file (`<segment>.del`) makes
+        // the rewrite recoverable — see `repair_pending_footer_rewrite`,
+        // which discovery invokes when a segment fails to open.
+        let journal = pending_delete_journal_path(path);
+        write_delete_journal(&journal, source.data_end, &new_footer)?;
+
+        let write_result = Self::apply_footer_bytes_with_retry(path, source.data_end, &new_footer);
+        if write_result.is_err() {
+            // The journal stays behind: the next open of this segment
+            // repairs from it instead of losing the data block.
+            return write_result;
+        }
+        let _ = fs::remove_file(&journal);
         Ok(())
+    }
+
+    /// Truncate to `data_end` and append the new footer, retrying with
+    /// backoff: on Windows, `set_len` fails while a reader holds the segment
+    /// mmapped (ERROR_USER_MAPPED_FILE). The write is idempotent, so
+    /// retrying the whole body after a partial attempt is safe. A long
+    /// analytical scan easily holds its mmap for many seconds, so the window
+    /// grows to ~10s (fixed 200ms steps); a delete failing here used to
+    /// leave the statement partially applied.
+    fn apply_footer_bytes_with_retry(path: &Path, data_end: u64, footer: &[u8]) -> Result<()> {
+        const ATTEMPTS: usize = 50;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+        let mut last_err = None;
+        for attempt in 0..ATTEMPTS {
+            let result = (|| -> Result<()> {
+                let mut file = fs::OpenOptions::new().write(true).open(path)?;
+                file.set_len(data_end)?;
+                file.seek(SeekFrom::Start(data_end))?;
+                file.write_all(footer)?;
+                file.write_all(&data_end.to_le_bytes())?;
+                file.flush()?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    // Non-retryable errors (permissions, missing file) fail
+                    // fast instead of burning the full retry window.
+                    if !error_is_retryable_file_conflict(&err) {
+                        return Err(err);
+                    }
+                    last_err = Some(err);
+                    if attempt + 1 < ATTEMPTS {
+                        std::thread::sleep(RETRY_DELAY);
+                    }
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| TaibaiError::Storage("segment footer rewrite failed".to_string())))
+    }
+
+    /// Complete or discard an interrupted delete-footer rewrite. Returns
+    /// `true` when the embedded footer was repaired from the journal.
+    pub fn repair_pending_footer_rewrite(path: &Path) -> Result<bool> {
+        let journal = pending_delete_journal_path(path);
+        if !journal.exists() {
+            return Ok(false);
+        }
+        let Some((data_end, footer)) = read_delete_journal(&journal)? else {
+            // Unreadable journal: nothing we can safely apply. Remove it so
+            // it does not mask future rewrites of this segment.
+            let _ = fs::remove_file(&journal);
+            return Ok(false);
+        };
+        if Self::read_dat_footer_source(path, None).is_ok() {
+            // The embedded footer parses: the rewrite had completed and only
+            // the journal removal was lost.
+            let _ = fs::remove_file(&journal);
+            return Ok(false);
+        }
+        tracing::warn!(
+            file = %path.display(),
+            "repairing segment from interrupted delete-footer journal"
+        );
+        Self::apply_footer_bytes_with_retry(path, data_end, &footer)?;
+        let _ = fs::remove_file(&journal);
+        Ok(true)
     }
 
     fn read_footer_source(path: &Path, file_len_hint: Option<u64>) -> Result<FooterSource> {
@@ -296,23 +440,75 @@ impl SegmentReader {
     }
 
     pub fn read_column(&self, row_group: usize, column_idx: usize) -> Result<ColumnArray> {
+        self.read_column_allow_dictionary(row_group, column_idx, false)
+    }
+
+    pub fn read_column_allow_dictionary(
+        &self,
+        row_group: usize,
+        column_idx: usize,
+        allow_dictionary: bool,
+    ) -> Result<ColumnArray> {
+        self.read_column_passthrough(row_group, column_idx, allow_dictionary, false)
+    }
+
+    /// `allow_runs` keeps Rle/DeltaRle columns in run form for run-aware
+    /// consumers (everything else flattens lazily).
+    pub fn read_column_passthrough(
+        &self,
+        row_group: usize,
+        column_idx: usize,
+        allow_dictionary: bool,
+        allow_runs: bool,
+    ) -> Result<ColumnArray> {
         let rg = &self.footer.row_groups[row_group];
         let col_def = &self.footer.schema.columns[column_idx];
 
         let decompressed = self.read_column_raw(row_group, column_idx)?;
-        decode_column(&decompressed, rg.row_count as usize, col_def)
+        decode_column_with_runs(
+            &decompressed,
+            rg.row_count as usize,
+            col_def,
+            allow_dictionary,
+            allow_runs,
+        )
     }
 
     pub fn read_column_raw(&self, row_group: usize, column_idx: usize) -> Result<Vec<u8>> {
         let rg = &self.footer.row_groups[row_group];
         let mut col_offset = rg.offset as usize;
         for i in 0..column_idx {
-            col_offset += rg.column_compressed_sizes[i] as usize;
+            col_offset = col_offset.wrapping_add(rg.column_compressed_sizes[i] as usize);
         }
         let col_len = rg.column_compressed_sizes[column_idx] as usize;
 
         let data = self.data.as_slice();
-        let compressed = &data[col_offset..col_offset + col_len];
+        // Footer offsets come from disk: a corrupted footer must surface as
+        // an error, not as an out-of-bounds panic.
+        let col_end = col_offset
+            .checked_add(col_len)
+            .ok_or_else(|| TaibaiError::Storage("segment column offset overflow".to_string()))?;
+        if col_offset > data.len() || col_end > data.len() {
+            return Err(TaibaiError::Storage(format!(
+                "segment column range {}..{} exceeds data length {}",
+                col_offset,
+                col_end,
+                data.len()
+            )));
+        }
+        let compressed = &data[col_offset..col_end];
+
+        // Block checksum (present for segments written with the CRC
+        // extension): bit rot must fail the read instead of decompressing
+        // into garbage values.
+        if let Some(&expected) = rg.column_crcs.get(column_idx) {
+            if crc32fast::hash(compressed) != expected {
+                return Err(TaibaiError::Storage(format!(
+                    "segment column checksum mismatch at row group {} column {}",
+                    row_group, column_idx
+                )));
+            }
+        }
 
         Ok(Self::decompress_column_block(compressed)?.into_owned())
     }
@@ -321,6 +517,25 @@ impl SegmentReader {
         &self,
         row_group: usize,
         column_indices: &[usize],
+    ) -> Result<Vec<(usize, ColumnArray)>> {
+        self.read_row_group_batch_allow_dictionary(row_group, column_indices, false)
+    }
+
+    pub fn read_row_group_batch_allow_dictionary(
+        &self,
+        row_group: usize,
+        column_indices: &[usize],
+        allow_dictionary: bool,
+    ) -> Result<Vec<(usize, ColumnArray)>> {
+        self.read_row_group_batch_passthrough(row_group, column_indices, allow_dictionary, false)
+    }
+
+    pub fn read_row_group_batch_passthrough(
+        &self,
+        row_group: usize,
+        column_indices: &[usize],
+        allow_dictionary: bool,
+        allow_runs: bool,
     ) -> Result<Vec<(usize, ColumnArray)>> {
         if column_indices.is_empty() {
             return Ok(Vec::new());
@@ -333,7 +548,21 @@ impl SegmentReader {
         }
 
         let data = self.data.as_slice();
-        let all_data = &data[rg.offset as usize..rg.offset as usize + total_size];
+        // Footer offsets come from disk: a corrupted footer must surface as
+        // an error, not as an out-of-bounds panic (same contract as
+        // read_column_raw).
+        let rg_end = (rg.offset as usize)
+            .checked_add(total_size)
+            .ok_or_else(|| TaibaiError::Storage("segment row group offset overflow".to_string()))?;
+        if rg.offset as usize > data.len() || rg_end > data.len() {
+            return Err(TaibaiError::Storage(format!(
+                "segment row group range {}..{} exceeds data length {}",
+                rg.offset,
+                rg_end,
+                data.len()
+            )));
+        }
+        let all_data = &data[rg.offset as usize..rg_end];
 
         let col_offsets: Vec<usize> = rg
             .column_compressed_sizes
@@ -358,7 +587,13 @@ impl SegmentReader {
                 let compressed = &all_data[col_offset..col_offset + col_len];
                 let decompressed = Self::decompress_column_block(compressed)?;
                 let col_def = &self.footer.schema.columns[col_idx];
-                let col_array = decode_column(&decompressed, rg.row_count as usize, col_def)?;
+                let col_array = decode_column_with_runs(
+                    &decompressed,
+                    rg.row_count as usize,
+                    col_def,
+                    allow_dictionary,
+                    allow_runs,
+                )?;
                 Ok(Some((col_idx, col_array)))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -383,7 +618,21 @@ impl SegmentReader {
         }
 
         let data = self.data.as_slice();
-        let all_data = &data[rg.offset as usize..rg.offset as usize + total_size];
+        // Footer offsets come from disk: a corrupted footer must surface as
+        // an error, not as an out-of-bounds panic (same contract as
+        // read_column_raw).
+        let rg_end = (rg.offset as usize)
+            .checked_add(total_size)
+            .ok_or_else(|| TaibaiError::Storage("segment row group offset overflow".to_string()))?;
+        if rg.offset as usize > data.len() || rg_end > data.len() {
+            return Err(TaibaiError::Storage(format!(
+                "segment row group range {}..{} exceeds data length {}",
+                rg.offset,
+                rg_end,
+                data.len()
+            )));
+        }
+        let all_data = &data[rg.offset as usize..rg_end];
 
         let col_offsets: Vec<usize> = rg
             .column_compressed_sizes
@@ -427,7 +676,31 @@ impl SegmentReader {
         row_group: usize,
         column_indices: &[usize],
     ) -> Result<crate::types::batch::RecordBatch> {
-        let columns_data = self.read_row_group_batch(row_group, column_indices)?;
+        self.read_columns_fast_allow_dictionary(row_group, column_indices, false)
+    }
+
+    pub fn read_columns_fast_allow_dictionary(
+        &self,
+        row_group: usize,
+        column_indices: &[usize],
+        allow_dictionary: bool,
+    ) -> Result<crate::types::batch::RecordBatch> {
+        self.read_columns_fast_passthrough(row_group, column_indices, allow_dictionary, false)
+    }
+
+    pub fn read_columns_fast_passthrough(
+        &self,
+        row_group: usize,
+        column_indices: &[usize],
+        allow_dictionary: bool,
+        allow_runs: bool,
+    ) -> Result<crate::types::batch::RecordBatch> {
+        let columns_data = self.read_row_group_batch_passthrough(
+            row_group,
+            column_indices,
+            allow_dictionary,
+            allow_runs,
+        )?;
 
         let mut columns = Vec::with_capacity(column_indices.len());
         let mut col_defs = Vec::with_capacity(column_indices.len());
@@ -505,6 +778,7 @@ impl SegmentReader {
                     primary_key: self.footer.schema.columns[idx].primary_key,
                     default_value: self.footer.schema.columns[idx].default_value.clone(),
                     column_id: self.footer.schema.columns[idx].column_id,
+                    added_at_micros: None,
                     previous_names: self.footer.schema.columns[idx].previous_names.clone(),
                 })
                 .collect(),
@@ -527,10 +801,39 @@ impl SegmentReader {
         row_group: usize,
         projection: &[usize],
     ) -> Result<crate::types::batch::RecordBatch> {
+        self.read_row_group_with_projection_and_dictionary(row_group, projection, false)
+    }
+
+    pub fn read_row_group_with_projection_and_dictionary(
+        &self,
+        row_group: usize,
+        projection: &[usize],
+        allow_dictionary: bool,
+    ) -> Result<crate::types::batch::RecordBatch> {
+        self.read_row_group_with_projection_passthrough(
+            row_group,
+            projection,
+            allow_dictionary,
+            false,
+        )
+    }
+
+    pub fn read_row_group_with_projection_passthrough(
+        &self,
+        row_group: usize,
+        projection: &[usize],
+        allow_dictionary: bool,
+        allow_runs: bool,
+    ) -> Result<crate::types::batch::RecordBatch> {
         let mut columns = Vec::with_capacity(projection.len());
         let mut col_defs = Vec::with_capacity(projection.len());
         for &col_idx in projection {
-            columns.push(self.read_column(row_group, col_idx)?);
+            columns.push(self.read_column_passthrough(
+                row_group,
+                col_idx,
+                allow_dictionary,
+                allow_runs,
+            )?);
             col_defs.push(self.footer.schema.columns[col_idx].clone());
         }
         let schema = crate::types::batch::Schema::new(col_defs);
@@ -740,9 +1043,14 @@ fn split_batch(
 ) -> crate::types::batch::RecordBatch {
     let mut columns = Vec::with_capacity(batch.num_columns());
     for i in 0..batch.num_columns() {
-        columns.push(split_column(batch.column(i).unwrap(), start, end));
+        columns.push(split_column(
+            batch.column(i).expect("column exists"),
+            start,
+            end,
+        ));
     }
-    crate::types::batch::RecordBatch::try_new(batch.schema.clone(), columns).unwrap()
+    crate::types::batch::RecordBatch::try_new(batch.schema.clone(), columns)
+        .expect("split_batch: sliced columns match the batch schema")
 }
 
 fn split_column(col: &ColumnArray, start: usize, end: usize) -> ColumnArray {
@@ -751,4 +1059,90 @@ fn split_column(col: &ColumnArray, start: usize, end: usize) -> ColumnArray {
         new_col.push(&col.scalar(i)).unwrap();
     }
     new_col
+}
+
+// ---------------------------------------------------------------------------
+// Delete-footer rewrite journal
+//
+// `<segment-file>.del` records the exact bytes of a pending in-place footer
+// rewrite before truncation starts, so a crash mid-rewrite can be repaired
+// on the next open instead of silently losing the segment's data.
+// Layout: magic(8) | data_end u64 | footer_len u32 | footer bytes | crc32 u32
+// ---------------------------------------------------------------------------
+
+const DELETE_JOURNAL_MAGIC: &[u8; 8] = b"TBDELJ01";
+
+fn pending_delete_journal_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".del");
+    PathBuf::from(name)
+}
+
+fn write_delete_journal(journal: &Path, data_end: u64, footer: &[u8]) -> Result<()> {
+    let mut body = Vec::with_capacity(footer.len() + 12);
+    body.extend_from_slice(&data_end.to_le_bytes());
+    body.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+    body.extend_from_slice(footer);
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&body);
+    let crc = crc.finalize();
+
+    let tmp = {
+        let mut name = journal.as_os_str().to_os_string();
+        name.push(".tmp");
+        PathBuf::from(name)
+    };
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    file.write_all(DELETE_JOURNAL_MAGIC)?;
+    file.write_all(&body)?;
+    file.write_all(&crc.to_le_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    // Journal visibility must be atomic: fs::rename replaces the destination
+    // on both platforms (MoveFileEx(REPLACE_EXISTING) semantics on Windows).
+    fs::rename(&tmp, journal)?;
+    Ok(())
+}
+
+fn read_delete_journal(journal: &Path) -> Result<Option<(u64, Vec<u8>)>> {
+    let Ok(bytes) = fs::read(journal) else {
+        return Ok(None);
+    };
+    if bytes.len() < 8 + 12 + 4 || !bytes.starts_with(DELETE_JOURNAL_MAGIC) {
+        return Ok(None);
+    }
+    let body = &bytes[8..bytes.len() - 4];
+    let crc = u32::from_le_bytes(
+        bytes[bytes.len() - 4..]
+            .try_into()
+            .expect("crc slice has fixed length"),
+    );
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(body);
+    if hasher.finalize() != crc {
+        return Ok(None);
+    }
+    let data_end = u64::from_le_bytes(body[0..8].try_into().expect("u64 slice"));
+    let footer_len = u32::from_le_bytes(body[8..12].try_into().expect("u32 slice")) as usize;
+    if body.len() < 12 + footer_len {
+        return Ok(None);
+    }
+    Ok(Some((data_end, body[12..12 + footer_len].to_vec())))
+}
+
+/// Whether a footer-write failure is worth retrying: transient sharing
+/// violations (Windows mapped-file truncation) clear once in-flight readers
+/// drop their mmap handles.
+fn error_is_retryable_file_conflict(err: &TaibaiError) -> bool {
+    let text = err.to_string();
+    text.contains("Access is denied")
+        || text.contains("used by another process")
+        || text.contains("being used by another")
+        || text.contains("Permission denied")
+        || text.contains("share")
+        || text.contains("resource temporarily unavailable")
 }

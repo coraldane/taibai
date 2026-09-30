@@ -22,7 +22,11 @@ pub fn encode_column_ex(col: &ColumnArray, offset: usize, count: usize) -> Resul
         buf.extend_from_slice(&encoded.1);
         let specialized = matches!(
             encoded.0,
-            EncodingType::GorillaXor | EncodingType::DeltaOfDelta
+            EncodingType::GorillaXor
+                | EncodingType::DeltaOfDelta
+                | EncodingType::BitPacked
+                | EncodingType::Rle
+                | EncodingType::DeltaRle
         );
         return Ok((buf, specialized));
     }
@@ -69,6 +73,20 @@ pub struct StoredColumnEncoding {
     pub uncompressed_size: u64,
 }
 
+/// Read the adaptive encoding tag from a full encoded column buffer
+/// (u32 bitmap_len + bitmap + magic + tag), if present.
+pub(crate) fn stored_encoding_tag(buf: &[u8]) -> Option<EncodingType> {
+    if buf.len() < 4 + COLUMN_ENCODING_MAGIC.len() + 1 {
+        return None;
+    }
+    let bitmap_len = u32::from_le_bytes(buf[..4].try_into().ok()?) as usize;
+    let tag_pos = 4 + bitmap_len + COLUMN_ENCODING_MAGIC.len();
+    if tag_pos >= buf.len() {
+        return None;
+    }
+    EncodingType::from_u8(buf[tag_pos]).ok()
+}
+
 pub fn choose_stored_column_encoding(
     col: &ColumnArray,
     offset: usize,
@@ -88,17 +106,84 @@ pub fn choose_stored_column_encoding(
     }
 
     let plain = encode_column_plain(col, offset, count)?;
-    let compressed = zstd::bulk::compress(&plain, zstd_level)
+    let compressed_plain = zstd::bulk::compress(&plain, zstd_level)
         .map_err(|e| TaibaiError::Storage(format!("zstd compress error: {}", e)))?;
-    if compressed.len() < encoded.len() {
-        Ok(StoredColumnEncoding {
-            data: compressed,
-            uncompressed_size: plain.len() as u64,
-        })
-    } else {
+    // Fast-decode adaptive layouts (bit unpacking) run an order of magnitude
+    // faster than a zstd frame, so they only yield to the zstd(plain)
+    // candidate when that one is decisively smaller — a marginal size edge is
+    // not worth a ~10x decode regression on scan-heavy reads.
+    if stored_encoding_tag(&encoded) == Some(EncodingType::BitPacked) {
+        let keep_verbatim = compressed_plain.len() * 5 > encoded.len() * 4;
+        return if keep_verbatim {
+            Ok(StoredColumnEncoding {
+                uncompressed_size: encoded.len() as u64,
+                data: encoded,
+            })
+        } else {
+            Ok(StoredColumnEncoding {
+                data: compressed_plain,
+                uncompressed_size: plain.len() as u64,
+            })
+        };
+    }
+
+    // RLE competes three ways: verbatim (run-fill decode, no zstd pass —
+    // wins on long runs where the payload is already tiny), zstd(RLE) (the
+    // densest form for short runs), and zstd(plain). Strictly by size.
+    // DeltaRle decodes per run (varint parse + fill), fast enough to deserve
+    // the same treatment as bit packing: verbatim unless the zstd frame of
+    // its own payload is decisively (>=20%) smaller, in which case take the
+    // denser of zstd(payload) / zstd(plain).
+    if stored_encoding_tag(&encoded) == Some(EncodingType::DeltaRle) {
+        let compressed_deltarle = zstd::bulk::compress(&encoded, zstd_level)
+            .map_err(|e| TaibaiError::Storage(format!("zstd compress error: {}", e)))?;
+        let keep_verbatim = compressed_deltarle.len() * 5 > encoded.len() * 4;
+        return if keep_verbatim {
+            Ok(StoredColumnEncoding {
+                uncompressed_size: encoded.len() as u64,
+                data: encoded,
+            })
+        } else if compressed_deltarle.len() <= compressed_plain.len() {
+            Ok(StoredColumnEncoding {
+                data: compressed_deltarle,
+                uncompressed_size: encoded.len() as u64,
+            })
+        } else {
+            Ok(StoredColumnEncoding {
+                data: compressed_plain,
+                uncompressed_size: plain.len() as u64,
+            })
+        };
+    }
+
+    if stored_encoding_tag(&encoded) == Some(EncodingType::Rle) {
+        let compressed_rle = zstd::bulk::compress(&encoded, zstd_level)
+            .map_err(|e| TaibaiError::Storage(format!("zstd compress error: {}", e)))?;
+        let encoded_len = encoded.len() as u64;
+        let mut best_len = encoded_len as usize;
+        let mut best = (encoded, encoded_len);
+        if compressed_rle.len() < best_len {
+            best_len = compressed_rle.len();
+            best = (compressed_rle, encoded_len);
+        }
+        if compressed_plain.len() < best_len {
+            best = (compressed_plain, plain.len() as u64);
+        }
+        return Ok(StoredColumnEncoding {
+            data: best.0,
+            uncompressed_size: best.1,
+        });
+    }
+
+    if compressed_plain.len() >= encoded.len() {
         Ok(StoredColumnEncoding {
             uncompressed_size: encoded.len() as u64,
             data: encoded,
+        })
+    } else {
+        Ok(StoredColumnEncoding {
+            data: compressed_plain,
+            uncompressed_size: plain.len() as u64,
         })
     }
 }
@@ -273,6 +358,30 @@ fn choose_numeric_encoding(values: &[i64], plain_width: usize) -> Option<(Encodi
         best = Some((EncodingType::Rle, rle));
     }
 
+    // Bit packing is not gated on sortedness: unlike varint Delta/DoD it
+    // pairs the deltas with a per-block minimum, so locally-steady columns
+    // (tick prices, volumes) compact well even when they oscillate.
+    if let Some(packed) = encode_i64_bitpacked_payload(values) {
+        if (packed.len() + 5 < plain_size || plain_width == 8 && packed.len() < plain_size)
+            && best
+                .as_ref()
+                .map(|(_, payload)| packed.len() < payload.len())
+                .unwrap_or(true)
+        {
+            best = Some((EncodingType::BitPacked, packed));
+        }
+    }
+
+    let delta_rle = encode_i64_delta_rle_payload(values);
+    if (delta_rle.len() + 5 < plain_size || plain_width == 8 && delta_rle.len() < plain_size)
+        && best
+            .as_ref()
+            .map(|(_, payload)| delta_rle.len() < payload.len())
+            .unwrap_or(true)
+    {
+        best = Some((EncodingType::DeltaRle, delta_rle));
+    }
+
     if values.windows(2).all(|w| w[0] <= w[1]) {
         let delta = encode_i64_delta_payload(values);
         if (delta.len() + 5 < plain_size || plain_width == 8 && delta.len() < plain_size)
@@ -322,6 +431,64 @@ fn encode_i64_rle_payload(values: &[i64]) -> Vec<u8> {
     out
 }
 
+/// RLE over run-to-run deltas: each run stores `varint(zigzag(value -
+/// prev_value))` plus `varint(len)` — 2~4 bytes per run on run-heavy data
+/// (clustered tick prices) versus the fixed 12 of the plain RLE above, dense
+/// enough to win the stored choice verbatim and skip the zstd pass entirely.
+/// The per-run (not per-value) varint parse keeps decode cheap even when runs
+/// are short. Worst case (random 64-bit jumps) is 15 bytes/run, so the plain
+/// RLE candidate stays in the competition for that shape.
+pub(crate) fn encode_i64_delta_rle_payload(values: &[i64]) -> Vec<u8> {
+    let mut runs = Vec::new();
+    let mut current = values[0];
+    let mut len = 1u64;
+    for &value in &values[1..] {
+        if value == current {
+            len += 1;
+        } else {
+            runs.push((current, len));
+            current = value;
+            len = 1;
+        }
+    }
+    runs.push((current, len));
+
+    let mut out = Vec::with_capacity(4 + runs.len() * 3);
+    out.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+    let mut prev = 0i64;
+    for (value, len) in runs {
+        write_varint(&mut out, zigzag_encode(value.wrapping_sub(prev)));
+        write_varint(&mut out, len);
+        prev = value;
+    }
+    out
+}
+
+pub(crate) fn decode_i64_delta_rle_payload(
+    payload: &[u8],
+    expected_rows: usize,
+) -> Result<Vec<i64>> {
+    let mut cursor = Cursor::new(payload);
+    let run_count = read_u32_le(&mut cursor)? as usize;
+    let mut values = Vec::new();
+    let mut prev = 0i64;
+    for _ in 0..run_count {
+        let delta = zigzag_decode(read_varint(&mut cursor)?);
+        prev = prev.wrapping_add(delta);
+        let len = read_varint(&mut cursor)? as usize;
+        // Same pre-expansion bound as the plain RLE decoder.
+        if values.len().saturating_add(len) > expected_rows {
+            return Err(TaibaiError::Storage(format!(
+                "delta-RLE run expansion reaches {} values, exceeding the row group's {}",
+                values.len().saturating_add(len),
+                expected_rows
+            )));
+        }
+        values.extend(std::iter::repeat_n(prev, len));
+    }
+    Ok(values)
+}
+
 fn encode_i64_delta_payload(values: &[i64]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + values.len() * 2);
     out.extend_from_slice(&(values.len() as u32).to_le_bytes());
@@ -352,6 +519,268 @@ fn encode_i64_dod_payload(values: &[i64]) -> Vec<u8> {
         prev = value;
     }
     out
+}
+
+pub(crate) const BITPACK_BLOCK_SIZE: usize = 128;
+
+/// Delta + frame-of-reference + bit packing (Parquet DELTA_BINARY_PACKED
+/// shape): each block of consecutive deltas is offset by its minimum and
+/// packed at a per-block fixed bit width. The decode side is a straight
+/// unpack-accumulate loop — no varint branching and, because the block is
+/// stored verbatim, no zstd pass — which is the point of competing this
+/// candidate against the zstd(plain) layout on size.
+fn encode_i64_bitpacked_payload(values: &[i64]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(16 + values.len());
+    out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    out.extend_from_slice(&values[0].to_le_bytes());
+    out.extend_from_slice(&(BITPACK_BLOCK_SIZE as u32).to_le_bytes());
+
+    let mut block_start = 1usize;
+    while block_start < values.len() {
+        let block_end = (block_start + BITPACK_BLOCK_SIZE).min(values.len());
+        let mut prev = values[block_start - 1];
+        let mut min = i64::MAX;
+        let mut max = i64::MIN;
+        for &value in &values[block_start..block_end] {
+            let delta = value.wrapping_sub(prev);
+            prev = value;
+            min = min.min(delta);
+            max = max.max(delta);
+        }
+        let range = max.wrapping_sub(min) as u64;
+        let width = 64 - range.leading_zeros(); // 0 when every delta equals min
+        if width > 56 {
+            // Wider blocks cannot use the 64-bit refill accumulator below and
+            // at >=7.125 bytes/value they cannot beat the 8-byte plain layout.
+            return None;
+        }
+        out.push(width as u8);
+        out.extend_from_slice(&min.to_le_bytes());
+
+        let packed_len = ((block_end - block_start) * width as usize + 7) / 8;
+        let packed_start = out.len();
+        out.resize(packed_start + packed_len, 0);
+        let mut acc = 0u64;
+        let mut bits = 0u32;
+        let mut pos = packed_start;
+        prev = values[block_start - 1];
+        for &value in &values[block_start..block_end] {
+            let delta = value.wrapping_sub(prev).wrapping_sub(min);
+            prev = value;
+            // `bits` stays below 8 between values (the flush loop drains full
+            // bytes), so the shifted delta never exceeds 64 bits for width<=56.
+            acc |= (delta as u64) << bits;
+            bits += width;
+            while bits >= 8 {
+                out[pos] = acc as u8;
+                pos += 1;
+                acc >>= 8;
+                bits -= 8;
+            }
+        }
+        if bits > 0 {
+            out[pos] = acc as u8;
+        }
+        block_start = block_end;
+    }
+    Some(out)
+}
+
+pub(crate) fn decode_i64_bitpacked_payload(payload: &[u8]) -> Result<Vec<i64>> {
+    let mut cursor = Cursor::new(payload);
+    let count = read_u32_le(&mut cursor)? as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut base_buf = [0u8; 8];
+    cursor.read_exact(&mut base_buf)?;
+    let mut prev = i64::from_le_bytes(base_buf);
+    let mut block_buf = [0u8; 4];
+    cursor.read_exact(&mut block_buf)?;
+    let block_size = u32::from_le_bytes(block_buf) as usize;
+    if block_size == 0 {
+        return Err(TaibaiError::Storage(
+            "bitpacked block size must be positive".into(),
+        ));
+    }
+
+    let mut values = Vec::with_capacity(count);
+    values.push(prev);
+    let bitstream = &payload[cursor.position() as usize..];
+    let mut pos = 0usize;
+    let mut remaining = count - 1;
+    while remaining > 0 {
+        let len = remaining.min(block_size);
+        if pos + 9 > bitstream.len() {
+            return Err(TaibaiError::Storage(
+                "bitpacked block header truncated".into(),
+            ));
+        }
+        let width = bitstream[pos] as u32;
+        pos += 1;
+        let min = i64::from_le_bytes(bitstream[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        if width > 56 {
+            return Err(TaibaiError::Storage(
+                "bitpacked width exceeds decoder capability".into(),
+            ));
+        }
+        if width == 0 {
+            // Constant-delta block: an arithmetic sequence, no bitstream.
+            for _ in 0..len {
+                prev = prev.wrapping_add(min);
+                values.push(prev);
+            }
+        } else {
+            let packed_len = (len * width as usize + 7) / 8;
+            if pos + packed_len > bitstream.len() {
+                return Err(TaibaiError::Storage("bitpacked block truncated".into()));
+            }
+            unpack_bitpacked_block(
+                &mut values,
+                &mut prev,
+                &bitstream[pos..pos + packed_len],
+                len,
+                width,
+                min,
+            );
+            pos += packed_len;
+        }
+        remaining -= len;
+    }
+    Ok(values)
+}
+
+/// Unpack `len` fixed-width offsets (LSB-first byte stream) and append
+/// `prev + min + offset` for each.
+///
+/// Widths that divide a byte (8/16/32) read straight from the stream. Other
+/// widths pull groups of values out of one 64-bit funnel-shift window (two
+/// unaligned loads), which removes the per-value refill branches and bounds
+/// checks; a group of g values spans g*width <= 64 bits, so g is 4 up to
+/// width 16, 2 up to 32, and 1 beyond (the stream ends in the 64-bit window
+/// only when width itself does). Anything a window cannot cover — the tail
+/// values and windows that would overrun the slice — falls back to the
+/// byte-granularity refill loop, whose shifts stay below 56 bits.
+fn unpack_bitpacked_block(
+    values: &mut Vec<i64>,
+    prev: &mut i64,
+    packed: &[u8],
+    len: usize,
+    width: u32,
+    min: i64,
+) {
+    if width == 8 {
+        for &byte in &packed[..len] {
+            *prev = prev.wrapping_add(min).wrapping_add(byte as i64);
+            values.push(*prev);
+        }
+        return;
+    }
+    if width == 16 {
+        for chunk in packed[..len * 2].chunks_exact(2) {
+            let offset = u16::from_le_bytes(chunk.try_into().unwrap()) as i64;
+            *prev = prev.wrapping_add(min).wrapping_add(offset);
+            values.push(*prev);
+        }
+        return;
+    }
+    if width == 32 {
+        for chunk in packed[..len * 4].chunks_exact(4) {
+            let offset = u32::from_le_bytes(chunk.try_into().unwrap()) as i64;
+            *prev = prev.wrapping_add(min).wrapping_add(offset);
+            values.push(*prev);
+        }
+        return;
+    }
+
+    let group: usize = if width <= 16 {
+        4
+    } else if width <= 32 {
+        2
+    } else {
+        1
+    };
+    let mask = (1u64 << width) - 1;
+    let group_bits = group * width as usize;
+    let mut bit_pos = 0usize;
+    let mut done = 0usize;
+    while done + group <= len {
+        let Some(window) = bit_window64(packed, bit_pos / 8, (bit_pos % 8) as u32) else {
+            break;
+        };
+        match group {
+            4 => {
+                let d0 = min.wrapping_add((window & mask) as i64);
+                let d1 = min.wrapping_add(((window >> width) & mask) as i64);
+                let d2 = min.wrapping_add(((window >> (width * 2)) & mask) as i64);
+                let d3 = min.wrapping_add(((window >> (width * 3)) & mask) as i64);
+                *prev = prev.wrapping_add(d0);
+                values.push(*prev);
+                *prev = prev.wrapping_add(d1);
+                values.push(*prev);
+                *prev = prev.wrapping_add(d2);
+                values.push(*prev);
+                *prev = prev.wrapping_add(d3);
+                values.push(*prev);
+            }
+            2 => {
+                let d0 = min.wrapping_add((window & mask) as i64);
+                let d1 = min.wrapping_add(((window >> width) & mask) as i64);
+                *prev = prev.wrapping_add(d0);
+                values.push(*prev);
+                *prev = prev.wrapping_add(d1);
+                values.push(*prev);
+            }
+            _ => {
+                let d0 = min.wrapping_add((window & mask) as i64);
+                *prev = prev.wrapping_add(d0);
+                values.push(*prev);
+            }
+        }
+        done += group;
+        bit_pos += group_bits;
+    }
+    if done == len {
+        return;
+    }
+
+    // Tail: resume mid-stream with the partial byte folded into the
+    // accumulator, then refill a byte at a time as before.
+    let mut acc = (packed[bit_pos / 8] >> (bit_pos % 8) as u32) as u64;
+    let mut bits = 8 - (bit_pos % 8) as u32;
+    let mut pos = bit_pos / 8 + 1;
+    for _ in done..len {
+        while bits < width {
+            acc |= (packed[pos] as u64) << bits;
+            pos += 1;
+            bits += 8;
+        }
+        let offset = acc & mask;
+        acc >>= width;
+        bits -= width;
+        *prev = prev.wrapping_add(min).wrapping_add(offset as i64);
+        values.push(*prev);
+    }
+}
+
+/// 64 bits of the stream starting at bit offset `byte_pos*8 + shift`, funnel-
+/// shifted from two unaligned loads. Returns None when the (rare) tail window
+/// would read past the packed slice.
+#[inline]
+fn bit_window64(packed: &[u8], byte_pos: usize, shift: u32) -> Option<u64> {
+    if byte_pos + 8 > packed.len() {
+        return None;
+    }
+    let lo = u64::from_le_bytes(packed[byte_pos..byte_pos + 8].try_into().unwrap());
+    if shift == 0 {
+        return Some(lo);
+    }
+    if byte_pos + 16 > packed.len() {
+        return None;
+    }
+    let hi = u64::from_le_bytes(packed[byte_pos + 8..byte_pos + 16].try_into().unwrap());
+    Some((lo >> shift) | (hi << (64 - shift)))
 }
 
 pub(crate) fn decode_i64_dod_payload(payload: &[u8]) -> Result<Vec<i64>> {
@@ -519,6 +948,10 @@ fn encode_varchar_dictionary_adaptive(
 
 pub fn encode_value(buf: &mut Vec<u8>, col: &ColumnArray, idx: usize) {
     match col {
+        ColumnArray::Selected { .. } | ColumnArray::Rle { .. } => {
+            encode_value(buf, col.flattened(), idx)
+        }
+        ColumnArray::Dictionary { .. } => encode_value(buf, &col.materialize_varchar(), idx),
         ColumnArray::Bool { data, .. } => buf.push(data[idx]),
         ColumnArray::Int8 { data, .. } => buf.push(data[idx] as u8),
         ColumnArray::Int16 { data, .. } => buf.extend_from_slice(&data[idx].to_le_bytes()),
@@ -553,7 +986,26 @@ pub fn encode_value(buf: &mut Vec<u8>, col: &ColumnArray, idx: usize) {
     }
 }
 
-pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Result<ColumnArray> {
+pub fn decode_column(
+    data: &[u8],
+    row_count: usize,
+    col_def: &ColumnDef,
+    allow_dictionary: bool,
+) -> Result<ColumnArray> {
+    decode_column_with_runs(data, row_count, col_def, allow_dictionary, false)
+}
+
+/// `allow_runs` keeps Rle/DeltaRle columns in their run form
+/// ([`ColumnArray::Rle`]) instead of expanding them — the run-aware
+/// aggregate consumes runs directly, and every other consumer flattens
+/// lazily.
+pub fn decode_column_with_runs(
+    data: &[u8],
+    row_count: usize,
+    col_def: &ColumnDef,
+    allow_dictionary: bool,
+    allow_runs: bool,
+) -> Result<ColumnArray> {
     let mut cursor = Cursor::new(data);
     let bitmap_len = read_u32_le(&mut cursor)? as usize;
     let mut bitmap_data = vec![0u8; bitmap_len];
@@ -562,85 +1014,65 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
 
     let remaining_data = &data[4 + bitmap_len..];
     if remaining_data.starts_with(COLUMN_ENCODING_MAGIC) {
-        return decode_adaptive_column(remaining_data, row_count, col_def, bitmap);
+        return decode_adaptive_column_with_runs(
+            remaining_data,
+            row_count,
+            col_def,
+            bitmap,
+            allow_dictionary,
+            allow_runs,
+        );
     }
     let mut dc = Cursor::new(remaining_data);
 
     macro_rules! read_fixed {
         ($ty:ty, $size:expr, $variant:ident) => {{
-            let mut vals = Vec::with_capacity(row_count);
-            for i in 0..row_count {
-                if bitmap.is_null(i) {
-                    vals.push(<$ty>::default());
-                } else {
-                    let mut b = [0u8; $size];
-                    dc.read_exact(&mut b)
-                        .map_err(|e| TaibaiError::Storage(format!("read error: {}", e)))?;
-                    vals.push(<$ty>::from_le_bytes(b));
+            // Null-free fast path: the payload is exactly row_count * $size
+            // little-endian values, so decode degrades to one bulk conversion
+            // (a per-word load on little-endian hosts) instead of a
+            // per-value Cursor::read_exact with bounds checks.
+            if bitmap.null_count() == 0
+                && remaining_data.len() - dc.position() as usize >= row_count * $size
+            {
+                let start = dc.position() as usize;
+                let raw = &remaining_data[start..start + row_count * $size];
+                let mut vals = Vec::with_capacity(row_count);
+                vals.extend(
+                    raw.chunks_exact($size)
+                        .map(|b| <$ty>::from_le_bytes(b.try_into().unwrap())),
+                );
+                dc.set_position((start + row_count * $size) as u64);
+                ColumnArray::$variant {
+                    data: vals.into(),
+                    bitmap: bitmap.clone(),
                 }
-            }
-            ColumnArray::$variant {
-                data: vals.into(),
-                bitmap: bitmap.clone(),
+            } else {
+                let mut vals = Vec::with_capacity(row_count);
+                for i in 0..row_count {
+                    if bitmap.is_null(i) {
+                        vals.push(<$ty>::default());
+                    } else {
+                        let mut b = [0u8; $size];
+                        dc.read_exact(&mut b)
+                            .map_err(|e| TaibaiError::Storage(format!("read error: {}", e)))?;
+                        vals.push(<$ty>::from_le_bytes(b));
+                    }
+                }
+                ColumnArray::$variant {
+                    data: vals.into(),
+                    bitmap: bitmap.clone(),
+                }
             }
         }};
     }
 
     let col = match col_def.data_type {
-        DataType::Bool => {
-            let mut vals = Vec::with_capacity(row_count);
-            for i in 0..row_count {
-                vals.push(if bitmap.is_null(i) {
-                    0u8
-                } else {
-                    let mut b = [0u8; 1];
-                    dc.read_exact(&mut b)
-                        .map_err(|e| TaibaiError::Storage(format!("read error: {}", e)))?;
-                    b[0]
-                });
-            }
-            ColumnArray::Bool {
-                data: vals,
-                bitmap: bitmap.clone(),
-            }
-        }
-        DataType::Int8 => {
-            let mut vals = Vec::with_capacity(row_count);
-            for i in 0..row_count {
-                vals.push(if bitmap.is_null(i) {
-                    0i8
-                } else {
-                    let mut b = [0u8; 1];
-                    dc.read_exact(&mut b)
-                        .map_err(|e| TaibaiError::Storage(format!("read error: {}", e)))?;
-                    b[0] as i8
-                });
-            }
-            ColumnArray::Int8 {
-                data: vals,
-                bitmap: bitmap.clone(),
-            }
-        }
+        DataType::Bool => read_fixed!(u8, 1, Bool),
+        DataType::Int8 => read_fixed!(i8, 1, Int8),
         DataType::Int16 => read_fixed!(i16, 2, Int16),
         DataType::Int32 => read_fixed!(i32, 4, Int32),
         DataType::Int64 => read_fixed!(i64, 8, Int64),
-        DataType::UInt8 => {
-            let mut vals = Vec::with_capacity(row_count);
-            for i in 0..row_count {
-                vals.push(if bitmap.is_null(i) {
-                    0u8
-                } else {
-                    let mut b = [0u8; 1];
-                    dc.read_exact(&mut b)
-                        .map_err(|e| TaibaiError::Storage(format!("read error: {}", e)))?;
-                    b[0]
-                });
-            }
-            ColumnArray::UInt8 {
-                data: vals,
-                bitmap: bitmap.clone(),
-            }
-        }
+        DataType::UInt8 => read_fixed!(u8, 1, UInt8),
         DataType::UInt16 => read_fixed!(u16, 2, UInt16),
         DataType::UInt32 => read_fixed!(u32, 4, UInt32),
         DataType::UInt64 => read_fixed!(u64, 8, UInt64),
@@ -652,19 +1084,41 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
         DataType::Timestamp => read_fixed!(i64, 8, Timestamp),
         DataType::Interval => read_fixed!(i64, 8, Interval),
         DataType::VarChar => {
-            let mut vals = Vec::with_capacity(row_count);
+            // Decode straight into the column's UTF-8 arena: one contiguous
+            // buffer + offsets, zero per-row String allocations.
+            let mut buffer = Utf8Buffer::with_capacity(row_count);
+            let mut pos = dc.position() as usize;
             for i in 0..row_count {
                 if bitmap.is_null(i) {
-                    vals.push(String::new());
-                } else {
-                    let len = read_u32_le(&mut dc).unwrap_or(0) as usize;
-                    let mut s = vec![0u8; len];
-                    dc.read_exact(&mut s).unwrap_or(());
-                    vals.push(String::from_utf8_lossy(&s).into_owned());
+                    buffer.push_str("");
+                    continue;
                 }
+                if pos + 4 > remaining_data.len() {
+                    return Err(TaibaiError::Storage(
+                        "varchar decode: truncated length".into(),
+                    ));
+                }
+                let len =
+                    u32::from_le_bytes(remaining_data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                if pos + len > remaining_data.len() {
+                    return Err(TaibaiError::Storage(
+                        "varchar decode: truncated value".into(),
+                    ));
+                }
+                let raw = &remaining_data[pos..pos + len];
+                match std::str::from_utf8(raw) {
+                    Ok(value) => buffer.push_str(value),
+                    Err(_) => {
+                        let owned = String::from_utf8_lossy(raw).into_owned();
+                        buffer.push_str(&owned);
+                    }
+                }
+                pos += len;
             }
+            dc.set_position(pos as u64);
             ColumnArray::VarChar {
-                data: vals.into(),
+                data: buffer,
                 bitmap: bitmap.clone(),
             }
         }
@@ -716,6 +1170,18 @@ pub(crate) fn decode_adaptive_column(
     row_count: usize,
     col_def: &ColumnDef,
     bitmap: NullBitmap,
+    allow_dictionary: bool,
+) -> Result<ColumnArray> {
+    decode_adaptive_column_with_runs(data, row_count, col_def, bitmap, allow_dictionary, false)
+}
+
+pub(crate) fn decode_adaptive_column_with_runs(
+    data: &[u8],
+    row_count: usize,
+    col_def: &ColumnDef,
+    bitmap: NullBitmap,
+    allow_dictionary: bool,
+    allow_runs: bool,
 ) -> Result<ColumnArray> {
     if data.len() < COLUMN_ENCODING_MAGIC.len() + 1 {
         return Err(TaibaiError::Storage(
@@ -724,10 +1190,31 @@ pub(crate) fn decode_adaptive_column(
     }
     let encoding = EncodingType::from_u8(data[COLUMN_ENCODING_MAGIC.len()])?;
     let payload = &data[COLUMN_ENCODING_MAGIC.len() + 1..];
+    if std::env::var("TAIBAI_ENC_TRACE").as_deref() == Ok("1") {
+        eprintln!(
+            "DBGENC col={} enc={:?} rows={} payload_len={}",
+            col_def.name,
+            encoding,
+            row_count,
+            payload.len()
+        );
+    }
 
     match encoding {
         EncodingType::Rle => {
-            let values = decode_i64_rle_payload(payload)?;
+            if allow_runs && crate::storage::segment::column_sum_supported(col_def.data_type) {
+                let runs = parse_i64_runs_plain_rle(payload)?;
+                return build_run_column(runs, row_count, col_def, bitmap);
+            }
+            let values = decode_i64_rle_payload(payload, row_count)?;
+            build_numeric_column_from_i64(values, row_count, col_def, bitmap)
+        }
+        EncodingType::DeltaRle => {
+            if allow_runs && crate::storage::segment::column_sum_supported(col_def.data_type) {
+                let runs = parse_i64_runs_delta_rle(payload)?;
+                return build_run_column(runs, row_count, col_def, bitmap);
+            }
+            let values = decode_i64_delta_rle_payload(payload, row_count)?;
             build_numeric_column_from_i64(values, row_count, col_def, bitmap)
         }
         EncodingType::Delta => {
@@ -736,6 +1223,10 @@ pub(crate) fn decode_adaptive_column(
         }
         EncodingType::DeltaOfDelta => {
             let values = decode_i64_dod_payload(payload)?;
+            build_numeric_column_from_i64(values, row_count, col_def, bitmap)
+        }
+        EncodingType::BitPacked => {
+            let values = decode_i64_bitpacked_payload(payload)?;
             build_numeric_column_from_i64(values, row_count, col_def, bitmap)
         }
         EncodingType::GorillaXor => {
@@ -753,8 +1244,7 @@ pub(crate) fn decode_adaptive_column(
             build_column_from_bits(bits, row_count, col_def, bitmap)
         }
         EncodingType::Dictionary if col_def.data_type == DataType::VarChar => {
-            let values = decode_varchar_dictionary_payload(payload)?;
-            build_varchar_column(values, row_count, bitmap)
+            expand_varchar_dictionary(payload, row_count, &bitmap, allow_dictionary)
         }
         other => Err(TaibaiError::Storage(format!(
             "unsupported adaptive column encoding {:?} for {}",
@@ -764,7 +1254,56 @@ pub(crate) fn decode_adaptive_column(
     }
 }
 
-pub(crate) fn decode_i64_rle_payload(payload: &[u8]) -> Result<Vec<i64>> {
+/// Parse plain-Rle runs without expanding them: `(value, len)` pairs.
+fn parse_i64_runs_plain_rle(payload: &[u8]) -> Result<Vec<(i64, u32)>> {
+    let mut cursor = Cursor::new(payload);
+    let run_count = read_u32_le(&mut cursor)? as usize;
+    let mut runs = Vec::with_capacity(run_count);
+    for _ in 0..run_count {
+        let mut value_buf = [0u8; 8];
+        cursor.read_exact(&mut value_buf)?;
+        let value = i64::from_le_bytes(value_buf);
+        let len = read_u32_le(&mut cursor)?;
+        runs.push((value, len));
+    }
+    Ok(runs)
+}
+
+/// Parse DeltaRle runs without expanding them: varint(zigzag delta) values.
+fn parse_i64_runs_delta_rle(payload: &[u8]) -> Result<Vec<(i64, u32)>> {
+    let mut cursor = Cursor::new(payload);
+    let run_count = read_u32_le(&mut cursor)? as usize;
+    let mut runs = Vec::with_capacity(run_count);
+    let mut prev = 0i64;
+    for _ in 0..run_count {
+        let delta = crate::storage::codec::io_util::zigzag_decode(read_varint(&mut cursor)?);
+        prev = prev.wrapping_add(delta);
+        let len = read_varint(&mut cursor)? as u32;
+        runs.push((prev, len));
+    }
+    Ok(runs)
+}
+
+/// Validate run lengths against the row/null counts and hand the runs to
+/// the lazy [`ColumnArray::Rle`] variant.
+fn build_run_column(
+    runs: Vec<(i64, u32)>,
+    row_count: usize,
+    col_def: &ColumnDef,
+    bitmap: NullBitmap,
+) -> Result<ColumnArray> {
+    let covered: u64 = runs.iter().map(|&(_, len)| len as u64).sum();
+    let expected = row_count.saturating_sub(bitmap.null_count());
+    if covered as usize != expected {
+        return Err(TaibaiError::Storage(format!(
+            "run-length value count mismatch: got {}, expected {}",
+            covered, expected
+        )));
+    }
+    Ok(ColumnArray::rle(runs, col_def.data_type, bitmap, row_count))
+}
+
+pub(crate) fn decode_i64_rle_payload(payload: &[u8], expected_rows: usize) -> Result<Vec<i64>> {
     let mut cursor = Cursor::new(payload);
     let run_count = read_u32_le(&mut cursor)? as usize;
     let mut values = Vec::new();
@@ -773,6 +1312,15 @@ pub(crate) fn decode_i64_rle_payload(payload: &[u8]) -> Result<Vec<i64>> {
         cursor.read_exact(&mut value_buf)?;
         let value = i64::from_le_bytes(value_buf);
         let len = read_u32_le(&mut cursor)? as usize;
+        // Validate BEFORE expanding: a corrupt run length used to drive a
+        // repeat_n allocation of up to 4 billion values.
+        if values.len().saturating_add(len) > expected_rows {
+            return Err(TaibaiError::Storage(format!(
+                "RLE run expansion reaches {} values, exceeding the row group's {}",
+                values.len().saturating_add(len),
+                expected_rows
+            )));
+        }
         values.extend(std::iter::repeat_n(value, len));
     }
     Ok(values)
@@ -801,26 +1349,115 @@ pub(crate) fn decode_i64_delta_payload(payload: &[u8]) -> Result<Vec<i64>> {
     Ok(values)
 }
 
-fn decode_varchar_dictionary_payload(payload: &[u8]) -> Result<Vec<String>> {
+/// Expand a dictionary-encoded varchar column directly into the column's
+/// UTF-8 arena: dictionary entries borrow from the payload and each row is a
+/// single memcpy — no per-row String allocation or clone.
+fn expand_varchar_dictionary(
+    payload: &[u8],
+    row_count: usize,
+    bitmap: &NullBitmap,
+    allow_dictionary: bool,
+) -> Result<ColumnArray> {
     let mut cursor = Cursor::new(payload);
     let dict_count = read_u32_le(&mut cursor)? as usize;
-    let mut dict = Vec::with_capacity(dict_count);
+    let mut dict: Vec<&str> = Vec::with_capacity(dict_count);
     for _ in 0..dict_count {
         let len = read_u32_le(&mut cursor)? as usize;
-        let mut bytes = vec![0u8; len];
-        cursor.read_exact(&mut bytes)?;
-        dict.push(String::from_utf8_lossy(&bytes).into_owned());
+        let start = cursor.position() as usize;
+        if start + len > payload.len() {
+            return Err(TaibaiError::Storage(
+                "dictionary varchar decode: truncated entry".into(),
+            ));
+        }
+        let bytes = &payload[start..start + len];
+        let value = match std::str::from_utf8(bytes) {
+            Ok(v) => v,
+            Err(_) => {
+                // Corrupt-data fallback (should not happen: writers validate
+                // UTF-8). Leak one boxed string rather than complicate the
+                // borrow structure for an unreachable path.
+                let leaked: &'static str =
+                    Box::leak(String::from_utf8_lossy(bytes).into_owned().into_boxed_str());
+                leaked
+            }
+        };
+        dict.push(value);
+        cursor.set_position((start + len) as u64);
     }
     let index_count = read_u32_le(&mut cursor)? as usize;
-    let mut values = Vec::with_capacity(index_count);
-    for _ in 0..index_count {
-        let idx = read_u32_le(&mut cursor)? as usize;
-        let value = dict.get(idx).ok_or_else(|| {
-            TaibaiError::Storage(format!("dictionary index {} out of bounds", idx))
-        })?;
-        values.push(value.clone());
+    if index_count != row_count.saturating_sub(bitmap.null_count()) {
+        return Err(TaibaiError::Storage(format!(
+            "adaptive varchar value count mismatch: got {}, expected {}",
+            index_count,
+            row_count.saturating_sub(bitmap.null_count())
+        )));
     }
-    Ok(values)
+    // Dictionary passthrough: keep (ids, dict) unexpanded so aggregation can
+    // group on u32 ids without any per-row string work. Gated: the
+    // ClusterKeyRangeRead strategy's binary search does not understand the
+    // dictionary variant yet, so this is opt-in until that path is adapted.
+    if !allow_dictionary {
+        let mut buffer = Utf8Buffer::with_capacity(row_count);
+        let mut pos = cursor.position() as usize;
+        for row in 0..row_count {
+            if bitmap.is_null(row) {
+                buffer.push_str("");
+                continue;
+            }
+            if pos + 4 > payload.len() {
+                return Err(TaibaiError::Storage(
+                    "dictionary varchar decode: truncated index".into(),
+                ));
+            }
+            let idx = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let value = dict.get(idx).ok_or_else(|| {
+                TaibaiError::Storage(format!("dictionary index {} out of bounds", idx))
+            })?;
+            buffer.push_str(value);
+        }
+        return Ok(ColumnArray::VarChar {
+            data: buffer,
+            bitmap: bitmap.clone(),
+        });
+    }
+    let start = cursor.position() as usize;
+    if start + index_count * 4 > payload.len() {
+        return Err(TaibaiError::Storage(
+            "dictionary varchar decode: truncated index".into(),
+        ));
+    }
+    let ids: Vec<u32> = payload[start..start + index_count * 4]
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    // The passthrough keeps raw ids: an out-of-range id would silently
+    // decode to "" downstream (scalar/encode_key_at fall back to ""), so
+    // validate against the dictionary here instead.
+    if ids.iter().any(|&idx| idx as usize >= dict.len()) {
+        return Err(TaibaiError::Storage(
+            "dictionary index out of bounds".into(),
+        ));
+    }
+    let mut ids_full = vec![0u32; row_count];
+    let mut value_pos = 0usize;
+    for (row, slot) in ids_full.iter_mut().enumerate() {
+        if bitmap.is_null(row) {
+            continue;
+        }
+        *slot = ids[value_pos];
+        value_pos += 1;
+    }
+    let mut dict_buf = Utf8Buffer::with_capacity(dict.len());
+    for value in &dict {
+        dict_buf.push_str(value);
+    }
+    Ok(ColumnArray::Dictionary {
+        ids: ids_full,
+        dict: dict_buf,
+        bitmap: bitmap.clone(),
+        flat: std::sync::OnceLock::new(),
+    })
 }
 
 fn build_numeric_column_from_i64(
@@ -839,49 +1476,82 @@ fn build_numeric_column_from_i64(
     }
 
     let mut value_pos = 0usize;
-    macro_rules! build_signed {
-        ($variant:ident, $ty:ty) => {{
-            let mut out = Vec::with_capacity(row_count);
-            for row in 0..row_count {
-                if bitmap.is_null(row) {
-                    out.push(<$ty>::default());
-                } else {
-                    out.push(values[value_pos] as $ty);
-                    value_pos += 1;
-                }
+    // Null-free fast path: values map 1:1 onto rows, so the build degrades to
+    // one vectorizable cast per element instead of a per-row bitmap probe
+    // (the same shape as the plain decoder's null-free bulk path). For the
+    // i64-backed types the decoded buffer itself becomes the column — no
+    // second pass, no copy.
+    if bitmap.null_count() == 0 {
+        match col_def.data_type {
+            DataType::Int64 => {
+                return Ok(ColumnArray::Int64 {
+                    data: values,
+                    bitmap,
+                })
             }
-            ColumnArray::$variant { data: out, bitmap }
-        }};
+            DataType::Decimal => {
+                return Ok(ColumnArray::Decimal {
+                    data: values,
+                    bitmap,
+                })
+            }
+            DataType::Time => {
+                return Ok(ColumnArray::Time {
+                    data: values,
+                    bitmap,
+                })
+            }
+            DataType::Timestamp => {
+                return Ok(ColumnArray::Timestamp {
+                    data: values,
+                    bitmap,
+                })
+            }
+            DataType::Interval => {
+                return Ok(ColumnArray::Interval {
+                    data: values,
+                    bitmap,
+                })
+            }
+            _ => {}
+        }
     }
-    macro_rules! build_unsigned {
+    // One macro serves signed and unsigned (and Date/Time/…) fixed-width
+    // targets alike: `as` casts handle both.
+    macro_rules! build_fixed {
         ($variant:ident, $ty:ty) => {{
-            let mut out = Vec::with_capacity(row_count);
-            for row in 0..row_count {
-                if bitmap.is_null(row) {
-                    out.push(<$ty>::default());
-                } else {
-                    out.push(values[value_pos] as $ty);
-                    value_pos += 1;
+            let out: Vec<$ty> = if bitmap.null_count() == 0 {
+                values.iter().map(|&v| v as $ty).collect()
+            } else {
+                let mut out = Vec::with_capacity(row_count);
+                for row in 0..row_count {
+                    if bitmap.is_null(row) {
+                        out.push(<$ty>::default());
+                    } else {
+                        out.push(values[value_pos] as $ty);
+                        value_pos += 1;
+                    }
                 }
-            }
+                out
+            };
             ColumnArray::$variant { data: out, bitmap }
         }};
     }
 
     Ok(match col_def.data_type {
-        DataType::Int8 => build_signed!(Int8, i8),
-        DataType::Int16 => build_signed!(Int16, i16),
-        DataType::Int32 => build_signed!(Int32, i32),
-        DataType::Int64 => build_signed!(Int64, i64),
-        DataType::Decimal => build_signed!(Decimal, i64),
-        DataType::Date => build_signed!(Date, i32),
-        DataType::Time => build_signed!(Time, i64),
-        DataType::Timestamp => build_signed!(Timestamp, i64),
-        DataType::Interval => build_signed!(Interval, i64),
-        DataType::UInt8 => build_unsigned!(UInt8, u8),
-        DataType::UInt16 => build_unsigned!(UInt16, u16),
-        DataType::UInt32 => build_unsigned!(UInt32, u32),
-        DataType::UInt64 => build_unsigned!(UInt64, u64),
+        DataType::Int8 => build_fixed!(Int8, i8),
+        DataType::Int16 => build_fixed!(Int16, i16),
+        DataType::Int32 => build_fixed!(Int32, i32),
+        DataType::Int64 => build_fixed!(Int64, i64),
+        DataType::Decimal => build_fixed!(Decimal, i64),
+        DataType::Date => build_fixed!(Date, i32),
+        DataType::Time => build_fixed!(Time, i64),
+        DataType::Timestamp => build_fixed!(Timestamp, i64),
+        DataType::Interval => build_fixed!(Interval, i64),
+        DataType::UInt8 => build_fixed!(UInt8, u8),
+        DataType::UInt16 => build_fixed!(UInt16, u16),
+        DataType::UInt32 => build_fixed!(UInt32, u32),
+        DataType::UInt64 => build_fixed!(UInt64, u64),
         other => {
             return Err(TaibaiError::Storage(format!(
                 "adaptive numeric encoding cannot decode {}",
@@ -954,51 +1624,6 @@ fn build_column_from_bits(
     Ok(column)
 }
 
-fn build_varchar_column(
-    values: Vec<String>,
-    row_count: usize,
-    bitmap: NullBitmap,
-) -> Result<ColumnArray> {
-    let expected = row_count.saturating_sub(bitmap.null_count());
-    if values.len() != expected {
-        return Err(TaibaiError::Storage(format!(
-            "adaptive varchar value count mismatch: got {}, expected {}",
-            values.len(),
-            expected
-        )));
-    }
-
-    let mut data = Vec::with_capacity(row_count);
-    let mut value_pos = 0usize;
-    for row in 0..row_count {
-        if bitmap.is_null(row) {
-            data.push(String::new());
-        } else {
-            data.push(values[value_pos].clone());
-            value_pos += 1;
-        }
-    }
-    Ok(ColumnArray::VarChar {
-        data: data.into(),
-        bitmap,
-    })
-}
-
-fn project_column(col: &ColumnArray, selected_rows: &[usize]) -> Result<ColumnArray> {
-    let mut out = ColumnArray::empty(col.data_type());
-    for &row in selected_rows {
-        if row >= col.len() {
-            return Err(TaibaiError::Storage(format!(
-                "selected row {} out of bounds {}",
-                row,
-                col.len()
-            )));
-        }
-        out.push(&col.scalar(row))?;
-    }
-    Ok(out)
-}
-
 pub fn decode_column_selected(
     data: &[u8],
     row_count: usize,
@@ -1013,8 +1638,19 @@ pub fn decode_column_selected(
     let values = &data[4 + bitmap_len..];
 
     if values.starts_with(COLUMN_ENCODING_MAGIC) {
-        let decoded = decode_adaptive_column(values, row_count, col_def, bitmap)?;
-        return project_column(&decoded, selected_rows);
+        let decoded = decode_adaptive_column(values, row_count, col_def, bitmap, false)?;
+        if let Some(&row) = selected_rows.iter().max() {
+            if row >= decoded.len() {
+                return Err(TaibaiError::Storage(format!(
+                    "selected row {} out of bounds {}",
+                    row,
+                    decoded.len()
+                )));
+            }
+        }
+        // The adaptive decode produced a fully materialized column, so the
+        // gather is a typed indexed copy — no per-row `scalar()` boxing.
+        return Ok(decoded.gather_rows(selected_rows));
     }
 
     macro_rules! decode_fixed_variant {
@@ -1147,6 +1783,16 @@ where
             }
         }
         value_offset = end;
+    }
+
+    if out.len() != selected_rows.len() {
+        // selected_rows must be ascending and in bounds (callers guarantee
+        // it); falling short means the invariant broke and out would not
+        // line up with out_bitmap — fail loudly instead of silently
+        // returning a shorter column.
+        return Err(TaibaiError::Storage(
+            "selected decode did not cover every selected row".into(),
+        ));
     }
 
     Ok(build(out, out_bitmap))

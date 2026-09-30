@@ -3,12 +3,15 @@ server:
   port: 5151
   max_connections: 1024
   max_concurrent_requests: 8
+  # 列式批量导入消息（0x23）的接收上限；批量导入的载荷随批次行数增长，
+  # 因此独立于通用 max_message_size
+  max_bulk_message_size: 134217728
   # 重请求等待执行槽位的最长时间，超时返回 overload 错误而不是静默排队
-  request_queue_timeout_ms: 30000
+  request_queue_timeout_secs: 30
 
 storage:
-  # data_dir: "./data"
-  data_dir: "/Users/coral/Downloads/data/taibai_data"
+  # 数据目录；生产部署应改为独立的持久化目录
+  data_dir: "./data"
   default_database: "main"
   min_segment_seal_size_mb: 500
   max_segment_size_mb: 2048
@@ -20,18 +23,32 @@ storage:
   row_group_target_rows: 65536
   # reader 与 segment 元数据缓存的 segment 数量
   reader_cache_capacity: 1024
-  # 等待表级 mutation lock 的最长时间，超时返回锁超时错误而不是永久阻塞
-  mutation_lock_timeout_ms: 60000
+  # 等待表级 mutation lock 的最长时间（秒），超时返回锁超时错误而不是永久阻塞
+  mutation_lock_timeout_secs: 60
   # 加锁等待超过该阈值时输出 warn 日志，暴露锁排队
-  mutation_lock_warn_ms: 1000
+  mutation_lock_warn_secs: 1
   # 等待 durable tail group commit（fsync）确认的最长时间
-  tail_commit_timeout_ms: 120000
+  tail_commit_timeout_secs: 120
   # fsync 或 commit 确认超过该阈值时输出 warn 日志，暴露慢盘
-  tail_commit_warn_ms: 2000
+  tail_commit_warn_secs: 2
   # ACK 分级：false=ACK_ON_FSYNC（默认，fsync 落盘后应答，崩溃零丢失）；
   # true=ACK_ON_WAL（写入 page cache 即应答，延迟最低，但机器掉电可能丢失
   # 最近一批已应答数据）。测试/导入环境可用 true 换取吞吐，生产保持 false
   tail_async_fsync: false
+  # 清理 memtable tail 日志时归档而非删除（存放在 <data>/wal_archive/<db>/<table>/，
+  # 作为 PITR 与复制引导的增量日志源）。默认 false 保持原有删除行为（不增加磁盘占用）
+  tail_archive: false
+
+# 主备复制（可选）：role = none | primary | standby。
+# primary 发布物理操作流（拒绝 bulk/RELAXED 写入）；standby 只读、
+# 从 primary_addr 拉取事件流，本地调度与自动压缩关闭。
+# 引导方式：停主库 → backup 工具备份 → 备库以备份目录启动 → 自动续传。
+replication:
+  role: none
+  primary_addr: 127.0.0.1:5151
+  user: root
+  password: taibai
+  ring_capacity: 65536
 
 buffer:
   query_memory_limit_mb: 4096
@@ -42,8 +59,23 @@ buffer:
 
 compression:
   enabled: true
-  # bulk segment 写入的 zstd 压缩级别（1..=22，启动时截断）
+  # bulk segment 写入的 zstd 压缩级别（1..=22，启动时截断）。
+  # 这是所有表的默认级别；建表时可用 COMPRESSION_LEVEL = n 按表覆盖
+  # （如归档表 COMPRESSION_LEVEL = 19，热表 COMPRESSION_LEVEL = 1），
+  # 也可用 ALTER TABLE ... SET COMPRESSION_LEVEL = n | DEFAULT 修改。
   bulk_zstd_level: 3
+
+# 变更订阅（pubsub）：客户端通过 SUBSCRIBE 协议消息订阅表的插入变更，
+# 服务端异步推送带序号的通知。默认开启，但没有订阅者时写入路径只做一次
+# 原子读，几乎零开销。所有队列都有界，慢消费者只丢通知（有计数）不阻塞写入。
+pubsub:
+  enabled: true
+  # 写入线程 -> 扇出线程的事件通道容量；打满时丢弃事件并计数
+  event_channel_capacity: 65536
+  # 全局最大订阅数
+  max_subscriptions: 1024
+  # 每个连接的通知队列容量；客户端消费不过时超额通知被丢弃并计数
+  notification_channel_capacity: 1024
 
 log:
   level: "info"

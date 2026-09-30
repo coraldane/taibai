@@ -32,7 +32,7 @@ use super::operators::build_pipeline_with_subqueries;
 pub struct CorrelatedSnapshot {
     /// Inner FROM tables (and materialized derived tables) keyed by plan key.
     pub schemas: HashMap<String, Schema>,
-    pub batches: HashMap<String, Vec<RecordBatch>>,
+    pub batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
     pub cache: HashMap<String, CachedResult>,
 }
 
@@ -233,6 +233,12 @@ fn eval_row(
         }
         _ => unreachable!("cached/result kind mismatch"),
     };
+    // Memoization is a best-effort accelerator, not a guarantee: bound the
+    // per-node cache so high-cardinality correlation keys cannot grow it
+    // (and every cached IN list) without limit.
+    if snapshot.cache.len() >= 65536 {
+        snapshot.cache.clear();
+    }
     snapshot.cache.insert(key, result);
     Ok(value)
 }
@@ -251,9 +257,15 @@ fn in_list_contains(list: &[ScalarValue], lhs: &ScalarValue, negated: bool) -> b
 }
 
 fn cache_key(params: &[ScalarValue]) -> String {
+    // Length-prefixed encoding: a separator character can appear inside
+    // a VarChar parameter value, which made distinct parameter tuples
+    // collide.
     let mut key = String::new();
     for value in params {
-        key.push_str(&format!("{:?}\u{1f}", value));
+        let rendered = format!("{:?}", value);
+        key.push_str(&rendered.len().to_string());
+        key.push(':');
+        key.push_str(&rendered);
     }
     key
 }

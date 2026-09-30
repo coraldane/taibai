@@ -1,8 +1,37 @@
+/// Held for the duration of one hot-store feed: from the append until the
+/// batch's memtable staging completes. Dropping it releases the in-flight
+/// accounting; the captured epoch lets `feed_hot_store` detect that a
+/// concurrent reclaim invalidated the residency mark it computed.
+pub struct HotFeedGuard<'a> {
+    mgr: &'a crate::storage::core::hot_store::HotStoreManager,
+    db: String,
+    table: String,
+    epoch: u64,
+}
+
+impl HotFeedGuard<'_> {
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+impl Drop for HotFeedGuard<'_> {
+    fn drop(&mut self) {
+        self.mgr.end_feed(&self.db, &self.table);
+    }
+}
+
 impl Engine {
     pub(crate) fn performance_baselines(
         &self,
     ) -> &Arc<crate::common::performance_baseline::PerformanceBaselineStore> {
         &self.performance_baselines
+    }
+
+    /// Running-query registry backing `SHOW PROCESSLIST` and `KILL QUERY`.
+    /// The request handler registers every heavy request here.
+    pub fn query_registry(&self) -> Arc<crate::sql::execution::query_registry::QueryRegistry> {
+        Arc::clone(&self.query_registry)
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -15,6 +44,21 @@ impl Engine {
 
     pub fn batch_writer(&self) -> &BatchWriter {
         &self.batch_writer
+    }
+
+    /// Change-notification hub backing the SUBSCRIBE protocol messages. The
+    /// write path reaches it through `BatchWriter` (transaction commits) and
+    /// the insert executor (autocommit inserts); connections reach it through
+    /// the request handler.
+    pub fn pubsub(&self) -> &Arc<crate::pubsub::PubSubHub> {
+        &self.pubsub
+    }
+
+    /// Reliable-subscription manager backing the SUBSCRIBE_V2 protocol
+    /// messages (resumable sequences, acks, named bookmarks, column
+    /// filters). Mirrored through [`Self::pubsub`] on every committed insert.
+    pub fn pubsub_manager(&self) -> &Arc<crate::storage::core::pubsub::PubSubManager> {
+        &self.pubsub_manager
     }
 
     pub fn memtable_manager(&self) -> &Arc<MemTableManager> {
@@ -31,12 +75,33 @@ impl Engine {
         table: &str,
         table_meta: &crate::storage::catalog::schema::TableMeta,
         batch: &crate::types::batch::RecordBatch,
+        feed: &HotFeedGuard<'_>,
     ) -> crate::common::error::Result<()> {
         let resident_mark = self.hot_resident_mark_for_append(db, table, table_meta, batch);
         self.hot_store_mgr
             .try_append(db, table, table_meta, batch)?;
-        self.apply_hot_resident_mark(db, table, resident_mark);
+        // A concurrent backpressure reclaim may have compacted the store
+        // between the mark computation and the append (feed epoch bump):
+        // applying the now-stale positive residency mark would let the
+        // resident fast path answer from the shortened store.
+        if self.hot_store_mgr.feed_epoch(db, table) == feed.epoch() {
+            self.apply_hot_resident_mark(db, table, resident_mark);
+        }
         Ok(())
+    }
+
+    /// Account a hot-store feed for the whole write: the guard must be held
+    /// from the append until the batch's memtable staging completes, so a
+    /// concurrent [`Self::reclaim_hot_store_pressure`] never mistakes the
+    /// in-flight rows for persisted prefix.
+    pub fn begin_hot_feed(&self, db: &str, table: &str) -> HotFeedGuard<'_> {
+        let epoch = self.hot_store_mgr.begin_feed(db, table);
+        HotFeedGuard {
+            mgr: &self.hot_store_mgr,
+            db: db.to_string(),
+            table: table.to_string(),
+            epoch,
+        }
     }
 
     fn hot_resident_mark_for_append(
@@ -61,6 +126,50 @@ impl Engine {
             };
         }
 
+        let partitions = Self::batch_partition_keys(table_meta, batch);
+        if partitions.is_empty() {
+            return HotResidentMark::None;
+        }
+
+        // Consult the positive segment cache before hitting the filesystem:
+        // once a partition is known to own a segment, it never needs marking
+        // resident again, and skip-list decisions must stay conservative.
+        let markable = {
+            let mut cache = self.hot_partition_segments.lock().unwrap();
+            let known = cache.entry(table_dir.clone()).or_default();
+            partitions
+                .into_iter()
+                .filter(|partition| {
+                    if known.contains(partition.as_str()) {
+                        return false;
+                    }
+                    if Self::partition_has_segment(&table_dir, partition) {
+                        known.insert(partition.clone());
+                        return false;
+                    }
+                    true
+                })
+                .collect::<Vec<_>>()
+        };
+        if markable.is_empty() {
+            HotResidentMark::None
+        } else {
+            HotResidentMark::Partitions(markable)
+        }
+    }
+
+    /// Distinct partition keys of a batch (empty for non-partitioned tables
+    /// or when no key can be derived). Typed, memoized key derivation
+    /// straight from column storage; the scalar-based
+    /// `hot_partition_key_for_value` is the semantic reference. NULL rows and
+    /// unsupported partition types are skipped.
+    pub fn batch_partition_keys(
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        batch: &crate::types::batch::RecordBatch,
+    ) -> Vec<String> {
+        if !table_meta.is_partitioned() {
+            return Vec::new();
+        }
         let Some(partition_col_idx) =
             table_meta.get_partition_column_index_cached().or_else(|| {
                 table_meta
@@ -69,31 +178,74 @@ impl Engine {
                     .position(|col| col.name.eq_ignore_ascii_case(&table_meta.partition_key))
             })
         else {
-            return HotResidentMark::None;
+            return Vec::new();
         };
-
+        use crate::storage::catalog::schema::PartitionType;
+        use crate::storage::partition::partition_function::{PartitionKeyKind, PartitionKeysAt};
+        let partition_column = batch.column(partition_col_idx);
+        // Derive the kind through `partition_strategy()` so every scheme
+        // (Hash/Mod included) gets per-partition mirror accounting, matching
+        // the write path's `partition_keys_computer`.
+        let kind = match table_meta.partition_type {
+            PartitionType::Value => Some(PartitionKeyKind::ValueText),
+            PartitionType::None => None,
+            _ => Some(PartitionKeyKind::Strategy(table_meta.partition_strategy())),
+        };
+        let Some((kind, partition_column)) = kind.zip(partition_column) else {
+            return Vec::new();
+        };
+        let mut keys = PartitionKeysAt::new(kind, partition_column);
         let mut partitions = std::collections::HashSet::new();
         for row_idx in 0..batch.num_rows() {
-            let Some(value) = batch.scalar(row_idx, partition_col_idx) else {
+            if partition_column.bitmap().is_null(row_idx) {
                 continue;
-            };
-            let Some(key) = Self::hot_partition_key_for_value(table_meta, &value) else {
+            }
+            let key = keys.key_at(row_idx);
+            if matches!(
+                kind,
+                PartitionKeyKind::Strategy(
+                    crate::storage::partition::partition_function::PartitionFunction::Day,
+                ) | PartitionKeyKind::Strategy(
+                    crate::storage::partition::partition_function::PartitionFunction::Month,
+                ) | PartitionKeyKind::Strategy(
+                    crate::storage::partition::partition_function::PartitionFunction::Year,
+                )
+            ) && key.is_empty()
+            {
+                // Temporal derivation failed for this value; the scalar path
+                // returned None here.
                 continue;
-            };
-            partitions.insert(key);
+            }
+            partitions.insert(key.to_string());
         }
-        if partitions.is_empty() {
-            return HotResidentMark::None;
-        }
+        partitions.into_iter().collect()
+    }
 
-        let markable = partitions
-            .into_iter()
-            .filter(|partition| !Self::partition_has_segment(&table_dir, partition))
-            .collect::<Vec<_>>();
-        if markable.is_empty() {
-            HotResidentMark::None
+    /// Mirror accounting for a batch written outside the regular auto-commit
+    /// INSERT path (bulk / relaxed direct writes). `hot_fed` must reflect
+    /// whether the batch was actually mirrored into the hot store.
+    pub fn note_mirror_batch(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        batch: &crate::types::batch::RecordBatch,
+        hot_fed: bool,
+    ) {
+        if hot_fed || batch.num_rows() == 0 {
+            return;
+        }
+        if crate::storage::core::hot_store::resolve_key_column(table_meta).is_none() {
+            // Table has no hot store; nothing to account for.
+            return;
+        }
+        let mt_mgr = self.batch_writer.memtable_manager();
+        if table_meta.is_partitioned() {
+            for partition in Self::batch_partition_keys(table_meta, batch) {
+                mt_mgr.note_hot_unfed_rows(db, table, &partition, batch.num_rows() as u64);
+            }
         } else {
-            HotResidentMark::Partitions(markable)
+            mt_mgr.note_hot_unfed_rows(db, table, "", batch.num_rows() as u64);
         }
     }
 
@@ -112,28 +264,15 @@ impl Engine {
         }
     }
 
-    fn hot_partition_key_for_value(
-        table_meta: &crate::storage::catalog::schema::TableMeta,
-        value: &crate::types::scalar::ScalarValue,
-    ) -> Option<String> {
-        match table_meta.partition_type {
-            crate::storage::catalog::schema::PartitionType::Value => value.to_text(),
-            crate::storage::catalog::schema::PartitionType::Day => {
-                crate::storage::partition::compute_partition_key(value, PartitionStrategy::Day).ok()
-            }
-            crate::storage::catalog::schema::PartitionType::Month => {
-                crate::storage::partition::compute_partition_key(value, PartitionStrategy::Month)
-                    .ok()
-            }
-            crate::storage::catalog::schema::PartitionType::Year => {
-                crate::storage::partition::compute_partition_key(value, PartitionStrategy::Year)
-                    .ok()
-            }
-            _ => None,
-        }
+    /// Drop the cached partition-segment knowledge for one table directory.
+    pub fn clear_hot_partition_segments(&self, table_dir: &std::path::Path) {
+        self.hot_partition_segments
+            .lock()
+            .unwrap()
+            .remove(table_dir);
     }
 
-    fn table_has_any_segment(table_dir: &std::path::Path) -> bool {
+    pub(crate) fn table_has_any_segment(table_dir: &std::path::Path) -> bool {
         SegmentManager::discover_segments(table_dir)
             .map(|segments| !segments.is_empty())
             .unwrap_or(true)
@@ -174,9 +313,26 @@ impl Engine {
             .iter()
             .map(|mt| mt.row_count())
             .sum::<u64>();
-        let prefix = store_rows.saturating_sub(live);
+        let prefix = store_rows
+            .saturating_sub(live)
+            // Rows appended to the store but not staged into the memtables
+            // yet are neither persisted nor counted in `live`: subtracting
+            // them keeps the persisted-prefix estimate stable while their
+            // write is in progress.
+            .saturating_sub(self.hot_store_mgr.in_flight(db, table))
+            // Rows sitting in the active segment without a published footer
+            // are not queryable yet; dropping their mirror here would hide
+            // them from every query until the next footer publish.
+            .saturating_sub(self.segment_mgr.unpublished_active_rows(db, table));
         if prefix > 0 {
             let dropped = self.hot_store_mgr.compact_prefix(db, table, prefix);
+            // Rows below the new front are gone from the store: retract
+            // residency and flip the mirror accounting so resident-partition
+            // scans fall back to the segment scan instead of under-counting.
+            self.hot_store_mgr.clear_resident_coverage(db, table);
+            self.batch_writer
+                .memtable_manager()
+                .retract_hot_mirror_coverage(db, table);
             tracing::warn!(
                 db,
                 table,
@@ -194,12 +350,41 @@ impl Engine {
         &self.auth_manager
     }
 
+    /// Drop the hot store of a table together with its mirror accounting.
+    /// Every row-mutation path that invalidates the store (UPDATE/DELETE,
+    /// tail recovery) must go through here so the resident fast path and the
+    /// mirror bookkeeping stay consistent.
+    pub fn invalidate_hot_store(&self, db: &str, table: &str) {
+        self.hot_store_mgr.invalidate(db, table);
+        self.batch_writer
+            .memtable_manager()
+            .clear_hot_unfed(db, table);
+    }
+
     pub fn auto_increment_manager(&self) -> &Arc<AutoIncrementManager> {
         &self.auto_increment_mgr
     }
 
     pub fn index_manager(&self) -> &Arc<IndexManager> {
         &self.index_manager
+    }
+
+    /// Standby replication apply: replace an in-memory catalog from its
+    /// on-disk JSON (the snapshot was written by the applier).
+    pub fn reload_catalog(&self, db: &str) -> Result<()> {
+        let meta_dir = self.data_dir.join("meta");
+        let catalog =
+            crate::storage::catalog::schema::DatabaseCatalog::load_or_create(&meta_dir, db)?;
+        self.catalogs
+            .write()
+            .unwrap()
+            .insert(db.to_string(), catalog);
+        Ok(())
+    }
+
+    /// Standby replication apply: DROP DATABASE.
+    pub fn remove_catalog(&self, db: &str) {
+        self.catalogs.write().unwrap().remove(db);
     }
 
     pub fn commit_session_txn(&self, session: &mut Session) -> Result<()> {
@@ -214,20 +399,93 @@ impl Engine {
             .unwrap_or(false);
 
         if had_writes {
-            self.batch_writer().commit_txn(txn_id)?;
+            // Deferred in-transaction DELETE/UPDATE must be durable (footer
+            // rewrites, memtable tail rewrites) before the visibility flip
+            // inside commit_txn exposes the transaction's new rows.
+            super::txn_dml::materialize_txn_mutations_at_commit(self, txn_id)?;
+            if let Err(first_error) = self.batch_writer().commit_txn(txn_id) {
+                // By the time commit_txn reports an error, the visibility flip
+                // has usually already happened (the failure comes from the
+                // durable-tail fsync wait) — and the flip clears each
+                // memtable's txn_id, so retrying commit_txn(txn_id) would find
+                // no memtables and report success with the rows still only in
+                // memory. Re-drive durability for the committed memtables
+                // directly instead: flushing them to segments persists the rows
+                // even when the tail lost its frames. If that also fails, fail
+                // with an explicit "fate ambiguous" error — the changes are
+                // visible and ROLLBACK cannot undo them.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if let Err(retry_error) = self.batch_writer().redrive_commit_durability() {
+                    tracing::error!(
+                        txn_id,
+                        first_error = %first_error,
+                        retry_error = %retry_error,
+                        "COMMIT durable-tail wait failed and durability redrive failed; transaction fate ambiguous"
+                    );
+                    return Err(TaibaiError::Storage(format!(
+                        "COMMIT applied but the durable-tail wait failed twice ({retry_error}); \
+                         the transaction's changes are visible and ROLLBACK cannot undo them — \
+                         verify the data with SELECT"
+                    )));
+                }
+            }
         }
 
+        // The published index entries are authoritative now; drop the
+        // rollback record.
+        self.index_manager().forget_txn_published_entries(txn_id);
         session.commit_txn();
         Ok(())
+    }
+
+    /// Roll back the session's open transaction: drop deferred DML plans,
+    /// roll the batch writer back, retract the unique/PK index entries the
+    /// transaction published at statement time, and clear the session's
+    /// transaction state. This is the single rollback protocol — the SQL
+    /// ROLLBACK statement, the wire ROLLBACK message, and the disconnect
+    /// path all go through it, so the cleanup steps cannot drift apart.
+    ///
+    /// On failure the session's transaction state is left intact so the
+    /// caller can retry or report; callers that cannot propagate (disconnect)
+    /// log instead.
+    pub fn rollback_session_txn(&self, session: &mut Session) -> Result<u64> {
+        if !session.in_txn() {
+            return Err(TaibaiError::Sql("no active transaction".into()));
+        }
+        let txn_id = session.active_txn_id();
+        // Deferred DML plans are dropped first: no durable state was
+        // written at statement time, so discarding them restores the
+        // pre-statement state.
+        let discarded_dml = super::txn_dml::discard_txn_mutations_at_rollback(self, txn_id);
+        let rolled_back = self.batch_writer().rollback_txn(txn_id)?;
+        // Retract the unique/PK index entries INSERT statements published at
+        // statement time; otherwise the next INSERT of the same key sees a
+        // phantom duplicate until the next snapshot refresh.
+        self.index_manager()
+            .discard_txn_published_entries_at_rollback(txn_id);
+        let rows = rolled_back + discarded_dml;
+        tracing::debug!(txn_id, rows_rolled_back = rows, "transaction rolled back");
+        session.rollback_txn();
+        Ok(rows)
     }
 
     pub fn get_table_meta(
         &self,
         db: &str,
         table: &str,
-    ) -> Option<crate::storage::catalog::schema::TableMeta> {
+    ) -> Option<std::sync::Arc<crate::storage::catalog::schema::TableMeta>> {
         let catalogs = self.catalogs.read().unwrap();
-        catalogs.get(db).and_then(|c| c.get_table(table).cloned())
+        catalogs
+            .get(db)
+            .and_then(|c| c.get_table_shared(table).cloned())
+    }
+
+    /// Run one pass of partition-level TTL purge across all candidate
+    /// tables (temporal partitions whose TTL column is the partition
+    /// column). Invoked periodically by the close-of-day scheduler; see
+    /// `ttl_purge`.
+    pub fn run_ttl_partition_purge(&self) -> Result<u64> {
+        crate::sql::execution::ttl_purge::purge_expired_partitions(self)
     }
 
     pub fn database_exists(&self, db: &str) -> bool {
@@ -270,10 +528,7 @@ impl Engine {
         let mut total = 0u64;
         for (db, table) in tables {
             total = total.saturating_add(self.flush_table_buffers(&db, &table)?);
-            self.bulk_dirty_tables
-                .lock()
-                .unwrap()
-                .remove(&(db, table));
+            self.bulk_dirty_tables.lock().unwrap().remove(&(db, table));
         }
         if !self.is_bulk_mode() {
             self.index_manager.resume_unique_index_compaction();
@@ -291,6 +546,11 @@ impl Engine {
     }
 
     pub fn flush_table_buffers(&self, db: &str, table: &str) -> Result<u64> {
+        // The end-of-bulk-import flush can write gigabytes per table; when it
+        // takes this long, every bulk commit of the last session (and the
+        // client behind it) waited just as long — worth a permanent WARN.
+        const SLOW_TABLE_FLUSH_WARN: std::time::Duration = std::time::Duration::from_secs(30);
+        let start = std::time::Instant::now();
         self.batch_writer.flush_table(db, table)?;
 
         let rows = self.segment_mgr.flush_table_active(db, table)?;
@@ -306,6 +566,17 @@ impl Engine {
             let mut state = self.catalog_save_state.lock().unwrap();
             state.pending_insert_rows = 0;
             state.last_save_at = Instant::now();
+        }
+
+        let elapsed = start.elapsed();
+        if elapsed >= SLOW_TABLE_FLUSH_WARN {
+            tracing::warn!(
+                db,
+                table,
+                rows,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "slow table buffer flush; the requesting bulk client waited for the whole duration"
+            );
         }
 
         Ok(rows)
@@ -463,12 +734,33 @@ impl Engine {
                 );
             }
         }
-        let today = chrono::Local::now().date_naive().to_string();
+        let now = chrono::Local::now();
+        let today = now.date_naive().to_string();
+        // Establish the partial-residency coverage bound. The mirror was just
+        // emptied, so every row whose partition-column value exceeds the
+        // archived maximum can only come from post-close writes, which the
+        // insert path mirrors; any later bypass re-closes the gate through
+        // `hot_partition_mirrored`.
+        let covers_from = match SegmentManager::discover_segments(
+            &self.segment_mgr.table_dir(db, table),
+        ) {
+            // An empty table legitimately yields i64::MIN (nothing archived,
+            // every future row is post-close). A discovery FAILURE must not:
+            // the mirror is empty here, so claiming full coverage would hide
+            // every archived row — decline the feature for this cycle.
+            Ok(segments) => self.max_partition_value_of_segments(&table_meta, &segments),
+            Err(e) => {
+                tracing::warn!(db, table, error = %e, "close-of-day: segment discovery failed, hybrid mirror coverage disabled");
+                None
+            }
+        };
         {
             let mut catalogs = self.catalogs.write().unwrap();
             if let Some(catalog) = catalogs.get_mut(db) {
                 if let Some(meta) = catalog.get_table_mut(table) {
                     meta.hot_last_close_date = Some(today);
+                    meta.hot_last_close_at = Some(now.timestamp_millis());
+                    meta.hot_mirror_covers_from = covers_from;
                 }
                 let meta_dir = self.data_dir.join("meta");
                 catalog.save(&meta_dir)?;
@@ -480,9 +772,49 @@ impl Engine {
             rows_written = stats.rows_written,
             rows_dropped = stats.rows_dropped,
             partitions_optimized = dirty_partitions.len(),
+            hot_mirror_covers_from = ?covers_from,
             "close-of-day: table resident state evicted and optimized"
         );
         Ok(())
+    }
+
+    /// Max partition-column value across `segments`' zone maps, as i64 in the
+    /// column's own value domain (integer partition columns only). `None`
+    /// means the mirror-coverage claim cannot be proven (unreadable segment
+    /// metadata or a non-integer partition column); `Some(i64::MIN)` when
+    /// there is nothing archived, so every future row is post-close.
+    fn max_partition_value_of_segments(
+        &self,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        segments: &[std::path::PathBuf],
+    ) -> Option<i64> {
+        use crate::types::scalar::ScalarValue;
+        let pk_idx = table_meta.get_partition_column_index()?;
+        let column = table_meta.columns.get(pk_idx)?;
+        if !matches!(
+            column.data_type,
+            crate::protocol::types::DataType::Int32 | crate::protocol::types::DataType::Int64
+        ) {
+            return None;
+        }
+        if segments.is_empty() {
+            return Some(i64::MIN);
+        }
+        let mut max: Option<i64> = None;
+        for seg in segments {
+            let meta = self.segment_mgr.segment_meta(seg).ok().flatten()?;
+            let zone = meta.segment_zone_maps.get(pk_idx)?;
+            if zone.row_count == 0 {
+                continue;
+            }
+            let value = match zone.max_value.clone() {
+                ScalarValue::Int32(Some(v)) => v as i64,
+                ScalarValue::Int64(Some(v)) => v,
+                _ => return None,
+            };
+            max = Some(max.map_or(value, |m| m.max(value)));
+        }
+        Some(max.unwrap_or(i64::MIN))
     }
 
     /// Rebuild resident hot stores from on-disk segments after a restart (design
@@ -491,6 +823,13 @@ impl Engine {
     /// the store. For each hot-eligible table we load the most recently written
     /// segments (up to a row budget) so the inverted index is warm again.
     /// Best-effort: unreadable segments are skipped.
+    ///
+    /// Close-aware: segments archived by a close-of-day flush are NOT
+    /// reloaded. Only segments modified after the recorded close completion
+    /// (`hot_last_close_at`) are eligible, because a continuously-running
+    /// server would hold nothing older resident — the close evicted it. A
+    /// table closed by a legacy binary that recorded only
+    /// `hot_last_close_date` stays cold until its next close.
     pub fn warmup_hot_stores(&self) {
         use crate::storage::core::hot_store::resolve_key_column;
         use crate::storage::partition::parse_partition_key;
@@ -500,6 +839,7 @@ impl Engine {
 
         const WARMUP_ROW_BUDGET: u64 = 20_000_000;
 
+        let mut covers_updates: Vec<(String, String, i64)> = Vec::new();
         let catalogs = self.catalogs.read().unwrap();
         for (db, catalog) in catalogs.iter() {
             for (table, table_meta) in catalog.tables.iter() {
@@ -521,16 +861,56 @@ impl Engine {
                     continue;
                 }
 
+                // Close-aware recency cutoff. A close-of-day flush archives
+                // the resident mirror and evicts it, so a continuously-running
+                // server holds nothing for the table until new writes arrive.
+                // Reloading every segment on restart would undo that memory
+                // release, so only segments written after the recorded close
+                // completion are eligible for the rebuild.
+                let close_cutoff_ms: Option<i64> = if let Some(at) = table_meta.hot_last_close_at {
+                    Some(at)
+                } else if table_meta.hot_last_close_date.is_some() {
+                    // Legacy catalog state: closed before this binary began
+                    // recording the completion instant. The archived set
+                    // cannot be separated from post-close writes, so keep the
+                    // table cold; the next close records the cutoff.
+                    tracing::info!(
+                        db,
+                        table,
+                        last_close_date = ?table_meta.hot_last_close_date,
+                        "warmup: table closed without a recorded close instant, skipping hot store rebuild"
+                    );
+                    continue;
+                } else {
+                    None
+                };
+
                 let mut mtimed: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
                 for seg in &segments {
                     if let Ok(meta) = std::fs::metadata(seg) {
                         if let Ok(mtime) = meta.modified() {
+                            if let Some(cutoff) = close_cutoff_ms {
+                                let mtime_ms = mtime
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as i64)
+                                    .unwrap_or(i64::MAX);
+                                if mtime_ms <= cutoff {
+                                    continue;
+                                }
+                            }
                             mtimed.push((mtime, seg.clone()));
                         }
                     }
                 }
                 mtimed.sort_by(|a, b| b.cmp(a));
                 if mtimed.is_empty() {
+                    if close_cutoff_ms.is_some() {
+                        tracing::info!(
+                            db,
+                            table,
+                            "warmup: no segments written after the last close, hot store stays cold"
+                        );
+                    }
                     continue;
                 }
 
@@ -538,6 +918,8 @@ impl Engine {
                 let mut loaded_segments: HashSet<std::path::PathBuf> = HashSet::new();
                 let mut failed_segments: HashSet<std::path::PathBuf> = HashSet::new();
                 let mut budget_exhausted = false;
+                let eligible: HashSet<std::path::PathBuf> =
+                    mtimed.iter().map(|(_, path)| path.clone()).collect();
                 for (_, seg_path) in &mtimed {
                     if loaded_rows >= WARMUP_ROW_BUDGET {
                         budget_exhausted = true;
@@ -618,13 +1000,17 @@ impl Engine {
                                 .push(seg.clone());
                         }
                         for (partition_key, partition_segments) in by_partition {
-                            if partition_segments
-                                .iter()
-                                .all(|seg| loaded_segments.contains(seg))
-                                && partition_segments
-                                    .iter()
-                                    .all(|seg| !failed_segments.contains(seg))
-                            {
+                            // The store may answer a partition alone only when
+                            // it holds the partition's complete row set: every
+                            // segment must be inside the close-recency window
+                            // and fully loaded. A partition with any archived
+                            // (pre-cutoff) segment stays cold, matching a
+                            // server that never restarted.
+                            if partition_segments.iter().all(|seg| {
+                                eligible.contains(seg)
+                                    && loaded_segments.contains(seg)
+                                    && !failed_segments.contains(seg)
+                            }) {
                                 store.mark_partition_resident(partition_key);
                             }
                         }
@@ -637,6 +1023,44 @@ impl Engine {
                         loaded_rows,
                         "warmup: rebuilt resident hot store from segments"
                     );
+                }
+
+                // Re-establish the partial-residency bound: when every
+                // post-close segment was fully loaded, the mirror holds all
+                // rows above the archived maximum, so hybrid scans may serve
+                // that range without full-partition residency. Applied to the
+                // catalog after the read lock is released.
+                if close_cutoff_ms.is_some()
+                    && !budget_exhausted
+                    && eligible
+                        .iter()
+                        .all(|seg| loaded_segments.contains(seg) && !failed_segments.contains(seg))
+                {
+                    let archived: Vec<std::path::PathBuf> = segments
+                        .iter()
+                        .filter(|seg| !eligible.contains(*seg))
+                        .cloned()
+                        .collect();
+                    if let Some(covers) =
+                        self.max_partition_value_of_segments(table_meta, &archived)
+                    {
+                        covers_updates.push((db.clone(), table.clone(), covers));
+                    }
+                }
+            }
+        }
+        drop(catalogs);
+        if !covers_updates.is_empty() {
+            let mut catalogs = self.catalogs.write().unwrap();
+            for (db, table, covers) in covers_updates {
+                if let Some(catalog) = catalogs.get_mut(&db) {
+                    if let Some(meta) = catalog.get_table_mut(&table) {
+                        meta.hot_mirror_covers_from = Some(covers);
+                    }
+                    let meta_dir = self.data_dir.join("meta");
+                    if let Err(e) = catalog.save(&meta_dir) {
+                        tracing::warn!(db, table, error = %e, "warmup: persisting mirror coverage failed");
+                    }
                 }
             }
         }

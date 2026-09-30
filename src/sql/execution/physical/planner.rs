@@ -38,7 +38,7 @@ pub fn build_physical_pipeline(
 pub(crate) fn build_profiled_materialized_pipeline(
     plan: LogicalPlan,
     ctx: &mut PhysicalContext<'_>,
-    table_batches: &HashMap<String, Vec<RecordBatch>>,
+    table_batches: &HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
     scan_seeds: &HashMap<String, ScanProfileSeed>,
     profile: &QueryProfile,
 ) -> Result<Box<dyn ExecutionOp>> {
@@ -84,11 +84,83 @@ pub fn drain_pipeline(
     Ok((result_schema.unwrap_or_else(Schema::empty), result_batches))
 }
 
+/// Rewrite the input of `SELECT DISTINCT` into a zone-map-answering scan
+/// when the shape is a single plain column reference over an unfiltered
+/// scan: the scan's projection is narrowed to that column and flagged with
+/// `distinct_column`, and the wrapping Project is remapped onto it. Returns
+/// `None` when the fast path does not apply.
+fn try_rewrite_distinct_scan(
+    input: &LogicalPlan,
+    ctx: &PhysicalContext<'_>,
+) -> Option<LogicalPlan> {
+    let (project, scan) = match input {
+        LogicalPlan::Project(p) => {
+            if p.expressions.len() != 1 || p.aliases.len() != p.expressions.len() {
+                return None;
+            }
+            let LogicalExpr::Column(col_idx) = p.expressions[0] else {
+                return None;
+            };
+            let LogicalPlan::Scan(s) = p.input.as_ref() else {
+                return None;
+            };
+            (Some((p, col_idx)), s)
+        }
+        LogicalPlan::Scan(s) => (None, s),
+        _ => return None,
+    };
+
+    // The zone-map answer is only exact for an unfiltered, unordered scan.
+    let eligible = scan.pushed_filter.is_none()
+        && scan.zone_map_filters.is_empty()
+        && scan.pushed_limit.is_none()
+        && scan.pushed_order.is_none()
+        && scan.partition_filter.is_none()
+        && scan.time_range.is_none()
+        && scan.index_columns.is_empty()
+        && scan.bloom_filter_columns.is_empty()
+        && scan.minmax_index_columns.is_empty()
+        && scan.set_index_columns.is_empty();
+    if !eligible {
+        return None;
+    }
+
+    // Resolve the projected column to its index in the table schema.
+    let table_idx = match (&scan.projection, &project) {
+        (Some(projection), Some((_, col_idx))) => *projection.get(*col_idx)?,
+        (Some(projection), None) => {
+            if projection.len() != 1 {
+                return None;
+            }
+            projection[0]
+        }
+        (None, Some((_, col_idx))) => *col_idx,
+        (None, None) => return None,
+    };
+
+    let table_schema = ctx.schema(&scan.table_name)?;
+    let column = table_schema.columns.get(table_idx)?;
+    let column_name = column.name.clone();
+
+    let mut new_scan = scan.clone();
+    new_scan.projection = Some(vec![table_idx]);
+    new_scan.distinct_column = Some(column_name);
+
+    match project {
+        Some((p, _)) => Some(LogicalPlan::Project(ProjectPlan {
+            expressions: vec![LogicalExpr::Column(0)],
+            aliases: p.aliases.clone(),
+            input: Box::new(LogicalPlan::Scan(new_scan)),
+        })),
+        None => Some(LogicalPlan::Scan(new_scan)),
+    }
+}
+
 fn build_operator_with_limit(
     plan: LogicalPlan,
     ctx: &mut PhysicalContext<'_>,
     limit_hint: Option<usize>,
-    table_batches: Option<&HashMap<String, Vec<RecordBatch>>>,
+    table_batches: Option<&HashMap<String, Vec<std::sync::Arc<RecordBatch>>>>,
     scan_seeds: Option<&HashMap<String, ScanProfileSeed>>,
     profile: Option<&QueryProfile>,
     depth: usize,
@@ -119,7 +191,7 @@ fn build_operator_with_limit(
                     .cloned()
                     .unwrap_or_default();
                 Ok(Box::new(
-                    ScanExec::new(batches, scan.projection).with_table_schema(scan.schema),
+                    ScanExec::new_shared(batches, scan.projection).with_table_schema(scan.schema),
                 ))
             } else {
                 let (physical_table_name, database) = {
@@ -170,12 +242,12 @@ fn build_operator_with_limit(
                 profile,
                 depth + 1,
             )?;
-            Ok(Box::new(FilterExec {
-                predicate: filter.predicate,
+            Ok(Box::new(FilterExec::new(
+                filter.predicate,
                 input,
                 schema,
-                subqueries: ctx.subqueries.clone(),
-            }))
+                ctx.subqueries.clone(),
+            )))
         }
         LogicalPlan::Project(project) => {
             let input_schema = get_scan_schema(&project.input);
@@ -194,6 +266,7 @@ fn build_operator_with_limit(
                 input,
                 input_schema,
                 subqueries: ctx.subqueries.clone(),
+                remapped: None,
             }))
         }
         LogicalPlan::Sort(sort) => {
@@ -364,8 +437,20 @@ fn build_operator_with_limit(
             )))
         }
         LogicalPlan::Distinct(distinct) => {
+            // `SELECT DISTINCT <single column>` over an unfiltered scan is
+            // answered from row-group zone maps by flagging the scan; the
+            // DistinctExec/Project above it then see one already-distinct
+            // batch and pass it through unchanged.
+            let input_plan = if table_batches.is_none() {
+                match try_rewrite_distinct_scan(distinct.input.as_ref(), ctx) {
+                    Some(rewritten) => rewritten,
+                    None => *distinct.input,
+                }
+            } else {
+                *distinct.input
+            };
             let input = build_operator_with_limit(
-                *distinct.input,
+                input_plan,
                 ctx,
                 None,
                 table_batches,
@@ -377,15 +462,25 @@ fn build_operator_with_limit(
                 crate::sql::execution::operators::DistinctExec::new(input),
             ))
         }
-        LogicalPlan::Window(window) => build_operator_with_limit(
-            *window.input,
-            ctx,
-            None,
-            table_batches,
-            scan_seeds,
-            profile,
-            depth + 1,
-        ),
+        LogicalPlan::Window(window) => {
+            let input_schema = get_scan_schema_from_window(&window);
+            let input = build_operator_with_limit(
+                *window.input,
+                ctx,
+                None,
+                table_batches,
+                scan_seeds,
+                profile,
+                depth + 1,
+            )?;
+            Ok(Box::new(
+                crate::sql::execution::operators::window::WindowExec::new(
+                    input,
+                    window.funcs,
+                    input_schema,
+                ),
+            ))
+        }
         LogicalPlan::Empty => Ok(Box::new(ScanExec::new(vec![], None))),
     };
     let operator = operator?;
@@ -1541,7 +1636,7 @@ fn estimate_plan_profile(plan: &LogicalPlan, ctx: &PhysicalContext<'_>) -> PlanE
                 JoinType::Right => inner_rows.max(right.rows),
                 JoinType::Full => inner_rows.max(left.rows).max(right.rows),
                 JoinType::Cross => left.rows.saturating_mul(right.rows),
-                JoinType::Semi | JoinType::Anti | JoinType::Asof => left.rows,
+                JoinType::Semi | JoinType::Anti | JoinType::Asof | JoinType::LeftAsof => left.rows,
             };
             let merged = merge_join_ndv(
                 rows,
@@ -1799,11 +1894,74 @@ fn try_skip_sort_for_ordered_scan(plan: LogicalPlan, ctx: &PhysicalContext<'_>) 
                     .unwrap_or(false),
                 _ => false,
             });
-    if matches {
+    if matches && ordered_cluster_scan_is_safe(ctx, meta, schema, &meta.cluster_key[0]) {
         *sort.input.clone()
     } else {
         plan
     }
+}
+
+/// Removing a Sort on the strength of the cluster key alone is only valid
+/// when the scan's output is globally ordered: segments must be mutually
+/// monotonic on the leading cluster column AND no memtable may hold
+/// unflushed rows (memtable batches restart the cluster-key ordering).
+/// This mirrors the streaming executor's `ordered_cluster_segments_are_monotonic`
+/// guard that the ordered-limit path has always required.
+fn ordered_cluster_scan_is_safe(
+    ctx: &PhysicalContext<'_>,
+    meta: &crate::storage::catalog::schema::TableMeta,
+    schema: &Schema,
+    leading_cluster_column: &str,
+) -> bool {
+    use crate::storage::segment_manager::SegmentManager;
+    let Some(col_idx) = schema
+        .columns
+        .iter()
+        .position(|c| c.name == leading_cluster_column)
+    else {
+        return false;
+    };
+    let table_dir = ctx
+        .scan_runtime
+        .data_dir()
+        .join(&meta.database)
+        .join(&meta.name);
+    let Ok(segments) = SegmentManager::discover_segments(&table_dir) else {
+        return false;
+    };
+    if segments.len() > 1 {
+        let mgr = ctx.scan_runtime.segment_mgr();
+        let mut prev_min: Option<crate::types::scalar::ScalarValue> = None;
+        let mut prev_max: Option<crate::types::scalar::ScalarValue> = None;
+        for segment in &segments {
+            // Same accessor the streaming executor's monotonicity guard
+            // uses (cluster_meta_cache-backed).
+            let Some(zm) = mgr.cluster_zone_map_cached(segment, col_idx) else {
+                return false;
+            };
+            let compare = crate::storage::index::sort_key::compare_scalars_for_sort;
+            if let Some(prev) = &prev_min {
+                if compare(&zm.min_value, prev) == std::cmp::Ordering::Less {
+                    return false;
+                }
+            }
+            if let Some(prev) = &prev_max {
+                if compare(&zm.max_value, prev) == std::cmp::Ordering::Less {
+                    return false;
+                }
+            }
+            prev_min = Some(zm.min_value);
+            prev_max = Some(zm.max_value);
+        }
+    }
+    !ctx.scan_runtime
+        .memtable_manager()
+        .get_by_table(&meta.database, &meta.name)
+        .iter()
+        .any(|mt| {
+            mt.read_snapshot_arc()
+                .is_some_and(|batch| batch.num_rows() > 0)
+        })
 }
 
 fn single_scan(plan: &LogicalPlan) -> Option<&crate::sql::planner::ScanPlan> {
@@ -1895,6 +2053,19 @@ fn annotate_scan(
     }
 }
 
+/// Schema of a Window node: its input's columns plus one result column per
+/// window function.
+fn get_scan_schema_from_window(window: &crate::sql::planner::WindowPlan) -> Schema {
+    let mut schema = get_scan_schema(&window.input);
+    for func in &window.funcs {
+        schema.columns.push(ColumnDef::new(
+            &func.output_name,
+            crate::sql::execution::operators::window::window_result_type(&func.kind, &schema),
+        ));
+    }
+    schema
+}
+
 pub(crate) fn get_scan_schema(plan: &LogicalPlan) -> Schema {
     match plan {
         LogicalPlan::Scan(s) => s.schema.clone(),
@@ -1956,7 +2127,7 @@ pub(crate) fn get_scan_schema(plan: &LogicalPlan) -> Schema {
         LogicalPlan::SemiJoin(s) => s.left_schema.clone(),
         LogicalPlan::TopN(t) => get_scan_schema(&t.input),
         LogicalPlan::Distinct(d) => get_scan_schema(&d.input),
-        LogicalPlan::Window(w) => get_scan_schema(&w.input),
+        LogicalPlan::Window(w) => get_scan_schema_from_window(w),
         LogicalPlan::Empty => Schema::new(vec![ColumnDef::new("count(*)", DataType::Int64)]),
     }
 }

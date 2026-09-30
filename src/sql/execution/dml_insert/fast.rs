@@ -13,6 +13,16 @@ fn log_insert_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
     }
 }
 
+/// Test seam: force INSERTs down the standard parse/materialize path so
+/// differential tests can compare both routes' outcomes on the same SQL.
+/// Production value stays false.
+static FAST_INSERT_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_fast_insert_disabled_for_tests(disabled: bool) {
+    FAST_INSERT_DISABLED.store(disabled, std::sync::atomic::Ordering::Release);
+}
+
 pub fn try_exec_fast_insert_sql(
     engine: &Engine,
     default_db: &str,
@@ -22,6 +32,9 @@ pub fn try_exec_fast_insert_sql(
     bulk_import_mode: bool,
     username: &str,
 ) -> Option<Result<ExecResult>> {
+    if FAST_INSERT_DISABLED.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
     match try_exec_fast_insert_sql_inner(
         engine,
         default_db,
@@ -94,26 +107,26 @@ fn try_exec_fast_insert_sql_inner(
     }
 
     let catalogs = engine.catalogs().read().unwrap();
-    let catalog = match catalogs.get(db) {
-        Some(catalog) => catalog,
+    let table_meta = match catalogs
+        .get(db)
+        .and_then(|catalog| catalog.get_table_shared(table))
+        .cloned()
+    {
+        Some(meta) => meta,
         None => {
-            return FastInsertOutcome::Executed(Err(TaibaiError::Sql(format!(
-                "database '{}' does not exist",
-                db
-            ))))
-        }
-    };
-    let table_meta = match catalog.get_table(table) {
-        Some(meta) => meta.clone(),
-        None => {
-            return FastInsertOutcome::Executed(Err(TaibaiError::Sql(format!(
-                "table '{}.{}' does not exist",
-                db, table
-            ))))
+            let missing = if catalogs.get(db).is_none() {
+                format!("database '{}' does not exist", db)
+            } else {
+                format!("table '{}.{}' does not exist", db, table)
+            };
+            return FastInsertOutcome::Executed(Err(TaibaiError::Sql(missing)));
         }
     };
     drop(catalogs);
 
+    // Arc-shared metadata: the standard path uses `get_table_shared`; cloning
+    // the whole TableMeta per statement showed up on high-frequency
+    // single-row INSERTs. One schema build remains (Schema owns its columns).
     let schema = Schema::new(table_meta.columns.clone());
     let columns = match parse_insert_column_list(sql, bytes, &mut pos) {
         Some(columns) => columns,
@@ -165,8 +178,13 @@ fn try_exec_fast_insert_sql_inner(
                     None => return FastInsertOutcome::Unsupported,
                 };
                 let col_idx = col_indices[value_idx];
-                if let Err(e) = push_fast_insert_provided_value(&mut batch, &schema, col_idx, value)
-                {
+                if let Err(e) = push_fast_insert_provided_value(
+                    &mut batch,
+                    &schema,
+                    col_idx,
+                    value,
+                    timezone_offset_hours,
+                ) {
                     return FastInsertOutcome::Executed(Err(e));
                 }
                 skip_spaces(bytes, &mut pos);
@@ -283,16 +301,49 @@ fn parse_insert_column_list(sql: &str, bytes: &[u8], pos: &mut usize) -> Option<
     let mut columns = Vec::new();
     loop {
         skip_spaces(bytes, pos);
-        let start = *pos;
-        while *pos < bytes.len()
-            && !matches!(bytes[*pos], b',' | b')' | b' ' | b'\t' | b'\r' | b'\n')
-        {
-            *pos += 1;
-        }
-        if *pos == start {
+        if *pos >= bytes.len() {
             return None;
         }
-        columns.push(sql[start..*pos].to_string());
+        // Quoted identifier ("col" or `col`): the real lexer strips the
+        // quotes, so the fast path must too — otherwise the plan resolves
+        // against a name that still carries them.
+        let quote = bytes[*pos];
+        if quote == b'"' || quote == b'`' {
+            *pos += 1;
+            let mut name = String::new();
+            let mut seg_start = *pos;
+            loop {
+                let Some(&c) = bytes.get(*pos) else {
+                    return None;
+                };
+                if c == quote {
+                    if bytes.get(*pos + 1) == Some(&quote) {
+                        name.push_str(&sql[seg_start..*pos]);
+                        name.push(quote as char);
+                        *pos += 2;
+                        seg_start = *pos;
+                    } else {
+                        name.push_str(&sql[seg_start..*pos]);
+                        *pos += 1;
+                        break;
+                    }
+                } else {
+                    *pos += 1;
+                }
+            }
+            columns.push(name);
+        } else {
+            let start = *pos;
+            while *pos < bytes.len()
+                && !matches!(bytes[*pos], b',' | b')' | b' ' | b'\t' | b'\r' | b'\n')
+            {
+                *pos += 1;
+            }
+            if *pos == start {
+                return None;
+            }
+            columns.push(sql[start..*pos].to_string());
+        }
         skip_spaces(bytes, pos);
         if *pos >= bytes.len() {
             return None;
@@ -380,8 +431,16 @@ fn get_or_build_fast_insert_plan(
         missing_auto_inc,
     });
     let mut cache = FAST_INSERT_PLAN_CACHE.lock().unwrap();
-    if cache.len() > 1024 {
-        cache.clear();
+    if cache.len() >= 1024 {
+        // Evict a few oldest entries instead of clearing the whole table:
+        // clear-all threw every hot plan out at once, collapsing the hit
+        // rate whenever 1024 cold keys had cycled through. Vec insertion
+        // order = HashMap iteration is unspecified, but evicting arbitrary
+        // entries still keeps the working set warm, which clear() did not.
+        let victims: Vec<String> = cache.keys().take(64).cloned().collect();
+        for key in victims {
+            cache.remove(&key);
+        }
     }
     cache.insert(plan_key.to_string(), Arc::clone(&plan));
     Ok(plan)
@@ -422,9 +481,33 @@ fn parse_fast_value<'a>(sql: &'a str, bytes: &[u8], pos: &mut usize) -> Option<F
     }
     if text.eq_ignore_ascii_case("NULL") {
         Some(FastValue::Null)
-    } else {
+    } else if bare_token_is_literal(text) {
         Some(FastValue::Bare(text))
+    } else {
+        // Bare identifiers (`VALUES (abc)`) are not literals; hand the
+        // statement back to the standard parser, which reports them as
+        // unknown columns instead of silently storing "abc" as a string.
+        None
     }
+}
+
+/// A bare (unquoted) token the fast path may treat as a literal: numbers and
+/// boolean words. Anything else is an identifier.
+#[inline]
+fn bare_token_is_literal(text: &str) -> bool {
+    if text.eq_ignore_ascii_case("true") || text.eq_ignore_ascii_case("false") {
+        return true;
+    }
+    let bytes = text.as_bytes();
+    let digits = match bytes.first() {
+        Some(b'+' | b'-') => &bytes[1..],
+        Some(b'0'..=b'9') => bytes,
+        _ => return false,
+    };
+    !digits.is_empty()
+        && digits
+            .iter()
+            .all(|b| matches!(b, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'))
 }
 
 #[inline]
@@ -433,6 +516,7 @@ fn push_fast_insert_provided_value(
     schema: &Schema,
     col_idx: usize,
     value: FastValue<'_>,
+    timezone_offset_hours: i32,
 ) -> Result<()> {
     let col = &schema.columns[col_idx];
     if matches!(value, FastValue::Null) {
@@ -444,7 +528,12 @@ fn push_fast_insert_provided_value(
         }
         batch.column_mut(col_idx).unwrap().push_null_value();
     } else {
-        push_fast_value_direct(batch.column_mut(col_idx).unwrap(), value, col.scale)?;
+        push_fast_value_direct(
+            batch.column_mut(col_idx).unwrap(),
+            value,
+            col.scale,
+            timezone_offset_hours,
+        )?;
     }
     Ok(())
 }
@@ -474,7 +563,12 @@ fn materialize_fast_insert_row(
                 }
                 batch.column_mut(col_idx).unwrap().push_null_value();
             } else {
-                push_fast_value_direct(batch.column_mut(col_idx).unwrap(), value, col.scale)?;
+                push_fast_value_direct(
+                    batch.column_mut(col_idx).unwrap(),
+                    value,
+                    col.scale,
+                    timezone_offset_hours,
+                )?;
             }
         } else {
             push_missing_insert_value(
@@ -493,8 +587,17 @@ fn materialize_fast_insert_row(
 }
 
 #[inline]
-fn push_fast_value_direct(col: &mut ColumnArray, value: FastValue<'_>, scale: i32) -> Result<()> {
+fn push_fast_value_direct(
+    col: &mut ColumnArray,
+    value: FastValue<'_>,
+    scale: i32,
+    timezone_offset_hours: i32,
+) -> Result<()> {
+    col.flatten_in_place();
     match col {
+        ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => {
+            unreachable!("flattened above")
+        }
         ColumnArray::Bool { data, bitmap } => {
             data.push(if parse_bool_fast(value)? { 1 } else { 0 });
             bitmap.push_valid();
@@ -550,7 +653,13 @@ fn push_fast_value_direct(col: &mut ColumnArray, value: FastValue<'_>, scale: i3
             bitmap.push_valid();
         }
         ColumnArray::Date { data, bitmap } => {
-            let v = parse_i64_fast(value)?;
+            let v = match parse_i64_fast(value) {
+                Ok(v) => v,
+                Err(int_err) => match parse_date_string_fast(value, timezone_offset_hours) {
+                    Some(days) => days as i64,
+                    None => return Err(int_err),
+                },
+            };
             data.push(i32::try_from(v).map_err(|_| overflow_error(v, "DATE"))?);
             bitmap.push_valid();
         }
@@ -559,7 +668,14 @@ fn push_fast_value_direct(col: &mut ColumnArray, value: FastValue<'_>, scale: i3
             bitmap.push_valid();
         }
         ColumnArray::Timestamp { data, bitmap } => {
-            data.push(parse_i64_fast(value)?);
+            let v = match parse_i64_fast(value) {
+                Ok(v) => v,
+                Err(int_err) => match parse_timestamp_string_fast(value, timezone_offset_hours) {
+                    Some(ts) => ts,
+                    None => return Err(int_err),
+                },
+            };
+            data.push(v);
             bitmap.push_valid();
         }
         ColumnArray::Interval { data, bitmap } => {
@@ -653,7 +769,7 @@ fn materialize_missing_insert_scalar(
             Some(counter) => counter.next_value(),
             None => engine.auto_increment_manager().next_value(db, table)?,
         };
-        materialize_auto_increment_value(schema, col_idx, next_val)
+        materialize_auto_increment_value(schema, col_idx, next_val)?
     } else if let Some(default) = &schema.columns[col_idx].default_value {
         materialize_default_value(default, schema, col_idx, timezone_offset_hours)?
     } else {
@@ -663,14 +779,24 @@ fn materialize_missing_insert_scalar(
     Ok(scalar)
 }
 
-fn materialize_auto_increment_value(schema: &Schema, col_idx: usize, next_val: u64) -> ScalarValue {
-    match schema.columns[col_idx].data_type {
-        DataType::Int32 => ScalarValue::Int32(Some(next_val as i32)),
-        DataType::Int64 => ScalarValue::Int64(Some(next_val as i64)),
-        DataType::UInt32 => ScalarValue::UInt32(Some(next_val as u32)),
+fn materialize_auto_increment_value(
+    schema: &Schema,
+    col_idx: usize,
+    next_val: u64,
+) -> Result<ScalarValue> {
+    let overflow = || {
+        TaibaiError::Sql(format!(
+            "auto-increment value {} overflows column type",
+            next_val
+        ))
+    };
+    Ok(match schema.columns[col_idx].data_type {
+        DataType::Int32 => ScalarValue::Int32(Some(i32::try_from(next_val).map_err(|_| overflow())?)),
+        DataType::Int64 => ScalarValue::Int64(Some(i64::try_from(next_val).map_err(|_| overflow())?)),
+        DataType::UInt32 => ScalarValue::UInt32(Some(u32::try_from(next_val).map_err(|_| overflow())?)),
         DataType::UInt64 => ScalarValue::UInt64(Some(next_val)),
-        _ => ScalarValue::Int64(Some(next_val as i64)),
-    }
+        _ => ScalarValue::Int64(Some(i64::try_from(next_val).map_err(|_| overflow())?)),
+    })
 }
 
 #[inline]
@@ -679,6 +805,23 @@ fn parse_text_fast(value: FastValue<'_>) -> Result<&str> {
         FastValue::String(v) | FastValue::Bare(v) => Ok(v),
         FastValue::Null => Err(TaibaiError::Sql("unexpected NULL".into())),
     }
+}
+
+/// `'2024-01-01 10:00:00'`-style TIMESTAMP literals, mirroring the standard
+/// path's `parse_timestamp_smart`. Integer literals keep the raw fast-path
+/// passthrough.
+fn parse_timestamp_string_fast(value: FastValue<'_>, timezone_offset_hours: i32) -> Option<i64> {
+    let text = parse_text_fast(value).ok()?;
+    crate::sql::execution::functions::date::parse_timestamp_smart(text, timezone_offset_hours)
+}
+
+/// `'2024-01-01'`-style DATE literals as days since epoch, mirroring the
+/// standard path's `parse_datetime_string` conversion.
+fn parse_date_string_fast(value: FastValue<'_>, timezone_offset_hours: i32) -> Option<i32> {
+    let text = parse_text_fast(value).ok()?;
+    let ts =
+        crate::sql::execution::functions::date::parse_datetime_string(text, timezone_offset_hours)?;
+    Some((ts / 86400) as i32)
 }
 
 fn parse_owned_string_fast(value: FastValue<'_>) -> Result<String> {

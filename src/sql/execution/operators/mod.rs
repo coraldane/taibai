@@ -9,6 +9,7 @@ pub mod scan;
 pub mod semi_join;
 pub mod sort;
 pub mod topn;
+pub mod window;
 
 use std::collections::HashMap;
 
@@ -38,60 +39,89 @@ pub trait ExecutionOp {
 
 pub struct DistinctExec {
     input: Box<dyn ExecutionOp>,
-    emitted: bool,
+    seen: std::collections::HashSet<Vec<u8>>,
+    key_buf: Vec<u8>,
+    done: bool,
+    /// Memory accounting for the global key set: DISTINCT over a
+    /// high-cardinality input used to grow `seen` without any bound and
+    /// could take the process down. The set is charged to the shared query
+    /// memory budget; exceeding it fails the query with a clear error
+    /// instead of an OOM kill.
+    memory: crate::sql::execution::spill::MemoryReservation,
+    seen_bytes: usize,
 }
 
 impl DistinctExec {
     pub fn new(input: Box<dyn ExecutionOp>) -> Self {
         Self {
             input,
-            emitted: false,
+            seen: std::collections::HashSet::new(),
+            key_buf: Vec::new(),
+            done: false,
+            memory: crate::sql::execution::spill::MemoryReservation::default(),
+            seen_bytes: 0,
         }
+    }
+}
+
+impl Default for crate::sql::execution::spill::MemoryReservation {
+    fn default() -> Self {
+        crate::sql::execution::spill::MemoryManager::reservation()
     }
 }
 
 impl ExecutionOp for DistinctExec {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        if self.emitted {
+        if self.done {
             return Ok(None);
         }
-        self.emitted = true;
-        let mut seen = std::collections::HashSet::new();
-        let mut columns: Vec<crate::types::array::ColumnArray> = Vec::new();
-        let mut output_schema: Option<Schema> = None;
         while let Some(batch) = self.input.next_batch()? {
+            crate::common::query_cancel::check()?;
             if batch.num_rows() == 0 {
                 continue;
             }
-            if output_schema.is_none() {
-                output_schema = Some(batch.schema.clone());
-                for def in &batch.schema.columns {
-                    columns.push(crate::types::array::ColumnArray::empty(def.data_type));
-                }
-            }
+            // Deduplicate on typed byte keys (type tag + null flag + raw
+            // bytes, self-delimiting) built straight from column storage; a
+            // global `HashSet` spans batches, and each batch is filtered
+            // with one columnar gather instead of a per-cell scalar pass.
+            let mut keep = Vec::with_capacity(batch.num_rows());
+            let mut kept_count = 0usize;
             for row in 0..batch.num_rows() {
-                let key = (0..batch.num_columns())
-                    .map(|c| {
-                        batch
-                            .scalar(row, c)
-                            .map(|v| v.to_string())
-                            .unwrap_or_default()
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\u{1f}");
-                if seen.insert(key) {
-                    for (col_idx, out) in columns.iter_mut().enumerate() {
-                        if let Some(value) = batch.scalar(row, col_idx) {
-                            out.push(&value)?;
-                        }
-                    }
+                self.key_buf.clear();
+                for column in &batch.columns {
+                    column.encode_key_at(row, &mut self.key_buf);
                 }
+                let is_new = self.seen.insert(self.key_buf.clone());
+                if is_new {
+                    // Vec header + heap buffer + hash-set slot overhead.
+                    self.seen_bytes += self.key_buf.len() + 24 + 32;
+                }
+                keep.push(is_new);
+                kept_count += is_new as usize;
             }
+            if kept_count == 0 {
+                continue;
+            }
+            if !self.memory.try_resize(self.seen_bytes) {
+                return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
+                    "DISTINCT key set exceeds the query memory budget ({} bytes)",
+                    self.seen_bytes
+                )));
+            }
+            let kept_rows: Vec<u32> = keep
+                .iter()
+                .enumerate()
+                .filter_map(|(row, &keep)| keep.then_some(row as u32))
+                .collect();
+            let columns = batch
+                .columns
+                .iter()
+                .map(|column| column.take(&kept_rows))
+                .collect();
+            return Ok(Some(RecordBatch::try_new(batch.schema.clone(), columns)?));
         }
-        match output_schema {
-            Some(schema) => Ok(Some(RecordBatch::try_new(schema, columns)?)),
-            None => Ok(None),
-        }
+        self.done = true;
+        Ok(None)
     }
 }
 
@@ -108,7 +138,7 @@ pub fn apply_filter_mask(batch: &RecordBatch, mask: &[bool]) -> RecordBatch {
 
 pub fn build_pipeline(
     plan: LogicalPlan,
-    table_batches: &HashMap<String, Vec<RecordBatch>>,
+    table_batches: &HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
 ) -> Result<Box<dyn ExecutionOp>> {
     build_pipeline_with_subqueries(plan, table_batches, None)
 }
@@ -119,7 +149,7 @@ pub fn build_pipeline(
 /// subqueries are rejected at bind time).
 pub fn build_pipeline_with_subqueries(
     plan: LogicalPlan,
-    table_batches: &HashMap<String, Vec<RecordBatch>>,
+    table_batches: &HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
     subqueries: Option<&SubqueryRegistry>,
 ) -> Result<Box<dyn ExecutionOp>> {
     match plan {
@@ -129,18 +159,18 @@ pub fn build_pipeline_with_subqueries(
                 .cloned()
                 .unwrap_or_default();
             Ok(Box::new(
-                ScanExec::new(batches, scan.projection).with_table_schema(scan.schema),
+                ScanExec::new_shared(batches, scan.projection).with_table_schema(scan.schema),
             ))
         }
         LogicalPlan::Filter(filter) => {
             let schema = get_scan_schema(&filter.input);
             let input = build_pipeline_with_subqueries(*filter.input, table_batches, subqueries)?;
-            Ok(Box::new(FilterExec {
-                predicate: filter.predicate,
+            Ok(Box::new(FilterExec::new(
+                filter.predicate,
                 input,
-                schema: schema.clone(),
-                subqueries: subqueries.cloned(),
-            }))
+                schema.clone(),
+                subqueries.cloned(),
+            )))
         }
         LogicalPlan::Project(proj) => {
             let input_schema = get_scan_schema(&proj.input);
@@ -151,6 +181,7 @@ pub fn build_pipeline_with_subqueries(
                 input,
                 input_schema,
                 subqueries: subqueries.cloned(),
+                remapped: None,
             }))
         }
         LogicalPlan::Sort(sort) => {
@@ -228,8 +259,17 @@ pub fn build_pipeline_with_subqueries(
             Ok(Box::new(DistinctExec::new(input)))
         }
         LogicalPlan::Window(window) => {
+            // Window functions are computed here too (e.g. inside snapshot /
+            // subquery pipelines) instead of silently dropping the columns.
+            let input_schema = get_scan_schema(&window.input);
             let input = build_pipeline_with_subqueries(*window.input, table_batches, subqueries)?;
-            Ok(input)
+            Ok(Box::new(
+                crate::sql::execution::operators::window::WindowExec::new(
+                    input,
+                    window.funcs,
+                    input_schema,
+                ),
+            ))
         }
         LogicalPlan::Empty => Ok(Box::new(ScanExec::new(vec![], None))),
     }

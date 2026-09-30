@@ -12,6 +12,7 @@ pub fn exec_create_table(
     ttl: &Option<TtlDef>,
     hot: &Option<HotDef>,
     durability: &Option<DurabilityLevel>,
+    compression_level: &Option<i32>,
 ) -> Result<ExecResult> {
     let mut catalogs = engine.catalogs().write().unwrap();
     let catalog = get_existing_catalog(&mut catalogs, db)?;
@@ -54,6 +55,8 @@ pub fn exec_create_table(
         validate_hot_def(&col_defs, name, hot_def)?;
     }
 
+    validate_compression_level(compression_level)?;
+
     catalog.create_table(name, col_defs)?;
 
     if let Some(meta) = catalog.get_table_mut(name) {
@@ -94,6 +97,9 @@ pub fn exec_create_table(
                 DurabilityLevel::Strict => TableDurability::Strict,
                 DurabilityLevel::Relaxed => TableDurability::Relaxed,
             };
+        }
+        if let Some(level) = compression_level {
+            meta.compression_level = Some(*level);
         }
     }
 
@@ -147,6 +153,10 @@ pub fn exec_create_table(
 
     let meta_dir = engine.data_dir().join("meta");
     catalog.save(&meta_dir)?;
+
+    engine
+        .segment_mgr()
+        .set_table_compression_level(db, name, *compression_level);
 
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
@@ -431,6 +441,9 @@ pub fn exec_drop_table(
     let total_start = Instant::now();
     tracing::info!(db, table = name, "drop table: start");
     let table_dir = engine.data_dir().join(db).join(name);
+    // The dropped directory invalidates any cached "partition has segment"
+    // entries; a same-name recreate must re-probe the filesystem.
+    engine.clear_hot_partition_segments(&table_dir);
     let mut catalogs = engine.catalogs().write().unwrap();
     tracing::info!(db, table = name, path = %table_dir.display(), "drop table: waiting for table mutation lock");
     let mut lock_attempts = 0u32;
@@ -511,7 +524,7 @@ pub fn exec_drop_table(
             catalog.drop_table(name)?;
             let meta_dir = engine.data_dir().join("meta");
             if let Err(save_error) = catalog.save(&meta_dir) {
-                catalog.tables.insert(name.to_string(), table_meta.clone());
+                catalog.tables.insert(name.to_string(), std::sync::Arc::new(table_meta.clone()));
                 if let Some(tombstone) = tombstone.as_deref() {
                     if let Err(restore_error) =
                         restore_staged_table_directory(tombstone, &table_dir)
@@ -764,6 +777,15 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
     };
     drop(catalogs);
 
+    // The renamed table's storage state was removed with the old name; carry
+    // the compression-level override over to the new table's state.
+    let compression_level = catalog_before
+        .get_table(name)
+        .and_then(|meta| meta.compression_level);
+    engine
+        .segment_mgr()
+        .set_table_compression_level(db, new_name, compression_level);
+
     engine
         .auto_increment_manager()
         .rename_table(db, name, new_name);
@@ -881,7 +903,7 @@ fn exec_partition_change(
 
             let meta_dir = engine.data_dir().join("meta");
             if let Err(error) = catalog.save(&meta_dir) {
-                catalog.tables.insert(name.to_string(), before_meta.clone());
+                catalog.tables.insert(name.to_string(), std::sync::Arc::new(before_meta.clone()));
                 restore_partition_files(&operation_dir, &table_dir)?;
                 return Err(error);
             }
@@ -994,7 +1016,7 @@ fn exec_set_hot(engine: &Engine, db: &str, name: &str, hot: &HotDef) -> Result<E
 
             let meta_dir = engine.data_dir().join("meta");
             if let Err(error) = catalog.save(&meta_dir) {
-                catalog.tables.insert(name.to_string(), before_meta.clone());
+                catalog.tables.insert(name.to_string(), std::sync::Arc::new(before_meta.clone()));
                 return Err(error);
             }
 
@@ -1101,6 +1123,15 @@ pub fn exec_alter_table(
                     .with_auto_increment(column.auto_increment)
                     .with_primary_key(column.primary_key)
                     .with_default_value(default_value);
+                // Pin CURRENT_TIMESTAMP backfill at ALTER time: pre-existing
+                // rows must read a stable value, not the query instant.
+                if matches!(col_def.default_value, Some(ColumnDefaultValue::CurrentTimestamp)) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as i64;
+                    col_def.added_at_micros = Some(now);
+                }
                 validate_column_constraints(std::slice::from_mut(&mut col_def))?;
                 if !col_def.nullable && col_def.default_value.is_none() {
                     let existing_rows = catalog
@@ -1278,11 +1309,24 @@ pub fn exec_alter_table(
                 })?;
                 meta.clear_ttl();
             }
+            AlterOperation::SetCompressionLevel { level } => {
+                validate_compression_level(&level)?;
+                let meta = catalog.get_table_mut(name).ok_or_else(|| {
+                    TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name))
+                })?;
+                meta.compression_level = *level;
+            }
         }
     }
 
     let meta_dir = engine.data_dir().join("meta");
     catalog.save(&meta_dir)?;
+
+    if let [AlterOperation::SetCompressionLevel { level }] = operations {
+        engine
+            .segment_mgr()
+            .set_table_compression_level(db, name, *level);
+    }
 
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
@@ -1357,6 +1401,20 @@ fn validate_ttl_columns(columns: &[ColumnDef], ttl: &TtlDef) -> Result<()> {
         )));
     }
 
+    Ok(())
+}
+
+/// zstd supports levels 1..=22; anything outside is a user error rather than
+/// something to silently clamp.
+pub(crate) fn validate_compression_level(level: &Option<i32>) -> Result<()> {
+    if let Some(level) = level {
+        if !(1..=22).contains(level) {
+            return Err(TaibaiError::Sql(format!(
+                "COMPRESSION_LEVEL must be between 1 and 22, got {}",
+                level
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1490,7 +1548,7 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
             if let Err(error) = catalog.save(&meta_dir) {
                 catalog
                     .tables
-                    .insert(table.to_string(), before_meta.clone());
+                    .insert(table.to_string(), std::sync::Arc::new(before_meta.clone()));
                 rollback_staged_table_data(&operation_dir, &table_dir)?;
                 return Err(error);
             }

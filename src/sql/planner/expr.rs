@@ -68,6 +68,8 @@ pub fn infer_scalar_function_type(name: &str, arg_types: &[DataType]) -> DataTyp
         "current_date" | "last_day" => DataType::Date,
         "current_time" => DataType::Time,
         "to_float" => DataType::Float64,
+        // cast(value, NULL::<target>, scale): the target is the second arg.
+        "cast" => arg_types.get(1).copied().unwrap_or(DataType::Int64),
         "to_bool" => DataType::Bool,
         "vector_normalize" | "vector_add" | "vector_sub" | "vector_scale" => DataType::Vector,
         "coalesce" | "ifnull" | "isnull" => common_function_type(arg_types),
@@ -298,6 +300,9 @@ pub fn ast_expr_to_logical_with_context(
                 },
             )))
         }
+        Expr::WindowFunction { .. } => Err(TaibaiError::Sql(
+            "window functions are only supported as top-level SELECT expressions".to_string(),
+        )),
         _ => Err(TaibaiError::Sql("unsupported expression type".to_string())),
     }
 }
@@ -480,6 +485,9 @@ pub fn ast_expr_to_logical(
                 },
             )))
         }
+        Expr::WindowFunction { .. } => Err(TaibaiError::Sql(
+            "window functions are only supported as top-level SELECT expressions".to_string(),
+        )),
         _ => Err(TaibaiError::Sql("unsupported expression type".to_string())),
     }
 }
@@ -800,11 +808,9 @@ pub fn collect_aggregate_calls(
                 collect_aggregate_calls(arg, aggs)?;
             }
         }
-        Expr::WindowFunction { .. } => {
-            return Err(TaibaiError::Sql(
-                "window functions are not supported yet".to_string(),
-            ));
-        }
+        // Window functions are planned separately; their arguments must not
+        // register as plain aggregates.
+        Expr::WindowFunction { .. } => {}
         Expr::BinaryOp { left, right, .. } => {
             collect_aggregate_calls(left, aggs)?;
             collect_aggregate_calls(right, aggs)?;
@@ -1363,4 +1369,170 @@ pub fn contains_correlated_subquery(expr: &LogicalExpr) -> bool {
         LogicalExpr::Aggregate(agg) => contains_correlated_subquery(&agg.arg),
         _ => false,
     }
+}
+
+/// True when the expression tree contains any window function call.
+pub fn contains_window_function(expr: &Expr) -> bool {
+    match expr {
+        Expr::WindowFunction { .. } => true,
+        Expr::BinaryOp { left, right, .. } => {
+            contains_window_function(left) || contains_window_function(right)
+        }
+        Expr::UnaryNot(inner) | Expr::UnaryMinus(inner) => contains_window_function(inner),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => contains_window_function(inner),
+        Expr::In { expr, .. } => contains_window_function(expr),
+        Expr::Between { expr, .. } => contains_window_function(expr),
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            operand
+                .as_ref()
+                .map(|e| contains_window_function(e))
+                .unwrap_or(false)
+                || when_clauses
+                    .iter()
+                    .any(|(w, t)| contains_window_function(w) || contains_window_function(t))
+                || else_clause
+                    .as_ref()
+                    .map(|e| contains_window_function(e))
+                    .unwrap_or(false)
+        }
+        Expr::Function { args, .. } => args.iter().any(contains_window_function),
+        _ => false,
+    }
+}
+
+/// Convert one parsed window function call into its planned form with a
+/// canonical output column name (used for projection references and dedup).
+pub fn window_function_to_plan(
+    func: &WindowFunc,
+    partition_by: &[Expr],
+    order_by: &[OrderByItem],
+    frame: Option<&WindowFrame>,
+    schema: &Schema,
+    alias_map: &AliasMap,
+    ctx: &PlannerContext,
+) -> Result<WindowFuncPlan> {
+    let to_logical = |e: &Expr| ast_expr_to_logical_with_context(e, schema, alias_map, ctx);
+
+    let kind = match func {
+        WindowFunc::RowNumber => WindowFuncKind::RowNumber,
+        WindowFunc::Rank => WindowFuncKind::Rank,
+        WindowFunc::DenseRank => WindowFuncKind::DenseRank,
+        WindowFunc::Lead {
+            arg,
+            offset,
+            default,
+        } => WindowFuncKind::Lead {
+            arg: Box::new(to_logical(arg)?),
+            offset: *offset,
+            default: default
+                .as_ref()
+                .map(|d| to_logical(d))
+                .transpose()?
+                .map(Box::new),
+        },
+        WindowFunc::Lag {
+            arg,
+            offset,
+            default,
+        } => WindowFuncKind::Lag {
+            arg: Box::new(to_logical(arg)?),
+            offset: *offset,
+            default: default
+                .as_ref()
+                .map(|d| to_logical(d))
+                .transpose()?
+                .map(Box::new),
+        },
+        WindowFunc::Aggregate {
+            func: name,
+            args,
+            distinct,
+        } => {
+            let agg_func = aggregate_func(name).ok_or_else(|| {
+                TaibaiError::Sql(format!("unsupported window aggregate function '{name}'"))
+            })?;
+            if args.len() > 1 {
+                return Err(TaibaiError::Sql(format!(
+                    "window aggregate '{name}' takes at most one argument"
+                )));
+            }
+            let arg = match args.first() {
+                // COUNT(*) parses `*` as a bare column name.
+                Some(Expr::Column(name)) if name == "*" => None,
+                None => None,
+                Some(e) => Some(Box::new(to_logical(e)?)),
+            };
+            WindowFuncKind::Aggregate {
+                func: agg_func,
+                arg,
+                distinct: *distinct,
+            }
+        }
+    };
+
+    let partition_names: Vec<String> = partition_by.iter().map(expr_to_name).collect();
+    let order_names: Vec<String> = order_by
+        .iter()
+        .map(|item| expr_to_name(&item.expr))
+        .collect();
+    let partition_by = partition_by
+        .iter()
+        .map(to_logical)
+        .collect::<Result<Vec<_>>>()?;
+    let order_by = order_by
+        .iter()
+        .map(|item| {
+            Ok(SortKey {
+                expr: to_logical(&item.expr)?,
+                desc: item.desc,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut output_name = String::new();
+    match func {
+        WindowFunc::RowNumber => output_name.push_str("ROW_NUMBER()"),
+        WindowFunc::Rank => output_name.push_str("RANK()"),
+        WindowFunc::DenseRank => output_name.push_str("DENSE_RANK()"),
+        WindowFunc::Lead { .. } => output_name.push_str("LEAD()"),
+        WindowFunc::Lag { .. } => output_name.push_str("LAG()"),
+        WindowFunc::Aggregate {
+            func,
+            args,
+            distinct,
+        } => {
+            output_name.push_str(&func.to_uppercase());
+            output_name.push('(');
+            if *distinct {
+                output_name.push_str("DISTINCT ");
+            }
+            output_name.push_str(&args.iter().map(expr_to_name).collect::<Vec<_>>().join(", "));
+            output_name.push(')');
+        }
+    }
+    output_name.push_str(" OVER (");
+    if !partition_by.is_empty() {
+        output_name.push_str("PARTITION BY ");
+        output_name.push_str(&partition_names.join(", "));
+    }
+    if !order_by.is_empty() {
+        if !partition_by.is_empty() {
+            output_name.push(' ');
+        }
+        output_name.push_str("ORDER BY ");
+        output_name.push_str(&order_names.join(", "));
+    }
+    output_name.push(')');
+
+    Ok(WindowFuncPlan {
+        kind,
+        partition_by,
+        order_by,
+        frame: frame.cloned(),
+        output_name,
+    })
 }

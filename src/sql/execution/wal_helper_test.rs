@@ -5,7 +5,7 @@ use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 fn assert_round_trip(batch: &RecordBatch) -> Result<()> {
-    let bytes = serialize_batch_for_wal(batch);
+    let bytes = serialize_batch_for_wal(batch)?;
     let restored = deserialize_batch_from_wal(&bytes, &batch.schema)?;
     assert_eq!(restored.num_rows(), batch.num_rows());
     assert_eq!(restored.num_columns(), batch.num_columns());

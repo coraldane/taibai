@@ -17,6 +17,7 @@ pub enum RowGroupReadStrategy {
     ClusterKeyRangeRead,
 }
 
+#[derive(Clone)]
 pub struct ScanPlan {
     pub predicate_cols: Vec<usize>,
     pub projection_cols: Vec<usize>,
@@ -94,6 +95,7 @@ impl<'a> ScanPlanner<'a> {
         if self.spec.has_aggregate
             || self.spec.has_group_by
             || self.spec.has_join
+            || self.spec.has_distinct_or_window
             || self.spec.remaining_predicate.is_some()
         {
             return None;
@@ -109,34 +111,60 @@ impl<'a> ScanPlanner<'a> {
             || self.spec.has_aggregate
             || self.spec.has_group_by
             || self.spec.has_join
+            || self.spec.has_distinct_or_window
             || self.spec.remaining_predicate.is_some()
-            || self.spec.order_by.len() != 1
+            || self.spec.order_by.is_empty()
         {
             return None;
         }
 
         let cluster_key = self.spec.cluster_key.as_ref()?;
-        let order = self.spec.order_by.first()?;
-        let order_col_name = self
+        let first = self.spec.order_by.first()?;
+        let first_name = self
             .table_schema
             .columns
-            .get(order.column_index)?
+            .get(first.column_index)?
             .name
             .as_str();
-        let order_key_pos = cluster_key
+        let first_pos = cluster_key
             .iter()
-            .position(|key| key.eq_ignore_ascii_case(order_col_name))?;
+            .position(|key| key.eq_ignore_ascii_case(first_name))?;
 
-        if order_key_pos > 0 {
-            for key in cluster_key.iter().take(order_key_pos) {
-                let key_idx = self.table_schema.index_of(key)?;
-                self.spec.eq_value_for_column(key_idx)?;
+        // Order keys before the matched cluster position must be pinned by
+        // equality predicates, otherwise the surviving rows are not globally
+        // ordered by the ORDER BY suffix.
+        for key in cluster_key.iter().take(first_pos) {
+            let key_idx = self.table_schema.index_of(key)?;
+            self.spec.eq_value_for_column(key_idx)?;
+        }
+
+        // The ORDER BY list must occupy consecutive cluster-key positions,
+        // all in the same direction; segment/RG reversal then yields a
+        // globally ordered stream whichever direction it is.
+        for (offset, order) in self.spec.order_by.iter().enumerate() {
+            let name = self
+                .table_schema
+                .columns
+                .get(order.column_index)?
+                .name
+                .as_str();
+            let pos = cluster_key
+                .iter()
+                .position(|key| key.eq_ignore_ascii_case(name))?;
+            if pos != first_pos + offset {
+                return None;
             }
+            if order.desc != first.desc {
+                return None;
+            }
+        }
+        if first_pos + self.spec.order_by.len() > cluster_key.len() {
+            return None;
         }
 
         Some(OrderedClusterLimit {
-            order_column_index: order.column_index,
-            desc: order.desc,
+            order_column_index: first.column_index,
+            desc: first.desc,
         })
     }
 
@@ -164,57 +192,74 @@ impl<'a> ScanPlanner<'a> {
         self.spec.projection.is_some()
     }
 
+    /// Walk the cluster key in order: equality-pinned columns extend the
+    /// prefix; the first column with range predicates becomes the range
+    /// column. A prefix without any range still yields bounds (equality run
+    /// on the prefix), so `symbol = ?` on `CLUSTER BY (symbol, ts)` keeps
+    /// using the sorted-key binary search.
     fn cluster_key_bounds(&self) -> Option<ClusterKeyBounds> {
         let cluster_key = self.spec.cluster_key.as_ref()?;
-        let key_col = cluster_key.first()?;
-        let key_col_idx = self.table_schema.index_of(key_col)?;
+        let mut prefix: Vec<(usize, ScalarValue)> = Vec::new();
 
-        if let Some(value) = self.spec.eq_value_for_column(key_col_idx) {
-            return Some(ClusterKeyBounds {
-                column_index: key_col_idx,
-                lower: Some((value.clone(), true)),
-                upper: Some((value.clone(), true)),
+        for key_col in cluster_key {
+            let col_idx = self.table_schema.index_of(key_col)?;
+
+            let eq_value = self.spec.eq_value_for_column(col_idx).cloned().or_else(|| {
+                self.spec
+                    .range_predicates
+                    .iter()
+                    .find(|clause| {
+                        clause.column_index == col_idx
+                            && clause.op == crate::storage::partition::pruning::RangeOp::Eq
+                    })
+                    .map(|clause| clause.value.clone())
             });
-        }
-
-        let mut lower: Option<(crate::types::scalar::ScalarValue, bool)> = None;
-        let mut upper: Option<(crate::types::scalar::ScalarValue, bool)> = None;
-        for clause in &self.spec.range_predicates {
-            if clause.column_index != key_col_idx {
+            if let Some(value) = eq_value {
+                prefix.push((col_idx, value));
                 continue;
             }
-            match clause.op {
-                crate::storage::partition::pruning::RangeOp::Eq => {
-                    return Some(ClusterKeyBounds {
-                        column_index: key_col_idx,
-                        lower: Some((clause.value.clone(), true)),
-                        upper: Some((clause.value.clone(), true)),
-                    });
+
+            let mut lower: Option<(ScalarValue, bool)> = None;
+            let mut upper: Option<(ScalarValue, bool)> = None;
+            for clause in &self.spec.range_predicates {
+                if clause.column_index != col_idx {
+                    continue;
                 }
-                crate::storage::partition::pruning::RangeOp::Gt => {
-                    set_tighter_lower(&mut lower, clause.value.clone(), false);
-                }
-                crate::storage::partition::pruning::RangeOp::Ge => {
-                    set_tighter_lower(&mut lower, clause.value.clone(), true);
-                }
-                crate::storage::partition::pruning::RangeOp::Lt => {
-                    set_tighter_upper(&mut upper, clause.value.clone(), false);
-                }
-                crate::storage::partition::pruning::RangeOp::Le => {
-                    set_tighter_upper(&mut upper, clause.value.clone(), true);
+                match clause.op {
+                    crate::storage::partition::pruning::RangeOp::Eq => {}
+                    crate::storage::partition::pruning::RangeOp::Gt => {
+                        set_tighter_lower(&mut lower, clause.value.clone(), false);
+                    }
+                    crate::storage::partition::pruning::RangeOp::Ge => {
+                        set_tighter_lower(&mut lower, clause.value.clone(), true);
+                    }
+                    crate::storage::partition::pruning::RangeOp::Lt => {
+                        set_tighter_upper(&mut upper, clause.value.clone(), false);
+                    }
+                    crate::storage::partition::pruning::RangeOp::Le => {
+                        set_tighter_upper(&mut upper, clause.value.clone(), true);
+                    }
                 }
             }
+
+            if lower.is_some() || upper.is_some() {
+                return Some(ClusterKeyBounds {
+                    prefix_eq: prefix,
+                    range_column_index: col_idx,
+                    lower,
+                    upper,
+                });
+            }
+            break;
         }
 
-        if lower.is_some() || upper.is_some() {
-            Some(ClusterKeyBounds {
-                column_index: key_col_idx,
-                lower,
-                upper,
-            })
-        } else {
-            None
-        }
+        let (last_col, last_value) = prefix.last().cloned()?;
+        Some(ClusterKeyBounds {
+            prefix_eq: prefix[..prefix.len() - 1].to_vec(),
+            range_column_index: last_col,
+            lower: Some((last_value.clone(), true)),
+            upper: Some((last_value, true)),
+        })
     }
 }
 
@@ -366,15 +411,40 @@ pub fn read_plain_row_group(
     reader: &SegmentReader,
     rg_idx: usize,
 ) -> Result<RecordBatch> {
-    let mut batch = read_projected_row_group(projection_cols, table_schema, reader, rg_idx)?;
+    if spec.has_predicates() && !projection_cols.is_empty() {
+        return read_predicated_plain_row_group(
+            spec,
+            projection_cols,
+            table_schema,
+            reader,
+            rg_idx,
+        );
+    }
+
+    // Dictionary passthrough: when nothing downstream needs per-row strings,
+    // dictionary-encoded columns stay as (ids, dict) so the grouped
+    // aggregate's fast path consumes u32 ids directly. Predicates materialize
+    // dictionary columns before typed evaluation, and delete-bitmap gathers
+    // need plain columns, so both cases keep the expanded form. Run
+    // passthrough rides the same gate for Rle/DeltaRle columns: the
+    // run-aware aggregate consumes runs directly, everything else flattens
+    // lazily.
+    let passthrough_safe = !spec.has_predicates() && reader.delete_bitmap().is_empty();
+    let allow_dictionary = passthrough_safe;
+    let allow_runs = passthrough_safe;
+    let mut batch = read_projected_row_group_passthrough(
+        projection_cols,
+        table_schema,
+        reader,
+        rg_idx,
+        allow_dictionary,
+        allow_runs,
+    )?;
 
     if !reader.delete_bitmap().is_empty() {
-        let rg_start_row: u64 = reader
-            .footer_row_groups_info()
-            .iter()
-            .take(rg_idx)
-            .map(|r| r.row_count)
-            .sum();
+        // O(1) prefix sum; the old clone-the-whole-footer sum was quadratic
+        // in the row-group count for bitmap segments.
+        let rg_start_row: u64 = reader.row_group_start_row(rg_idx);
         batch = crate::storage::segment::delete_bitmap::filter_batch(
             &batch,
             rg_start_row,
@@ -382,21 +452,112 @@ pub fn read_plain_row_group(
         )?;
     }
 
-    if batch.num_rows() == 0 {
+    if batch.num_rows() == 0 || !spec.has_predicates() {
         return Ok(batch);
     }
 
-    if spec.has_predicates() {
-        row_filter::apply_predicates(
+    // Projection covers every column (empty projection reads the full row
+    // group above), so the full-table predicate indices line up as-is.
+    row_filter::apply_predicates(
+        &batch,
+        &spec.eq_predicates,
+        &spec.range_predicates,
+        &spec.in_predicates,
+        spec.remaining_predicate.as_ref(),
+    )
+}
+
+/// Predicated plain read. Predicates carry full-table column indices, but the
+/// caller's projection may not include the predicate columns at all (e.g. a
+/// GROUP BY scan narrowed to its group keys). On such a batch an equality on
+/// a filtered-out column would zero every row and a range on one would
+/// silently pass — so read the union of projection and predicate columns,
+/// evaluate with remapped indices, and project back down.
+fn read_predicated_plain_row_group(
+    spec: &ScanSpec,
+    projection_cols: &[usize],
+    table_schema: &Schema,
+    reader: &SegmentReader,
+    rg_idx: usize,
+) -> Result<RecordBatch> {
+    let mut union_cols = projection_cols.to_vec();
+    for idx in spec.all_predicate_columns() {
+        if !union_cols.contains(&idx) {
+            union_cols.push(idx);
+        }
+    }
+    union_cols.sort_unstable();
+
+    if union_cols.len() == projection_cols.len() {
+        let mut batch =
+            read_row_group_with_schema_mapping(projection_cols, table_schema, reader, rg_idx)?;
+        batch = apply_delete_bitmap(reader, rg_idx, batch)?;
+        if batch.num_rows() == 0 {
+            return Ok(batch);
+        }
+        return row_filter::apply_predicates_with_column_map(
             &batch,
+            projection_cols,
             &spec.eq_predicates,
             &spec.range_predicates,
             &spec.in_predicates,
             spec.remaining_predicate.as_ref(),
-        )
-    } else {
-        Ok(batch)
+        );
     }
+
+    let mut batch = read_row_group_with_schema_mapping(&union_cols, table_schema, reader, rg_idx)?;
+    batch = apply_delete_bitmap(reader, rg_idx, batch)?;
+    if batch.num_rows() == 0 {
+        return Ok(batch);
+    }
+    let filtered = row_filter::apply_predicates_with_column_map(
+        &batch,
+        &union_cols,
+        &spec.eq_predicates,
+        &spec.range_predicates,
+        &spec.in_predicates,
+        spec.remaining_predicate.as_ref(),
+    )?;
+    project_union_columns(filtered, &union_cols, projection_cols)
+}
+
+fn apply_delete_bitmap(
+    reader: &SegmentReader,
+    rg_idx: usize,
+    batch: RecordBatch,
+) -> Result<RecordBatch> {
+    if reader.delete_bitmap().is_empty() {
+        return Ok(batch);
+    }
+    // O(1) prefix sum instead of cloning the whole footer per row group.
+    let rg_start_row: u64 = reader.row_group_start_row(rg_idx);
+    crate::storage::segment::delete_bitmap::filter_batch(
+        &batch,
+        rg_start_row,
+        reader.delete_bitmap(),
+    )
+}
+
+/// Keep only `projection_cols` from a batch read over `union_cols`, in
+/// projection order.
+fn project_union_columns(
+    batch: RecordBatch,
+    union_cols: &[usize],
+    projection_cols: &[usize],
+) -> Result<RecordBatch> {
+    let mut columns = Vec::with_capacity(projection_cols.len());
+    let mut col_defs = Vec::with_capacity(projection_cols.len());
+    for &idx in projection_cols {
+        let pos = union_cols.iter().position(|&u| u == idx).ok_or_else(|| {
+            crate::common::error::TaibaiError::Internal(format!(
+                "projected column {idx} missing from predicate batch"
+            ))
+        })?;
+        columns.push(batch.columns[pos].clone());
+        col_defs.push(batch.schema.columns[pos].clone());
+    }
+    RecordBatch::try_new(Schema::new(col_defs), columns)
+        .map_err(|e| crate::common::error::TaibaiError::Internal(e.to_string()))
 }
 
 pub fn read_projected_row_group(
@@ -404,6 +565,37 @@ pub fn read_projected_row_group(
     table_schema: &Schema,
     reader: &SegmentReader,
     rg_idx: usize,
+) -> Result<RecordBatch> {
+    read_projected_row_group_allow_dictionary(projection_cols, table_schema, reader, rg_idx, false)
+}
+
+pub fn read_projected_row_group_allow_dictionary(
+    projection_cols: &[usize],
+    table_schema: &Schema,
+    reader: &SegmentReader,
+    rg_idx: usize,
+    allow_dictionary: bool,
+) -> Result<RecordBatch> {
+    read_projected_row_group_passthrough(
+        projection_cols,
+        table_schema,
+        reader,
+        rg_idx,
+        allow_dictionary,
+        false,
+    )
+}
+
+/// `allow_runs` keeps Rle/DeltaRle columns in run form: safe when no
+/// predicate must evaluate against them and no delete gather needs plain
+/// values — the same contract as dictionary passthrough.
+pub fn read_projected_row_group_passthrough(
+    projection_cols: &[usize],
+    table_schema: &Schema,
+    reader: &SegmentReader,
+    rg_idx: usize,
+    allow_dictionary: bool,
+    allow_runs: bool,
 ) -> Result<RecordBatch> {
     if projection_cols.is_empty() {
         if reader_schema_differs(reader.schema(), table_schema) {
@@ -414,7 +606,12 @@ pub fn read_projected_row_group(
     }
 
     if !reader_schema_differs(reader.schema(), table_schema) {
-        return reader.read_row_group_with_projection(rg_idx, projection_cols);
+        return reader.read_row_group_with_projection_passthrough(
+            rg_idx,
+            projection_cols,
+            allow_dictionary,
+            allow_runs,
+        );
     }
 
     read_row_group_with_schema_mapping(projection_cols, table_schema, reader, rg_idx)
@@ -464,7 +661,7 @@ fn read_row_group_with_schema_mapping(
     RecordBatch::try_new(Schema::new(col_defs), columns)
 }
 
-fn reader_schema_differs(reader_schema: &Schema, table_schema: &Schema) -> bool {
+pub(super) fn reader_schema_differs(reader_schema: &Schema, table_schema: &Schema) -> bool {
     if reader_schema.num_columns() != table_schema.num_columns() {
         return true;
     }
@@ -487,7 +684,10 @@ fn default_column_for_missing_schema_col(
     let value = match &col_def.default_value {
         Some(crate::types::batch::ColumnDefaultValue::Literal(value)) => value.clone(),
         Some(crate::types::batch::ColumnDefaultValue::CurrentTimestamp) => {
-            ScalarValue::Timestamp(Some(now_micros()))
+            // Rows that predate an ALTER ADD COLUMN read the value pinned at
+            // ALTER time (col.added_at_micros); reading "now" made repeated
+            // queries return different values for the same row.
+            ScalarValue::Timestamp(Some(col_def.added_at_micros.unwrap_or_else(now_micros)))
         }
         None => ScalarValue::null_for_type(col_def.data_type),
     };

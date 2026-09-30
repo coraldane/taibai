@@ -1,3 +1,75 @@
+fn log_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
+    if crate::common::config::insert_profile_enabled() {
+        println!(
+            "[insert-profile] stage=direct_bulk_{} rows={} elapsed_us={}",
+            stage,
+            rows,
+            elapsed.as_micros()
+        );
+    }
+}
+
+/// Bulk appends this slow deserve a permanent WARN (not only behind the
+/// insert-profile flag): the usual cause is high table COMPRESSION_LEVEL
+/// (zstd 19 is single-digit MB/s per core) or a saturated disk; segment
+/// seals run outside the locks, so they no longer stall concurrent writers.
+const SLOW_BULK_APPEND_WARN: std::time::Duration = std::time::Duration::from_secs(10);
+const SLOW_SEAL_WARN: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn warn_slow_seal(
+    db: &str,
+    table: &str,
+    partition: &str,
+    size_bytes: u64,
+    elapsed: std::time::Duration,
+) {
+    if elapsed >= SLOW_SEAL_WARN {
+        tracing::warn!(
+            db,
+            table,
+            partition,
+            size_bytes,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow segment seal; it runs outside the table locks so writers keep going, but the disk/fsync behind it is slow"
+        );
+    }
+}
+
+/// RAII finish of a seal registration; Drop is the safety net for error and
+/// panic paths so a leaked entry can never wedge the wide-gate drain.
+struct SealingToken {
+    state: Arc<TableSegmentState>,
+    path: PathBuf,
+}
+
+impl Drop for SealingToken {
+    fn drop(&mut self) {
+        self.state.finish_sealing_segment(&self.path);
+    }
+}
+
+/// A segment removed from the active map whose seal (footer + fsync) still
+/// has to run — always executed after the partition and active-segments
+/// locks have been released.
+struct PendingSeal {
+    token: SealingToken,
+    writer: ActiveSegmentWriter,
+    partition: String,
+}
+
+impl PendingSeal {
+    fn new(state: Arc<TableSegmentState>, partition: &str, writer: ActiveSegmentWriter) -> Self {
+        Self {
+            token: SealingToken {
+                state,
+                path: writer.path.clone(),
+            },
+            partition: partition.to_string(),
+            writer,
+        }
+    }
+}
+
 impl SegmentManager {
     pub fn bulk_insert_payload(&self, db: &str, payload: &[u8]) -> Result<u64> {
         let req = parse_direct_bulk_payload(payload)?;
@@ -24,10 +96,14 @@ impl SegmentManager {
         let key = table_key(db, req.table_name);
         let state = self.get_or_create_state(&key);
 
-        let compressed_columns = self.compress_direct_bulk_columns(&req.columns)?;
+        let compressed_columns =
+            self.compress_direct_bulk_columns(&req.columns, bulk_compression_level())?;
 
+        let mut pending_seal = None;
         {
-            let _mutation_guard = state.mutation_lock.lock().unwrap();
+            let partition_lock = partition_mutation_lock_arc(&state, "");
+            let _partition_guard =
+                acquire_partition_mutation_lock(&state, &partition_lock, &key, "")?;
             ensure_state_not_retired(&state, db, req.table_name)?;
 
             let mut active_guard = state.active_segments.lock().unwrap();
@@ -36,27 +112,53 @@ impl SegmentManager {
                 &schema,
                 "",
                 &mut active_guard,
+                &state.sealing_paths(),
             )?;
 
-            let seg = active_guard.get_mut("").unwrap();
+            let seal_full = {
+                let seg = active_guard.get_mut("").unwrap();
+                seg.append_direct_row_group(
+                    &req.columns,
+                    &compressed_columns,
+                    req.row_count as u64,
+                    true,
+                    None,
+                )?;
+                seg.current_size >= self.max_segment_size()
+            };
 
-            seg.append_direct_row_group(
-                &req.columns,
-                &compressed_columns,
-                req.row_count as u64,
-                true,
-                None,
-            )?;
-
-            if seg.current_size >= self.max_segment_size() {
-                seg.seal(&|path| self.invalidate_reader(path))?;
-                active_guard.remove("");
+            if seal_full {
+                if let Some(seg) = active_guard.remove("") {
+                    state.register_sealing_segment("", seg.path.clone());
+                    pending_seal = Some(PendingSeal::new(Arc::clone(&state), "", seg));
+                }
             } else {
-                seg.flush_meta(&|path| self.invalidate_reader(path))?;
+                active_guard
+                    .get_mut("")
+                    .unwrap()
+                    .flush_meta(&|path| self.invalidate_reader(path))?;
             }
         }
 
-        self.note_direct_segment_append(db, req.table_name);
+        if let Some(mut pending) = pending_seal {
+            let seal_start = std::time::Instant::now();
+            let result = pending.writer.seal(&|path| self.invalidate_reader(path));
+            let size = pending.writer.current_size;
+            if let Err(error) = &result {
+                tracing::error!(
+                    db,
+                    table = req.table_name,
+                    error = %error,
+                    "segment seal failed outside the locks"
+                );
+            } else {
+                warn_slow_seal(db, req.table_name, &pending.partition, size, seal_start.elapsed());
+            }
+            drop(pending.token);
+            result?;
+        }
+
+        self.note_segments_changed(db, req.table_name);
         Ok(req.row_count as u64)
     }
 
@@ -67,7 +169,9 @@ impl SegmentManager {
         catalogs: &crate::storage::catalog::schema::DatabaseCatalog,
         flush_immediately: bool,
     ) -> Result<u64> {
+        let parse_start = std::time::Instant::now();
         let req = parse_direct_bulk_payload(payload)?;
+        log_profile("parse", req.row_count, parse_start.elapsed());
         if req.row_count == 0 {
             return Ok(0);
         }
@@ -113,9 +217,7 @@ impl SegmentManager {
                     idx, col_def.name, payload_col.name
                 )));
             }
-            if (col_def.primary_key || !col_def.nullable)
-                && payload_col.has_nulls(req.row_count)
-            {
+            if (col_def.primary_key || !col_def.nullable) && payload_col.has_nulls(req.row_count) {
                 return Err(TaibaiError::Protocol(format!(
                     "bulk column '{}' does not allow NULL values",
                     col_def.name
@@ -133,14 +235,27 @@ impl SegmentManager {
         table_meta: &crate::storage::catalog::schema::TableMeta,
         flush_immediately: bool,
     ) -> Result<u64> {
+        // Timed from the very top: column compression (prepare_direct_bulk_groups)
+        // runs before any lock and can dominate the request at high table
+        // COMPRESSION_LEVEL — zstd 19 is single-digit MB/s per core.
+        let total_start = std::time::Instant::now();
         let table_dir = self.data_dir.join(db).join(req.table_name);
         std::fs::create_dir_all(&table_dir)?;
+        self.set_table_compression_level(db, req.table_name, table_meta.compression_level);
+        let compression_level = crate::storage::segment_manager::config::resolve_compression_level(
+            table_meta.compression_level,
+        );
+        let partition_start = std::time::Instant::now();
         let partition_groups = self.direct_bulk_partition_groups(req, table_meta)?;
+        log_profile("partition", req.row_count, partition_start.elapsed());
+        let prepare_start = std::time::Instant::now();
         let prepared_groups = self.prepare_direct_bulk_groups(
             req,
             partition_groups,
             self.config.row_group_target_rows.max(1),
+            compression_level,
         )?;
+        log_profile("prepare", req.row_count, prepare_start.elapsed());
         let key = table_key(db, req.table_name);
         let state = self.get_or_create_state(&key);
         let build_value_sets = flush_immediately;
@@ -150,61 +265,113 @@ impl SegmentManager {
             Some(self.direct_bulk_key_column_indices(schema, table_meta))
         };
 
-        let _mutation_guard = state.mutation_lock.lock().unwrap();
-        ensure_state_not_retired(&state, db, req.table_name)?;
+        let mut partition_keys = prepared_groups
+            .iter()
+            .map(|group| group.partition_key.clone())
+            .collect::<Vec<_>>();
+        partition_keys.sort();
+        partition_keys.dedup();
+        let partition_refs = partition_keys
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
 
-        let mut written = 0u64;
-        let mut active_guard = state.active_segments.lock().unwrap();
-        for group in prepared_groups {
-            self.get_or_create_active_segment_for_partition_locked(
-                &table_dir,
-                schema,
-                &group.partition_key,
-                &mut active_guard,
-            )?;
-            let seg = active_guard.get_mut(&group.partition_key).unwrap();
-            match &group.columns {
-                PreparedDirectColumns::Borrowed(columns) => {
+        let result = self.with_partition_set_mutation_lock(db, req.table_name, &partition_refs, || {
+            ensure_state_not_retired(&state, db, req.table_name)?;
+
+            let mut written = 0u64;
+            let mut pending_seals: Vec<PendingSeal> = Vec::new();
+            let append_start = std::time::Instant::now();
+            for group in prepared_groups {
+                let mut active_guard = state.active_segments.lock().unwrap();
+                self.get_or_create_active_segment_for_partition_locked(
+                    &table_dir,
+                    schema,
+                    &group.partition_key,
+                    &mut active_guard,
+                    &state.sealing_paths(),
+                )?;
+                let seal_full = {
+                    let seg = active_guard.get_mut(&group.partition_key).unwrap();
                     seg.append_direct_row_group(
-                        columns,
+                        &group.columns,
                         &group.compressed_columns,
                         group.row_count as u64,
                         build_value_sets,
                         zone_map_columns.as_deref(),
                     )?;
+                    seg.current_size >= self.max_segment_size()
+                };
+                if seal_full {
+                    if let Some(seg) = active_guard.remove(&group.partition_key) {
+                        state.register_sealing_segment(&group.partition_key, seg.path.clone());
+                        pending_seals.push(PendingSeal::new(
+                            Arc::clone(&state),
+                            &group.partition_key,
+                            seg,
+                        ));
+                    }
+                } else if flush_immediately {
+                    active_guard
+                        .get_mut(&group.partition_key)
+                        .unwrap()
+                        .flush_meta(&|path| self.invalidate_reader(path))?;
                 }
-                PreparedDirectColumns::Owned(storage) => {
-                    let columns: Vec<DirectBulkColumn<'_>> = storage
-                        .iter()
-                        .map(|col| DirectBulkColumn {
-                            name: col.name,
-                            data_type: col.data_type,
-                            scale: col.scale,
-                            precision: col.precision,
-                            data: &col.data,
-                            nulls: &col.nulls,
-                            variable_ranges: col.variable_ranges.clone(),
-                        })
-                        .collect();
-                    seg.append_direct_row_group(
-                        &columns,
-                        &group.compressed_columns,
-                        group.row_count as u64,
-                        build_value_sets,
-                        zone_map_columns.as_deref(),
-                    )?;
+                written += group.row_count as u64;
+            }
+            if written > 0 {
+                self.note_segments_changed(db, req.table_name);
+            }
+            log_profile("append", written as usize, append_start.elapsed());
+            Ok((written, pending_seals))
+        });
+        let (written, pending_seals) = match result {
+            Ok(pair) => pair,
+            Err(error) => return Err(error),
+        };
+        let mut sealed_any = false;
+        let mut first_seal_error: Option<TaibaiError> = None;
+        for mut pending in pending_seals {
+            let partition = pending.partition.clone();
+            let seal_start = std::time::Instant::now();
+            let result = pending.writer.seal(&|path| self.invalidate_reader(path));
+            let size = pending.writer.current_size;
+            drop(pending.token);
+            match result {
+                Ok(()) => {
+                    sealed_any = true;
+                    warn_slow_seal(db, req.table_name, &partition, size, seal_start.elapsed());
+                }
+                Err(error) => {
+                    tracing::error!(
+                        db,
+                        table = req.table_name,
+                        partition = %partition,
+                        error = %error,
+                        "segment seal failed outside the locks"
+                    );
+                    if first_seal_error.is_none() {
+                        first_seal_error = Some(error);
+                    }
                 }
             }
-            if seg.current_size >= self.max_segment_size() {
-                seg.seal(&|path| self.invalidate_reader(path))?;
-                active_guard.remove(&group.partition_key);
-            } else if flush_immediately {
-                seg.flush_meta(&|path| self.invalidate_reader(path))?;
-            }
-            written += group.row_count as u64;
         }
-        if written > 0 {
-            self.note_direct_segment_append(db, req.table_name);
+        if sealed_any {
+            self.note_segments_changed(db, req.table_name);
+        }
+        let elapsed = total_start.elapsed();
+        if elapsed >= SLOW_BULK_APPEND_WARN {
+            tracing::warn!(
+                db,
+                table = req.table_name,
+                rows = req.row_count,
+                compression_level,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "slow direct bulk append: high table COMPRESSION_LEVEL makes column compression dominate (zstd 19 is single-digit MB/s per core); a saturated disk is the other usual cause (segment seals run outside the locks)"
+            );
+        }
+        if let Some(error) = first_seal_error {
+            return Err(error);
         }
         Ok(written)
     }
@@ -251,6 +418,15 @@ impl SegmentManager {
             ))
         })?;
         let strategy = table_meta.partition_strategy();
+
+        // Uniform fast path: day-ordered imports land every row of a request
+        // in one partition. If the partition column's raw slots are all equal
+        // (and NULL-free), one key computation replaces the per-row
+        // scalar + format! work.
+        if let Some(key) = direct_bulk_uniform_partition_key(pk_col, req.row_count, &strategy)? {
+            return Ok(vec![(key, (0..req.row_count).collect())]);
+        }
+
         let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
         let mut order = Vec::new();
         for row_idx in 0..req.row_count {
@@ -273,163 +449,46 @@ impl SegmentManager {
         req: &'a DirectBulkRequest<'a>,
         partition_groups: Vec<(String, Vec<usize>)>,
         row_group_target_rows: usize,
+        compression_level: i32,
     ) -> Result<Vec<PreparedDirectBulkGroup<'a>>> {
         let mut prepared = Vec::with_capacity(partition_groups.len());
         for (partition_key, rows) in partition_groups {
             if rows.is_empty() {
                 continue;
             }
-            for chunk in rows.chunks(row_group_target_rows.max(1)) {
-            if self.direct_bulk_rows_are_full_range(chunk, req.row_count) {
-                let columns: Vec<DirectBulkColumn<'a>> = req
-                    .columns
-                    .iter()
-                    .map(|col| DirectBulkColumn {
-                        name: col.name,
-                        data_type: col.data_type,
-                        scale: col.scale,
-                        precision: col.precision,
-                        data: col.data,
-                        nulls: col.nulls,
-                        variable_ranges: col.variable_ranges.clone(),
-                    })
-                    .collect();
-                let compressed_columns = self.compress_direct_bulk_columns(&columns)?;
-                prepared.push(PreparedDirectBulkGroup {
-                    partition_key: partition_key.clone(),
-                    row_count: req.row_count,
-                    columns: PreparedDirectColumns::Borrowed(columns),
-                    compressed_columns,
-                });
-            } else {
-                let storage = self.direct_bulk_select_columns(req, chunk)?;
-                let columns: Vec<DirectBulkColumn<'_>> = storage
-                    .iter()
-                    .map(|col| DirectBulkColumn {
-                        name: col.name,
-                        data_type: col.data_type,
-                        scale: col.scale,
-                        precision: col.precision,
-                        data: &col.data,
-                        nulls: &col.nulls,
-                        variable_ranges: col.variable_ranges.clone(),
-                    })
-                    .collect();
-                let compressed_columns = self.compress_direct_bulk_columns(&columns)?;
-                prepared.push(PreparedDirectBulkGroup {
-                    partition_key: partition_key.clone(),
-                    row_count: chunk.len(),
-                    columns: PreparedDirectColumns::Owned(storage),
-                    compressed_columns,
-                });
-            }
+            // Row groups are cut from contiguous runs of the request so every
+            // group stays a zero-copy sub-slice of the payload; the per-value
+            // gather only existed because arbitrary chunks rarely covered the
+            // whole request.
+            for (run_start, run_len) in contiguous_row_runs(&rows) {
+                let mut offset = 0usize;
+                while offset < run_len {
+                    let piece_len = (run_len - offset).min(row_group_target_rows.max(1));
+                    let first_row = run_start + offset;
+                    let columns = direct_bulk_zero_copy_columns(req, first_row, piece_len)?;
+                    let compress_start = std::time::Instant::now();
+                    let compressed_columns =
+                        self.compress_direct_bulk_columns(&columns, compression_level)?;
+                    log_profile("compress", piece_len, compress_start.elapsed());
+                    prepared.push(PreparedDirectBulkGroup {
+                        partition_key: partition_key.clone(),
+                        row_count: piece_len,
+                        columns,
+                        compressed_columns,
+                    });
+                    offset += piece_len;
+                }
             }
         }
         Ok(prepared)
     }
 
-    fn direct_bulk_rows_are_full_range(&self, rows: &[usize], row_count: usize) -> bool {
-        rows.len() == row_count
-            && rows
-                .iter()
-                .enumerate()
-                .all(|(idx, &row_idx)| idx == row_idx)
-    }
-
-    fn direct_bulk_select_columns<'a>(
-        &self,
-        req: &'a DirectBulkRequest<'a>,
-        rows: &[usize],
-    ) -> Result<Vec<OwnedDirectBulkColumn<'a>>> {
-        req.columns
-            .iter()
-            .map(|col| self.direct_bulk_select_column(col, rows))
-            .collect()
-    }
-
-    fn direct_bulk_select_column<'a>(
-        &self,
-        col: &DirectBulkColumn<'a>,
-        rows: &[usize],
-    ) -> Result<OwnedDirectBulkColumn<'a>> {
-        let mut data = Vec::new();
-        let mut variable_ranges = col
-            .variable_ranges
-            .as_ref()
-            .map(|_| Vec::with_capacity(rows.len()));
-        let mut nulls = if col.nulls.is_empty() {
-            Vec::new()
-        } else {
-            vec![0u8; rows.len().div_ceil(64) * 8]
-        };
-        let mut selected_has_nulls = false;
-        for (selected_idx, &row_idx) in rows.iter().enumerate() {
-            if col.is_null(row_idx) {
-                nulls[selected_idx / 8] |= 1u8 << (selected_idx % 8);
-                selected_has_nulls = true;
-            }
-        }
-        if !selected_has_nulls {
-            nulls.clear();
-        }
-        if let Some(width) = col.data_type.fixed_size() {
-            data.reserve(rows.len() * width);
-            for &row_idx in rows {
-                let offset = row_idx
-                    .checked_mul(width)
-                    .ok_or_else(|| TaibaiError::Protocol("bulk column offset overflow".into()))?;
-                let end = offset + width;
-                if end > col.data.len() {
-                    return Err(TaibaiError::Protocol(format!(
-                        "bulk column '{}' row {} is truncated",
-                        col.name, row_idx
-                    )));
-                }
-                data.extend_from_slice(&col.data[offset..end]);
-            }
-        } else {
-            for &row_idx in rows {
-                let (offset, len) = col
-                    .variable_ranges
-                    .as_ref()
-                    .and_then(|ranges| ranges.get(row_idx).copied())
-                    .ok_or_else(|| {
-                        TaibaiError::Protocol(format!(
-                            "bulk column '{}' row {} not found",
-                            col.name, row_idx
-                        ))
-                    })?;
-                if offset + len > col.data.len() {
-                    return Err(TaibaiError::Protocol(format!(
-                        "bulk column '{}' variable data truncated",
-                        col.name
-                    )));
-                }
-                data.extend_from_slice(&(len as u32).to_le_bytes());
-                let value_offset = data.len();
-                data.extend_from_slice(&col.data[offset..offset + len]);
-                if let Some(ranges) = variable_ranges.as_mut() {
-                    ranges.push((value_offset, len));
-                }
-            }
-        }
-        Ok(OwnedDirectBulkColumn {
-            name: col.name,
-            data_type: col.data_type,
-            scale: col.scale,
-            precision: col.precision,
-            data,
-            nulls,
-            variable_ranges,
-        })
-    }
-
     fn compress_direct_bulk_columns(
         &self,
         columns: &[DirectBulkColumn<'_>],
+        compression_level: i32,
     ) -> Result<Vec<(Vec<u8>, u64)>> {
         use rayon::prelude::*;
-        let compression_level = bulk_compression_level();
         columns
             .par_iter()
             .map(|col| {
@@ -443,15 +502,200 @@ impl SegmentManager {
     }
 }
 
+/// Split an ascending row-index list into maximal contiguous
+/// `(first_row, len)` runs. Contiguous runs tile the input, so zero-copy
+/// row groups can cover arbitrary partition groupings.
+/// Partition key of the whole request when every row carries the identical
+/// fixed-width partition-column value, else `None`. Raw-slot equality implies
+/// key equality, so a memcmp scan is sufficient to detect the uniform case;
+/// non-uniform requests fall back to per-row key computation.
+fn direct_bulk_uniform_partition_key(
+    pk_col: &DirectBulkColumn<'_>,
+    row_count: usize,
+    strategy: &crate::storage::partition::partition_function::PartitionFunction,
+) -> Result<Option<String>> {
+    let Some(width) = pk_col.data_type.fixed_size() else {
+        return Ok(None);
+    };
+    if row_count == 0 || !pk_col.nulls.iter().all(|&byte| byte == 0) {
+        return Ok(None);
+    }
+    let n = row_count.min(pk_col.data.len() / width);
+    if n == 0 || n != row_count {
+        return Ok(None);
+    }
+    let first = &pk_col.data[..width];
+    if !pk_col.data[width..n * width]
+        .chunks_exact(width)
+        .all(|slot| slot == first)
+    {
+        return Ok(None);
+    }
+    let value = helpers::direct_bulk_column_scalar_at(pk_col, 0)?;
+    Ok(Some(compute_partition_key_from_scalar(strategy, &value)))
+}
+
+fn contiguous_row_runs(rows: &[usize]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut idx = 0usize;
+    while idx < rows.len() {
+        let start = rows[idx];
+        let mut end = idx + 1;
+        while end < rows.len() && rows[end] == rows[end - 1] + 1 {
+            end += 1;
+        }
+        runs.push((start, end - idx));
+        idx = end;
+    }
+    runs
+}
+
+/// Borrow the row range `[first_row, first_row + len)` of a parsed bulk
+/// request as zero-copy column slices. Fixed-width columns sub-slice the raw
+/// payload directly; variable columns keep the whole arena and slice the
+/// per-row ranges. Returns an empty null bitmap when the range has no NULLs so
+/// downstream encoding keeps its null-free fast path.
+fn direct_bulk_zero_copy_columns<'a>(
+    req: &'a DirectBulkRequest<'a>,
+    first_row: usize,
+    len: usize,
+) -> Result<Vec<DirectBulkColumn<'a>>> {
+    let end_row = first_row
+        .checked_add(len)
+        .ok_or_else(|| TaibaiError::Protocol("bulk row range overflow".into()))?;
+    req.columns
+        .iter()
+        .map(|col| {
+            let nulls: Vec<u8> = if col.nulls.is_empty() {
+                Vec::new()
+            } else {
+                slice_null_bitmap(&col.nulls, first_row, len)
+            };
+            if let Some(width) = col.data_type.fixed_size() {
+                let start = first_row
+                    .checked_mul(width)
+                    .ok_or_else(|| TaibaiError::Protocol("bulk column offset overflow".into()))?;
+                let end = start
+                    .checked_add(len.checked_mul(width).ok_or_else(|| {
+                        TaibaiError::Protocol("bulk column length overflow".into())
+                    })?)
+                    .ok_or_else(|| TaibaiError::Protocol("bulk column offset overflow".into()))?;
+                if end > col.data.len() {
+                    return Err(TaibaiError::Protocol(format!(
+                        "bulk column '{}' rows {}..{} are truncated",
+                        col.name, first_row, end_row
+                    )));
+                }
+                Ok(DirectBulkColumn {
+                    name: col.name,
+                    data_type: col.data_type,
+                    scale: col.scale,
+                    precision: col.precision,
+                    data: &col.data[start..end],
+                    nulls: std::borrow::Cow::Owned(nulls),
+                    variable_ranges: None,
+                })
+            } else {
+                let ranges = col.variable_ranges.as_ref().ok_or_else(|| {
+                    TaibaiError::Protocol(format!(
+                        "bulk column '{}' is missing variable value ranges",
+                        col.name
+                    ))
+                })?;
+                if end_row > ranges.len() {
+                    return Err(TaibaiError::Protocol(format!(
+                        "bulk column '{}' rows {}..{} are truncated",
+                        col.name, first_row, end_row
+                    )));
+                }
+                // The wire arena is a concatenation of per-row
+                // [u32 length prefix][value] slots, so a contiguous row range
+                // occupies one contiguous arena span. Slice it — the codec's
+                // null-free fast path appends `data` verbatim, so passing the
+                // whole request arena would replay every piece's rows in every
+                // row group — and re-base the ranges onto the slice.
+                let first = &ranges[first_row];
+                let last = &ranges[end_row - 1];
+                let start_prefix = first
+                    .0
+                    .checked_sub(4)
+                    .ok_or_else(|| TaibaiError::Protocol("bulk variable range underflow".into()))?;
+                let end = last
+                    .0
+                    .checked_add(last.1)
+                    .ok_or_else(|| TaibaiError::Protocol("bulk variable range overflow".into()))?;
+                if end > col.data.len() {
+                    return Err(TaibaiError::Protocol(format!(
+                        "bulk column '{}' rows {}..{} are truncated",
+                        col.name, first_row, end_row
+                    )));
+                }
+                Ok(DirectBulkColumn {
+                    name: col.name,
+                    data_type: col.data_type,
+                    scale: col.scale,
+                    precision: col.precision,
+                    data: &col.data[start_prefix..end],
+                    nulls: std::borrow::Cow::Owned(nulls),
+                    variable_ranges: Some(
+                        ranges[first_row..end_row]
+                            .iter()
+                            .map(|(offset, len)| (offset - start_prefix, *len))
+                            .collect(),
+                    ),
+                })
+            }
+        })
+        .collect()
+}
+
+/// Extract bits `[start, start + len)` of a row-null bitmap into a fresh
+/// bitmap. NullBitmap serializes complete little-endian u64 words with zero
+/// trailing bits (`types::bitmap::from_bytes` copies whole words and would
+/// drop a byte-granular tail), so the output is word-aligned and trimmed;
+/// null-free ranges return an empty bitmap to keep the codec's fast path.
+fn slice_null_bitmap(nulls: &[u8], start: usize, len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len.div_ceil(64) * 8];
+    let mut any = false;
+    if start.is_multiple_of(8) {
+        let src = &nulls[start / 8..];
+        let byte_len = len.div_ceil(8);
+        for (i, byte) in out.iter_mut().enumerate().take(byte_len) {
+            *byte = src.get(i).copied().unwrap_or(0);
+        }
+        let tail_bits = len % 8;
+        if tail_bits != 0 {
+            out[byte_len - 1] &= (1u8 << tail_bits) - 1;
+        }
+        any = out.iter().any(|&byte| byte != 0);
+    } else {
+        for row in 0..len {
+            let src_bit = start + row;
+            if (nulls[src_bit / 8] >> (src_bit % 8)) & 1 != 0 {
+                out[row / 8] |= 1 << (row % 8);
+                any = true;
+            }
+        }
+    }
+    if any {
+        out
+    } else {
+        Vec::new()
+    }
+}
+
 /// Convert the wire representation (one physical value slot per row) into the
 /// segment codec representation (bitmap followed by non-null values only).
 fn encode_direct_bulk_column(col: &DirectBulkColumn<'_>) -> Result<Vec<u8>> {
     let bitmap_len = u32::try_from(col.nulls.len()).map_err(|_| {
-        TaibaiError::Protocol(format!("bulk column '{}' null bitmap is too large", col.name))
+        TaibaiError::Protocol(format!(
+            "bulk column '{}' null bitmap is too large",
+            col.name
+        ))
     })?;
     let mut encoded = Vec::with_capacity(4 + col.nulls.len() + col.data.len());
     encoded.extend_from_slice(&bitmap_len.to_le_bytes());
-    encoded.extend_from_slice(col.nulls);
+    encoded.extend_from_slice(&col.nulls);
 
     if col.nulls.is_empty() {
         encoded.extend_from_slice(col.data);

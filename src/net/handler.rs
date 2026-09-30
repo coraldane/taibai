@@ -1,16 +1,22 @@
 use bytes::Bytes;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::common::config::ServerConfig;
 use crate::common::error::{Result, TaibaiError};
+use crate::net::pubsub_session::{
+    confirmed_message, decode_subscribe, decode_table_and_sub, decode_table_sub_and_seq,
+    frame_to_message, spawn_delivery,
+};
 use crate::net::session::Session;
 use crate::protocol::message::*;
 use crate::protocol::types::DataType;
+use crate::pubsub::ConnHandle;
 use crate::sql::execution::{Engine, ExecResult};
 use crate::sql::parser::ast::Statement;
 use crate::sql::parser::parser::Parser;
+use crate::storage::catalog::auth::{PermissionObjectType, PermissionType};
+use crate::storage::core::pubsub::{PublishedFrame, SubscribeMode, SubscribeRequest};
 use crate::types::scalar::ScalarValue;
 
 pub struct Handler {
@@ -18,6 +24,11 @@ pub struct Handler {
     config: Arc<ServerConfig>,
     engine: Arc<Engine>,
     stream_sender: Option<tokio::sync::mpsc::Sender<Message>>,
+    /// Connection push queue used by the pubsub fan-out thread. Set once by
+    /// the connection task after the handler is created.
+    push_channel: Option<tokio::sync::mpsc::Sender<Message>>,
+    /// Delivery handle grouping every subscription made on this connection.
+    pubsub_conn: Option<Arc<ConnHandle>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -27,6 +38,41 @@ struct ServerTimings {
     encode: Duration,
 }
 
+impl Drop for Handler {
+    fn drop(&mut self) {
+        // Safety net for every path that abandons a handler without the
+        // normal `flush_on_disconnect` cleanup (decode errors, push send
+        // failures, aborted request workers): release the connection's
+        // pubsub subscriptions so they cannot outlive the socket. The normal
+        // path already `take()`s the handle first, making this a no-op there.
+        if let Some(conn) = self.pubsub_conn.take() {
+            self.engine.pubsub().drop_connection(&conn);
+            tracing::debug!(
+                conn_id = conn.conn_id(),
+                "pubsub subscriptions released on handler drop"
+            );
+        }
+        if let Some(session) = &self.session {
+            let removed = self
+                .engine
+                .pubsub_manager()
+                .unsubscribe_session(&session.id);
+            if removed > 0 {
+                tracing::debug!(
+                    session_id = %session.id,
+                    removed,
+                    "reliable pubsub subscriptions released on handler drop"
+                );
+            }
+        }
+        // A client that vanishes mid-transaction must not leave its
+        // transactional memtables and mutation pins behind forever: pins
+        // block compaction/flush for the whole table, and transactional
+        // memtables are only removable via commit/rollback.
+        self.rollback_open_txn_on_disconnect();
+    }
+}
+
 impl Handler {
     pub fn new(config: Arc<ServerConfig>, engine: Arc<Engine>) -> Self {
         Self {
@@ -34,10 +80,46 @@ impl Handler {
             config,
             engine,
             stream_sender: None,
+            push_channel: None,
+            pubsub_conn: None,
         }
     }
 
+    /// Install the per-connection push queue. The server creates it before
+    /// the first request is processed; subscriptions made later deliver
+    /// through it.
+    pub fn set_push_channel(&mut self, push_tx: tokio::sync::mpsc::Sender<Message>) {
+        self.push_channel = Some(push_tx);
+    }
+
+    /// Whether this connection currently holds an open bulk-import session.
+    /// The connection loop widens the idle window while this is true: bulk
+    /// import clients go silent for long stretches and must not be idle-
+    /// disconnected mid-import.
+    pub(crate) fn is_bulk_import_mode(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| s.bulk_import_mode)
+    }
+
     pub fn flush_on_disconnect(&mut self) {
+        // Same rationale as the Drop safety net below; the normal path gets
+        // the tidy, ordered rollback before any bulk-import flush work.
+        self.rollback_open_txn_on_disconnect();
+        if let Some(conn) = self.pubsub_conn.take() {
+            self.engine.pubsub().drop_connection(&conn);
+        }
+        if let Some(ref session) = self.session {
+            let removed = self
+                .engine
+                .pubsub_manager()
+                .unsubscribe_session(&session.id);
+            if removed > 0 {
+                tracing::debug!(
+                    session_id = %session.id,
+                    removed,
+                    "reliable pubsub subscriptions released on disconnect"
+                );
+            }
+        }
         if let Some(ref mut session) = self.session {
             let mut remaining_bulk_sessions = self.engine.bulk_mode_session_count();
             if session.bulk_import_mode {
@@ -64,14 +146,60 @@ impl Handler {
         }
     }
 
+    /// Rolls back any open transaction, tolerating (and logging) failures so
+    /// it is safe from both the normal disconnect path and `Drop` — including
+    /// `Drop` during unwind, where a second panic would abort the process.
+    fn rollback_open_txn_on_disconnect(&mut self) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        if !session.in_txn() {
+            return;
+        }
+        let txn_id = session.active_txn_id();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.engine.rollback_session_txn(session)
+        }));
+        match outcome {
+            Ok(Ok(rows)) => tracing::info!(
+                txn_id,
+                rows_rolled_back = rows,
+                "open transaction rolled back on disconnect"
+            ),
+            Ok(Err(error)) => tracing::warn!(
+                txn_id,
+                error = %error,
+                "failed to roll back open transaction on disconnect"
+            ),
+            Err(_) => tracing::warn!(
+                txn_id,
+                "panicked while rolling back open transaction on disconnect"
+            ),
+        }
+    }
+
     pub fn handle_message_cancellable(
         &mut self,
         msg: Message,
-        cancelled: Arc<AtomicBool>,
+        context: Arc<crate::common::query_cancel::QueryContext>,
         stream_sender: Option<tokio::sync::mpsc::Sender<Message>>,
     ) -> Result<Vec<Message>> {
         self.stream_sender = stream_sender;
-        let _cancellation = crate::common::query_cancel::QueryCancellationGuard::enter(cancelled);
+        // Commit/rollback/flush and bulk-import chunks mutate durable state in
+        // steps that cannot be rolled back cheaply, so they run to completion
+        // even when the client disconnects mid-request.
+        if matches!(
+            msg.msg_type,
+            MSG_TYPE_COMMIT_TXN
+                | MSG_TYPE_ROLLBACK_TXN
+                | MSG_TYPE_FLUSH
+                | MSG_TYPE_BULK_INSERT_COLUMNAR
+        ) {
+            context.enter_phase(crate::common::query_cancel::QueryPhase::Committing);
+        } else if context.phase() == crate::common::query_cancel::QueryPhase::Planning {
+            context.enter_phase(crate::common::query_cancel::QueryPhase::Executing);
+        }
+        let _cancellation = crate::common::query_cancel::QueryCancellationGuard::enter(context);
         let result = match msg.msg_type {
             MSG_TYPE_LOGIN => self.handle_login(&msg.payload),
             MSG_TYPE_PING => Ok(vec![build_pong()]),
@@ -82,6 +210,9 @@ impl Handler {
             MSG_TYPE_QUERY => self.handle_query(&msg.payload),
             MSG_TYPE_BULK_INSERT_COLUMNAR => self.handle_bulk_insert(&msg.payload),
             MSG_TYPE_FLUSH => self.handle_flush(),
+            MSG_TYPE_REPL_HELLO => self.handle_repl_hello(&msg.payload),
+            MSG_TYPE_REPL_SEGMENT_FETCH => self.handle_repl_segment_fetch(&msg.payload),
+            MSG_TYPE_REPL_ACK => self.handle_repl_ack(&msg.payload),
 
             MSG_TYPE_PREPARE => self.handle_prepare(&msg.payload),
             MSG_TYPE_EXECUTE => self.handle_execute(&msg.payload),
@@ -94,9 +225,16 @@ impl Handler {
 
             MSG_TYPE_AUTH_FAIL => Ok(vec![build_error("authentication failed")]),
 
+            // 0x40 is a query-execution alias (see message.rs); there are no
+            // cursor semantics to open, so the payload runs as a plain query.
             MSG_TYPE_CURSOR => self.handle_cursor_open(&msg.payload),
-            MSG_TYPE_CURSOR_FETCH => self.handle_cursor_fetch(&msg.payload),
-            MSG_TYPE_CURSOR_CLOSE => self.handle_cursor_close(&msg.payload),
+
+            MSG_TYPE_SUBSCRIBE => self.handle_subscribe(&msg.payload),
+            MSG_TYPE_UNSUBSCRIBE => self.handle_unsubscribe(&msg.payload),
+
+            MSG_TYPE_SUBSCRIBE_V2 => self.handle_subscribe_v2(&msg.payload),
+            MSG_TYPE_UNSUBSCRIBE_V2 => self.handle_unsubscribe_v2(&msg.payload),
+            MSG_TYPE_SUB_ACK => self.handle_sub_ack(&msg.payload),
 
             MSG_TYPE_BINARY_QUERY_RESULT => {
                 Ok(vec![build_error("unexpected binary result message")])
@@ -111,6 +249,34 @@ impl Handler {
         };
         self.stream_sender = None;
         result
+    }
+
+    /// List the request in the engine's running-query registry so it is
+    /// visible to `SHOW PROCESSLIST` and stoppable via `KILL QUERY`. Called
+    /// by the connection task before the request queues, so queued work is
+    /// killable too. Requests before login (or lightweight ones) are not
+    /// registered; dropping the returned guard unregisters.
+    pub(crate) fn register_running_query(
+        &self,
+        context: &Arc<crate::common::query_cancel::QueryContext>,
+        msg: &Message,
+    ) -> Option<crate::sql::execution::query_registry::QueryRegistration> {
+        if !is_heavy_request(msg.msg_type) {
+            return None;
+        }
+        let session = self.session.as_ref()?;
+        let sql = if msg.msg_type == MSG_TYPE_QUERY {
+            message_sql_snippet(&msg.payload)
+        } else {
+            String::new()
+        };
+        Some(self.engine.query_registry().register(
+            Arc::clone(context),
+            session.session_id_string(),
+            session.username.clone(),
+            session.database.clone(),
+            &sql,
+        ))
     }
 
     fn handle_login(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
@@ -317,7 +483,12 @@ impl Handler {
             }
             Ok(ExecResult::Query { schema, batches }) => {
                 let encode_start = Instant::now();
-                let msg = build_binary_query_result(&schema, &batches);
+                let timings = ServerTimings {
+                    total: server_start.elapsed(),
+                    execute: execute_elapsed,
+                    encode: encode_start.elapsed(),
+                };
+                let msg = build_binary_query_result_with_timings(&schema, &batches, timings);
                 let msg = match self.validate_query_response(msg) {
                     Ok(msg) => msg,
                     Err(error) => return Ok(vec![build_error(&error.to_string())]),
@@ -330,12 +501,7 @@ impl Handler {
                     "ok",
                     server_start.elapsed(),
                 );
-                let timings = ServerTimings {
-                    total: server_start.elapsed(),
-                    execute: execute_elapsed,
-                    encode: encode_start.elapsed(),
-                };
-                Ok(vec![append_server_timings(msg, timings)])
+                Ok(vec![msg])
             }
             Err(e) => {
                 if !is_insert {
@@ -371,6 +537,25 @@ impl Handler {
         let Some(session) = self.session.as_mut() else {
             return Ok(vec![build_error("not logged in")]);
         };
+
+        // Entering bulk mode globally defers unique-index compaction and
+        // catalog flushes: require an INSERT grant on the current database so
+        // read-only accounts cannot degrade the server for everyone else.
+        // Per-table writes are permission-checked again in the bulk handler.
+        if !self.engine.auth_manager().check_permission(
+            &session.username,
+            PermissionType::Insert,
+            PermissionObjectType::Database,
+            &session.database,
+        ) {
+            return Ok(vec![build_error(&format!(
+                "access denied for user '{}' to {:?} on {:?} '{}'",
+                session.username,
+                PermissionType::Insert,
+                PermissionObjectType::Database,
+                session.database
+            ))]);
+        }
 
         let active_sessions = if session.bulk_import_mode {
             self.engine.bulk_mode_session_count()
@@ -427,14 +612,31 @@ impl Handler {
             session.had_writes = true;
         }
 
-        match self.engine.exec_bulk_insert_payload_with_options(
+        // Covers the whole engine call chain (payload decode → constraint
+        // checks → column compression → locks → seal). The segment-manager
+        // WARN only sees its own stage; anything slow that hides above it
+        // (e.g. zstd at a high table COMPRESSION_LEVEL) surfaces here.
+        const SLOW_BULK_INSERT_REQUEST_WARN: Duration = Duration::from_secs(10);
+        let started = Instant::now();
+        let outcome = self.engine.exec_bulk_insert_payload_as(
             &db,
             payload,
             self.session
                 .as_ref()
                 .map(|s| s.bulk_import_mode)
                 .unwrap_or(false),
-        ) {
+            self.session.as_ref().map(|s| s.username.as_str()),
+        );
+        let elapsed = started.elapsed();
+        if elapsed >= SLOW_BULK_INSERT_REQUEST_WARN {
+            tracing::warn!(
+                db = %db,
+                payload_len = payload.len(),
+                elapsed_ms = elapsed.as_millis() as u64,
+                "slow bulk insert request: check the table COMPRESSION_LEVEL (zstd 19 is single-digit MB/s per core) and the segment-manager seal WARN"
+            );
+        }
+        match outcome {
             Ok(row_count) => Ok(vec![build_ok(row_count)]),
             Err(e) => {
                 tracing::warn!(error = %e, "bulk insert error");
@@ -659,17 +861,17 @@ impl Handler {
             }
             Ok(ExecResult::Query { schema, batches }) => {
                 let encode_start = Instant::now();
-                let msg = build_binary_query_result(&schema, &batches);
-                let msg = match self.validate_query_response(msg) {
-                    Ok(msg) => msg,
-                    Err(error) => return Ok(vec![build_error(&error.to_string())]),
-                };
                 let timings = ServerTimings {
                     total: server_start.elapsed(),
                     execute: execute_elapsed,
                     encode: encode_start.elapsed(),
                 };
-                Ok(vec![append_server_timings(msg, timings)])
+                let msg = build_binary_query_result_with_timings(&schema, &batches, timings);
+                let msg = match self.validate_query_response(msg) {
+                    Ok(msg) => msg,
+                    Err(error) => return Ok(vec![build_error(&error.to_string())]),
+                };
+                Ok(vec![msg])
             }
             Err(e) => Ok(vec![build_error(&e.to_string())]),
         }
@@ -1069,24 +1271,12 @@ impl Handler {
         if !session.in_txn() {
             return Ok(vec![build_error("no active transaction")]);
         }
-        let txn_id = session.active_txn_id();
-        let rolled_back = self.engine.batch_writer().rollback_txn(txn_id)?;
-        session.rollback_txn();
-        Ok(vec![build_ok(rolled_back)])
+        let rows = self.engine.rollback_session_txn(session)?;
+        Ok(vec![build_ok(rows)])
     }
 
     fn handle_cursor_open(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
         self.handle_query(payload)
-    }
-
-    fn handle_cursor_fetch(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
-        let _ = payload;
-        Ok(vec![build_error("cursors not fully implemented")])
-    }
-
-    fn handle_cursor_close(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
-        let _ = payload;
-        Ok(vec![build_ok(0)])
     }
 
     fn handle_flush(&mut self) -> Result<Vec<Message>> {
@@ -1101,6 +1291,337 @@ impl Handler {
                 Ok(vec![build_ok(rows_flushed)])
             }
             Err(e) => Ok(vec![build_error(&e.to_string())]),
+        }
+    }
+
+    /// MSG_TYPE_SUBSCRIBE: payload is one length-prefixed topic string, either
+    /// `table` (session database), `database.table`, `database.*` or `>`.
+    /// Replies MSG_TYPE_OK carrying the subscription id, or an error.
+    /// SUBSCRIBE permission gate shared by the hub (v1, wildcard topics)
+    /// and reliable (v2, exact table) subscription paths. `Err(messages)` is
+    /// the ready-to-send rejection reply.
+    fn require_subscribe_permission(
+        engine: &Engine,
+        username: &str,
+        topic_display: &str,
+        object_type: PermissionObjectType,
+        object: &str,
+    ) -> std::result::Result<(), Vec<Message>> {
+        if engine.auth_manager().check_permission(
+            username,
+            PermissionType::Subscribe,
+            object_type,
+            object,
+        ) {
+            Ok(())
+        } else {
+            tracing::warn!(
+                username,
+                topic = topic_display,
+                "subscribe rejected: missing SUBSCRIBE permission"
+            );
+            Err(vec![build_error(&format!(
+                "access denied for user '{username}' to SUBSCRIBE on '{topic_display}'"
+            ))])
+        }
+    }
+
+    fn handle_subscribe(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
+        let (topic, _) = match read_len_prefixed_string(payload) {
+            Ok(v) => v,
+            Err(_) => return Ok(vec![build_error("invalid subscribe message")]),
+        };
+        let session = match &mut self.session {
+            Some(s) => s,
+            None => return Ok(vec![build_error("not logged in")]),
+        };
+        session.touch();
+
+        let Some(push_tx) = self.push_channel.clone() else {
+            return Ok(vec![build_error(
+                "subscriptions are not available on this connection",
+            )]);
+        };
+
+        // Validate the pattern before the permission check so malformed
+        // topics (e.g. `db.t*cks`) are rejected as such instead of being
+        // permission-checked as a database-level wildcard.
+        if let Err(reason) = crate::pubsub::TopicPattern::parse(topic) {
+            return Ok(vec![build_error(&format!(
+                "invalid subscription topic '{topic}': {reason}"
+            ))]);
+        }
+
+        // Resolve the topic against the session database, validate that the
+        // referenced objects exist, and require SUBSCRIBE (or admin) rights.
+        // `>` subscribes to every database; `db`-scoped wildcards require a
+        // database-level grant, exact tables a table-level grant.
+        let permission_object = if topic == ">" {
+            (PermissionObjectType::Global, "*".to_string())
+        } else if topic == "*" || topic.is_empty() {
+            return Ok(vec![build_error(&format!(
+                "invalid subscription topic '{topic}': expected 'table', 'database.table', 'database.*' or '>'"
+            ))]);
+        } else {
+            match topic.split_once('.') {
+                Some((db, rest)) if rest.contains('*') || rest == ">" => {
+                    (PermissionObjectType::Database, db.to_string())
+                }
+                Some((db, table)) => (PermissionObjectType::Table, format!("{db}.{table}")),
+                None => (
+                    PermissionObjectType::Table,
+                    format!("{}.{}", session.database, topic),
+                ),
+            }
+        };
+        let (topic_db, topic_table) = if topic == ">" {
+            (None, None)
+        } else {
+            match topic.split_once('.') {
+                Some((db, table)) => (Some(db), Some(table)),
+                None => (Some(session.database.as_str()), Some(topic)),
+            }
+        };
+        if let Some(db) = topic_db {
+            if !self.engine.database_exists(db) {
+                return Ok(vec![build_error(&format!(
+                    "database '{db}' does not exist"
+                ))]);
+            }
+        }
+        if let (Some(db), Some(table)) = (topic_db, topic_table) {
+            if !table.contains('*')
+                && table != ">"
+                && self.engine.get_table_meta(db, table).is_none()
+            {
+                return Ok(vec![build_error(&format!(
+                    "table '{db}.{table}' does not exist"
+                ))]);
+            }
+        }
+        let subscriber = session.username.clone();
+        if let Err(messages) = Self::require_subscribe_permission(
+            &self.engine,
+            &subscriber,
+            topic,
+            permission_object.0.clone(),
+            &permission_object.1,
+        ) {
+            return Ok(messages);
+        }
+
+        let conn = match &self.pubsub_conn {
+            Some(conn) => Arc::clone(conn),
+            None => {
+                let conn = self.engine.pubsub().create_conn(push_tx);
+                self.pubsub_conn = Some(Arc::clone(&conn));
+                conn
+            }
+        };
+        // Register the fully qualified pattern: hub subjects are always
+        // `database.table`, so a bare table name must be expanded before
+        // matching.
+        let registered_topic = if topic.contains('.') || topic == ">" {
+            topic.to_string()
+        } else {
+            format!("{}.{}", session.database, topic)
+        };
+        match self.engine.pubsub().subscribe(&conn, &registered_topic) {
+            Ok(sub_id) => {
+                tracing::info!(
+                    username = %session.username,
+                    topic = %registered_topic,
+                    sub_id,
+                    conn_id = conn.conn_id(),
+                    "subscription registered"
+                );
+                Ok(vec![build_ok(sub_id)])
+            }
+            Err(reason) => Ok(vec![build_error(&reason)]),
+        }
+    }
+
+    /// MSG_TYPE_UNSUBSCRIBE: payload is a u64 subscription id.
+    fn handle_unsubscribe(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
+        if payload.len() < 8 {
+            return Ok(vec![build_error("invalid unsubscribe message")]);
+        }
+        let session = match &mut self.session {
+            Some(s) => s,
+            None => return Ok(vec![build_error("not logged in")]),
+        };
+        session.touch();
+        let sub_id = u64::from_le_bytes(payload[..8].try_into().unwrap());
+        let Some(conn) = &self.pubsub_conn else {
+            return Ok(vec![build_error(&format!(
+                "subscription {sub_id} not found"
+            ))]);
+        };
+        if self.engine.pubsub().unsubscribe(conn, sub_id) {
+            tracing::info!(username = %session.username, sub_id, "subscription removed");
+            Ok(vec![build_ok(0)])
+        } else {
+            Ok(vec![build_error(&format!(
+                "subscription {sub_id} not found"
+            ))])
+        }
+    }
+
+    /// MSG_TYPE_SUBSCRIBE_V2: resumable single-table subscription with an
+    /// optional start sequence, named bookmark and column filter. Replies
+    /// SUB_CONFIRMED (or SUB_ERROR); data arrives later as SUB_DATA pushes.
+    fn handle_subscribe_v2(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
+        let (username, session_id) = match &mut self.session {
+            Some(session) => {
+                session.touch();
+                (session.username.clone(), session.id)
+            }
+            None => return Ok(vec![build_error("not logged in")]),
+        };
+
+        let request = match decode_subscribe(payload) {
+            Ok(request) => request,
+            Err(err) => {
+                return Ok(vec![build_error(&err.to_string())]);
+            }
+        };
+
+        // The reliable stream is per exact table: retention, acks and
+        // bookmarks are all keyed on (db, table), so wildcards make no sense.
+        if request.db.is_empty()
+            || request.table.is_empty()
+            || request.table.contains('*')
+            || request.table.contains('>')
+        {
+            return Ok(vec![build_error(
+                "reliable subscriptions require an exact 'database.table' topic",
+            )]);
+        }
+        let manager = Arc::clone(self.engine.pubsub_manager());
+        if !manager.is_enabled() {
+            return Ok(vec![build_error("pubsub is disabled on this server")]);
+        }
+        let Some(table_meta) = self.engine.get_table_meta(&request.db, &request.table) else {
+            return Ok(vec![build_error(&format!(
+                "table '{}.{}' does not exist",
+                request.db, request.table
+            ))]);
+        };
+        if let Some(column) = &request.filter_column {
+            if !table_meta.columns.iter().any(|c| &c.name == column) {
+                return Ok(vec![build_error(&format!(
+                    "filter column '{column}' does not exist on '{}.{}'",
+                    request.db, request.table
+                ))]);
+            }
+        }
+        let topic_display = format!("{}.{}", request.db, request.table);
+        if let Err(messages) = Self::require_subscribe_permission(
+            &self.engine,
+            &username,
+            &topic_display,
+            PermissionObjectType::Table,
+            &topic_display,
+        ) {
+            return Ok(messages);
+        }
+        let Some(push_tx) = self.push_channel.clone() else {
+            return Ok(vec![build_error(
+                "subscriptions are not available on this connection",
+            )]);
+        };
+
+        // Frames from the delivery task are re-encoded as protocol messages
+        // and funneled into the shared per-connection push queue, so the
+        // connection loop forwards them exactly like hub notifications.
+        let frame_capacity = self.config.pubsub.notification_channel_capacity.max(1);
+        let max_frame_batches = self.config.pubsub.max_batches_per_frame.max(1);
+        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<PublishedFrame>(frame_capacity);
+        tokio::spawn(async move {
+            while let Some(frame) = frame_rx.recv().await {
+                match frame_to_message(frame) {
+                    Ok(msg) => {
+                        if push_tx.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => tracing::warn!(
+                        error = %err,
+                        "reliable pubsub frame encode failed; frame dropped"
+                    ),
+                }
+            }
+        });
+
+        let subscribe_request = SubscribeRequest {
+            db: request.db.clone(),
+            table: request.table.clone(),
+            mode: match request.from_seq {
+                Some(seq) => SubscribeMode::FromSeq(seq),
+                None => SubscribeMode::FromNow,
+            },
+            filter_column: request.filter_column,
+            filter_values: request.filter_values,
+            named: request.named,
+            session_id,
+            frame_tx: frame_tx.clone(),
+        };
+        match manager.subscribe(subscribe_request) {
+            Ok((grant, handle)) => {
+                spawn_delivery(handle, max_frame_batches, frame_tx);
+                tracing::info!(
+                    username,
+                    db = %request.db,
+                    table = %request.table,
+                    sub_id = grant.sub_id,
+                    granted_from = grant.granted_from,
+                    "reliable subscription registered"
+                );
+                Ok(vec![confirmed_message(&grant)])
+            }
+            Err(reason) => Ok(vec![build_error(&reason.to_string())]),
+        }
+    }
+
+    /// MSG_TYPE_UNSUBSCRIBE_V2: payload is `[string db][string table][u64 sub_id]`.
+    fn handle_unsubscribe_v2(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
+        let Some(session) = &mut self.session else {
+            return Ok(vec![build_error("not logged in")]);
+        };
+        session.touch();
+        match decode_table_and_sub(payload) {
+            Ok((db, table, sub_id)) => {
+                if self
+                    .engine
+                    .pubsub_manager()
+                    .unsubscribe(&db, &table, sub_id)
+                {
+                    tracing::info!(username = %session.username, db, table, sub_id, "reliable subscription removed");
+                    Ok(vec![build_ok(0)])
+                } else {
+                    Ok(vec![build_error(&format!(
+                        "subscription {sub_id} not found"
+                    ))])
+                }
+            }
+            Err(err) => Ok(vec![build_error(&err.to_string())]),
+        }
+    }
+
+    /// MSG_TYPE_SUB_ACK: payload is `[string db][string table][u64 sub_id][u64 seq]`.
+    fn handle_sub_ack(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
+        let Some(session) = &mut self.session else {
+            return Ok(vec![build_error("not logged in")]);
+        };
+        session.touch();
+        match decode_table_sub_and_seq(payload) {
+            Ok((db, table, sub_id, seq)) => {
+                match self.engine.pubsub_manager().ack(&db, &table, sub_id, seq) {
+                    Ok(()) => Ok(vec![build_ok(0)]),
+                    Err(err) => Ok(vec![build_error(&err.to_string())]),
+                }
+            }
+            Err(err) => Ok(vec![build_error(&err.to_string())]),
         }
     }
 }
@@ -1128,9 +1649,48 @@ fn is_heartbeat_query(sql: &str) -> bool {
     )
 }
 
+/// Requests that run outside the async networking path and can outlive the
+/// client's patience; these are the ones worth listing and killing.
+pub(crate) fn is_heavy_request(msg_type: u8) -> bool {
+    matches!(
+        msg_type,
+        MSG_TYPE_QUERY
+            | MSG_TYPE_BULK_INSERT_COLUMNAR
+            | MSG_TYPE_FLUSH
+            | MSG_TYPE_EXECUTE
+            | MSG_TYPE_BATCH_EXECUTE
+            | MSG_TYPE_COMMIT_TXN
+            | MSG_TYPE_ROLLBACK_TXN
+            | MSG_TYPE_CURSOR
+            | MSG_TYPE_REPL_SEGMENT_FETCH
+    )
+}
+
+/// Best-effort SQL text from a QUERY payload (`[database][sql]`), bounded by
+/// the registry's snippet cap. Malformed payloads fall back to the raw bytes.
+fn message_sql_snippet(payload: &[u8]) -> String {
+    if let Ok((_, rest)) = read_len_prefixed_string(payload) {
+        if let Ok((sql, _)) = read_len_prefixed_string(rest) {
+            return sql.trim().to_string();
+        }
+    }
+    std::str::from_utf8(payload)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
 fn should_log_query_sql(sql: &str) -> bool {
     // INSERT statements can be megabytes long. Do not parse every statement a
     // second time merely to decide whether it produces a result set.
+    //
+    // The parse here is only needed to classify the statement for the query
+    // log, so skip it entirely when the query log is disabled: otherwise
+    // every SELECT/SHOW/EXPLAIN would be parsed twice per request even with
+    // logging off.
+    if !crate::common::query_log::enabled() {
+        return false;
+    }
     if !starts_like_query(sql) {
         return false;
     }
@@ -1180,6 +1740,226 @@ fn build_auth_fail(reason: &str) -> Message {
     Message::new(MSG_TYPE_AUTH_FAIL, Bytes::from(reason.to_string()))
 }
 
+impl Handler {
+    // ===================== Replication (R1) =====================
+
+    /// REPL_HELLO (standby -> primary, after LOGIN): authenticate, then turn
+    /// this connection into a replication event stream. Live events flow
+    /// through the per-connection push queue; a resumed standby first
+    /// receives the ring history.
+    fn handle_repl_hello(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
+        let Some(session) = &self.session else {
+            return Ok(vec![build_error("REPL_HELLO requires LOGIN first")]);
+        };
+        let username = session.username.clone();
+        let Some(rep_log) = self.engine.rep_log().map(Arc::clone) else {
+            return Ok(vec![build_error("server is not a replication primary")]);
+        };
+
+        let (user, rest) = read_len_prefixed_string(payload)?;
+        let (password, rest) = read_len_prefixed_string(rest)?;
+        if rest.len() < 8 {
+            return Ok(vec![build_error("REPL_HELLO payload truncated")]);
+        }
+        let last_seq = u64::from_le_bytes(rest[..8].try_into().unwrap());
+
+        // The logged-in session must belong to the same user, and that user
+        // must hold the REPLICATION permission.
+        if user != username {
+            return Ok(vec![build_error(&format!(
+                "REPL_HELLO user '{user}' does not match the logged-in user '{username}'"
+            ))]);
+        }
+        match self.engine.auth_manager().authenticate(&username, password) {
+            Ok(true) => {}
+            _ => {
+                return Ok(vec![build_error(&format!(
+                    "REPL_HELLO credentials for user '{username}' are invalid"
+                ))]);
+            }
+        }
+        if !self.engine.auth_manager().check_permission(
+            &username,
+            crate::storage::catalog::auth::PermissionType::Replication,
+            crate::storage::catalog::auth::PermissionObjectType::Global,
+            "*",
+        ) {
+            return Ok(vec![build_error(&format!(
+                "access denied for user '{username}' to REPLICATION"
+            ))]);
+        }
+
+        let history = match rep_log.events_after(last_seq) {
+            Ok(history) => history,
+            Err(error) => return Ok(vec![build_error(&error.to_string())]),
+        };
+
+        // A (re)connecting standby proved it durably applied `last_seq`.
+        // Fast-forward the seq file before handing out any new events: the
+        // primary may have crashed and restarted with the file lagging behind
+        // this seq, and re-stamping consumed seqs would make the standby skip
+        // everything up to its old position.
+        rep_log.note_standby_applied(last_seq);
+
+        let Some(push_tx) = self.push_channel.clone() else {
+            return Ok(vec![build_error(
+                "replication pushes are not available on this connection",
+            )]);
+        };
+
+        let (sink_tx, sink_rx) = crossbeam_channel::bounded::<(
+            u64,
+            Arc<crate::storage::replication::ReplicationEvent>,
+        )>(4096);
+        rep_log.register_session(&sink_tx);
+
+        // Bridge thread: ring history first, then live fan-out, both funneled
+        // into the connection push queue in strict seq order.
+        std::thread::Builder::new()
+            .name("taibai-repl-push".into())
+            .spawn(move || {
+                use std::collections::BTreeMap;
+                use std::sync::Arc as StdArc;
+                let push = |seq: u64, event: &crate::storage::replication::ReplicationEvent| {
+                    let mut payload_bytes = Vec::with_capacity(8 + 4 + 128);
+                    payload_bytes.extend_from_slice(&seq.to_le_bytes());
+                    let encoded = event.encode();
+                    payload_bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                    payload_bytes.extend_from_slice(&encoded);
+                    push_tx.blocking_send(Message {
+                        msg_type: MSG_TYPE_REPL_EVENT,
+                        payload: bytes::Bytes::from(payload_bytes),
+                    })
+                };
+                let mut next = last_seq + 1;
+                let mut pending: BTreeMap<
+                    u64,
+                    StdArc<crate::storage::replication::ReplicationEvent>,
+                > = BTreeMap::new();
+                for (seq, event) in history {
+                    if seq < next {
+                        continue;
+                    }
+                    pending.insert(seq, event);
+                    while let Some(event) = pending.remove(&next) {
+                        if push(next, &event).is_err() {
+                            rep_log.remove_session(&sink_tx);
+                            return;
+                        }
+                        next += 1;
+                    }
+                }
+                loop {
+                    while let Some(event) = pending.remove(&next) {
+                        if push(next, &event).is_err() {
+                            rep_log.remove_session(&sink_tx);
+                            return;
+                        }
+                        next += 1;
+                    }
+                    match sink_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                        Ok((seq, event)) => {
+                            if seq < next {
+                                continue;
+                            }
+                            pending.insert(seq, event);
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                rep_log.remove_session(&sink_tx);
+            })
+            .expect("failed to spawn replication push thread");
+
+        Ok(vec![build_ok(0)])
+    }
+
+    /// REPL_SEGMENT_FETCH (standby -> primary): stream the requested segment
+    /// file back as one or more REPL_SEGMENT_CHUNK response frames.
+    fn handle_repl_segment_fetch(&self, payload: &[u8]) -> Result<Vec<Message>> {
+        let Some(_session) = &self.session else {
+            return Ok(vec![build_error("REPL_SEGMENT_FETCH requires LOGIN first")]);
+        };
+        if self.engine.rep_log().is_none() {
+            return Ok(vec![build_error("server is not a replication primary")]);
+        }
+        let (db, rest) = read_len_prefixed_string(payload)?;
+        let (table, rest) = read_len_prefixed_string(rest)?;
+        let (segment, rest) = read_len_prefixed_string(rest)?;
+        if rest.len() < 12 {
+            return Ok(vec![build_error("REPL_SEGMENT_FETCH payload truncated")]);
+        }
+        let offset = u64::from_le_bytes(rest[..8].try_into().unwrap());
+        let max_chunk = u32::from_le_bytes(rest[8..12].try_into().unwrap()).max(1);
+        // Path safety: bare file name only.
+        if segment.contains('/')
+            || segment.contains('\\')
+            || segment.contains("..")
+            || db.contains("..")
+            || table.contains("..")
+        {
+            return Ok(vec![build_error("REPL_SEGMENT_FETCH: unsafe path")]);
+        }
+        let path = self.engine.data_dir().join(&db).join(&table).join(&segment);
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A compaction/TTL may have retired the segment between the
+                // SegmentUpdate's commit and this fetch. When the ring proves
+                // the retirement, tell the standby to skip the stale update;
+                // the replacement event later in the stream carries the rows.
+                if self
+                    .engine
+                    .rep_log()
+                    .is_some_and(|log| log.segment_retired(&db, &table, &segment))
+                {
+                    return Ok(vec![Message::empty(MSG_TYPE_REPL_SEGMENT_GONE)]);
+                }
+                return Ok(vec![build_error(&format!(
+                    "segment fetch failed for {db}.{table}/{segment}: {error}"
+                ))]);
+            }
+            Err(error) => {
+                return Ok(vec![build_error(&format!(
+                    "segment fetch failed for {db}.{table}/{segment}: {error}"
+                ))]);
+            }
+        };
+        let total_len = file.metadata()?.len();
+        let mut file = file;
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(offset))?;
+        let chunk_len = (max_chunk as usize).min(4 * 1024 * 1024);
+        let mut chunk = vec![0u8; chunk_len];
+        let read = file.read(&mut chunk)?;
+        chunk.truncate(read);
+
+        let mut message_bytes = Vec::with_capacity(16 + read);
+        message_bytes.extend_from_slice(&total_len.to_le_bytes());
+        message_bytes.extend_from_slice(&offset.to_le_bytes());
+        message_bytes.extend_from_slice(&chunk);
+        Ok(vec![Message {
+            msg_type: MSG_TYPE_REPL_SEGMENT_CHUNK,
+            payload: bytes::Bytes::from(message_bytes),
+        }])
+    }
+
+    /// REPL_ACK (standby -> primary): progress report. The ack doubles as the
+    /// durability driver for the primary's seq file — without it the file
+    /// lags `persist_every` events behind and a crash reuses consumed seqs.
+    fn handle_repl_ack(&self, payload: &[u8]) -> Result<Vec<Message>> {
+        if payload.len() >= 8 {
+            let applied = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            if let Some(rep_log) = self.engine.rep_log() {
+                rep_log.note_standby_applied(applied);
+            }
+            tracing::debug!(applied_seq = applied, "standby replication ack");
+        }
+        Ok(Vec::new())
+    }
+}
+
 fn build_pong() -> Message {
     Message::empty(MSG_TYPE_PONG)
 }
@@ -1220,11 +2000,16 @@ fn append_duration_micros(buf: &mut Vec<u8>, elapsed: Duration) {
     buf.extend_from_slice(&(elapsed.as_micros().min(u128::from(u64::MAX)) as u64).to_le_bytes());
 }
 
-fn build_binary_query_result(
+/// Build the binary result message with the server-timing trailer
+/// appended before the payload is frozen, avoiding a second copy of the
+/// whole result payload.
+fn build_binary_query_result_with_timings(
     schema: &crate::types::batch::Schema,
     batches: &[crate::types::batch::RecordBatch],
+    timings: ServerTimings,
 ) -> Message {
-    let encoded = crate::protocol::result::encode_binary_result_batches(schema, batches);
+    let mut encoded = crate::protocol::result::encode_binary_result_batches(schema, batches);
+    append_server_timing_trailer(&mut encoded, timings);
     Message::new(MSG_TYPE_BINARY_QUERY_RESULT, Bytes::from(encoded))
 }
 

@@ -129,6 +129,7 @@ performance:
     assert_eq!(config.server.max_connections, 1024);
     assert!(config.server.max_concurrent_requests >= 4);
     assert_eq!(config.server.connection_idle_timeout_secs, 300);
+    assert_eq!(config.server.bulk_import_idle_timeout_secs, 3600);
     assert_eq!(config.server.tls_handshake_timeout_secs, 10);
 
     let performance = PerformanceBaselineConfig::from(&config.performance);

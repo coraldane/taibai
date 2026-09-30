@@ -4,18 +4,29 @@ use tokio_util::codec::{Decoder, Encoder};
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::message::{
     Message, MessageHeader, HEADER_SIZE, MSG_TYPE_BATCH_EXECUTE, MSG_TYPE_CLOSE_STMT,
-    MSG_TYPE_EXECUTE, MSG_TYPE_PREPARE, MSG_TYPE_QUERY,
+    MSG_TYPE_EXECUTE, MSG_TYPE_NOTIFICATION, MSG_TYPE_NOTIFICATION_DELETE,
+    MSG_TYPE_NOTIFICATION_INSERT, MSG_TYPE_NOTIFICATION_UPDATE, MSG_TYPE_PREPARE, MSG_TYPE_QUERY,
+    MSG_TYPE_REPL_EVENT, MSG_TYPE_REPL_SEGMENT_CHUNK,
 };
+
+use crate::protocol::message::MSG_TYPE_BULK_INSERT_COLUMNAR;
 
 pub struct MessageCodec {
     max_message_size: usize,
+    bulk_max_message_size: usize,
     compress_threshold: usize,
 }
 
 impl MessageCodec {
+    pub fn with_bulk_max_message_size(mut self, bulk_max_message_size: usize) -> Self {
+        self.bulk_max_message_size = bulk_max_message_size.max(self.max_message_size);
+        self
+    }
+
     pub fn new(max_message_size: usize) -> Self {
         Self {
             max_message_size,
+            bulk_max_message_size: max_message_size,
             compress_threshold: 4096,
         }
     }
@@ -39,10 +50,16 @@ impl Decoder for MessageCodec {
         let header = MessageHeader::decode(&header_bytes)?;
 
         let payload_len = header.payload_len as usize;
-        if payload_len > self.max_message_size {
+        // Bulk imports carry batch-proportional payloads and get their own
+        // ceiling (see ServerSettings::max_bulk_message_size).
+        let limit = if header.msg_type == MSG_TYPE_BULK_INSERT_COLUMNAR {
+            self.bulk_max_message_size
+        } else {
+            self.max_message_size
+        };
+        if payload_len > limit {
             return Err(TaibaiError::Protocol(format!(
-                "payload length {payload_len} exceeds max {}",
-                self.max_message_size
+                "payload length {payload_len} exceeds max {limit}"
             )));
         }
 
@@ -88,8 +105,29 @@ impl Encoder<Message> for MessageCodec {
             msg.msg_type,
             MSG_TYPE_PREPARE | MSG_TYPE_EXECUTE | MSG_TYPE_CLOSE_STMT | MSG_TYPE_BATCH_EXECUTE
         );
-        let should_compress =
-            !is_bulk && !is_query && !is_prepared && msg.payload.len() > self.compress_threshold;
+        // Notification payloads were compressed once by the pubsub fan-out
+        // thread; compressing here again would force clients to decompress
+        // twice and pay double CPU per subscriber. The delete/update event
+        // types share the fan-out path, so they are exempt too.
+        let is_pubsub_push = matches!(
+            msg.msg_type,
+            MSG_TYPE_NOTIFICATION
+                | MSG_TYPE_NOTIFICATION_INSERT
+                | MSG_TYPE_NOTIFICATION_DELETE
+                | MSG_TYPE_NOTIFICATION_UPDATE
+        );
+        // Replication pushes carry pre-compressed WAL frames and raw
+        // segment bytes: zlib on top would burn CPU for no size win.
+        let is_replication_push = matches!(
+            msg.msg_type,
+            MSG_TYPE_REPL_EVENT | MSG_TYPE_REPL_SEGMENT_CHUNK
+        );
+        let should_compress = !is_bulk
+            && !is_replication_push
+            && !is_query
+            && !is_prepared
+            && !is_pubsub_push
+            && msg.payload.len() > self.compress_threshold;
 
         let payload = if should_compress {
             match crate::protocol::compress::zlib_compress(&msg.payload) {

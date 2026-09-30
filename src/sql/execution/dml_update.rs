@@ -1,15 +1,15 @@
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::segment_manager::SegmentManager;
+use crate::types::array::ColumnArray;
 use crate::types::batch::RecordBatch;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::engine::{Engine, ExecResult};
-use super::helpers::{
-    build_row_group_predicate, collect_expr_column_indices, eval_expr_to_scalar,
-    eval_where_clause_batch,
-};
+use super::helpers::{eval_expr_to_scalar, eval_where_clause_batch};
 use crate::sql::parser::ast::{Assignment, Expr};
 
 pub fn exec_update(
@@ -20,20 +20,43 @@ pub fn exec_update(
     where_clause: &Option<Expr>,
     reader_txn_id: u64,
 ) -> Result<ExecResult> {
-    let (table_schema, table_meta) = {
-        let catalogs = engine.catalogs().read().unwrap();
-        let catalog = catalogs
-            .get(db)
-            .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-        let meta = catalog
-            .get_table(table)
-            .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
-            .clone();
-        (Schema::new(meta.columns.clone()), meta)
-    };
+    if reader_txn_id > 0 {
+        return super::txn_dml::exec_update_in_txn(
+            engine,
+            db,
+            table,
+            assignments,
+            where_clause,
+            reader_txn_id,
+        );
+    }
+    super::txn_dml::refuse_auto_commit_dml_while_pinned(engine, db, table)?;
+    // Join the INSERT/REPLACE writer protocol. UPDATE is the mutator the
+    // existing guards missed: INSERT probes unique keys under this striped
+    // lock, but an UPDATE that introduces a key under only the table mutation
+    // lock can interleave between the probe and the publish, and the INSERT
+    // then commits a duplicate the post-hoc index rebuild bakes in
+    // permanently. Held across the whole statement and taken before the
+    // mutation lock so the global order constraint_insert_lock → mutation
+    // lock matches the INSERT path.
+    let _constraint_guard = super::dml_insert::constraint_insert_lock(db, table)
+        .lock()
+        .unwrap();
+
+    let ctx = super::txn_dml::DmlStatementContext::plan(engine, db, table, where_clause)?;
+    // Shadow the raw parameter: every consumer below — the memtable batch
+    // updates, the segment masks — must see the subquery-resolved clause,
+    // never the statement's original AST.
+    let where_clause = &ctx.resolved_where;
+    let table_schema = &ctx.table_schema;
+    let table_meta = &ctx.table_meta;
+    let predicate = ctx.predicate.as_ref();
+    let predicate_projection = &ctx.predicate_projection;
+    let target_partition_key = ctx.narrowed_partition();
 
     let table_dir = engine.data_dir().join(db).join(table);
     let mgr = engine.segment_mgr();
+    mgr.set_table_compression_level(db, table, table_meta.compression_level);
     if table_meta.is_partitioned()
         && assignments.iter().any(|assignment| {
             assignment
@@ -46,35 +69,65 @@ pub fn exec_update(
             table_meta.partition_key
         )));
     }
-    let predicate = build_row_group_predicate(where_clause, &table_schema);
-    let predicate_projection = where_clause
-        .as_ref()
-        .map(|expr| collect_expr_column_indices(expr, &table_schema))
-        .unwrap_or_default();
-    let target_partition_key =
-        super::dml_delete::delete_partition_eq_key(where_clause, &table_schema, &table_meta);
+
+    // Resolve subqueries in the assignment values up front, exactly like the
+    // WHERE clause inside `DmlStatementContext::plan` — without it, a SET
+    // subquery would reach the evaluator as an opaque expression.
+    let resolved_assignments: Vec<Assignment> = assignments
+        .iter()
+        .map(|assignment| {
+            Ok(Assignment {
+                column: assignment.column.clone(),
+                value: super::query::resolve_expr_in_subqueries_clone(
+                    engine,
+                    db,
+                    &assignment.value,
+                )?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    let assignments = resolved_assignments.as_slice();
 
     engine
         .batch_writer()
         .checkpoint_before_rewrite(db, table, 1)?;
 
-    let updated_count = mgr.with_table_mutation_lock(db, table, || {
+    // From here the statement rewrites memtables and segment tails; the work
+    // is no longer safely abortable, so cancellation checks stop firing.
+    crate::common::query_cancel::enter_committing_phase();
+
+    let update_body = || -> Result<u64> {
+        // Updated rows are published as change events (post-update values
+        // for memtable rows, which are entirely in memory).
+        let publish_updates = engine.pubsub().has_subscribers();
+        let mut updated_events = super::helpers::ChangeEventBuffer::new("update", db, table);
         let mut updated_count = 0u64;
-        let mut memtable_updates = Vec::new();
-        for memtable in engine
-            .memtable_manager()
-            .get_visible_to(db, table, reader_txn_id)
-        {
-            let Some(batch) = memtable.read_snapshot() else {
-                continue;
-            };
-            let (new_batch, affected) =
-                update_memtable_batch(assignments, where_clause, &table_schema, &batch)?;
-            if affected > 0 {
-                updated_count += affected;
-                memtable_updates.push((memtable, new_batch));
-            }
-        }
+        let mut memtable_updates: Vec<(
+            Arc<crate::storage::core::memtable::MemTable>,
+            Arc<RecordBatch>,
+        )> = Vec::new();
+        let narrowed_partition = target_partition_key;
+        super::dml_delete::for_each_visible_memtable(
+            engine,
+            db,
+            table,
+            reader_txn_id,
+            narrowed_partition,
+            |memtable, _original, batch, _live_positions| {
+                let (new_batch, affected, matched_rows) =
+                    update_memtable_batch(assignments, where_clause, &table_schema, &batch)?;
+                if let Some(new_batch) = new_batch {
+                    updated_count += affected;
+                    if publish_updates {
+                        // Change events carry the post-update row images: take
+                        // from `new_batch`, not the pre-update snapshot.
+                        updated_events.push(&new_batch, &matched_rows);
+                    }
+                    memtable_updates.push((memtable, Arc::new(new_batch)));
+                }
+                Ok(())
+            },
+        )?;
 
         // A background memtable flush may have produced an active segment.
         // Seal only this table's active writers before replacing segment files;
@@ -95,11 +148,14 @@ pub fn exec_update(
         } else {
             Vec::new()
         };
-        let mut rewritten_segments = Vec::new();
+        let mut rewritten_segments: Vec<(std::path::PathBuf, Vec<Arc<RecordBatch>>)> = Vec::new();
+        // Assignments are constant per statement; resolve them once for every
+        // segment/row group below.
+        let assigned = precompute_assigned_values(assignments, &table_schema)?;
 
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
-            if !segment_may_match(&reader, predicate.as_ref()) {
+            if !super::helpers::segment_may_match(&reader, predicate) {
                 continue;
             }
 
@@ -128,36 +184,42 @@ pub fn exec_update(
 
                 segment_updated = true;
                 let batch = reader.read_row_group(rg_idx)?;
-                let mut new_batch = RecordBatch::new(batch.schema.clone());
-                for (row_idx, matches) in mask.into_iter().enumerate() {
-                    let absolute_row = reader.row_group_start_row(rg_idx) + row_idx as u64;
+                let rg_publish = publish_updates;
+                // Surviving rows keep their order; matched survivors receive
+                // the assigned value in their assigned columns only.
+                let start_row = reader.row_group_start_row(rg_idx);
+                let delete_bitmap = reader.delete_bitmap();
+                let mut kept: Vec<u32> = Vec::new();
+                let mut kept_matched: Vec<bool> = Vec::with_capacity(mask.len());
+                for (row_idx, matches) in mask.iter().enumerate() {
+                    let absolute_row = start_row + row_idx as u64;
                     if crate::storage::segment::delete_bitmap::is_deleted(
-                        reader.delete_bitmap(),
+                        delete_bitmap,
                         absolute_row,
                     ) {
                         continue;
                     }
-                    for col_idx in 0..batch.num_columns() {
-                        let val = if matches {
-                            updated_value_for_column(
-                                assignments,
-                                &batch,
-                                row_idx,
-                                col_idx,
-                                &table_schema,
-                            )?
-                        } else {
-                            batch
-                                .scalar(row_idx, col_idx)
-                                .unwrap_or(ScalarValue::null_for_type(
-                                    table_schema.columns[col_idx].data_type,
-                                ))
-                        };
-                        new_batch.column_mut(col_idx).unwrap().push(&val)?;
-                    }
-                    if matches {
-                        updated_count += 1;
-                    }
+                    kept.push(row_idx as u32);
+                    kept_matched.push(*matches);
+                }
+                let mut new_columns = Vec::with_capacity(batch.num_columns());
+                for (col_idx, column) in batch.columns.iter().enumerate() {
+                    new_columns.push(rebuild_update_column(
+                        column,
+                        assigned.get(&col_idx),
+                        &kept,
+                        &kept_matched,
+                    )?);
+                }
+                let new_batch = RecordBatch::try_new(batch.schema.clone(), new_columns)?;
+                updated_count += kept_matched.iter().filter(|m| **m).count() as u64;
+                if rg_publish {
+                    let matched: Vec<u32> = kept_matched
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, m)| m.then_some(idx as u32))
+                        .collect();
+                    updated_events.push(&new_batch, &matched);
                 }
                 row_group_updates.push((rg_idx, Some(new_batch)));
             }
@@ -166,7 +228,7 @@ pub fn exec_update(
                 let mut new_batches = Vec::new();
                 for (rg_idx, batch) in row_group_updates {
                     match batch {
-                        Some(batch) => new_batches.push(batch),
+                        Some(batch) => new_batches.push(Arc::new(batch)),
                         None => {
                             let mut batch = reader.read_row_group(rg_idx)?;
                             if !reader.delete_bitmap().is_empty() {
@@ -177,7 +239,7 @@ pub fn exec_update(
                                 )?;
                             }
                             if batch.num_rows() > 0 {
-                                new_batches.push(batch);
+                                new_batches.push(Arc::new(batch));
                             }
                         }
                     }
@@ -190,8 +252,43 @@ pub fn exec_update(
             return Ok(0);
         }
 
-        if !table_meta.unique_indexes.is_empty() {
-            let mut validation_batches = Vec::new();
+        // Unique/PK validation. Only indexes whose columns are actually
+        // touched by this UPDATE can gain new collisions (assignments are
+        // constant per statement), and the primary key must be validated
+        // even though it is not listed in `unique_indexes` — UPDATE used to
+        // skip PK checks entirely, letting `SET id = <existing>` through.
+        let indexes_to_validate = indexes_touched_by_assignments(
+            &table_meta.unique_indexes,
+            &table_schema,
+            assigned.keys().copied().collect(),
+        );
+        if !indexes_to_validate.is_empty() {
+            // Materialize only the key columns (not whole rows) to keep the
+            // validation working set proportional to the index width.
+            let mut needed: Vec<usize> = indexes_to_validate
+                .iter()
+                .flat_map(|index| index.columns.iter())
+                .filter_map(|column| table_schema.index_of(column))
+                .collect();
+            needed.sort_unstable();
+            needed.dedup();
+            let validation_schema = Schema::new(
+                needed
+                    .iter()
+                    .map(|&idx| table_schema.columns[idx].clone())
+                    .collect(),
+            );
+            let project = |batch: &RecordBatch| -> RecordBatch {
+                RecordBatch::try_new(
+                    validation_schema.clone(),
+                    needed
+                        .iter()
+                        .map(|&idx| batch.columns[idx].clone())
+                        .collect(),
+                )
+                .expect("validation projection preserves column types")
+            };
+            let mut validation_batches: Vec<Arc<RecordBatch>> = Vec::new();
             for seg_path in SegmentManager::discover_segments(&table_dir)? {
                 if rewritten_segments
                     .iter()
@@ -210,36 +307,47 @@ pub fn exec_update(
                         )?;
                     }
                     if batch.num_rows() > 0 {
-                        validation_batches.push(batch);
+                        validation_batches.push(Arc::new(project(&batch)));
                     }
                 }
             }
             for (_, batches) in &rewritten_segments {
-                validation_batches.extend(batches.iter().cloned());
+                validation_batches.extend(batches.iter().map(|batch| Arc::new(project(batch))));
             }
-            for memtable in engine.memtable_manager().get_by_table(db, table) {
+            // Visible-to-this-transaction memtables only: another session's
+            // uncommitted keys used to cause spurious duplicate errors here.
+            for memtable in engine
+                .memtable_manager()
+                .get_visible_to(db, table, reader_txn_id)
+            {
                 let batch = memtable_updates
                     .iter()
                     .find(|(updated, _)| Arc::ptr_eq(updated, &memtable))
-                    .map(|(_, batch)| batch.clone())
-                    .or_else(|| memtable.read_snapshot());
+                    .map(|(_, batch)| Arc::clone(batch))
+                    .or_else(|| memtable.read_snapshot_arc());
                 if let Some(batch) = batch {
                     if batch.num_rows() > 0 {
-                        validation_batches.push(batch);
+                        validation_batches.push(Arc::new(project(&batch)));
                     }
                 }
             }
             super::dml_insert::validate_unique_indexes_in_batches(
                 table,
-                &table_schema,
-                &table_meta.unique_indexes,
+                &validation_schema,
+                &indexes_to_validate,
                 &validation_batches,
             )?;
         }
 
-        for (old_seg, batches) in rewritten_segments {
+        // Two-phase rewrite: write every replacement segment to its temp
+        // file first, and only then perform the (metadata-only) swaps. A
+        // failure in phase one aborts the statement with the old segments
+        // fully intact; before this split, the loop replaced segment N while
+        // segment N+1 was still unwritten, so an error left the statement
+        // half-applied ("some rows updated" despite the reported failure).
+        let mut staged_segments: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::new();
+        for (old_seg, batches) in &rewritten_segments {
             let Some(schema) = batches.first().map(|batch| batch.schema.clone()) else {
-                mgr.remove_segment_file(&old_seg)?;
                 continue;
             };
             let partition_key = old_seg.file_name().and_then(|name| {
@@ -249,29 +357,55 @@ pub fn exec_update(
                 mgr.next_replacement_segment_path(&table_dir, partition_key.as_deref())?;
             let tmp_path =
                 crate::storage::segment::store::replacement_tmp_path(&final_path, "update_tmp");
-            let write_result = mgr.write_new_segment_batches(
+            if let Err(error) = mgr.write_new_segment_batches(
                 &tmp_path,
                 schema,
                 mgr.row_group_target_rows(),
-                &batches,
-            );
-            if let Err(error) = write_result {
+                batches,
+                mgr.table_compression_level(db, table),
+            ) {
+                // Drop every temp file written so far and abort cleanly.
+                for (_, tmp, final_path) in &staged_segments {
+                    let _ = std::fs::remove_file(tmp);
+                    let _ = crate::storage::segment::meta::remove_sidecar_meta(tmp);
+                    let _ = std::fs::remove_file(final_path);
+                }
                 let _ = std::fs::remove_file(&tmp_path);
                 let _ = crate::storage::segment::meta::remove_sidecar_meta(&tmp_path);
                 return Err(error);
             }
-            mgr.replace_segments_with_tmp(&tmp_path, &final_path, &[old_seg])?;
+            staged_segments.push((old_seg.clone(), tmp_path, final_path));
+        }
+        // Empty rewritten segments (no surviving rows): removed outright.
+        for (old_seg, batches) in &rewritten_segments {
+            if batches.is_empty() {
+                mgr.remove_segment_file(old_seg)?;
+            }
+        }
+        for (old_seg, tmp_path, final_path) in staged_segments {
+            if let Err(error) = mgr.replace_segments_with_tmp(&tmp_path, &final_path, &[old_seg]) {
+                // The replacement failed: drop the orphaned temp segment
+                // instead of leaking it (startup cleanup only knows the
+                // compaction temp patterns).
+                let _ = std::fs::remove_file(&tmp_path);
+                let _ = crate::storage::segment::meta::remove_sidecar_meta(&tmp_path);
+                return Err(error);
+            }
         }
 
         let mut tail_persist_failed = false;
         for (memtable, batch) in memtable_updates {
-            if !memtable.replace_pending_batch(batch) {
-                return Err(TaibaiError::Internal(format!(
-                    "memtable for '{}.{}' left pending state during UPDATE",
-                    db, table
-                )));
-            }
-            if let Err(error) = engine.batch_writer().persist_memtable_tail(&memtable) {
+            // Durable tail BEFORE the in-memory swap: the segment rewrites
+            // above already committed the new values, so a crash between the
+            // two steps must not let recovery restore the pre-update tail
+            // next to them. This loop runs under the table/partition
+            // mutation lock, so no flush can invalidate `batch` in between.
+            // A tail write failure still swaps in memory and falls back to
+            // the flush below (same degradation as before).
+            if let Err(error) = engine
+                .batch_writer()
+                .persist_memtable_tail_batch(&memtable, &batch)
+            {
                 tail_persist_failed = true;
                 tracing::warn!(
                     db,
@@ -280,24 +414,55 @@ pub fn exec_update(
                     "UPDATE durable tail write failed; flushing target table"
                 );
             }
+            if !memtable.replace_pending_batch(batch) {
+                return Err(TaibaiError::Internal(format!(
+                    "memtable for '{}.{}' left pending state during UPDATE",
+                    db, table
+                )));
+            }
         }
         if tail_persist_failed {
-            engine
-                .batch_writer()
-                .flush_table_under_table_lock(db, table)?;
+            // Partition-pruned UPDATEs run under the target partition's lock
+            // only; flushing the whole table with the "table lock held"
+            // freeze would race concurrent appends in OTHER partitions.
+            // Flush just the pruned partition, whose appenders this
+            // statement's partition lock already excludes.
+            if let Some(partition) = target_partition_key
+                .as_deref()
+                .filter(|key| !key.is_empty())
+            {
+                engine
+                    .batch_writer()
+                    .flush_partition_under_partition_lock(db, table, partition)?;
+            } else {
+                engine
+                    .batch_writer()
+                    .flush_table_under_table_lock(db, table)?;
+            }
         }
 
         // HotStore is append-only. Once rows are updated in place it is no
         // longer authoritative, and must not be lazily recreated from only
         // later INSERTs while older memtable rows are still live.
-        engine.hot_store_manager().invalidate(db, table);
+        engine.invalidate_hot_store(db, table);
 
-        // UPDATE rewrites rows into new segments, so old index locations die.
-        // Rebuild the location-index snapshots from a fresh scan while still
-        // holding the table lock so the next statement stays incremental; a
-        // failure falls back to wholesale invalidation, whose lazy rebuild on
-        // the next probe preserves correctness.
+        // Publish post-update rows as change events once every segment
+        // replacement has committed. One event per batch: rewritten segments
+        // and memtables may carry different schemas after ALTER TABLE ADD
+        // COLUMN (metadata-only), so merging by column index would panic.
+        if publish_updates && updated_count > 0 {
+            for batch in updated_events.batches {
+                engine
+                    .pubsub()
+                    .publish_change(crate::pubsub::ChangeKind::Update, db, table, batch);
+            }
+        }
         if updated_count > 0 {
+            // Rebuild location indexes while STILL holding the mutation lock.
+            // Doing this after releasing the lock (as before) left a window
+            // where a concurrent INSERT probed a stale index snapshot and
+            // committed a key this UPDATE had just introduced, permanently
+            // baking a duplicate into the rebuilt index.
             if let Err(error) = super::dml_insert::rebuild_table_location_indexes(
                 engine,
                 db,
@@ -326,18 +491,20 @@ pub fn exec_update(
         }
 
         Ok(updated_count)
-    })?;
+    };
+
+    let updated_count = match target_partition_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+    {
+        Some(partition) => {
+            mgr.with_partition_set_mutation_lock(db, table, &[partition], update_body)?
+        }
+        None => mgr.with_table_mutation_lock(db, table, update_body)?,
+    };
 
     if updated_count == 0 {
         return Ok(ExecResult::Ok { rows_affected: 0 });
-    }
-
-    let mut catalogs = engine.catalogs().write().unwrap();
-    if let Some(catalog) = catalogs.get_mut(db) {
-        if let Some(_meta) = catalog.get_table_mut(table) {
-            let meta_dir = engine.data_dir().join("meta");
-            catalog.save(&meta_dir)?;
-        }
     }
 
     Ok(ExecResult::Ok {
@@ -345,44 +512,171 @@ pub fn exec_update(
     })
 }
 
-fn update_memtable_batch(
+/// Unique indexes whose key can change under this UPDATE: an index needs
+/// revalidation only when at least one of its columns is assigned a new
+/// value. The primary key is included as a pseudo index — it is deliberately
+/// absent from `unique_indexes`, and UPDATE previously skipped it entirely.
+fn indexes_touched_by_assignments(
+    unique_indexes: &[crate::storage::catalog::schema::UniqueIndexMeta],
+    table_schema: &Schema,
+    assigned_columns: std::collections::HashSet<usize>,
+) -> Vec<crate::storage::catalog::schema::UniqueIndexMeta> {
+    let mut indexes: Vec<crate::storage::catalog::schema::UniqueIndexMeta> = unique_indexes
+        .iter()
+        .filter(|index| {
+            index.columns.iter().any(|column| {
+                table_schema
+                    .index_of(column)
+                    .is_some_and(|idx| assigned_columns.contains(&idx))
+            })
+        })
+        .cloned()
+        .collect();
+    let pk_columns: Vec<String> = {
+        // The primary key is one composite constraint: once any of its columns
+        // is rewritten, the NEW (c1, c2, ...) combinations must be checked for
+        // uniqueness against the full key. Filtering to the assigned subset
+        // used to reject legal updates — PK(id, ts) with `SET id = 1` flagged
+        // (1, 1) vs (1, 2) as duplicates.
+        let any_pk_assigned = table_schema
+            .columns
+            .iter()
+            .enumerate()
+            .any(|(idx, column)| column.primary_key && assigned_columns.contains(&idx));
+        if !any_pk_assigned {
+            Vec::new()
+        } else {
+            table_schema
+                .columns
+                .iter()
+                .filter(|column| column.primary_key)
+                .map(|column| column.name.clone())
+                .collect()
+        }
+    };
+    if !pk_columns.is_empty() {
+        indexes.push(crate::storage::catalog::schema::UniqueIndexMeta {
+            name: "PRIMARY".to_string(),
+            columns: pk_columns,
+        });
+    }
+    indexes
+}
+
+pub(crate) fn update_memtable_batch(
     assignments: &[Assignment],
     where_clause: &Option<Expr>,
     table_schema: &Schema,
     batch: &RecordBatch,
-) -> Result<(RecordBatch, u64)> {
+) -> Result<(Option<RecordBatch>, u64, Vec<u32>)> {
     let mask = if let Some(where_expr) = where_clause.as_ref() {
         eval_where_clause_batch(where_expr, batch, table_schema)?
     } else {
         vec![true; batch.num_rows()]
     };
-    if !mask.iter().any(|matches| *matches) {
-        return Ok((batch.clone(), 0));
+    // `None` means no row matched, so the caller skips the memtable without
+    // paying for any copy.
+    let matched_rows: Vec<u32> = mask
+        .iter()
+        .enumerate()
+        .filter_map(|(row_idx, matches)| matches.then_some(row_idx as u32))
+        .collect();
+    if matched_rows.is_empty() {
+        return Ok((None, 0, Vec::new()));
     }
 
-    let mut affected = 0u64;
-    let mut new_batch = RecordBatch::new(batch.schema.clone());
-    for (row_idx, matches) in mask.into_iter().enumerate() {
-        for col_idx in 0..batch.num_columns() {
-            let value = if matches {
-                updated_value_for_column(assignments, batch, row_idx, col_idx, table_schema)?
-            } else {
-                batch
-                    .scalar(row_idx, col_idx)
-                    .unwrap_or(ScalarValue::null_for_type(
-                        table_schema.columns[col_idx].data_type,
-                    ))
-            };
-            new_batch.column_mut(col_idx).unwrap().push(&value)?;
-        }
-        if matches {
-            affected += 1;
-        }
+    let assigned = precompute_assigned_values(assignments, table_schema)?;
+    let all_rows: Vec<u32> = (0..batch.num_rows() as u32).collect();
+    let mut new_columns = Vec::with_capacity(batch.num_columns());
+    for (col_idx, column) in batch.columns.iter().enumerate() {
+        new_columns.push(rebuild_update_column(
+            column,
+            assigned.get(&col_idx),
+            &all_rows,
+            &mask,
+        )?);
     }
-    Ok((new_batch, affected))
+    let affected = matched_rows.len() as u64;
+    Ok((
+        Some(RecordBatch::try_new(batch.schema.clone(), new_columns)?),
+        affected,
+        matched_rows,
+    ))
 }
 
-fn build_update_mask(
+/// Rebuild one column for the surviving rows of an UPDATE: untouched rows
+/// keep their value, matched survivors receive the (constant) assigned value.
+pub(crate) fn rebuild_update_column(
+    column: &ColumnArray,
+    assigned: Option<&ScalarValue>,
+    kept: &[u32],
+    kept_matched: &[bool],
+) -> Result<ColumnArray> {
+    match assigned {
+        // Untouched columns: one bulk gather instead of a per-cell
+        // ScalarValue round-trip.
+        None => Ok(column.take(kept)),
+        Some(value) => {
+            // Split the survivors into maximal constant runs: long unmatched
+            // runs go through `gather_into` (memcpy for ascending runs, bulk
+            // bitmaps), and only the matched rows pay a per-row push. The old
+            // loop routed EVERY row through a scalar() + push() round-trip,
+            // cloning a String per VarChar cell of a million-row group to
+            // change one row.
+            let mut out = ColumnArray::empty(column.data_type());
+            let mut idx = 0usize;
+            while idx < kept.len() {
+                let matched = kept_matched[idx];
+                let start = idx;
+                while idx < kept.len() && kept_matched[idx] == matched {
+                    idx += 1;
+                }
+                if matched {
+                    for _ in start..idx {
+                        out.push(value)?;
+                    }
+                } else {
+                    column.gather_into(&kept[start..idx], &mut out)?;
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Assignment expressions are constant per statement (they are evaluated
+/// without row context), so resolve every assigned column index and value
+/// once instead of per row. Evaluation errors abort the statement (matching
+/// the pre-optimization behavior) instead of silently writing NULL.
+pub(crate) fn precompute_assigned_values(
+    assignments: &[Assignment],
+    table_schema: &Schema,
+) -> Result<HashMap<usize, ScalarValue>> {
+    let mut assigned = HashMap::new();
+    for assign in assignments {
+        if let Some(col_idx) = table_schema
+            .columns
+            .iter()
+            .position(|column| column.name == assign.column)
+        {
+            if !assigned.contains_key(&col_idx) {
+                let value =
+                    eval_expr_to_scalar(&assign.value, &table_schema.columns[col_idx].data_type)?;
+                assigned.insert(col_idx, value);
+            }
+        } else {
+            // A silent skip used to report rows_affected while changing
+            // nothing (`UPDATE t SET nosuchcol = 1 WHERE ...`).
+            return Err(TaibaiError::Sql(format!(
+                "unknown column '{}' in SET clause",
+                assign.column
+            )));
+        }
+    }
+    Ok(assigned)
+}
+
+pub(crate) fn build_update_mask(
     reader: &crate::storage::segment::SegmentReader,
     row_group_idx: usize,
     where_clause: &Option<Expr>,
@@ -412,36 +706,4 @@ fn build_update_mask(
         }
     }
     Ok(mask)
-}
-
-fn segment_may_match(
-    reader: &crate::storage::segment::SegmentReader,
-    predicate: Option<&crate::storage::segment::RowGroupPredicate>,
-) -> bool {
-    let Some(predicate) = predicate else {
-        return true;
-    };
-    let segment_zone_maps = reader.segment_zone_maps();
-    if !segment_zone_maps.is_empty() {
-        return predicate.matches_row_group(segment_zone_maps);
-    }
-    (0..reader.num_row_groups()).any(|rg_idx| predicate.matches_row_group(reader.zone_maps(rg_idx)))
-}
-
-fn updated_value_for_column(
-    assignments: &[Assignment],
-    batch: &RecordBatch,
-    row_idx: usize,
-    col_idx: usize,
-    table_schema: &Schema,
-) -> Result<ScalarValue> {
-    let col_name = &table_schema.columns[col_idx].name;
-    if let Some(assign) = assignments.iter().find(|a| &a.column == col_name) {
-        return eval_expr_to_scalar(&assign.value, &table_schema.columns[col_idx].data_type);
-    }
-    Ok(batch
-        .scalar(row_idx, col_idx)
-        .unwrap_or(ScalarValue::null_for_type(
-            table_schema.columns[col_idx].data_type,
-        )))
 }

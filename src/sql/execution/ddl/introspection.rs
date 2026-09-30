@@ -311,6 +311,10 @@ pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<
         create_sql.push_str(" DURABILITY = RELAXED");
     }
 
+    if let Some(level) = table_meta.compression_level {
+        create_sql.push_str(&format!(" COMPRESSION_LEVEL = {}", level));
+    }
+
     for secondary_index in &table_meta.secondary_indexes {
         let cols = secondary_index.columns.join(", ");
         create_sql.push_str(&format!(
@@ -553,7 +557,8 @@ pub fn exec_show_engines(_engine: &Engine) -> Result<ExecResult> {
     })
 }
 
-pub fn exec_show_processlist(_engine: &Engine, _full: bool) -> Result<ExecResult> {
+pub fn exec_show_processlist(engine: &Engine, full: bool) -> Result<ExecResult> {
+    let entries = engine.query_registry().list();
     let schema = Schema::new(vec![
         ColumnDef::new("Id", DataType::Int64),
         ColumnDef::new("User", DataType::VarChar),
@@ -563,11 +568,73 @@ pub fn exec_show_processlist(_engine: &Engine, _full: bool) -> Result<ExecResult
         ColumnDef::new("State", DataType::VarChar),
         ColumnDef::new("Info", DataType::VarChar),
     ]);
-    let batch = RecordBatch::new(schema.clone());
+    let mut batch = RecordBatch::new(schema.clone());
+    for entry in entries {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(entry.query_id as i64)))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(entry.username.clone())))?;
+        batch
+            .column_mut(2)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(entry.database.clone())))?;
+        batch
+            .column_mut(3)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some("Query".to_string())))?;
+        batch
+            .column_mut(4)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(entry.elapsed_secs as i64)))?;
+        let state = if entry.cancelled {
+            "Killed".to_string()
+        } else {
+            match entry.phase {
+                crate::common::query_cancel::QueryPhase::Planning => "Planning".to_string(),
+                crate::common::query_cancel::QueryPhase::Executing => "Executing".to_string(),
+                crate::common::query_cancel::QueryPhase::Committing => "Committing".to_string(),
+            }
+        };
+        batch.column_mut(5).unwrap().push(&ScalarValue::VarChar(Some(state)))?;
+        batch
+            .column_mut(6)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(processlist_info(&entry.sql, full))))?;
+    }
     Ok(ExecResult::Query {
         schema,
         batches: vec![batch],
     })
+}
+
+/// The `Info` column: the retained statement snippet in full, or truncated
+/// to 100 characters like MySQL's default processlist.
+fn processlist_info(sql: &str, full: bool) -> String {
+    if full || sql.len() <= 100 {
+        return sql.to_string();
+    }
+    let mut truncated: String = sql.chars().take(100).collect();
+    truncated.push_str("...");
+    truncated
+}
+
+pub fn exec_kill_query(engine: &Engine, killer: &str, query_id: u64) -> Result<ExecResult> {
+    let killed = engine.query_registry().kill(
+        query_id,
+        format!("query {} was killed by user '{}'", query_id, killer),
+    );
+    if !killed {
+        return Err(TaibaiError::Sql(format!(
+            "query {} is not running",
+            query_id
+        )));
+    }
+    tracing::info!(query_id, killer, "KILL QUERY dispatched");
+    Ok(ExecResult::Ok { rows_affected: 0 })
 }
 
 pub fn exec_flush_table(engine: &Engine, db: &str, table: &Option<String>) -> Result<ExecResult> {
@@ -616,6 +683,19 @@ pub fn exec_optimize_table(
     } else {
         compactor.optimize_table(db, table, &table_meta)?
     };
+
+    // TTL-expired rows physically removed by the rewrite were never
+    // subtracted from the catalog by a DELETE; correct row_count first.
+    if stats.rows_dropped_ttl > 0 {
+        let mut catalogs = engine.catalogs().write().unwrap();
+        if let Some(catalog) = catalogs.get_mut(db) {
+            if let Some(meta) = catalog.get_table_mut(table) {
+                meta.row_count = (meta.row_count - stats.rows_dropped_ttl as i64).max(0);
+                let meta_dir = engine.data_dir().join("meta");
+                let _ = catalog.save(&meta_dir);
+            }
+        }
+    }
 
     // The rewrite moved rows to new segment locations, so rebuild the
     // location-index snapshots eagerly instead of invalidating them for a
@@ -675,10 +755,16 @@ pub fn exec_analyze_table(engine: &Engine, db: &str, table: &str) -> Result<Exec
     };
     let table_dir = engine.data_dir().join(db).join(table);
     let composite_groups = analyze_composite_groups(&table_meta);
+    // Statistics are advisory and the scan below is read-only over
+    // immutable segments, so it does NOT take the wide mutation gate:
+    // holding that gate for a full-table scan would freeze every
+    // partition's INSERTs for the scan duration. The flush-visibility
+    // read lock only keeps the scan from observing a memtable→segment
+    // transition mid-flip.
     let (row_count, columns, composite_columns) =
         engine
             .segment_mgr()
-            .with_table_mutation_lock(db, table, || {
+            .with_table_flush_read_lock(db, table, || {
                 let paths =
                     crate::storage::segment_manager::SegmentManager::discover_segments(&table_dir)?;
                 let mut collectors = table_meta
@@ -918,12 +1004,12 @@ impl AnalyzeColumnCollector {
             }
             self.non_null_count = self.non_null_count.saturating_add(1);
             if self.min_value.as_ref().is_none_or(|current| {
-                crate::sql::execution::operators::sort::compare_scalars(&value, current).is_lt()
+                crate::sql::execution::operators::sort::compare_scalars_null_last(&value, current).is_lt()
             }) {
                 self.min_value = Some(value.clone());
             }
             if self.max_value.as_ref().is_none_or(|current| {
-                crate::sql::execution::operators::sort::compare_scalars(&value, current).is_gt()
+                crate::sql::execution::operators::sort::compare_scalars_null_last(&value, current).is_gt()
             }) {
                 self.max_value = Some(value.clone());
             }
@@ -995,7 +1081,7 @@ fn build_histogram(
         .into_iter()
         .map(|sample| sample.value)
         .collect::<Vec<_>>();
-    values.sort_by(crate::sql::execution::operators::sort::compare_scalars);
+    values.sort_by(crate::sql::execution::operators::sort::compare_scalars_null_last);
     if values.is_empty() {
         return Vec::new();
     }
@@ -1005,7 +1091,7 @@ fn build_histogram(
     while start < values.len() {
         let mut end = (start + target).min(values.len());
         while end < values.len()
-            && crate::sql::execution::operators::sort::compare_scalars(
+            && crate::sql::execution::operators::sort::compare_scalars_null_last(
                 &values[end - 1],
                 &values[end],
             )

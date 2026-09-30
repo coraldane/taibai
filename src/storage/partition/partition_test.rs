@@ -79,3 +79,49 @@ fn test_partition_strategy_from_str() {
     );
     assert!(PartitionStrategy::from_str("invalid").is_err());
 }
+
+/// Regression: bounds that are not valid YYYYMMDD-style dates (a wall-clock
+/// `deal_time` value like 2000, or an invalid date like 20261000) must not
+/// prune partitions. The old epoch-micros fallback reinterpreted them as
+/// "197001" and eliminated every partition.
+#[test]
+fn pruner_ignores_bounds_that_are_not_valid_date_numbers() {
+    let pruner = PartitionPruner::new(PartitionStrategy::Month);
+    let partitions = vec!["202609".to_string()];
+
+    let upper_wall_clock = ScalarValue::Int64(Some(2000));
+    assert_eq!(
+        pruner.prune(&partitions, None, Some(&upper_wall_clock)),
+        partitions,
+        "wall-clock upper bound must not prune"
+    );
+
+    let upper_invalid_date = ScalarValue::Int32(Some(20261000));
+    assert_eq!(
+        pruner.prune(&partitions, None, Some(&upper_invalid_date)),
+        partitions,
+        "invalid YYYYMMDD upper bound must not prune"
+    );
+
+    let lower_invalid_date = ScalarValue::Int64(Some(930));
+    assert_eq!(
+        pruner.prune(&partitions, Some(&lower_invalid_date), None),
+        partitions,
+        "invalid lower bound must not prune"
+    );
+
+    // Convertible bounds keep pruning.
+    let upper_valid = ScalarValue::Int64(Some(20261101));
+    assert_eq!(
+        pruner.prune(&partitions, None, Some(&upper_valid)),
+        partitions,
+        "later-month upper bound keeps the partition"
+    );
+    let upper_before = ScalarValue::Int64(Some(20260831));
+    assert!(
+        pruner
+            .prune(&partitions, None, Some(&upper_before))
+            .is_empty(),
+        "earlier-month upper bound prunes the partition"
+    );
+}

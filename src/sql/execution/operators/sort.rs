@@ -68,6 +68,7 @@ impl SortExec {
             .max(1);
 
         while let Some(batch) = self.input.next_batch()? {
+            crate::common::query_cancel::check()?;
             if output_schema.is_none() {
                 let physical_schema = batch.schema.clone();
                 sort_exprs = Some(
@@ -184,6 +185,11 @@ fn sort_batches(
     let mut rows = (0..total_rows as u32).collect::<Vec<_>>();
     let compare = |left: &u32, right: &u32| {
         compare_key_rows(&evaluated_keys, *left as usize, *right as usize, sort_exprs)
+            // Deterministic total order for tied keys: the original row
+            // position. `select_nth_unstable_by` shuffles ties, so without
+            // this tie-break ORDER BY + LIMIT picked arbitrary peers between
+            // executions (unstable pagination).
+            .then(left.cmp(right))
     };
     if let Some(limit) = limit {
         if limit > 0 && rows.len() > limit {
@@ -232,7 +238,9 @@ fn compare_key_rows(
     for (index, (_, desc)) in sort_exprs.iter().enumerate() {
         let ordering = match &keys[index] {
             SortKeyColumn::Typed(column) => column.compare_at(left, right),
-            SortKeyColumn::Scalar(values) => compare_scalars(&values[left], &values[right]),
+            SortKeyColumn::Scalar(values) => {
+                compare_scalars_null_last(&values[left], &values[right])
+            }
         };
         let ordering = if *desc { ordering.reverse() } else { ordering };
         if !ordering.is_eq() {
@@ -342,7 +350,7 @@ impl Eq for MergeHeapItem {}
 impl Ord for MergeHeapItem {
     fn cmp(&self, other: &Self) -> Ordering {
         for (index, descending) in self.descending.iter().enumerate() {
-            let ordering = compare_scalars(&self.keys[index], &other.keys[index]);
+            let ordering = compare_scalars_null_last(&self.keys[index], &other.keys[index]);
             let ordering = if *descending {
                 ordering.reverse()
             } else {
@@ -442,7 +450,10 @@ impl ExternalMerge {
     }
 }
 
-pub fn compare_scalars(left: &ScalarValue, right: &ScalarValue) -> std::cmp::Ordering {
+/// Total order over scalars with NULLs sorting LAST in ascending order.
+/// Distinct from `aggregate::compare_scalars`, which sorts NULLs first;
+/// the two exist because TopN/ORDER BY and MIN/MAX differ in NULL intent.
+pub fn compare_scalars_null_last(left: &ScalarValue, right: &ScalarValue) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (left, right) {
         (ScalarValue::Int8(Some(left)), ScalarValue::Int8(Some(right))) => left.cmp(right),

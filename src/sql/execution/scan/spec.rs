@@ -21,6 +21,10 @@ pub struct ScanSpec {
     pub has_order_by: bool,
     pub has_group_by: bool,
     pub has_join: bool,
+    /// DISTINCT or window functions wrap the scan: a pushed-down LIMIT must
+    /// not truncate the scan, because the wrapper needs every row to dedup
+    /// or to compute frames before applying its own limit.
+    pub has_distinct_or_window: bool,
     pub limit: Option<usize>,
     pub order_by: Vec<ScanSortKey>,
 
@@ -30,11 +34,23 @@ pub struct ScanSpec {
     pub minmax_index_columns: Vec<usize>,
     pub set_index_columns: Vec<usize>,
     pub reader_txn_id: u64,
+    /// Partial-residency bound when the hybrid hot-mirror leg is active:
+    /// `(partition_column_index, covers_from_value)`. The mirror answers rows
+    /// with `column > value` (its leg adds a `Gt` clause); every non-mirror
+    /// leg gains a `Le` clause on the same column so the two sides partition
+    /// the table exactly. Set only when the mirror provably covers all rows
+    /// above the bound (`TableMeta::hot_mirror_covers_from`).
+    pub hot_mirror_bound: Option<(usize, ScalarValue)>,
 
-    /// Simple metadata-only aggregate fast path (COUNT/MIN/MAX, no GROUP BY).
+    /// Simple metadata-only aggregate fast path (COUNT/MIN/MAX/SUM/AVG, no
+    /// GROUP BY).
     /// When set, the scan executor answers the query from row-group zone maps
     /// / footers instead of streaming the data.
     pub simple_metadata_aggregates: Option<Vec<AggregateExpr>>,
+
+    /// DISTINCT fast path target column (name in the table schema). Set only
+    /// for single-column, predicate-free `SELECT DISTINCT` scans.
+    pub distinct_column: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +84,7 @@ impl ScanSpec {
             projection: None,
             is_count_star: false,
             has_aggregate: false,
+            has_distinct_or_window: false,
             has_order_by: false,
             has_group_by: false,
             has_join: false,
@@ -79,7 +96,9 @@ impl ScanSpec {
             minmax_index_columns: Vec::new(),
             set_index_columns: Vec::new(),
             reader_txn_id: 0,
+            hot_mirror_bound: None,
             simple_metadata_aggregates: None,
+            distinct_column: None,
         }
     }
 
@@ -141,6 +160,10 @@ pub fn compile_scan_spec(
     table_meta: &TableMeta,
 ) -> ScanSpec {
     let mut spec = ScanSpec::new(table_name);
+
+    if let LogicalPlan::Scan(scan) = plan {
+        spec.distinct_column = scan.distinct_column.clone();
+    }
 
     if !table_meta.cluster_key.is_empty() {
         spec.cluster_key = Some(table_meta.cluster_key.clone());
@@ -340,8 +363,14 @@ fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec
             set_scan_limit(spec, t.limit.saturating_add(t.offset));
             collect_from_plan(&t.input, table_name, schema, spec);
         }
-        LogicalPlan::Distinct(d) => collect_from_plan(&d.input, table_name, schema, spec),
-        LogicalPlan::Window(w) => collect_from_plan(&w.input, table_name, schema, spec),
+        LogicalPlan::Distinct(d) => {
+            spec.has_distinct_or_window = true;
+            collect_from_plan(&d.input, table_name, schema, spec);
+        }
+        LogicalPlan::Window(w) => {
+            spec.has_distinct_or_window = true;
+            collect_from_plan(&w.input, table_name, schema, spec);
+        }
         LogicalPlan::Join(j) => {
             spec.has_join = true;
             collect_from_plan(&j.left, table_name, schema, spec);
@@ -463,16 +492,27 @@ fn extract_predicates(expr: &LogicalExpr, schema: &Schema, spec: &mut ScanSpec) 
             if let (LogicalExpr::Column(idx), LogicalExpr::Literal(lo), LogicalExpr::Literal(hi)) =
                 (&**inner, &**low, &**high)
             {
-                spec.range_predicates.push(RangeClause {
-                    column_index: *idx,
-                    op: crate::storage::partition::pruning::RangeOp::Ge,
-                    value: lo.clone(),
-                });
-                spec.range_predicates.push(RangeClause {
-                    column_index: *idx,
-                    op: crate::storage::partition::pruning::RangeOp::Le,
-                    value: hi.clone(),
-                });
+                // Coerce like eq/range literals so downstream zone/bloom/set
+                // checks compare values in the column's own type and scale.
+                let column = &schema.columns[*idx];
+                match (
+                    coerce_scalar(lo, &column.data_type, column.scale),
+                    coerce_scalar(hi, &column.data_type, column.scale),
+                ) {
+                    (Some(lo), Some(hi)) => {
+                        spec.range_predicates.push(RangeClause {
+                            column_index: *idx,
+                            op: crate::storage::partition::pruning::RangeOp::Ge,
+                            value: lo,
+                        });
+                        spec.range_predicates.push(RangeClause {
+                            column_index: *idx,
+                            op: crate::storage::partition::pruning::RangeOp::Le,
+                            value: hi,
+                        });
+                    }
+                    _ => set_remaining(expr.clone(), spec),
+                }
             } else {
                 set_remaining(expr.clone(), spec);
             }
@@ -484,10 +524,32 @@ fn extract_predicates(expr: &LogicalExpr, schema: &Schema, spec: &mut ScanSpec) 
         } => {
             if let LogicalExpr::Column(idx) = &**inner {
                 if !values.is_empty() {
-                    spec.in_predicates.push(InPredicate {
-                        column_index: *idx,
-                        values: values.clone(),
-                    });
+                    // IN values feed bloom/set index pruning, which are exact
+                    // hash/equality checks with no cross-type fallback: an
+                    // Int64 literal against an Int32-built index hashes
+                    // differently and prunes row groups that actually match.
+                    // Coerce to the column type; if any literal cannot be
+                    // coerced, keep the predicate generic instead.
+                    let column = &schema.columns[*idx];
+                    let mut coerced = Vec::with_capacity(values.len());
+                    let mut all_coerced = true;
+                    for value in values {
+                        match coerce_scalar(value, &column.data_type, column.scale) {
+                            Some(v) => coerced.push(v),
+                            None => {
+                                all_coerced = false;
+                                break;
+                            }
+                        }
+                    }
+                    if all_coerced {
+                        spec.in_predicates.push(InPredicate {
+                            column_index: *idx,
+                            values: coerced,
+                        });
+                    } else {
+                        set_remaining(expr.clone(), spec);
+                    }
                 }
             } else {
                 set_remaining(expr.clone(), spec);
@@ -604,26 +666,34 @@ fn coerce_scalar(
         return Some(ScalarValue::null_for_type(*target_type));
     }
     match (target_type, value) {
-        (DataType::Int32, ScalarValue::Int64(Some(v))) => {
-            i32::try_from(*v).ok().map(|v| ScalarValue::Int32(Some(v)))
+        // Bool, integer, and float coercions delegate to the single ladder
+        // in `execution::helpers` that SET/INSERT and the DML predicate
+        // masks share, so `WHERE flag = 'yes'` accepts exactly the literals
+        // `SET flag = 'yes'` accepts. The Option contract is preserved:
+        // a rejected (or unknown) combination returns None and the
+        // predicate stays in the generic row-level filter instead of
+        // erroring or feeding an index probe a mistyped value.
+        (DataType::Bool, ScalarValue::VarChar(Some(_)))
+        | (DataType::Bool, ScalarValue::Int64(Some(_)))
+        | (DataType::Bool, ScalarValue::Int32(Some(_))) => {
+            crate::sql::execution::helpers::coerce_scalar_for_dtype(value, DataType::Bool).ok()
         }
-        (DataType::Int16, ScalarValue::Int64(Some(v))) => {
-            i16::try_from(*v).ok().map(|v| ScalarValue::Int16(Some(v)))
-        }
-        (DataType::Int8, ScalarValue::Int64(Some(v))) => {
-            i8::try_from(*v).ok().map(|v| ScalarValue::Int8(Some(v)))
-        }
-        (DataType::UInt32, ScalarValue::Int64(Some(v))) => {
-            u32::try_from(*v).ok().map(|v| ScalarValue::UInt32(Some(v)))
-        }
-        (DataType::UInt16, ScalarValue::Int64(Some(v))) => {
-            u16::try_from(*v).ok().map(|v| ScalarValue::UInt16(Some(v)))
-        }
-        (DataType::UInt8, ScalarValue::Int64(Some(v))) => {
-            u8::try_from(*v).ok().map(|v| ScalarValue::UInt8(Some(v)))
-        }
-        (DataType::Float32, ScalarValue::Float64(Some(v))) => {
-            Some(ScalarValue::Float32(Some(*v as f32)))
+        (
+            target @ (DataType::Int64
+            | DataType::Int32
+            | DataType::Int16
+            | DataType::Int8
+            | DataType::UInt64
+            | DataType::UInt32
+            | DataType::UInt16
+            | DataType::UInt8),
+            value,
+        ) => crate::sql::execution::helpers::coerce_integer_scalar(value, *target).ok(),
+        // Integer literals against float/unsigned-64 columns: without these
+        // arms the literal kept its Int64 tag, the bloom/set-index hash
+        // mismatched, and row groups containing matches were pruned away.
+        (DataType::Float64, _) | (DataType::Float32, _) => {
+            crate::sql::execution::helpers::coerce_scalar_for_dtype(value, *target_type).ok()
         }
         (DataType::Decimal, ScalarValue::Float64(Some(v))) => {
             let m = 10_i64.checked_pow(scale as u32)?;
@@ -634,6 +704,112 @@ fn coerce_scalar(
             v.checked_mul(m).map(|v| ScalarValue::Decimal(Some(v)))
         }
         (dt, v) if *dt == v.data_type() => Some(v.clone()),
-        _ => Some(value.clone()),
+        // Unhandled type combinations return None: the predicate then stays
+        // in the generic (row-level) filter instead of feeding an index
+        // probe with a mistyped value that would prune matching row groups.
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::types::DataType;
+    use crate::sql::parser::ast::BinOp;
+    use crate::types::batch::ColumnDef;
+
+    fn int32_schema() -> Schema {
+        Schema::new(vec![
+            ColumnDef::new("id", DataType::Int64),
+            ColumnDef::new("deal_date", DataType::Int32),
+        ])
+    }
+
+    /// Regression: IN literals must be coerced to the column type. Bloom and
+    /// set index pruning hash/compare the stored type exactly, so Int64
+    /// literals against an Int32 column used to prune every matching row.
+    #[test]
+    fn in_predicate_values_are_coerced_to_column_type() {
+        let schema = int32_schema();
+        let expr = LogicalExpr::In {
+            expr: Box::new(LogicalExpr::Column(1)),
+            values: vec![
+                ScalarValue::Int64(Some(20260916)),
+                ScalarValue::Int64(Some(20260917)),
+            ],
+            negated: false,
+        };
+        let mut spec = ScanSpec::new("t");
+        extract_predicates(&expr, &schema, &mut spec);
+
+        assert!(spec.remaining_predicate.is_none());
+        assert_eq!(spec.in_predicates.len(), 1);
+        assert_eq!(
+            spec.in_predicates[0].values,
+            vec![
+                ScalarValue::Int32(Some(20260916)),
+                ScalarValue::Int32(Some(20260917))
+            ]
+        );
+    }
+
+    /// Between bounds feed the same index checks as range clauses; coerce them
+    /// too so DECIMAL scale and integer widths match the stored column.
+    #[test]
+    fn between_bounds_are_coerced_to_column_type() {
+        let schema = int32_schema();
+        let expr = LogicalExpr::Between {
+            expr: Box::new(LogicalExpr::Column(1)),
+            low: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(20260901)))),
+            high: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(20260930)))),
+            negated: false,
+        };
+        let mut spec = ScanSpec::new("t");
+        extract_predicates(&expr, &schema, &mut spec);
+
+        assert!(spec.remaining_predicate.is_none());
+        assert_eq!(spec.range_predicates.len(), 2);
+        assert!(spec.range_predicates.iter().all(|clause| {
+            clause.value == ScalarValue::Int32(Some(20260901))
+                || clause.value == ScalarValue::Int32(Some(20260930))
+        }));
+    }
+
+    /// A literal that cannot be represented in the column type keeps the
+    /// predicate out of the pushed-down sets entirely (generic evaluation).
+    #[test]
+    fn in_predicate_with_uncoercible_value_stays_generic() {
+        let schema = int32_schema();
+        let expr = LogicalExpr::In {
+            expr: Box::new(LogicalExpr::Column(1)),
+            values: vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(i64::from(i32::MAX) + 1)),
+            ],
+            negated: false,
+        };
+        let mut spec = ScanSpec::new("t");
+        extract_predicates(&expr, &schema, &mut spec);
+
+        assert!(spec.in_predicates.is_empty());
+        assert!(spec.remaining_predicate.is_some());
+    }
+
+    /// Sanity: eq literals were already coerced before the IN fix.
+    #[test]
+    fn eq_predicate_values_are_coerced_to_column_type() {
+        let schema = int32_schema();
+        let expr = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(1)),
+            op: BinOp::Eq,
+            right: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(20260916)))),
+        };
+        let mut spec = ScanSpec::new("t");
+        extract_predicates(&expr, &schema, &mut spec);
+
+        assert_eq!(
+            spec.eq_predicates,
+            vec![(1usize, ScalarValue::Int32(Some(20260916)))]
+        );
     }
 }

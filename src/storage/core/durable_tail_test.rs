@@ -66,13 +66,13 @@ fn group_committer_acknowledges_only_recoverable_appends() -> Result<()> {
         temp.path().to_path_buf(),
         id,
         "2026".into(),
-        PreparedTailAppend::new(&first),
+        PreparedTailAppend::new(&first)?,
     );
     let second_ticket = committer.submit(
         temp.path().to_path_buf(),
         id,
         "2026".into(),
-        PreparedTailAppend::new(&second),
+        PreparedTailAppend::new(&second)?,
     );
     first_ticket.wait()?;
     second_ticket.wait()?;
@@ -100,7 +100,7 @@ fn async_fsync_committer_still_leaves_recoverable_tail() -> Result<()> {
         temp.path().to_path_buf(),
         id,
         "2026".into(),
-        PreparedTailAppend::new(&batch),
+        PreparedTailAppend::new(&batch)?,
     );
     ticket.wait()?;
     committer.barrier(temp.path())?;
@@ -151,6 +151,7 @@ fn incomplete_flush_recovers_tail_and_completed_flush_suppresses_it() -> Result<
         &temp.path().join("seg_00001.dat"),
         schema.clone(),
         DEFAULT_ROW_GROUP_SIZE,
+        3,
     )?;
     writer.write_batch(&batch)?;
     writer.seal()?;
@@ -172,6 +173,7 @@ fn flush_intent_watermark_requires_segment_row_count() -> Result<()> {
         &temp.path().join("seg_00001.dat"),
         schema.clone(),
         DEFAULT_ROW_GROUP_SIZE,
+        3,
     )?;
     writer.write_batch(&batch)?;
     writer.seal()?;
@@ -197,6 +199,7 @@ fn flush_intent_watermark_satisfied_by_shared_segment_growth() -> Result<()> {
         &temp.path().join("seg_00001.dat"),
         schema.clone(),
         DEFAULT_ROW_GROUP_SIZE,
+        3,
     )?;
     writer.write_batch(&first)?;
     writer.write_batch(&second)?;
@@ -225,6 +228,7 @@ fn batched_tail_queries_match_single_id_semantics() -> Result<()> {
         &temp.path().join("seg_00001.dat"),
         schema.clone(),
         DEFAULT_ROW_GROUP_SIZE,
+        3,
     )?;
     writer.write_batch(&flushed_batch)?;
     writer.seal()?;
@@ -416,7 +420,11 @@ fn garbage_frame_length_is_treated_as_torn_frame() -> Result<()> {
     let path = live_tail_path(temp.path(), id)?.expect("tail should exist");
     let mut bytes = fs::read(&path)?;
     let first_payload_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
-    let second_frame = 8 + 16 + first_payload_len + 4;
+    let frame_header_len =
+        TailFormat::from_magic(u32::from_le_bytes(bytes[0..4].try_into().unwrap()))
+            .expect("current tail format")
+            .frame_header_len;
+    let second_frame = 8 + frame_header_len + first_payload_len + 4;
     bytes[second_frame..second_frame + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     fs::write(&path, &bytes)?;
 
@@ -546,5 +554,356 @@ fn recovered_tail_preserves_null_values_in_mixed_columns() -> Result<()> {
             row
         );
     }
+    Ok(())
+}
+
+#[test]
+fn v3_frames_carry_monotonic_lsn_and_commit_timestamp() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    append(temp.path(), id, "2026", &test_batch(&schema, &[1])?)?;
+    append(temp.path(), id, "2026", &test_batch(&schema, &[2, 3])?)?;
+
+    let path = live_tail_path(temp.path(), id)?.expect("tail should exist");
+    let bytes = fs::read(&path)?;
+    let (partition, batch, frames) = decode_tail_with_meta(&bytes, &schema)?;
+    assert_eq!(partition, "2026");
+    assert_eq!(batch.num_rows(), 3);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0].rows, 1);
+    assert_eq!(frames[1].rows, 2);
+    assert!(frames[0].lsn < frames[1].lsn, "LSNs must be monotonic");
+    // Timestamps are wall-clock micros: after 2023-11-01 and not in the future.
+    let now_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64;
+    for frame in &frames {
+        assert!(frame.commit_ts_micros > 1_699_000_000_000_000);
+        assert!(frame.commit_ts_micros <= now_micros);
+    }
+    // The row-count scan still answers from headers alone.
+    assert_eq!(tail_log_rows(&path)?, Some(3));
+    Ok(())
+}
+
+#[test]
+fn v2_tail_log_still_decodes_with_zero_metadata() -> Result<()> {
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let batch = test_batch(&schema, &[7, 8])?;
+    // Hand-build a V2-format tail log: 16-byte frame header.
+    let payload = serialize_batch_for_wal(&batch)?;
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    frame.extend_from_slice(&2u64.to_le_bytes());
+    frame.extend_from_slice(&payload);
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&frame);
+    frame.extend_from_slice(&hasher.finalize().to_le_bytes());
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&TAIL_LOG_MAGIC_V2.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&frame);
+    let (partition, decoded, frames) = decode_tail_with_meta(&bytes, &schema)?;
+    assert_eq!(partition, "");
+    assert_eq!(decoded.num_rows(), 2);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].lsn, 0);
+    assert_eq!(frames[0].commit_ts_micros, 0);
+    assert_eq!(frames[0].rows, 2);
+    Ok(())
+}
+
+#[test]
+fn dispose_tail_file_archives_only_when_enabled() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    // Proper <data>/<db>/<table> nesting so the archive root derives to
+    // <data>/wal/<db>/<table>/memtable_tail.
+    let table_dir = temp.path().join("data").join("main").join("t");
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(&table_dir, id, "", &test_batch(&schema, &[1])?)?;
+    let tail_dir = table_dir.join(TAIL_DIR);
+    let tail_file = live_tail_path(&table_dir, id)?.expect("tail should exist");
+
+    // Disabled: the tail is deleted (historic behavior).
+    dispose_tail_file(&tail_dir, &tail_file, false);
+    assert!(!tail_file.exists());
+
+    // Re-create and dispose with archive enabled: the file moves under
+    // <data>/wal/<db>/<table>/memtable_tail/.
+    persist(&table_dir, id, "", &test_batch(&schema, &[2])?)?;
+    let tail_file = live_tail_path(&table_dir, id)?.expect("tail should exist");
+    dispose_tail_file(&tail_dir, &tail_file, true);
+    assert!(!tail_file.exists(), "moved out of the tail dir");
+    // db dir inside tempdir = temp/<db>; persist created temp path directly,
+    // so the archive layout derives the db name from the parent chain.
+    let archived = find_archived_tail(temp.path());
+    if archived.is_none() {
+        let wal = temp.path().join("data").join("wal");
+        eprintln!("wal tree: {}", wal.display());
+        for entry in walk(&wal) {
+            eprintln!("  {}", entry.display());
+        }
+        panic!("archived copy must exist");
+    }
+    Ok(())
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk(&path));
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+fn find_archived_tail(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let wal = root.join("data").join("wal");
+    for db in fs::read_dir(&wal).ok()? {
+        let db = db.ok()?.path();
+        for table in fs::read_dir(&db).ok()? {
+            let table = table.ok()?.path().join(TAIL_DIR);
+            for entry in fs::read_dir(&table).ok()? {
+                let entry = entry.ok()?.path();
+                if entry.extension().and_then(|e| e.to_str()) == Some("tail") {
+                    return Some(entry);
+                }
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Delete sidecars (`<id>.<seq>.del`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn delete_sidecar_round_trips_through_recovery() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(
+        temp.path(),
+        id,
+        "2026",
+        &test_batch(&schema, &[0, 1, 2, 3, 4, 5])?,
+    )?;
+
+    assert!(delete_rows(temp.path(), id, &mut [1, 3])?);
+    // A sidecar pend: rows still exist, but the tail is no longer "plain"
+    // (a spill must not run over it).
+    assert!(has_tail(temp.path(), id));
+    assert!(!tail_is_plain(temp.path(), id)?);
+
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].batch.num_rows(), 4);
+    let values: Vec<Option<ScalarValue>> = (0..4)
+        .map(|row| recovered[0].batch.scalar(row, 0))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            Some(ScalarValue::Int64(Some(0))),
+            Some(ScalarValue::Int64(Some(2))),
+            Some(ScalarValue::Int64(Some(4))),
+            Some(ScalarValue::Int64(Some(5))),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn stacked_delete_sidecars_apply_oldest_first() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(
+        temp.path(),
+        id,
+        "2026",
+        &test_batch(&schema, &[10, 20, 30, 40])?,
+    )?;
+    // First delete speaks in the original batch's coordinates (removes 20)...
+    delete_rows(temp.path(), id, &mut [1])?;
+    // ...the second in the post-first-delete batch's coordinates:
+    // [10, 30, 40], position 0 removes 10.
+    delete_rows(temp.path(), id, &mut [0])?;
+
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered[0].batch.num_rows(), 2);
+    assert_eq!(
+        recovered[0].batch.scalar(0, 0),
+        Some(ScalarValue::Int64(Some(30)))
+    );
+    assert_eq!(
+        recovered[0].batch.scalar(1, 0),
+        Some(ScalarValue::Int64(Some(40)))
+    );
+    Ok(())
+}
+
+#[test]
+fn insert_delta_after_delete_keeps_positions_prefix_stable() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
+    delete_rows(temp.path(), id, &mut [1])?;
+    // New rows append at the end; recorded positions must keep referring to
+    // the original prefix.
+    append(temp.path(), id, "2026", &test_batch(&schema, &[4])?)?;
+
+    let recovered = recover(temp.path(), &schema)?;
+    let values: Vec<i64> = (0..recovered[0].batch.num_rows())
+        .filter_map(|row| match recovered[0].batch.scalar(row, 0) {
+            Some(ScalarValue::Int64(Some(v))) => Some(v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(values, vec![1, 3, 4]);
+    Ok(())
+}
+
+#[test]
+fn torn_delete_sidecar_fails_recovery_closed() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
+    delete_rows(temp.path(), id, &mut [0])?;
+
+    // Simulate on-disk corruption: a truncated sidecar must fail the whole
+    // recovery instead of silently resurrecting the deleted row.
+    let tail_dir = temp.path().join(TAIL_DIR);
+    let sidecar = std::fs::read_dir(&tail_dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|e| e.to_str()) == Some("del"))
+        .expect("sidecar exists");
+    let bytes = std::fs::read(&sidecar)?;
+    std::fs::write(&sidecar, &bytes[..bytes.len() - 3])?;
+
+    assert!(recover(temp.path(), &schema).is_err());
+    Ok(())
+}
+
+#[test]
+fn persist_supersedes_pending_sidecars() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
+    delete_rows(temp.path(), id, &mut [0])?;
+    // The DELETE statement's in-memory result, persisted as a fresh
+    // generation: sidecars below it are superseded and must not re-apply.
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[2, 3])?)?;
+
+    assert!(tail_is_plain(temp.path(), id)?);
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered[0].batch.num_rows(), 2);
+    assert_eq!(
+        recovered[0].batch.scalar(0, 0),
+        Some(ScalarValue::Int64(Some(2)))
+    );
+    Ok(())
+}
+
+#[test]
+fn clear_tombstone_removes_sidecars_too() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2])?)?;
+    delete_rows(temp.path(), id, &mut [0])?;
+    clear(temp.path(), id)?;
+    assert!(recover(temp.path(), &schema)?.is_empty());
+    assert!(!has_tail(temp.path(), id));
+    Ok(())
+}
+
+#[test]
+fn recover_index_folds_pending_sidecars_into_a_plain_tail() -> Result<()> {
+    // The engine's lazy recovery reads only the tail file, so recover_index
+    // must consolidate pending delete sidecars at startup: the deleted row
+    // must not resurrect when the memtable materializes later.
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
+    delete_rows(temp.path(), id, &mut [0])?;
+
+    let indexed = recover_index(temp.path(), &schema)?;
+    assert_eq!(indexed.len(), 1);
+    assert_eq!(indexed[0].rows, 2);
+
+    // After folding, the tail is plain and decodes to the filtered batch.
+    assert!(tail_is_plain(temp.path(), id)?);
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered[0].batch.num_rows(), 2);
+    assert_eq!(
+        recovered[0].batch.scalar(0, 0),
+        Some(ScalarValue::Int64(Some(2)))
+    );
+    Ok(())
+}
+
+/// A tail torn before its first fsync (shorter than the log header) is
+/// discarded by recovery — correctly, since it can hold no committed frame —
+/// and the discard is observable: the file is gone and the damage snapshot
+/// counts it. The recovery used to be silent, so crash-time loss was
+/// undiscoverable.
+#[test]
+fn torn_tail_is_discarded_and_counted() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+
+    // A healthy tail first: it must survive.
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1])?)?;
+
+    // A torn sibling tail for a different memtable: magic + key length
+    // present, key bytes (and everything else) missing.
+    let torn_id = Uuid::new_v4();
+    let torn_path = temp
+        .path()
+        .join("memtable_tail")
+        .join(format!("{}.0.tail", torn_id.simple()));
+    std::fs::create_dir_all(temp.path().join("memtable_tail"))?;
+    // Same magic a real tail starts with: copy the first bytes from the
+    // healthy tail written above.
+    let live_dir = temp.path().join("memtable_tail");
+    let healthy = live_dir
+        .read_dir()?
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().and_then(|e| e.to_str()) == Some("tail"))
+        .expect("healthy tail exists");
+    let mut bytes = std::fs::read(&healthy)?[..4].to_vec();
+    bytes.extend_from_slice(&64u32.to_le_bytes()); // partition key length...
+                                                   // ...and nothing after: the header extent is torn.
+    std::fs::write(&torn_path, &bytes)?;
+    let before = tail_damage_snapshot();
+
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered.len(), 1, "healthy tail must survive");
+    assert!(!torn_path.exists(), "torn tail must be discarded");
+
+    let after = tail_damage_snapshot();
+    assert_eq!(
+        after.tails_discarded,
+        before.tails_discarded + 1,
+        "the discard must be counted"
+    );
+    assert!(after.tail_bytes_discarded > before.tail_bytes_discarded);
     Ok(())
 }

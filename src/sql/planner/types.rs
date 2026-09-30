@@ -37,6 +37,10 @@ pub struct ScanPlan {
     pub minmax_index_columns: Vec<String>,
     pub set_index_columns: Vec<String>,
     pub partition_filter: Option<PartitionFilter>,
+    /// Set by the DISTINCT fast path: answer `SELECT DISTINCT <column>` from
+    /// row-group zone maps instead of streaming the column (see
+    /// `aggregate_meta::compute_distinct_column`).
+    pub distinct_column: Option<String>,
 }
 
 impl ScanPlan {
@@ -55,6 +59,7 @@ impl ScanPlan {
             minmax_index_columns: Vec::new(),
             set_index_columns: Vec::new(),
             partition_filter: None,
+            distinct_column: None,
         }
     }
 }
@@ -131,19 +136,47 @@ pub struct DistinctPlan {
     pub input: Box<LogicalPlan>,
 }
 
-/// Window function plan.
+/// Window computation plan: every window function carries its own OVER
+/// specification (partition/order/frame); the node appends one result column
+/// per function after its input's columns.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowPlan {
-    pub window_funcs: Vec<WindowFuncPlan>,
-    pub partition_by: Vec<LogicalExpr>,
-    pub order_by: Vec<SortKey>,
+    pub funcs: Vec<WindowFuncPlan>,
     pub input: Box<LogicalPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowFuncPlan {
-    pub func: WindowFunc,
+    pub kind: WindowFuncKind,
+    pub partition_by: Vec<LogicalExpr>,
+    pub order_by: Vec<SortKey>,
+    pub frame: Option<WindowFrame>,
     pub output_name: String,
+}
+
+/// Planner-level window function kind: value arguments are resolved to
+/// logical expressions (column indexes) unlike the parser AST, which still
+/// carries column names.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowFuncKind {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Lead {
+        arg: Box<LogicalExpr>,
+        offset: usize,
+        default: Option<Box<LogicalExpr>>,
+    },
+    Lag {
+        arg: Box<LogicalExpr>,
+        offset: usize,
+        default: Option<Box<LogicalExpr>>,
+    },
+    Aggregate {
+        func: AggFunc,
+        arg: Option<Box<LogicalExpr>>,
+        distinct: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -2,6 +2,9 @@ use crate::common::error::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodingType {
+    /// Reserved wire tag 0: the adaptive decoder never produces or accepts
+    /// it (tag 0 fails decode with "unknown encoding"), but the numbering of
+    /// the real encodings depends on it staying in place.
     Plain,
     Rle,
     Dictionary,
@@ -9,6 +12,7 @@ pub enum EncodingType {
     DeltaOfDelta,
     BitPacked,
     GorillaXor,
+    DeltaRle,
 }
 
 impl EncodingType {
@@ -21,6 +25,7 @@ impl EncodingType {
             4 => Ok(EncodingType::DeltaOfDelta),
             5 => Ok(EncodingType::BitPacked),
             6 => Ok(EncodingType::GorillaXor),
+            7 => Ok(EncodingType::DeltaRle),
             _ => Err(crate::common::error::TaibaiError::Storage(format!(
                 "unknown encoding type: {}",
                 v
@@ -37,6 +42,7 @@ impl EncodingType {
             EncodingType::DeltaOfDelta => 4,
             EncodingType::BitPacked => 5,
             EncodingType::GorillaXor => 6,
+            EncodingType::DeltaRle => 7,
         }
     }
 }

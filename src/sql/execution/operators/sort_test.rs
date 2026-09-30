@@ -25,6 +25,60 @@ impl ExecutionOp for OneBatchExec {
     }
 }
 
+struct CancellingInputExec {
+    remaining: usize,
+    cancel_after: usize,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ExecutionOp for CancellingInputExec {
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        self.remaining -= 1;
+        if self.remaining == self.cancel_after {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(Some(RecordBatch::new(Schema::new(vec![ColumnDef::new(
+            "id",
+            DataType::Int64,
+        )]))))
+    }
+}
+
+/// The sort input drain observes the ambient cancellation flag between
+/// batches instead of materializing the whole input once a disconnect is
+/// flagged.
+#[test]
+fn sort_input_drain_aborts_when_cancelled() {
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let context = std::sync::Arc::new(crate::common::query_cancel::QueryContext::new(
+        cancelled.clone(),
+    ));
+    let _guard = crate::common::query_cancel::QueryCancellationGuard::enter(context);
+
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let mut exec = SortExec::new(
+        vec![SortKey {
+            expr: LogicalExpr::Column(0),
+            desc: false,
+        }],
+        Box::new(CancellingInputExec {
+            remaining: 1000,
+            cancel_after: 500,
+            cancelled,
+        }),
+        schema,
+    );
+    let error = exec.next_batch().unwrap_err();
+    assert!(
+        error.to_string().contains("cancelled"),
+        "unexpected error: {error}"
+    );
+}
+
 #[test]
 fn sorts_by_expression_not_first_column() {
     let schema = Schema::new(vec![

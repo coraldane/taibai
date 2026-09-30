@@ -12,7 +12,7 @@ fn inspect_segment_skips_segment_zone_maps() {
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
 
     {
-        let mut writer = SegmentWriter::create(&path, schema.clone(), 4).unwrap();
+        let mut writer = SegmentWriter::create(&path, schema.clone(), 4, 3).unwrap();
         let mut batch = RecordBatch::new(schema);
         for value in 0..10i64 {
             batch

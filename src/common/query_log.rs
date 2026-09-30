@@ -49,6 +49,13 @@ pub fn init(path: &Path, max_size_mb: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+/// True when the query log is configured. Callers use this to skip
+/// log-related statement analysis (e.g. the extra SQL parse in the request
+/// handler) when the feature is off.
+pub fn enabled() -> bool {
+    QUERY_LOG_SENDER.get().is_some()
+}
+
 pub fn log_query(user: &str, database: &str, sql: &str, status: &str, elapsed: Duration) {
     let Some(sender) = QUERY_LOG_SENDER.get() else {
         return;

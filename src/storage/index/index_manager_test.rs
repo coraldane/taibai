@@ -109,7 +109,7 @@ fn flush_epoch_mismatch_refreshes_snapshot_incrementally() -> Result<()> {
     // A memtable flush after the snapshot was built bumps the epoch. With
     // no segment rows beyond the watermarks, the refresh is a no-op scan
     // and the probe succeeds without a full rebuild.
-    segment_mgr.note_memtable_flush("db", "ticks");
+    segment_mgr.note_segments_changed("db", "ticks");
     assert_eq!(
         manager.unique_key_locations(
             "db",
@@ -138,67 +138,77 @@ fn flush_epoch_mismatch_refreshes_snapshot_incrementally() -> Result<()> {
 }
 
 #[test]
-fn compact_prepared_entries_drops_tombstones_and_dedups_placeholders() -> Result<()> {
+fn stream_merge_drops_tombstones_and_dedups_placeholders() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
     let seg_path = "/tmp/taibai-test/seg_00000.dat".to_string();
-    let mut data = UniqueIndexData {
-        db: "db".to_string(),
-        table: "ticks".to_string(),
-        index_name: "uk_value".to_string(),
-        columns: vec!["value".to_string()],
-        entries: vec![
-            entry(1, 0),
-            entry(1, 5),
-            entry(2, 0),
-            UniqueIndexEntry {
-                key: vec![ScalarValue::Int64(Some(3))],
-                location: UniqueRowLocation {
-                    segment_path: seg_path.clone(),
-                    row_id: 0,
-                },
-            },
-            UniqueIndexEntry {
-                key: vec![ScalarValue::Int64(Some(4))],
-                location: UniqueRowLocation {
-                    segment_path: seg_path.clone(),
-                    row_id: 1,
-                },
-            },
-        ],
-        flush_epoch: Some(1),
-        segment_watermarks: HashMap::from([(seg_path.clone(), 2)]),
-        tombstones: HashSet::new(),
-        encoded_keys: Vec::new(),
-        blocks: Vec::new(),
-    };
-    prepare_unique_index_data(&mut data)?;
-    data.tombstones.insert(UniqueRowLocation {
-        segment_path: seg_path.clone(),
-        row_id: 1,
-    });
-    compact_prepared_unique_index_entries(&mut data);
 
-    let keys = data
-        .entries
-        .iter()
-        .map(|entry| entry.key[0].clone())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        keys,
-        vec![
-            ScalarValue::Int64(Some(1)),
-            ScalarValue::Int64(Some(2)),
-            ScalarValue::Int64(Some(3)),
-        ],
-        "duplicate placeholders collapse to one and tombstoned locations drop"
-    );
-    for (encoded, entry) in data.encoded_keys.iter().zip(&data.entries) {
-        assert_eq!(*encoded, encode_unique_key(&entry.key)?);
+    // Base: key 1 has one live and one tombstoned location, key 2 has two
+    // duplicate placeholders, key 5 will be removed by the delta.
+    let base_path = dir.path().join("uk.keys.tbi");
+    let file = std::fs::File::create(&base_path)?;
+    let mut writer = UniqueIndexBaseWriter::new(
+        std::io::BufWriter::new(file),
+        "db",
+        "ticks",
+        "uk_value",
+        vec!["value".to_string()],
+    )?;
+    let base_entries = vec![(1u64, 0u64), (1, 1), (2, 5), (2, 6), (3, 2), (5, 3)];
+    for (value, row_id) in base_entries {
+        let entry = if value == 2 {
+            entry(value as i64, row_id)
+        } else {
+            UniqueIndexEntry {
+                key: vec![ScalarValue::Int64(Some(value as i64))],
+                location: UniqueRowLocation {
+                    segment_path: seg_path.clone(),
+                    row_id,
+                },
+            }
+        };
+        writer.push_entry(&encode_unique_key(&entry.key)?, &entry.location)?;
     }
-    assert_eq!(
-        data.blocks.len(),
-        data.entries.len().div_ceil(UNIQUE_INDEX_BLOCK_SIZE)
-    );
-    assert_eq!(data.segment_watermarks.get(&seg_path), Some(&2));
+    writer.finish(Some(1), &HashMap::new())?;
+
+    let replayed = ReplayedDelta {
+        additions: HashMap::from([(
+            encode_unique_key(&[ScalarValue::Int64(Some(4))])?,
+            vec![UniqueRowLocation {
+                segment_path: String::new(),
+                row_id: 9,
+            }],
+        )]),
+        removed_keys: HashSet::from([encode_unique_key(&[ScalarValue::Int64(Some(5))])?]),
+        tombstones: HashSet::from([UniqueRowLocation {
+            segment_path: seg_path.clone(),
+            row_id: 1,
+        }]),
+    };
+
+    let out_path = dir.path().join("uk.keys.tbi.merged");
+    let out_file = std::fs::File::create(&out_path)?;
+    let mut writer = UniqueIndexBaseWriter::new(
+        std::io::BufWriter::new(out_file),
+        "db",
+        "ticks",
+        "uk_value",
+        vec!["value".to_string()],
+    )?;
+    let base = UniqueIndexBase::open(&base_path)?;
+    stream_merge_unique_index_base(&base, replayed, &mut writer)?;
+    writer.finish(Some(1), &HashMap::new())?;
+
+    let merged = UniqueIndexBase::open(&out_path)?;
+    assert_eq!(merged.entry_count, 4, "tombstone drops, placeholder dedup");
+    let locations_of = |value: i64| -> Result<Vec<UniqueRowLocation>> {
+        merged.find_locations(&encode_unique_key(&[ScalarValue::Int64(Some(value))])?)
+    };
+    assert_eq!(locations_of(1)?.len(), 1, "tombstoned location dropped");
+    assert_eq!(locations_of(2)?.len(), 1, "duplicate placeholders collapse");
+    assert_eq!(locations_of(3)?.len(), 1);
+    assert_eq!(locations_of(4)?.len(), 1, "delta addition merges in");
+    assert_eq!(locations_of(5)?.len(), 0, "removed key drops base rows");
+    assert_eq!(locations_of(6)?.len(), 0);
     Ok(())
 }
 
@@ -260,7 +270,10 @@ fn contains_any_key_uses_exact_binary_search_across_base_range() -> Result<()> {
         Ok(keys)
     }
 
-    let state = UniqueIndexState::new(data, UniqueIndexDeltaState::default());
+    let state = UniqueIndexState::new(
+        UniqueIndexBase::from_decoded(data),
+        UniqueIndexDeltaState::default(),
+    );
     // Needles confined to the last block must still be found.
     assert!(unique_index_state_contains_any_key(
         &segment_mgr,
@@ -302,7 +315,10 @@ fn contains_any_key_uses_exact_binary_search_across_base_range() -> Result<()> {
         blocks: Vec::new(),
     };
     prepare_unique_index_data(&mut sparse_data)?;
-    let sparse_state = UniqueIndexState::new(sparse_data, UniqueIndexDeltaState::default());
+    let sparse_state = UniqueIndexState::new(
+        UniqueIndexBase::from_decoded(sparse_data),
+        UniqueIndexDeltaState::default(),
+    );
     let missing_across_range: Vec<i64> = (0..6000i64).step_by(2).collect();
     assert!(!unique_index_state_contains_any_key(
         &segment_mgr,
@@ -367,8 +383,8 @@ fn background_compaction_preserves_appends_that_raced_the_merge() -> Result<()> 
         }
     }
 
-    let (tmp_path, data) = job.build_compacted_base(&snapshot)?;
-    assert!(job.publish(snapshot.delta_bytes.len(), &tmp_path, data)?);
+    let tmp_path = job.build_compacted_base(&snapshot)?;
+    assert!(job.publish(snapshot.delta_bytes.len(), &tmp_path)?);
 
     assert_eq!(
         manager.unique_keys_exist("db", "t", "uk", &int64_keys(&[5, 25, 45]))?,
@@ -390,7 +406,7 @@ fn background_compaction_preserves_appends_that_raced_the_merge() -> Result<()> 
     );
 
     let merged = manager.load_unique_index_state("db", "t", "uk")?.unwrap();
-    assert_eq!(merged.base.entries.len(), 40);
+    assert_eq!(merged.base.entry_count, 40);
     assert_eq!(merged.delta.read().unwrap().entry_count, 10);
     assert!(!merged.compaction_in_flight.load(Ordering::Acquire));
 
@@ -431,10 +447,10 @@ fn superseded_compaction_job_leaves_files_untouched() -> Result<()> {
     let snapshot = job.snapshot()?.unwrap();
     let delta_before = std::fs::read(job.delta_path())?;
     let base_before = std::fs::read(job.base_path())?;
-    let (tmp_path, data) = job.build_compacted_base(&snapshot)?;
+    let tmp_path = job.build_compacted_base(&snapshot)?;
 
     manager.invalidate_unique_index_snapshot("db", "t", "uk");
-    assert!(!job.publish(snapshot.delta_bytes.len(), &tmp_path, data)?);
+    assert!(!job.publish(snapshot.delta_bytes.len(), &tmp_path)?);
     let _ = std::fs::remove_file(&tmp_path);
 
     assert_eq!(std::fs::read(job.delta_path())?, delta_before);
@@ -458,17 +474,17 @@ fn compaction_waits_until_all_pauses_are_resumed() -> Result<()> {
     let batch: Vec<UniqueIndexEntry> = (10..60).map(|v| entry(v, v as u64)).collect();
     assert!(manager.append_unique_index_entries("db", "t", "uk", batch)?);
     let state = manager.load_unique_index_state("db", "t", "uk")?.unwrap();
-    assert_eq!(state.base.entries.len(), 10);
+    assert_eq!(state.base.entry_count, 10);
     assert_eq!(state.delta.read().unwrap().entry_count, 50);
 
     manager.resume_unique_index_compaction();
     let state = manager.load_unique_index_state("db", "t", "uk")?.unwrap();
-    assert_eq!(state.base.entries.len(), 10);
+    assert_eq!(state.base.entry_count, 10);
     assert_eq!(state.delta.read().unwrap().entry_count, 50);
 
     manager.resume_unique_index_compaction();
     let state = manager.load_unique_index_state("db", "t", "uk")?.unwrap();
-    assert_eq!(state.base.entries.len(), 60);
+    assert_eq!(state.base.entry_count, 60);
     assert_eq!(state.delta.read().unwrap().entry_count, 0);
     Ok(())
 }
@@ -484,7 +500,7 @@ fn dispatched_delta_compaction_publishes_new_base_and_resets_flag() -> Result<()
     assert!(manager.append_unique_index_entries("db", "t", "uk", batch)?);
 
     let state = manager.load_unique_index_state("db", "t", "uk")?.unwrap();
-    assert_eq!(state.base.entries.len(), 60);
+    assert_eq!(state.base.entry_count, 60);
     assert_eq!(state.delta.read().unwrap().entry_count, 0);
     assert!(!state.compaction_in_flight.load(Ordering::Acquire));
     assert!(!manager
@@ -552,7 +568,7 @@ fn refresh_collapses_duplicate_memtable_placeholders_at_compaction() -> Result<(
     // compaction threshold once it has been indexed into the delta.
     let tail: Vec<i64> = (4..54).collect();
     write_value_segment(&table_dir.join("seg_00001.dat"), &tail)?;
-    segment_mgr.note_memtable_flush("db", "ticks");
+    segment_mgr.note_segments_changed("db", "ticks");
     // The first refresh appends the tail to the delta without rewriting base.
     assert!(manager
         .unique_key_locations(
@@ -564,7 +580,7 @@ fn refresh_collapses_duplicate_memtable_placeholders_at_compaction() -> Result<(
         .is_some());
     // The next refresh past the threshold compacts the delta back into the
     // base snapshot, collapsing duplicate memtable placeholders per key.
-    segment_mgr.note_memtable_flush("db", "ticks");
+    segment_mgr.note_segments_changed("db", "ticks");
     assert!(manager
         .unique_key_locations(
             "db",
@@ -578,23 +594,13 @@ fn refresh_collapses_duplicate_memtable_placeholders_at_compaction() -> Result<(
     let state = indexes
         .get(&unique_index_key("db", "ticks", "uk_value"))
         .expect("refreshed state must be cached");
-    let placeholder_count = state
-        .base
-        .entries
-        .iter()
-        .filter(|entry| {
-            entry.location.segment_path.is_empty() && entry.key == vec![ScalarValue::Int64(Some(2))]
-        })
-        .count();
-    assert_eq!(
-        placeholder_count, 1,
-        "compaction must collapse duplicate memtable placeholders per key"
-    );
-    let total = state.base.entries.len();
+    // Key 2 carried two placeholders before compaction; the merged base must
+    // hold exactly one entry for it (one for key 1 plus one per tail key).
+    let total = state.base.entry_count;
     assert_eq!(
         total,
         2 + tail.len(),
-        "keys 1 and 2 plus the tail each keep exactly one entry"
+        "compaction must collapse duplicate memtable placeholders per key"
     );
     Ok(())
 }
@@ -608,7 +614,7 @@ fn write_value_segment(path: &Path, values: &[i64]) -> Result<()> {
             .unwrap()
             .push(&ScalarValue::Int64(Some(*value)))?;
     }
-    let mut writer = SegmentWriter::create(path, schema, 8192)?;
+    let mut writer = SegmentWriter::create(path, schema, 8192, 3)?;
     writer.write_batch(&batch)?;
     writer.seal()?;
     Ok(())
@@ -660,7 +666,7 @@ fn stale_epoch_refresh_keeps_physical_rows_with_delete_bitmap() -> Result<()> {
     crate::storage::segment::delete_bitmap::mark_deleted(&mut bitmap, 2);
     crate::storage::segment::delete_bitmap::mark_deleted(&mut bitmap, 3);
     segment_mgr.rewrite_delete_footer(&seg0_path, &bitmap, 2)?;
-    segment_mgr.note_memtable_flush("db", "ticks");
+    segment_mgr.note_segments_changed("db", "ticks");
 
     let locations = manager.unique_key_locations(
         "db",
@@ -727,7 +733,7 @@ fn stale_epoch_refresh_scans_only_new_segment_rows() -> Result<()> {
     // the epoch; the next probe must pick up their locations via an
     // incremental refresh.
     write_value_segment(&table_dir.join("seg_00001.dat"), &[4, 5])?;
-    segment_mgr.note_memtable_flush("db", "ticks");
+    segment_mgr.note_segments_changed("db", "ticks");
 
     let seg1 = table_dir
         .join("seg_00001.dat")
@@ -837,36 +843,142 @@ fn stock_minute_index_data(entry_count: u32, path: &str) -> UniqueIndexData {
 }
 
 #[test]
-fn unique_index_data_v5_roundtrip_preserves_entries_and_watermarks() -> Result<()> {
-    let path = "/data/monitor-data/taibai_data/quant_base/t_stock_minute/p2026_0007.dat";
-    let mut data = stock_minute_index_data(3000, path);
-    data.flush_epoch = Some(7);
-    data.segment_watermarks.insert(path.to_string(), 424_242);
+fn unique_index_base_v6_roundtrip_preserves_entries_and_watermarks() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("uk.keys.tbi");
+    let segment = "/data/monitor-data/taibai_data/quant_base/t_stock_minute/p2026_0007.dat";
+    let mut data = stock_minute_index_data(3000, segment);
+    // Entries must reach the writer sorted by encoded bytes, exactly like
+    // the persisted-snapshot path feeds it.
     prepare_unique_index_data(&mut data)?;
-    let bytes = encode_unique_index_data(&data)?;
-    assert_eq!(&bytes[..8], UNIQUE_INDEX_MAGIC_V5);
-    let decoded = decode_unique_index_data(&bytes)?.unwrap();
-    assert_eq!(
-        decoded.segment_watermarks.get(path),
-        Some(&424_242),
-        "segment watermarks must survive the round trip"
+
+    let file = std::fs::File::create(&path)?;
+    let mut writer = UniqueIndexBaseWriter::new(
+        std::io::BufWriter::new(file),
+        &data.db,
+        &data.table,
+        &data.index_name,
+        data.columns.clone(),
+    )?;
+    for (encoded, entry) in data.encoded_keys.iter().zip(&data.entries) {
+        writer.push_entry(encoded, &entry.location)?;
+    }
+    let watermarks = HashMap::from([(segment.to_string(), 424_242u64)]);
+    writer.finish(Some(7), &watermarks)?;
+
+    let base = UniqueIndexBase::open(&path)?;
+    assert_eq!(base.entry_count, 3000);
+    assert_eq!(base.db, data.db);
+    assert_eq!(base.table, data.table);
+    assert_eq!(base.index_name, data.index_name);
+    assert_eq!(base.columns, data.columns);
+    assert_eq!(base.flush_epoch, Some(7));
+    assert_eq!(base.segment_watermarks.get(segment), Some(&424_242));
+    assert!(
+        base.blocks.len() >= 12,
+        "seed must span multiple blocks for on-demand reads"
     );
-    assert_eq!(decoded.db, data.db);
-    assert_eq!(decoded.table, data.table);
-    assert_eq!(decoded.index_name, data.index_name);
-    assert_eq!(decoded.columns, data.columns);
-    assert_eq!(decoded.flush_epoch, Some(7));
-    assert_eq!(decoded.entries.len(), data.entries.len());
-    assert_eq!(decoded.encoded_keys, data.encoded_keys);
-    for (decoded_entry, expected_entry) in decoded.entries.iter().zip(&data.entries) {
-        assert_eq!(decoded_entry.key, expected_entry.key);
-        assert_eq!(decoded_entry.location, expected_entry.location);
+
+    // A single lookup parses header + footer and touches only its own
+    // blocks: nothing close to the whole index may be resident.
+    let hit = base.find_locations(&data.encoded_keys[2999])?;
+    assert_eq!(hit.len(), 1);
+    assert_eq!(hit[0], data.entries[2999].location);
+    assert!(
+        base.cached_block_count() <= 2,
+        "lookups must load blocks on demand, not eagerly"
+    );
+
+    for idx in (0..3000usize).step_by(97) {
+        let locations = base.find_locations(&data.encoded_keys[idx])?;
+        assert_eq!(locations.len(), 1, "key at {idx} must be found");
+        assert_eq!(locations[0], data.entries[idx].location);
     }
-    assert_eq!(decoded.blocks.len(), data.blocks.len());
-    for (decoded_block, expected_block) in decoded.blocks.iter().zip(&data.blocks) {
-        assert_eq!(decoded_block.start, expected_block.start);
-        assert_eq!(decoded_block.len, expected_block.len);
-        assert_eq!(decoded_block.first_key, expected_block.first_key);
+    let missing = encode_unique_key(&[
+        ScalarValue::VarChar(Some("999999.SZ".to_string())),
+        ScalarValue::Int32(Some(20260701)),
+        ScalarValue::Int32(Some(93000)),
+    ])?;
+    assert!(base.find_locations(&missing)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn find_locations_walks_equal_key_runs_across_block_boundaries() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("uk.keys.tbi");
+    let segment = "/tmp/taibai-test/seg_00000.dat";
+    let file = std::fs::File::create(&path)?;
+    let mut writer = UniqueIndexBaseWriter::new(
+        std::io::BufWriter::new(file),
+        "db",
+        "ticks",
+        "uk_value",
+        vec!["value".to_string()],
+    )?;
+
+    // 700 locations of one key span three blocks; single-location keys sit
+    // immediately before and after the run.
+    let total = 700usize;
+    let make = |value: i64, row_id: u64| UniqueIndexEntry {
+        key: vec![ScalarValue::Int64(Some(value))],
+        location: UniqueRowLocation {
+            segment_path: segment.to_string(),
+            row_id,
+        },
+    };
+    writer.push_entry(&encode_unique_key(&make(0, 0).key)?, &make(0, 0).location)?;
+    for row_id in 0..total as u64 {
+        let entry = make(1, row_id);
+        writer.push_entry(&encode_unique_key(&entry.key)?, &entry.location)?;
     }
+    let tail = make(2, total as u64);
+    writer.push_entry(&encode_unique_key(&tail.key)?, &tail.location)?;
+    writer.finish(Some(1), &HashMap::new())?;
+
+    let base = UniqueIndexBase::open(&path)?;
+    assert_eq!(base.entry_count, total + 2);
+    let run = base.find_locations(&encode_unique_key(&[ScalarValue::Int64(Some(1))])?)?;
+    assert_eq!(run.len(), total, "equal-key run must survive block edges");
+    let mut row_ids: Vec<u64> = run.iter().map(|location| location.row_id).collect();
+    row_ids.sort();
+    assert_eq!(row_ids.first(), Some(&0));
+    assert_eq!(row_ids.last(), Some(&(total as u64 - 1)));
+    assert_eq!(
+        base.find_locations(&encode_unique_key(&[ScalarValue::Int64(Some(0))])?)?
+            .len(),
+        1
+    );
+    assert_eq!(
+        base.find_locations(&encode_unique_key(&[ScalarValue::Int64(Some(2))])?)?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_decoded_snapshot_serves_lookups_from_memory_blocks() -> Result<()> {
+    let segment = "/data/monitor-data/taibai_data/quant_base/t_stock_minute/p2026_0007.dat";
+    let mut data = stock_minute_index_data(600, segment);
+    data.flush_epoch = Some(3);
+    data.segment_watermarks.insert(segment.to_string(), 600);
+    prepare_unique_index_data(&mut data)?;
+
+    let base = UniqueIndexBase::from_decoded(data);
+    assert_eq!(base.entry_count, 600);
+    // idx 480 maps to security 000002.SZ at deal_time 93000 (480 % 240 == 0).
+    let probe = encode_unique_key(&[
+        ScalarValue::VarChar(Some("000002.SZ".to_string())),
+        ScalarValue::Int32(Some(20260701)),
+        ScalarValue::Int32(Some(93000)),
+    ])?;
+    let locations = base.find_locations(&probe)?;
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].row_id, 480);
+    assert!(
+        base.cached_block_count() >= 3,
+        "legacy snapshots pre-build every block in the cache"
+    );
     Ok(())
 }

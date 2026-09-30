@@ -1,4 +1,5 @@
 pub mod aggregate_meta;
+pub(crate) mod cluster_prune;
 pub mod count;
 pub mod cursor;
 pub mod executor;

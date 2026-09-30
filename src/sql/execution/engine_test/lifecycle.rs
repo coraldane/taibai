@@ -206,3 +206,219 @@ fn close_of_day_only_optimizes_partitions_written_since_last_close() -> Result<(
     }));
     Ok(())
 }
+
+#[test]
+fn optimize_partition_does_not_freeze_other_partitions() -> Result<()> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main")?);
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE opt_freeze (id INT64, value INT64) PARTITION BY id",
+    )?;
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    engine.execute(&mut session, "INSERT INTO opt_freeze VALUES (1, 10)")?;
+    engine.execute(&mut session, "INSERT INTO opt_freeze VALUES (2, 20)")?;
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
+
+    let held = engine
+        .segment_mgr()
+        .partition_lock_arc_for_tests("main", "opt_freeze", "1");
+    let held_guard = held.lock().unwrap();
+
+    let (done_tx, done_rx) = mpsc::channel::<bool>();
+    let optimize_engine = Arc::clone(&engine);
+    let optimizer_session =
+        crate::net::session::Session::new("root".to_string(), "main".to_string());
+    let optimizer = std::thread::spawn(move || {
+        let mut session = optimizer_session;
+        let ok = optimize_engine
+            .execute(&mut session, "OPTIMIZE TABLE opt_freeze ON PARTITION p1")
+            .is_ok();
+        done_tx.send(ok).unwrap();
+    });
+
+    engine.execute(&mut session, "INSERT INTO opt_freeze VALUES (2, 21)")?;
+
+    assert!(
+        done_rx.try_recv().is_err(),
+        "optimize must stay blocked while the target partition lock is held"
+    );
+
+    drop(held_guard);
+    assert!(
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("optimize thread must not hang"),
+        "optimize must succeed after the partition lock is released"
+    );
+    optimizer.join().unwrap();
+
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM opt_freeze")?,
+            0,
+            0
+        ),
+        3
+    );
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM opt_freeze WHERE id = 1")?,
+            0,
+            0
+        ),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn optimize_heavy_phase_keeps_target_partition_writable() -> Result<()> {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main")?);
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE opt_writable (id INT64, value INT64) PARTITION BY id",
+    )?;
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    engine.execute(
+        &mut session,
+        "INSERT INTO opt_writable VALUES (1, 10), (1, 11), (1, 12)",
+    )?;
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
+
+    // Mark a row deleted so the OPTIMIZE rewrite path runs; a clean single
+    // segment would be skipped without ever reaching the heavy phase.
+    engine.execute(&mut session, "DELETE FROM opt_writable WHERE value = 10")?;
+
+    // Regression for the partition-lock pileup: the decode/sort/rewrite of
+    // a partition compaction must run OUTSIDE the partition mutation lock,
+    // so INSERTs into the very partition being compacted proceed. Before
+    // the split they queued behind the whole rewrite and timed out after
+    // mutation_lock_timeout_secs.
+    let result = (|| -> Result<()> {
+        crate::storage::core::compactor::Compactor::set_heavy_phase_delay_for_tests(2_000);
+
+        let (done_tx, done_rx) = mpsc::channel::<bool>();
+        let optimize_engine = Arc::clone(&engine);
+        let optimizer_session =
+            crate::net::session::Session::new("root".to_string(), "main".to_string());
+        let optimizer = std::thread::spawn(move || {
+            let mut session = optimizer_session;
+            let ok = optimize_engine
+                .execute(&mut session, "OPTIMIZE TABLE opt_writable ON PARTITION p1")
+                .is_ok();
+            done_tx.send(ok).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(200));
+        let insert_started = Instant::now();
+        engine.execute(&mut session, "INSERT INTO opt_writable VALUES (1, 99)")?;
+        assert!(
+            insert_started.elapsed() < Duration::from_millis(1_500),
+            "INSERT into the partition being compacted must not wait for the compaction heavy phase"
+        );
+
+        assert!(
+            done_rx.try_recv().is_err(),
+            "optimize must still be in its heavy phase while the INSERT completed"
+        );
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("optimize thread must not hang"),
+            "optimize must succeed after its heavy phase"
+        );
+        optimizer.join().unwrap();
+        Ok(())
+    })();
+    crate::storage::core::compactor::Compactor::set_heavy_phase_delay_for_tests(0);
+    result?;
+
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM opt_writable")?,
+            0,
+            0
+        ),
+        3
+    );
+    Ok(())
+}
+
+#[test]
+fn delete_partition_eq_does_not_freeze_other_partitions() -> Result<()> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main")?);
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE del_freeze (id INT64, value INT64) PARTITION BY id",
+    )?;
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    engine.execute(&mut session, "INSERT INTO del_freeze VALUES (1, 10)")?;
+    engine.execute(&mut session, "INSERT INTO del_freeze VALUES (2, 20)")?;
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
+
+    let held = engine
+        .segment_mgr()
+        .partition_lock_arc_for_tests("main", "del_freeze", "1");
+    let held_guard = held.lock().unwrap();
+
+    let (done_tx, done_rx) = mpsc::channel::<bool>();
+    let delete_engine = Arc::clone(&engine);
+    let deleter_session = crate::net::session::Session::new("root".to_string(), "main".to_string());
+    let deleter = std::thread::spawn(move || {
+        let mut session = deleter_session;
+        let ok = delete_engine
+            .execute(&mut session, "DELETE FROM del_freeze WHERE id = 1")
+            .is_ok();
+        done_tx.send(ok).unwrap();
+    });
+
+    engine.execute(&mut session, "INSERT INTO del_freeze VALUES (2, 21)")?;
+
+    assert!(
+        done_rx.try_recv().is_err(),
+        "delete must stay blocked while the target partition lock is held"
+    );
+
+    drop(held_guard);
+    assert!(
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("delete thread must not hang"),
+        "delete must succeed after the partition lock is released"
+    );
+    deleter.join().unwrap();
+
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM del_freeze")?,
+            0,
+            0
+        ),
+        2
+    );
+    Ok(())
+}

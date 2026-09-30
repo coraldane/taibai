@@ -196,6 +196,7 @@ impl Parser {
         let mut ttl: Option<TtlDef> = None;
         let mut hot: Option<HotDef> = None;
         let mut durability: Option<DurabilityLevel> = None;
+        let mut compression_level: Option<i32> = None;
 
         loop {
             if self.peek() == &Token::Cluster && cluster_by.is_none() {
@@ -290,6 +291,16 @@ impl Parser {
                         )))
                     }
                 });
+            } else if matches!(
+                self.peek(),
+                Token::Ident(s) if s.eq_ignore_ascii_case("COMPRESSION_LEVEL")
+            ) && compression_level.is_none()
+            {
+                self.advance();
+                if self.peek() == &Token::Eq {
+                    self.advance();
+                }
+                compression_level = Some(self.expect_integer()?);
             } else {
                 break;
             }
@@ -306,6 +317,7 @@ impl Parser {
             ttl,
             hot,
             durability,
+            compression_level,
         })
     }
 
@@ -840,9 +852,24 @@ impl Parser {
                     AlterOperation::SetTtl {
                         ttl: self.parse_ttl_def()?,
                     }
+                } else if matches!(
+                    self.peek(),
+                    Token::Ident(s) if s.eq_ignore_ascii_case("COMPRESSION_LEVEL")
+                ) {
+                    self.advance();
+                    if self.peek() == &Token::Eq {
+                        self.advance();
+                    }
+                    let level = if self.peek() == &Token::Default {
+                        self.advance();
+                        None
+                    } else {
+                        Some(self.expect_integer()?)
+                    };
+                    AlterOperation::SetCompressionLevel { level }
                 } else {
                     return Err(TaibaiError::Sql(
-                        "expected HOT or TTL after SET in ALTER TABLE".into(),
+                        "expected HOT, TTL or COMPRESSION_LEVEL after SET in ALTER TABLE".into(),
                     ));
                 }
             } else if self.peek() == &Token::Truncate {

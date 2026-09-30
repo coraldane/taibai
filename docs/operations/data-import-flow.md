@@ -215,7 +215,7 @@ MSG_TYPE_BULK_INSERT_COLUMNAR
 - segment 大小达到阈值时 seal，写入 footer 和 footer offset。
 - 未达到 seal 阈值时会刷新 meta，便于后续恢复未 seal segment。
 
-bulk 压缩级别由配置文件 `compression.bulk_zstd_level` 控制，默认值为 `3`。
+bulk 压缩级别由配置文件 `compression.bulk_zstd_level` 控制，默认值为 `3`。建表时可用 `COMPRESSION_LEVEL = n`（1..=22）按表覆盖，也可用 `ALTER TABLE ... SET COMPRESSION_LEVEL = n | DEFAULT` 调整或恢复全局默认，详见[建表选项 SQL 参考](../user-guide/table-options.md)。
 
 ## 分区与聚簇处理
 
@@ -316,7 +316,7 @@ examples/batch_import
 
 - 尽量使用列式二进制 bulk。
 - 调大 batch size 和 pipeline depth，但不要超过 `Client::start_pipeline` 当前上限 16。
-- 对无需查询裁剪的导入阶段，可通过配置文件调低 `compression.bulk_zstd_level`，减少 CPU 消耗；默认值为 `3`。
+- 对无需查询裁剪的导入阶段，可通过配置文件调低 `compression.bulk_zstd_level`，减少 CPU 消耗；默认值为 `3`。归档类表也可在建表时单独调高 `COMPRESSION_LEVEL` 换取更小体积（见[建表选项 SQL 参考](../user-guide/table-options.md)）。
 - 若希望直接列式路径收益最大，优先导入无分区/无聚簇表，或后续再执行整理/优化。
 
 ## 后续优化建议

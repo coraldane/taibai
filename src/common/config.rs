@@ -28,24 +28,24 @@ fn default_tls_handshake_timeout_secs() -> u64 {
     10
 }
 
-fn default_request_queue_timeout_ms() -> u64 {
-    30_000
+fn default_request_queue_timeout_secs() -> u64 {
+    30
 }
 
-fn default_mutation_lock_timeout_ms() -> u64 {
-    60_000
+fn default_mutation_lock_timeout_secs() -> u64 {
+    60
 }
 
-fn default_mutation_lock_warn_ms() -> u64 {
-    1_000
+fn default_mutation_lock_warn_secs() -> u64 {
+    1
 }
 
-fn default_tail_commit_timeout_ms() -> u64 {
-    120_000
+fn default_tail_commit_timeout_secs() -> u64 {
+    120
 }
 
-fn default_tail_commit_warn_ms() -> u64 {
-    2_000
+fn default_tail_commit_warn_secs() -> u64 {
+    2
 }
 
 /// Process-global runtime limits consulted by query operators (aggregation,
@@ -67,6 +67,10 @@ pub struct QueryLimits {
     pub max_parallel_segments: usize,
     pub global_io_permits: usize,
     pub global_cpu_permits: usize,
+    /// Hybrid partial-residency scans: let the resident hot mirror answer
+    /// rows above its close-aware coverage bound while segment scans handle
+    /// the complement. See `TableMeta::hot_mirror_covers_from`.
+    pub hybrid_hot_scan_enabled: bool,
 }
 
 impl Default for QueryLimits {
@@ -82,6 +86,7 @@ impl Default for QueryLimits {
             max_parallel_segments: default_max_parallel_segments(),
             global_io_permits: default_global_io_permits(),
             global_cpu_permits: default_global_cpu_permits(),
+            hybrid_hot_scan_enabled: default_hybrid_hot_scan_enabled(),
         }
     }
 }
@@ -99,19 +104,19 @@ static STORAGE_TIMEOUTS: OnceLock<StorageTimeouts> = OnceLock::new();
 /// as an explicit timeout error instead of an indefinite hang.
 #[derive(Debug, Clone, Copy)]
 pub struct StorageTimeouts {
-    pub mutation_lock_timeout_ms: u64,
-    pub mutation_lock_warn_ms: u64,
-    pub tail_commit_timeout_ms: u64,
-    pub tail_commit_warn_ms: u64,
+    pub mutation_lock_timeout_secs: u64,
+    pub mutation_lock_warn_secs: u64,
+    pub tail_commit_timeout_secs: u64,
+    pub tail_commit_warn_secs: u64,
 }
 
 impl Default for StorageTimeouts {
     fn default() -> Self {
         Self {
-            mutation_lock_timeout_ms: default_mutation_lock_timeout_ms(),
-            mutation_lock_warn_ms: default_mutation_lock_warn_ms(),
-            tail_commit_timeout_ms: default_tail_commit_timeout_ms(),
-            tail_commit_warn_ms: default_tail_commit_warn_ms(),
+            mutation_lock_timeout_secs: default_mutation_lock_timeout_secs(),
+            mutation_lock_warn_secs: default_mutation_lock_warn_secs(),
+            tail_commit_timeout_secs: default_tail_commit_timeout_secs(),
+            tail_commit_warn_secs: default_tail_commit_warn_secs(),
         }
     }
 }
@@ -134,6 +139,18 @@ pub fn set_insert_profile_enabled(enabled: bool) {
 
 pub fn insert_profile_enabled() -> bool {
     *INSERT_PROFILE_ENABLED.get().unwrap_or(&false)
+}
+
+static TAIL_ARCHIVE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Install the tail-archive switch sourced from `storage.tail_archive`.
+/// Called once during server startup; defaults to off.
+pub fn set_tail_archive_enabled(enabled: bool) {
+    let _ = TAIL_ARCHIVE_ENABLED.set(enabled);
+}
+
+pub fn tail_archive_enabled() -> bool {
+    *TAIL_ARCHIVE_ENABLED.get().unwrap_or(&false)
 }
 
 /// Install storage runtime tunables sourced from `compression.bulk_zstd_level`
@@ -161,6 +178,7 @@ pub fn set_query_limits(limits: QueryLimits) -> Result<(), QueryLimits> {
 /// Read the process-wide query limits (defaults if unset).
 pub fn query_limits() -> QueryLimits {
     *QUERY_LIMITS.get().unwrap_or(&QueryLimits {
+        hybrid_hot_scan_enabled: default_hybrid_hot_scan_enabled(),
         query_memory_limit_mb: default_query_memory_limit_mb(),
         max_result_message_bytes: default_max_message_size(),
         max_aggregate_groups: default_max_aggregate_groups(),
@@ -263,6 +281,10 @@ fn normalize_label(value: &str, fallback: &str) -> String {
     }
 }
 
+fn default_max_bulk_message_size() -> usize {
+    128 * 1024 * 1024
+}
+
 fn default_max_message_size() -> usize {
     64 * 1024 * 1024
 }
@@ -343,6 +365,14 @@ fn default_low_rate_memtable_max_age_secs() -> u64 {
     3600
 }
 
+fn default_hybrid_hot_scan_enabled() -> bool {
+    true
+}
+
+fn default_hot_warmup_enabled() -> bool {
+    true
+}
+
 fn default_hot_store_memory_limit_mb() -> u64 {
     8192
 }
@@ -383,10 +413,10 @@ fn default_join_spill_partitions() -> usize {
 }
 
 fn default_max_parallel_segments() -> usize {
-    default_execution_threads().clamp(1, 4)
+    default_execution_threads().clamp(1, 8)
 }
 fn default_global_io_permits() -> usize {
-    default_execution_threads().clamp(1, 4)
+    default_execution_threads().clamp(1, 16)
 }
 fn default_global_cpu_permits() -> usize {
     default_execution_threads().max(1)
@@ -476,6 +506,71 @@ pub struct ServerConfig {
     pub log: LogSettings,
     #[serde(default)]
     pub performance: PerformanceBaselineSettings,
+    #[serde(default)]
+    pub pubsub: PubSubSettings,
+    #[serde(default)]
+    pub replication: ReplicationSettings,
+}
+
+/// Primary/standby replication (see `src/storage/replication`). `role` is
+/// one of `"none"` (default), `"primary"` (emit the replication event
+/// stream, reject bulk/RELAXED direct writes) or `"standby"` (read-only
+/// engine; a background applier replays the primary's stream; local
+/// schedulers and auto-compaction are disabled).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationSettings {
+    /// `"none" | "primary" | "standby"`.
+    #[serde(default)]
+    pub role: String,
+    /// Standby only: primary's `host:port`.
+    #[serde(default)]
+    pub primary_addr: String,
+    /// Standby only: credentials used for `REPL_HELLO`.
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub password: String,
+    /// Primary only: events retained for reconnecting standbys.
+    #[serde(default = "default_replication_ring_capacity")]
+    pub ring_capacity: usize,
+}
+
+impl Default for ReplicationSettings {
+    fn default() -> Self {
+        Self {
+            role: "none".to_string(),
+            primary_addr: String::new(),
+            user: String::new(),
+            password: String::new(),
+            ring_capacity: default_replication_ring_capacity(),
+        }
+    }
+}
+
+fn default_replication_ring_capacity() -> usize {
+    65_536
+}
+
+impl ReplicationSettings {
+    pub fn role_is_primary(&self) -> bool {
+        self.role.eq_ignore_ascii_case("primary")
+    }
+
+    pub fn role_is_standby(&self) -> bool {
+        self.role.eq_ignore_ascii_case("standby")
+    }
+}
+
+static REPLICATION_SETTINGS: OnceLock<ReplicationSettings> = OnceLock::new();
+
+/// Install the replication role at startup (main). Engines read it during
+/// construction; tests may install it once before creating engines.
+pub fn set_replication_settings(settings: ReplicationSettings) {
+    let _ = REPLICATION_SETTINGS.set(settings);
+}
+
+pub fn replication_settings() -> ReplicationSettings {
+    REPLICATION_SETTINGS.get().cloned().unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -485,6 +580,11 @@ pub struct ServerSettings {
     pub port: u16,
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
+    /// Receive cap for columnar bulk-import messages (0x23). Bulk payloads are
+    /// proportional to batch rows, so they get their own ceiling instead of
+    /// inheriting the general per-message cap.
+    #[serde(default = "default_max_bulk_message_size")]
+    pub max_bulk_message_size: usize,
     /// Maximum number of established client sockets. Excess connections are
     /// accepted and closed immediately so the OS accept queue keeps draining.
     #[serde(default = "default_max_connections")]
@@ -497,14 +597,35 @@ pub struct ServerSettings {
     /// Set to 0 to disable the idle timeout.
     #[serde(default = "default_connection_idle_timeout_secs")]
     pub connection_idle_timeout_secs: u64,
+    /// Idle timeout applied while the connection holds an open bulk-import
+    /// session. Bulk import clients legitimately stay silent for long
+    /// stretches (decoding input files, filling batches) and rely on
+    /// keepalive PINGs; a keepalive interval that races the regular idle
+    /// timeout kills live imports mid-file. Set to 0 to exempt bulk sessions
+    /// from idle disconnects entirely.
+    #[serde(default = "default_bulk_import_idle_timeout_secs")]
+    pub bulk_import_idle_timeout_secs: u64,
     /// Maximum time allowed for an incoming TLS handshake. Set to 0 to disable.
     #[serde(default = "default_tls_handshake_timeout_secs")]
     pub tls_handshake_timeout_secs: u64,
     /// Maximum time a heavy request may wait for an execution slot before the
     /// server rejects it with an overload error. Bounds queueing so a
     /// saturated engine surfaces backpressure instead of silently hanging.
-    #[serde(default = "default_request_queue_timeout_ms")]
-    pub request_queue_timeout_ms: u64,
+    #[serde(default = "default_request_queue_timeout_secs")]
+    pub request_queue_timeout_secs: u64,
+    /// Maximum wall-clock time one statement may run before it is cancelled
+    /// at the next safe point (irreversible commit phases run to completion).
+    /// Set to 0 to disable the statement timeout.
+    #[serde(default = "default_statement_timeout_secs")]
+    pub statement_timeout_secs: u64,
+}
+
+fn default_statement_timeout_secs() -> u64 {
+    0
+}
+
+fn default_bulk_import_idle_timeout_secs() -> u64 {
+    3600
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -549,6 +670,17 @@ pub struct StorageSettings {
     pub low_rate_memtable_max_age_secs: u64,
     #[serde(default = "default_hot_store_memory_limit_mb")]
     pub hot_store_memory_limit_mb: u64,
+    /// Rebuild resident hot stores from segments at startup. Close-aware:
+    /// segments archived by a close-of-day flush are not reloaded, only
+    /// segments written after the last close. Disable to keep every restart
+    /// cold, trading resident point-lookup speed for zero warmup I/O and
+    /// memory.
+    #[serde(default = "default_hot_warmup_enabled")]
+    pub hot_warmup_enabled: bool,
+    /// Hybrid partial-residency scans (see `QueryLimits`). Disable to serve
+    /// every query from segments and memtables only.
+    #[serde(default = "default_hybrid_hot_scan_enabled")]
+    pub hybrid_hot_scan_enabled: bool,
     #[serde(default = "default_row_group_target_rows")]
     pub row_group_target_rows: usize,
     /// Ack durable-tail appends once the bytes reach the page cache. The tail
@@ -559,25 +691,31 @@ pub struct StorageSettings {
     /// fsync-bound disks. Default false keeps fsync-before-ack semantics.
     #[serde(default)]
     pub tail_async_fsync: bool,
+    /// Archive cleared durable-tail files under `<data>/wal_archive/<db>/<table>/`
+    /// instead of deleting them. The archive is the incremental-log source for
+    /// point-in-time recovery and future replication bootstrap. Default false
+    /// keeps the previous delete behavior (and the disk usage).
+    #[serde(default)]
+    pub tail_archive: bool,
     /// Number of segments kept in the reader and segment-metadata caches.
     #[serde(default = "default_reader_cache_capacity")]
     pub reader_cache_capacity: usize,
     /// Maximum time a write may wait for the per-table mutation lock before
     /// failing with a lock timeout error instead of blocking forever.
-    #[serde(default = "default_mutation_lock_timeout_ms")]
-    pub mutation_lock_timeout_ms: u64,
+    #[serde(default = "default_mutation_lock_timeout_secs")]
+    pub mutation_lock_timeout_secs: u64,
     /// Log a warning when acquiring the per-table mutation lock takes longer
     /// than this threshold, making lock queueing visible in the server log.
-    #[serde(default = "default_mutation_lock_warn_ms")]
-    pub mutation_lock_warn_ms: u64,
+    #[serde(default = "default_mutation_lock_warn_secs")]
+    pub mutation_lock_warn_secs: u64,
     /// Maximum time a request waits for durable-tail group commit (fsync)
     /// acknowledgement before failing with a commit timeout error.
-    #[serde(default = "default_tail_commit_timeout_ms")]
-    pub tail_commit_timeout_ms: u64,
+    #[serde(default = "default_tail_commit_timeout_secs")]
+    pub tail_commit_timeout_secs: u64,
     /// Log a warning when durable-tail commit acknowledgement takes longer
     /// than this threshold, surfacing slow fsync/disks.
-    #[serde(default = "default_tail_commit_warn_ms")]
-    pub tail_commit_warn_ms: u64,
+    #[serde(default = "default_tail_commit_warn_secs")]
+    pub tail_commit_warn_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -629,6 +767,113 @@ pub struct TlsConfigYaml {
     pub enabled: bool,
     pub cert_path: String,
     pub key_path: String,
+}
+
+/// Change-subscription (pubsub) settings. The feature is enabled by default
+/// but costs nothing while no client subscribes: the write path only does a
+/// relaxed atomic load, and every queue is bounded so memory use stays
+/// proportional to the configured capacities.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PubSubSettings {
+    /// Master switch. When false, SUBSCRIBE requests are rejected and the
+    /// write path short-circuits before touching the event channel.
+    #[serde(default = "default_pubsub_enabled")]
+    pub enabled: bool,
+    /// Capacity of the write-path -> fan-out event channel. Overflow drops
+    /// events (counted) instead of blocking writers.
+    #[serde(default = "default_pubsub_event_channel_capacity")]
+    pub event_channel_capacity: usize,
+    /// Maximum concurrent subscriptions server-wide.
+    #[serde(default = "default_pubsub_max_subscriptions")]
+    pub max_subscriptions: usize,
+    /// Per-connection notification queue capacity. A client that cannot keep
+    /// up has excess notifications dropped (counted per subscription) instead
+    /// of growing memory unboundedly.
+    #[serde(default = "default_pubsub_notification_channel_capacity")]
+    pub notification_channel_capacity: usize,
+    /// Payloads above this size are compressed once by the fan-out thread and
+    /// shared by all subscribers of the change. `usize::MAX` disables
+    /// notification compression. Follows `compression.enabled` at startup.
+    #[serde(default = "default_pubsub_compress_threshold")]
+    pub compress_threshold: usize,
+    /// Capacity of the commit ring between the write path and the reliable
+    /// pub/sub publisher thread (per-table retention log, resumable
+    /// subscriptions). Overflow marks a gap and asks subscribers to resync
+    /// instead of blocking writers.
+    #[serde(default = "default_pubsub_commit_ring_capacity")]
+    pub commit_ring_capacity: usize,
+    /// Fallback poll interval (ms) for reliable-subscription delivery tasks
+    /// when no change-notification wake-up arrives.
+    #[serde(default = "default_pubsub_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    /// Per-table retention log capacity, in committed batches. Subscribers
+    /// resuming from a sequence below the retained floor are asked to resync.
+    #[serde(default = "default_pubsub_log_max_batches")]
+    pub log_max_batches: usize,
+    /// Per-table retention log capacity, in MiB (approximate batch bytes).
+    #[serde(default = "default_pubsub_log_max_bytes_mb")]
+    pub log_max_bytes_mb: u64,
+    /// Maximum number of committed batches coalesced into one reliable
+    /// data push frame.
+    #[serde(default = "default_pubsub_max_batches_per_frame")]
+    pub max_batches_per_frame: usize,
+}
+
+impl Default for PubSubSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_pubsub_enabled(),
+            event_channel_capacity: default_pubsub_event_channel_capacity(),
+            max_subscriptions: default_pubsub_max_subscriptions(),
+            notification_channel_capacity: default_pubsub_notification_channel_capacity(),
+            compress_threshold: default_pubsub_compress_threshold(),
+            commit_ring_capacity: default_pubsub_commit_ring_capacity(),
+            poll_interval_ms: default_pubsub_poll_interval_ms(),
+            log_max_batches: default_pubsub_log_max_batches(),
+            log_max_bytes_mb: default_pubsub_log_max_bytes_mb(),
+            max_batches_per_frame: default_pubsub_max_batches_per_frame(),
+        }
+    }
+}
+
+fn default_pubsub_enabled() -> bool {
+    true
+}
+
+fn default_pubsub_event_channel_capacity() -> usize {
+    65_536
+}
+
+fn default_pubsub_max_subscriptions() -> usize {
+    1024
+}
+
+fn default_pubsub_notification_channel_capacity() -> usize {
+    1024
+}
+
+fn default_pubsub_compress_threshold() -> usize {
+    4096
+}
+
+fn default_pubsub_commit_ring_capacity() -> usize {
+    65_536
+}
+
+fn default_pubsub_poll_interval_ms() -> u64 {
+    50
+}
+
+fn default_pubsub_log_max_batches() -> usize {
+    1024
+}
+
+fn default_pubsub_log_max_bytes_mb() -> u64 {
+    64
+}
+
+fn default_pubsub_max_batches_per_frame() -> usize {
+    32
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -723,11 +968,14 @@ fn default_server_settings() -> ServerSettings {
         host: "0.0.0.0".to_string(),
         port: 5151,
         max_message_size: 64 * 1024 * 1024,
+        max_bulk_message_size: default_max_bulk_message_size(),
         max_connections: default_max_connections(),
         max_concurrent_requests: default_max_concurrent_requests(),
         connection_idle_timeout_secs: default_connection_idle_timeout_secs(),
+        bulk_import_idle_timeout_secs: default_bulk_import_idle_timeout_secs(),
         tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
-        request_queue_timeout_ms: default_request_queue_timeout_ms(),
+        request_queue_timeout_secs: default_request_queue_timeout_secs(),
+        statement_timeout_secs: default_statement_timeout_secs(),
     }
 }
 
@@ -753,13 +1001,16 @@ fn default_storage_settings() -> StorageSettings {
         low_rate_memtable_max_rows: default_low_rate_memtable_max_rows(),
         low_rate_memtable_max_age_secs: default_low_rate_memtable_max_age_secs(),
         hot_store_memory_limit_mb: default_hot_store_memory_limit_mb(),
+        hot_warmup_enabled: default_hot_warmup_enabled(),
+        hybrid_hot_scan_enabled: default_hybrid_hot_scan_enabled(),
         row_group_target_rows: default_row_group_target_rows(),
         reader_cache_capacity: default_reader_cache_capacity(),
         tail_async_fsync: false,
-        mutation_lock_timeout_ms: default_mutation_lock_timeout_ms(),
-        mutation_lock_warn_ms: default_mutation_lock_warn_ms(),
-        tail_commit_timeout_ms: default_tail_commit_timeout_ms(),
-        tail_commit_warn_ms: default_tail_commit_warn_ms(),
+        tail_archive: false,
+        mutation_lock_timeout_secs: default_mutation_lock_timeout_secs(),
+        mutation_lock_warn_secs: default_mutation_lock_warn_secs(),
+        tail_commit_timeout_secs: default_tail_commit_timeout_secs(),
+        tail_commit_warn_secs: default_tail_commit_warn_secs(),
     }
 }
 
@@ -806,6 +1057,8 @@ impl Default for ServerConfig {
             tls: TlsConfigYaml::default(),
             log: default_log_settings(),
             performance: PerformanceBaselineSettings::default(),
+            pubsub: PubSubSettings::default(),
+            replication: ReplicationSettings::default(),
         }
     }
 }

@@ -2,11 +2,9 @@
 
 Taibai 是一个用 Rust 编写的列式数据库服务端。
 
-> **项目状态：实验性。** 当前 `0.x` 版本适合数据库内核研究、功能验证和性能测试，尚未声明生产就绪。数据格式、协议、配置和 SQL 行为可能发生不兼容变化，详见[项目状态与限制](docs/user-guide/limitations.md)。
-
 第一次使用请从[五分钟快速开始](docs/getting-started/quick-start.md)开始。
 
-简单说，它是一个偏分析场景的数据库：适合写入大量数据，然后按列扫描、统计、聚合和查询。项目目前还在开发和完善中，更适合用来做数据库内核实验、功能验证和性能测试。
+简单说，它是一个偏分析场景的数据库：适合写入大量数据，然后按列扫描、统计、聚合和查询。生产部署前的准备事项见[兼容性与部署指引](docs/user-guide/limitations.md)。
 
 ## 它能做什么
 
@@ -15,7 +13,8 @@ Taibai 是一个用 Rust 编写的列式数据库服务端。
 - 数据按列存储，更适合统计分析类查询。
 - 支持批量导入，适合一次性写入大量数据。
 - 支持事务、用户权限、分区、数据过期清理和变更订阅等数据库能力。
-- 支持压缩数据，减少存储空间和网络传输开销。
+- 支持查询管理：`SHOW PROCESSLIST` 查看运行中的查询，`KILL QUERY` 终止失控语句，可配置语句超时。
+- 支持压缩数据，减少存储空间和网络传输开销；压缩级别可按表调整。
 - 支持可选的 TLS 加密连接。
 - 支持独立 SQL Query Log，可通过 `log.query_file` 配置查询日志文件。
 - 提供命令行客户端和若干示例程序。
@@ -111,6 +110,14 @@ CREATE TABLE ticks (
   volume INT64
 ) CLUSTER BY (symbol, ts);
 
+-- 归档表可提高压缩级别（1..=22，默认跟随配置 compression.bulk_zstd_level）
+CREATE TABLE ticks_archive (
+  symbol VARCHAR,
+  ts TIMESTAMP,
+  price FLOAT64,
+  volume INT64
+) COMPRESSION_LEVEL = 19;
+
 INSERT INTO ticks VALUES
   ('AAPL', 1717200000000, 191.2, 1000),
   ('AAPL', 1717200001000, 191.5, 800),
@@ -193,6 +200,11 @@ log:
 | `examples/multi_insert` | 多行插入示例 |
 | `examples/prepare_test` | 预处理语句示例 |
 | `examples/hot_insert` | 热数据持续写入示例 |
+| `examples/pubsub_demo` | 变更订阅示例：订阅表插入变更并接收服务端推送 |
+| `examples/export_csv` | 把查询结果导出为 CSV |
+| `examples/load_csv` / `examples/insert_csv` | 把 CSV 分别经 bulk 直写与普通 INSERT 路径导入 |
+
+各示例的参数与用法见[示例工具使用指南](docs/operations/examples-guide.md)。
 
 运行示例前，请先启动 Taibai 服务端，并根据示例源码调整连接参数。
 
@@ -200,11 +212,14 @@ log:
 
 - `docs/getting-started/quick-start.md`：五分钟快速开始。
 - `docs/overview/project-summary.md`：工程功能总览。
-- `docs/user-guide/limitations.md`：项目状态、兼容性和使用限制。
+- `docs/user-guide/transactions-and-concurrency.md`：事务与并发语义。
+- `docs/user-guide/query-management.md`：查询管理与语句超时。
+- `docs/user-guide/pubsub.md`：变更订阅（pub/sub）协议、权限与配置。
+- `docs/user-guide/limitations.md`：兼容性与部署指引。
 - `docs/design/TAIBAI_DESIGN_ZH.md`：整体设计说明。
 - `docs/operations/data-import-flow.md`：数据导入流程。
 - `docs/operations/windows-installation.md`：Windows 图形安装包和系统服务安装说明。
-- `docs/reports/performance-verification-report.md`：性能验证报告。
+- `docs/reports/benchmark-vs-duckdb-kdb-2026-09.md`：性能对比报告（vs DuckDB/kdb+）。
 - `CONTRIBUTING.md`：开发环境、质量检查和贡献流程。
 - `SECURITY.md`：漏洞报告和部署安全注意事项。
 

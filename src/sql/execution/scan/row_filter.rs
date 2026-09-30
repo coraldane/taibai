@@ -2,17 +2,103 @@ use crate::storage::codec::fastscan::apply_filter_mask_fast;
 use crate::storage::codec::predicate_scan::selected_eq_rows_from_raw;
 use crate::storage::partition::pruning::RangeOp;
 use crate::types::array::ColumnArray;
+
+/// Expand dictionary columns into plain varchars before typed predicate
+/// evaluation. Recursion terminates: the materialized batch has no
+/// dictionary columns.
+/// Column indices referenced by the scalar predicates (batch-local). The
+/// remaining predicate is excluded: its evaluation kernels flatten dictionary
+/// columns on demand.
+fn predicate_dictionary_targets(
+    eq_predicates: &[(usize, ScalarValue)],
+    range_predicates: &[crate::storage::partition::pruning::RangeClause],
+    in_predicates: &[InPredicate],
+) -> std::collections::HashSet<usize> {
+    let mut set = std::collections::HashSet::new();
+    for (idx, _) in eq_predicates {
+        set.insert(*idx);
+    }
+    for clause in range_predicates {
+        set.insert(clause.column_index);
+    }
+    for pred in in_predicates {
+        set.insert(pred.column_index);
+    }
+    set
+}
+
+/// Materialize only the dictionary columns the predicates actually touch;
+/// untouched dictionary columns stay encoded (read kernels flatten lazily).
+fn materialize_predicate_dictionaries(
+    batch: &RecordBatch,
+    eq_predicates: &[(usize, ScalarValue)],
+    range_predicates: &[crate::storage::partition::pruning::RangeClause],
+    in_predicates: &[InPredicate],
+) -> crate::common::error::Result<RecordBatch> {
+    // Materialize EVERY dictionary column, not just the predicate targets:
+    // apply_predicates re-invokes itself when any dictionary column remains,
+    // and a non-target dictionary column used to survive the "materialize
+    // targets" pass, recursing forever (stack overflow) on batches whose
+    // non-predicate columns were dictionary encoded.
+    let _ = predicate_dictionary_targets(eq_predicates, range_predicates, in_predicates);
+    let columns: crate::common::error::Result<Vec<ColumnArray>> = batch
+        .columns
+        .iter()
+        .map(|c| {
+            if matches!(c, ColumnArray::Dictionary { .. }) {
+                Ok(c.materialize_varchar())
+            } else {
+                Ok(c.clone())
+            }
+        })
+        .collect();
+    RecordBatch::try_new(batch.schema.clone(), columns?)
+}
+
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;
 
 use super::spec::InPredicate;
 
+/// Cluster-key search bounds for one scan: a leading equality prefix plus
+/// range bounds on the next cluster column. The binary-search key tuple is
+/// the prefix values followed by the range bound value; because the segment
+/// is sorted by the full cluster key lexicographically, tuple search on any
+/// leading subset of the key is always valid.
 #[derive(Debug, Clone)]
 pub struct ClusterKeyBounds {
-    pub column_index: usize,
+    /// `(column_index, value)` equality pairs in cluster-key order.
+    pub prefix_eq: Vec<(usize, ScalarValue)>,
+    /// The cluster column the range bounds apply to.
+    pub range_column_index: usize,
     pub lower: Option<(ScalarValue, bool)>,
     pub upper: Option<(ScalarValue, bool)>,
+}
+
+impl ClusterKeyBounds {
+    /// Single-column bounds on the first cluster column (no prefix).
+    pub fn single(
+        column_index: usize,
+        lower: Option<(ScalarValue, bool)>,
+        upper: Option<(ScalarValue, bool)>,
+    ) -> Self {
+        Self {
+            prefix_eq: Vec::new(),
+            range_column_index: column_index,
+            lower,
+            upper,
+        }
+    }
+
+    /// The columns forming the search key tuple, in order.
+    pub fn key_column_indices(&self) -> Vec<usize> {
+        let mut cols: Vec<usize> = self.prefix_eq.iter().map(|(idx, _)| *idx).collect();
+        if !cols.contains(&self.range_column_index) {
+            cols.push(self.range_column_index);
+        }
+        cols
+    }
 }
 
 pub fn apply_predicates(
@@ -24,6 +110,24 @@ pub fn apply_predicates(
 ) -> crate::common::error::Result<RecordBatch> {
     if batch.num_rows() == 0 {
         return Ok(batch.clone());
+    }
+    if batch
+        .columns
+        .iter()
+        .any(|c| matches!(c, ColumnArray::Dictionary { .. }))
+    {
+        return apply_predicates(
+            &materialize_predicate_dictionaries(
+                batch,
+                eq_predicates,
+                range_predicates,
+                in_predicates,
+            )?,
+            eq_predicates,
+            range_predicates,
+            in_predicates,
+            remaining_predicate,
+        );
     }
 
     let mut mask: Vec<bool> = vec![true; batch.num_rows()];
@@ -72,6 +176,25 @@ pub fn apply_predicates_with_column_map(
     in_predicates: &[InPredicate],
     remaining_predicate: Option<&crate::sql::planner::LogicalExpr>,
 ) -> crate::common::error::Result<RecordBatch> {
+    if batch
+        .columns
+        .iter()
+        .any(|c| matches!(c, ColumnArray::Dictionary { .. }))
+    {
+        return apply_predicates_with_column_map(
+            &materialize_predicate_dictionaries(
+                batch,
+                eq_predicates,
+                range_predicates,
+                in_predicates,
+            )?,
+            source_columns,
+            eq_predicates,
+            range_predicates,
+            in_predicates,
+            remaining_predicate,
+        );
+    }
     let col_pos_by_original: std::collections::HashMap<usize, usize> = source_columns
         .iter()
         .enumerate()
@@ -125,7 +248,29 @@ fn apply_range_mask(
 }
 
 fn apply_in_mask(batch: &RecordBatch, pred: &InPredicate, mask: &mut [bool]) {
-    if let Some(col) = batch.column(pred.column_index) {
+    let Some(col) = batch.column(pred.column_index) else {
+        for m in mask.iter_mut() {
+            *m = false;
+        }
+        return;
+    };
+    // The hashed probe needs a plain typed column: `from_column` ignores the
+    // null bitmap and would flatten Selected/Rle/Dictionary per row, and
+    // Blob/Vector values have no hashable form. Tiny lists also keep the
+    // linear probe (no set construction). Anything bigger — a hash join
+    // runtime filter injects up to 1024 values — probes a hash set built
+    // once per batch: O(rows + values) instead of O(rows × values) scalar
+    // comparisons.
+    let hashable = pred.values.len() > 4
+        && !matches!(
+            col,
+            ColumnArray::Selected { .. }
+                | ColumnArray::Rle { .. }
+                | ColumnArray::Dictionary { .. }
+                | ColumnArray::Blob { .. }
+                | ColumnArray::Vector { .. }
+        );
+    if !hashable {
         for (i, m) in mask.iter_mut().enumerate() {
             if !*m {
                 continue;
@@ -136,10 +281,24 @@ fn apply_in_mask(batch: &RecordBatch, pred: &InPredicate, mask: &mut [bool]) {
             });
             *m = found;
         }
-    } else {
-        for m in mask.iter_mut() {
-            *m = false;
-        }
+        return;
+    }
+    let values: std::collections::HashSet<
+        crate::sql::execution::join_hashtable::ScalarValueHashable,
+    > = pred
+        .values
+        .iter()
+        .filter(|value| !value.is_null())
+        .map(crate::sql::execution::join_hashtable::ScalarValueHashable::from_scalar)
+        .collect();
+    for (i, m) in mask.iter_mut().enumerate() {
+        // A NULL row never satisfies IN, and `from_column` would read the
+        // data slot regardless of the bitmap.
+        *m = *m
+            && !col.bitmap().is_null(i)
+            && values.contains(
+                &crate::sql::execution::join_hashtable::ScalarValueHashable::from_column(col, i),
+            );
     }
 }
 
@@ -155,6 +314,27 @@ fn apply_remaining_mask(
     Ok(())
 }
 
+/// Whether a zone map proves an eq/range clause holds for every row of the
+/// group (`classify_clause`'s `All` already accounts for NULLs never
+/// satisfying a comparison).
+fn zone_map_proves_clause(
+    zone_maps: &[crate::storage::partition::pruning::ZoneMap],
+    column: usize,
+    op: crate::storage::partition::pruning::RangeOp,
+    value: &ScalarValue,
+) -> bool {
+    zone_maps.get(column).is_some_and(|zone_map| {
+        crate::storage::partition::pruning::classify_clause(
+            &crate::storage::partition::pruning::RangeClause {
+                column_index: column,
+                op,
+                value: value.clone(),
+            },
+            zone_map,
+        ) == crate::storage::partition::pruning::PredicateMatch::All
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn predicate_first_read(
     reader: &crate::storage::segment::SegmentReader,
@@ -166,7 +346,93 @@ pub fn predicate_first_read(
     in_predicates: &[InPredicate],
     remaining_predicate: Option<&crate::sql::planner::LogicalExpr>,
 ) -> crate::common::error::Result<RecordBatch> {
-    let pred_batch = reader.read_columns_fast(rg_idx, predicate_cols)?;
+    // Zone-map vacuity: when only eq/range predicates are present, a clause
+    // the whole row group satisfies contributes an all-true mask — drop it
+    // from both the predicate-column read and the evaluation. A partition
+    // column pinned by equality (min == max across the group) vanishes for
+    // free. IN / remaining predicates may reference the same columns, so
+    // they disable the elimination.
+    let can_eliminate = in_predicates.is_empty() && remaining_predicate.is_none();
+    let zone_maps = reader.zone_maps(rg_idx);
+    let eq_predicates: Vec<&(usize, ScalarValue)> = eq_predicates
+        .iter()
+        .filter(|(column, value)| {
+            !can_eliminate
+                || !zone_map_proves_clause(
+                    zone_maps,
+                    *column,
+                    crate::storage::partition::pruning::RangeOp::Eq,
+                    value,
+                )
+        })
+        .collect();
+    let range_predicates: Vec<&crate::storage::partition::pruning::RangeClause> = range_predicates
+        .iter()
+        .filter(|clause| {
+            !can_eliminate
+                || !zone_map_proves_clause(zone_maps, clause.column_index, clause.op, &clause.value)
+        })
+        .collect();
+
+    // Columns predicate evaluation still needs, in a stable order.
+    let mut eval_cols: Vec<usize> = Vec::with_capacity(predicate_cols.len());
+    for (column, _) in &eq_predicates {
+        if !eval_cols.contains(column) {
+            eval_cols.push(*column);
+        }
+    }
+    for clause in &range_predicates {
+        if !eval_cols.contains(&clause.column_index) {
+            eval_cols.push(clause.column_index);
+        }
+    }
+    for &column in predicate_cols {
+        if !eval_cols.contains(&column) {
+            eval_cols.push(column);
+        }
+    }
+
+    let row_count = reader.row_group_rows(rg_idx) as usize;
+    if eval_cols.is_empty() {
+        // Every predicate is vacuous: the whole row group matches modulo the
+        // delete bitmap. No predicate column needs decoding at all.
+        if reader.delete_bitmap().is_empty() {
+            return reader.read_columns_fast_allow_dictionary(rg_idx, projection_cols, true);
+        }
+        let rg_start_row = reader.row_group_start_row(rg_idx);
+        let selected_rows: Vec<usize> = (0..row_count)
+            .filter(|row| !reader.is_row_deleted(rg_start_row + *row as u64))
+            .collect();
+        if selected_rows.is_empty() {
+            return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+        }
+        let mut columns_by_idx: std::collections::HashMap<usize, ColumnArray> =
+            std::collections::HashMap::with_capacity(projection_cols.len());
+        for (column, col) in
+            reader.read_columns_filtered(rg_idx, projection_cols, &selected_rows)?
+        {
+            columns_by_idx.insert(column, col);
+        }
+        let mut columns = Vec::with_capacity(projection_cols.len());
+        for &column in projection_cols {
+            let col = columns_by_idx.remove(&column).ok_or_else(|| {
+                crate::common::error::TaibaiError::Internal(format!(
+                    "projected column {column} was not read"
+                ))
+            })?;
+            columns.push(col);
+        }
+        let proj_schema = crate::types::batch::Schema::new(
+            projection_cols
+                .iter()
+                .map(|&idx| reader.schema().columns[idx].clone())
+                .collect(),
+        );
+        return crate::types::batch::RecordBatch::try_new(proj_schema, columns)
+            .map_err(|e| crate::common::error::TaibaiError::Internal(e.to_string()));
+    }
+
+    let pred_batch = reader.read_columns_fast(rg_idx, &eval_cols)?;
     if pred_batch.num_rows() == 0 {
         return Ok(empty_with_projection(reader, rg_idx, projection_cols));
     }
@@ -183,14 +449,11 @@ pub fn predicate_first_read(
         return Ok(empty_with_projection(reader, rg_idx, projection_cols));
     }
 
-    let pred_to_batch_pos: std::collections::HashMap<usize, usize> = predicate_cols
-        .iter()
-        .enumerate()
-        .map(|(pos, &idx)| (idx, pos))
-        .collect();
+    let pred_to_batch_pos =
+        |column: usize| -> Option<usize> { eval_cols.iter().position(|&c| c == column) };
 
-    for (col_idx, value) in eq_predicates {
-        if let Some(&pos) = pred_to_batch_pos.get(col_idx) {
+    for (col_idx, value) in eq_predicates.iter().map(|(column, value)| (*column, value)) {
+        if let Some(pos) = pred_to_batch_pos(col_idx) {
             if let Some(col) = pred_batch.column(pos) {
                 let col_mask = col.eq_vec(value);
                 for (i, m) in col_mask.iter().enumerate() {
@@ -203,8 +466,8 @@ pub fn predicate_first_read(
         }
     }
 
-    for clause in range_predicates {
-        if let Some(&pos) = pred_to_batch_pos.get(&clause.column_index) {
+    for clause in range_predicates.iter() {
+        if let Some(pos) = pred_to_batch_pos(clause.column_index) {
             if let Some(col) = pred_batch.column(pos) {
                 let col_mask = match clause.op {
                     RangeOp::Eq => col.eq_vec(&clause.value),
@@ -224,7 +487,7 @@ pub fn predicate_first_read(
     }
 
     for pred in in_predicates {
-        if let Some(&pos) = pred_to_batch_pos.get(&pred.column_index) {
+        if let Some(pos) = pred_to_batch_pos(pred.column_index) {
             if let Some(col) = pred_batch.column(pos) {
                 for (i, m) in mask.iter_mut().enumerate() {
                     if !*m {
@@ -244,7 +507,12 @@ pub fn predicate_first_read(
     }
 
     if let Some(expr) = remaining_predicate {
-        let remapped_expr = remap_expr(expr, &pred_to_batch_pos)?;
+        let col_pos_by_original: std::collections::HashMap<usize, usize> = eval_cols
+            .iter()
+            .enumerate()
+            .map(|(pos, &column)| (column, pos))
+            .collect();
+        let remapped_expr = remap_expr(expr, &col_pos_by_original)?;
         apply_remaining_mask(&pred_batch, &remapped_expr, &mut mask)?;
     }
 
@@ -253,7 +521,9 @@ pub fn predicate_first_read(
         return Ok(empty_with_projection(reader, rg_idx, projection_cols));
     }
     if match_count == pred_batch.num_rows() {
-        return reader.read_columns_fast(rg_idx, projection_cols);
+        // Whole row group matched: keep dictionary-encoded projections as
+        // (ids, dict) so downstream grouped aggregation consumes u32 ids.
+        return reader.read_columns_fast_allow_dictionary(rg_idx, projection_cols, true);
     }
 
     let selected_rows: Vec<usize> = mask
@@ -270,7 +540,7 @@ pub fn predicate_first_read(
         if columns_by_idx.contains_key(&col_idx) || cols_to_read.contains(&col_idx) {
             continue;
         }
-        if let Some(&pos) = pred_to_batch_pos.get(&col_idx) {
+        if let Some(pos) = pred_to_batch_pos(col_idx) {
             if let Some(col) = pred_batch.column(pos) {
                 columns_by_idx.insert(col_idx, col.filter_by_mask_fast(&mask, match_count));
                 continue;
@@ -315,27 +585,37 @@ pub fn cluster_key_range_read(
     in_predicates: &[InPredicate],
     remaining_predicate: Option<&crate::sql::planner::LogicalExpr>,
 ) -> crate::common::error::Result<RecordBatch> {
-    let key_col_idx = bounds.column_index;
-    if let Some(eq_value) = simple_cluster_eq_value(
-        key_col_idx,
-        bounds,
-        eq_predicates,
-        range_predicates,
-        in_predicates,
-        remaining_predicate,
-    ) {
-        return cluster_key_eq_read(reader, rg_idx, key_col_idx, eq_value, projection_cols);
+    let key_col_idx = bounds.range_column_index;
+    if bounds.prefix_eq.is_empty() {
+        if let Some(eq_value) = simple_cluster_eq_value(
+            key_col_idx,
+            bounds,
+            eq_predicates,
+            range_predicates,
+            in_predicates,
+            remaining_predicate,
+        ) {
+            return cluster_key_eq_read(reader, rg_idx, key_col_idx, eq_value, projection_cols);
+        }
     }
 
-    let key_batch = reader.read_columns_fast(rg_idx, &[key_col_idx])?;
+    let key_cols_idx = bounds.key_column_indices();
+    let key_batch = reader.read_columns_fast(rg_idx, &key_cols_idx)?;
     if key_batch.num_rows() == 0 {
         return Ok(empty_with_projection(reader, rg_idx, projection_cols));
     }
 
-    let Some(key_col) = key_batch.column(0) else {
-        return Ok(empty_with_projection(reader, rg_idx, projection_cols));
-    };
-    if !is_sorted_ascending(key_col) {
+    let key_cols: Vec<&ColumnArray> = key_cols_idx
+        .iter()
+        .enumerate()
+        .map(|(pos, _)| key_batch.column(pos))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            crate::common::error::TaibaiError::Internal(
+                "cluster key columns missing from key batch".into(),
+            )
+        })?;
+    if !key_tuple_is_sorted(&key_cols) {
         return predicate_first_read(
             reader,
             rg_idx,
@@ -350,25 +630,27 @@ pub fn cluster_key_range_read(
 
     let start = match &bounds.lower {
         Some((value, inclusive)) => {
+            let tuple = search_tuple(&bounds.prefix_eq, Some(value));
             if *inclusive {
-                lower_bound(key_col, value)
+                lower_bound_tuple(&key_cols, &tuple)
             } else {
-                upper_bound(key_col, value)
+                upper_bound_tuple(&key_cols, &tuple)
             }
         }
         None => 0,
     };
     let end = match &bounds.upper {
         Some((value, inclusive)) => {
+            let tuple = search_tuple(&bounds.prefix_eq, Some(value));
             if *inclusive {
-                upper_bound(key_col, value)
+                upper_bound_tuple(&key_cols, &tuple)
             } else {
-                lower_bound(key_col, value)
+                lower_bound_tuple(&key_cols, &tuple)
             }
         }
-        None => key_col.len(),
+        None => key_batch.num_rows(),
     };
-    if start == end {
+    if start >= end {
         return Ok(empty_with_projection(reader, rg_idx, projection_cols));
     }
 
@@ -382,18 +664,22 @@ pub fn cluster_key_range_read(
         std::collections::HashMap::with_capacity(union_cols.len());
     let mut cols_to_read = Vec::with_capacity(union_cols.len());
 
-    if union_cols.contains(&key_col_idx) {
+    for (pos, &col_idx) in key_cols_idx.iter().enumerate() {
+        if !union_cols.contains(&col_idx) || cols_to_read.contains(&col_idx) {
+            continue;
+        }
+        let key_col = key_cols[pos];
         let key_values = if reader.delete_bitmap().is_empty() {
             key_col.slice_fast(start, end)
         } else {
             let key_mask = selected_rows_mask(key_batch.num_rows(), &selected_rows);
             key_col.filter_by_mask_fast(&key_mask, selected_rows.len())
         };
-        columns_by_idx.insert(key_col_idx, key_values);
+        columns_by_idx.insert(col_idx, key_values);
     }
 
     for &col_idx in &union_cols {
-        if col_idx != key_col_idx && !cols_to_read.contains(&col_idx) {
+        if !key_cols_idx.contains(&col_idx) && !cols_to_read.contains(&col_idx) {
             cols_to_read.push(col_idx);
         }
     }
@@ -622,12 +908,43 @@ fn repeated_scalar_column(
     Ok(col)
 }
 
-fn lower_bound(col: &ColumnArray, value: &ScalarValue) -> usize {
+/// Compare one row against the search tuple lexicographically over the key
+/// columns. A NULL row value sorts after any non-NULL bound (mirroring the
+/// `compare_at` convention); the surviving slice is re-filtered by the
+/// regular predicates, so a slightly wide slice stays correct.
+fn compare_row_to_tuple(
+    cols: &[&ColumnArray],
+    tuple: &[ScalarValue],
+    row: usize,
+) -> std::cmp::Ordering {
+    for (col, value) in cols.iter().zip(tuple.iter()) {
+        match col.compare_scalar_at(row, value) {
+            Some(std::cmp::Ordering::Equal) => {}
+            Some(ord) => return ord,
+            None => return std::cmp::Ordering::Greater,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Prefix equality values plus an optional range bound value.
+fn search_tuple(
+    prefix_eq: &[(usize, ScalarValue)],
+    bound: Option<&ScalarValue>,
+) -> Vec<ScalarValue> {
+    let mut tuple: Vec<ScalarValue> = prefix_eq.iter().map(|(_, value)| value.clone()).collect();
+    if let Some(value) = bound {
+        tuple.push(value.clone());
+    }
+    tuple
+}
+
+fn lower_bound_tuple(cols: &[&ColumnArray], tuple: &[ScalarValue]) -> usize {
     let mut lo = 0usize;
-    let mut hi = col.len();
+    let mut hi = cols.first().map_or(0, |col| col.len());
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        if col.compare_scalar_at(mid, value) == Some(std::cmp::Ordering::Less) {
+        if compare_row_to_tuple(cols, tuple, mid) == std::cmp::Ordering::Less {
             lo = mid + 1;
         } else {
             hi = mid;
@@ -636,12 +953,12 @@ fn lower_bound(col: &ColumnArray, value: &ScalarValue) -> usize {
     lo
 }
 
-fn upper_bound(col: &ColumnArray, value: &ScalarValue) -> usize {
+fn upper_bound_tuple(cols: &[&ColumnArray], tuple: &[ScalarValue]) -> usize {
     let mut lo = 0usize;
-    let mut hi = col.len();
+    let mut hi = cols.first().map_or(0, |col| col.len());
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        if col.compare_scalar_at(mid, value) == Some(std::cmp::Ordering::Greater) {
+        if compare_row_to_tuple(cols, tuple, mid) == std::cmp::Ordering::Greater {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -650,12 +967,19 @@ fn upper_bound(col: &ColumnArray, value: &ScalarValue) -> usize {
     lo
 }
 
-fn is_sorted_ascending(col: &ColumnArray) -> bool {
-    if col.len() <= 1 {
-        return true;
-    }
-    for row_idx in 1..col.len() {
-        if col.compare_at(row_idx, row_idx - 1) == std::cmp::Ordering::Less {
+/// The leading cluster-key subset is non-decreasing. Lexicographic sort over
+/// the full cluster key implies this for every prefix of it.
+fn key_tuple_is_sorted(cols: &[&ColumnArray]) -> bool {
+    let len = cols.first().map_or(0, |col| col.len());
+    for row_idx in 1..len {
+        let mut ord = std::cmp::Ordering::Equal;
+        for col in cols {
+            ord = col.compare_at(row_idx, row_idx - 1);
+            if ord != std::cmp::Ordering::Equal {
+                break;
+            }
+        }
+        if ord == std::cmp::Ordering::Less {
             return false;
         }
     }
@@ -672,12 +996,8 @@ fn selected_live_rows(
         return (start..end).collect();
     }
 
-    let rg_start_row: u64 = reader
-        .footer_row_groups_info()
-        .iter()
-        .take(rg_idx)
-        .map(|r| r.row_count)
-        .sum();
+    // O(1) prefix sum instead of cloning the whole footer per row group.
+    let rg_start_row: u64 = reader.row_group_start_row(rg_idx);
     (start..end)
         .filter(|row| !reader.is_row_deleted(rg_start_row + *row as u64))
         .collect()

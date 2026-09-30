@@ -83,7 +83,7 @@ pub fn exec_explain(
 
     let plan = plan_select(select_from, &table_schemas)?;
     let plan = crate::sql::optimizer::optimize(plan);
-    let mut extra_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+    let mut extra_batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>> = HashMap::new();
     let plan = if let Some(query) = &resolved {
         let outcome = super::decorrelate::decorrelate(plan, &query.registry);
         extra_batches = outcome.extra_batches;
@@ -134,6 +134,12 @@ pub fn exec_explain(
             let s = &stats[t];
             out.push_str(&format!("Scan {}:\n", t));
             out.push_str(&format!("  segments      : {}\n", s.segments_opened));
+            if s.hot_mirror_rows > 0 {
+                out.push_str(&format!(
+                    "  hot_mirror    : {} rows served by the hybrid resident mirror\n",
+                    s.hot_mirror_rows
+                ));
+            }
             if s.segments_pruned_by_cluster_key > 0 {
                 out.push_str(&format!(
                     "  segment_prune : {} by cluster key\n",
@@ -316,7 +322,7 @@ fn plan_shape(plan: &LogicalPlan) -> String {
         LogicalPlan::Distinct(distinct) => format!("Distinct({})", plan_shape(&distinct.input)),
         LogicalPlan::Window(window) => format!(
             "Window({};{})",
-            window.window_funcs.len(),
+            window.funcs.len(),
             plan_shape(&window.input)
         ),
         LogicalPlan::Join(join) => format!(
@@ -555,11 +561,9 @@ fn render_plan(plan: &LogicalPlan, depth: usize, out: &mut String, ctx: &Physica
         }
         LogicalPlan::Window(w) => {
             out.push_str(&format!(
-                "{}Window: funcs={}, partition_by={}, order_by={}, estimated_rows={}\n",
+                "{}Window: funcs={}, estimated_rows={}\n",
                 pad,
-                w.window_funcs.len(),
-                w.partition_by.len(),
-                w.order_by.len(),
+                w.funcs.len(),
                 estimated_rows
             ));
             render_plan(&w.input, depth + 1, out, ctx);

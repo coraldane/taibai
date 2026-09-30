@@ -24,6 +24,7 @@ fn live_memtables_and_watermark(
 
 pub fn scan_resident_hot_store(
     hot_mgr: &HotStoreManager,
+    memtable_mgr: &MemTableManager,
     db: &str,
     table_meta: &TableMeta,
     spec: &ScanSpec,
@@ -35,7 +36,7 @@ pub fn scan_resident_hot_store(
     if store.row_count() == 0 {
         return None;
     }
-    if !resident_hot_covers(&store, table_meta, spec) {
+    if !resident_hot_covers(&store, memtable_mgr, db, table_meta, spec) {
         return None;
     }
     scan_hot_store_by_key(&store, spec, 0)
@@ -43,6 +44,7 @@ pub fn scan_resident_hot_store(
 
 pub fn count_resident_hot_store(
     hot_mgr: &HotStoreManager,
+    memtable_mgr: &MemTableManager,
     db: &str,
     table_meta: &TableMeta,
     spec: &ScanSpec,
@@ -54,13 +56,145 @@ pub fn count_resident_hot_store(
     if store.row_count() == 0 {
         return None;
     }
-    if !resident_hot_covers(&store, table_meta, spec) {
+    if !resident_hot_covers(&store, memtable_mgr, db, table_meta, spec) {
         return None;
     }
     count_hot_store_by_key(&store, spec, 0)
 }
 
-fn resident_hot_covers(store: &HotStore, table_meta: &TableMeta, spec: &ScanSpec) -> bool {
+/// Partial-residency gate. Returns `(partition_column_index, covers_value)`
+/// when the mirror provably holds every row whose partition-column value is
+/// strictly greater than `covers_value` (`TableMeta::hot_mirror_covers_from`,
+/// established at close-of-day / restart warmup) and the scan carries an
+/// equality on that column above the bound. `hot_partition_mirrored` closes
+/// the gate after any mirror bypass, prefix reclaim or transaction delta.
+fn hybrid_hot_mirror_bound(
+    store: &HotStore,
+    memtable_mgr: &MemTableManager,
+    db: &str,
+    table_meta: &TableMeta,
+    spec: &ScanSpec,
+) -> Option<(usize, ScalarValue)> {
+    if spec.reader_txn_id != 0 || table_meta.ttl.is_some() {
+        return None;
+    }
+    if !crate::common::config::query_limits().hybrid_hot_scan_enabled {
+        return None;
+    }
+    if store.row_count() == 0 {
+        return None;
+    }
+    let covers_from = table_meta.hot_mirror_covers_from?;
+    let pk_idx = table_meta.get_partition_column_index()?;
+    let value = spec.eq_value_for_column(pk_idx)?;
+    let value_i64 = match value {
+        ScalarValue::Int32(Some(v)) => *v as i64,
+        ScalarValue::Int64(Some(v)) => *v,
+        _ => return None,
+    };
+    if value_i64 <= covers_from {
+        return None;
+    }
+    let partition_info = spec.partition_info.as_ref()?;
+    let partition_key =
+        super::partition::extract_partition_eq_value(spec, partition_info, table_meta)?;
+    if !memtable_mgr.hot_partition_mirrored(db, &spec.table_name, &partition_key) {
+        return None;
+    }
+    let column = table_meta.columns.get(pk_idx)?;
+    let covers = match column.data_type {
+        crate::protocol::types::DataType::Int32 => {
+            // A bound below the column's representable range means "covers
+            // everything", which i32::MIN expresses exactly; a bound above it
+            // cannot be represented and must not be approximated.
+            if covers_from > i32::MAX as i64 {
+                return None;
+            }
+            ScalarValue::Int32(Some(
+                covers_from.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+            ))
+        }
+        crate::protocol::types::DataType::Int64 => ScalarValue::Int64(Some(covers_from)),
+        _ => return None,
+    };
+    Some((pk_idx, covers))
+}
+
+fn spec_with_mirror_bound(
+    spec: &ScanSpec,
+    pk_idx: usize,
+    covers: &ScalarValue,
+    op: crate::storage::partition::pruning::RangeOp,
+) -> ScanSpec {
+    let mut bound_spec = spec.clone();
+    bound_spec
+        .range_predicates
+        .push(crate::storage::partition::pruning::RangeClause {
+            column_index: pk_idx,
+            op,
+            value: covers.clone(),
+        });
+    bound_spec
+}
+
+/// Hybrid partial-residency mirror leg: gather the rows the mirror owns
+/// (`partition_column > covers`) through the inverted index. The caller adds
+/// the complementary `<= covers` range clause to every non-mirror leg, so the
+/// two sides partition the table exactly with no overlap. Returns `None` when
+/// the gate declines or the scan has no key equality for the index gather.
+pub fn hybrid_hot_mirror_scan(
+    hot_mgr: &HotStoreManager,
+    memtable_mgr: &MemTableManager,
+    db: &str,
+    table_meta: &TableMeta,
+    spec: &ScanSpec,
+) -> Option<(RecordBatch, usize, ScalarValue)> {
+    let store = hot_mgr.get(db, &spec.table_name)?;
+    let (pk_idx, covers) = hybrid_hot_mirror_bound(&store, memtable_mgr, db, table_meta, spec)?;
+    let mirror_spec = spec_with_mirror_bound(
+        spec,
+        pk_idx,
+        &covers,
+        crate::storage::partition::pruning::RangeOp::Gt,
+    );
+    let batch = scan_hot_store_by_key(&store, &mirror_spec, 0)?;
+    Some((batch, pk_idx, covers))
+}
+
+/// Count counterpart of [`hybrid_hot_mirror_scan`].
+pub fn hybrid_hot_mirror_count(
+    hot_mgr: &HotStoreManager,
+    memtable_mgr: &MemTableManager,
+    db: &str,
+    table_meta: &TableMeta,
+    spec: &ScanSpec,
+) -> Option<(u64, usize, ScalarValue)> {
+    let store = hot_mgr.get(db, &spec.table_name)?;
+    let (pk_idx, covers) = hybrid_hot_mirror_bound(&store, memtable_mgr, db, table_meta, spec)?;
+    let mirror_spec = spec_with_mirror_bound(
+        spec,
+        pk_idx,
+        &covers,
+        crate::storage::partition::pruning::RangeOp::Gt,
+    );
+    let count = count_hot_store_by_key(&store, &mirror_spec, 0)?;
+    Some((count, pk_idx, covers))
+}
+
+/// The hot store may answer a partition scan alone only when it holds the
+/// partition's full row set: the store must mark the partition resident AND
+/// no write may have bypassed the hot-store mirror for it. The second check
+/// is what keeps the fast path correct after memtables have been flushed to
+/// segments — the flush itself does not invalidate residency because the
+/// flushed rows are mirrored, but a transaction delta / relaxed or bulk
+/// bypass write does (recorded by the writer as hot-unfed rows).
+fn resident_hot_covers(
+    store: &HotStore,
+    memtable_mgr: &MemTableManager,
+    db: &str,
+    table_meta: &TableMeta,
+    spec: &ScanSpec,
+) -> bool {
     let target_partition = if table_meta.is_partitioned() {
         let Some(pi) = spec.partition_info.as_ref() else {
             return false;
@@ -74,7 +208,14 @@ fn resident_hot_covers(store: &HotStore, table_meta: &TableMeta, spec: &ScanSpec
     } else {
         None
     };
-    store.is_resident_for_partition(target_partition.as_deref())
+    if !store.is_resident_for_partition(target_partition.as_deref()) {
+        return false;
+    }
+    memtable_mgr.hot_partition_mirrored(
+        db,
+        &spec.table_name,
+        target_partition.as_deref().unwrap_or(""),
+    )
 }
 
 pub fn scan_memtables(
@@ -83,7 +224,7 @@ pub fn scan_memtables(
     db: &str,
     table_name: &str,
     spec: &ScanSpec,
-) -> Vec<RecordBatch> {
+) -> crate::common::error::Result<Vec<RecordBatch>> {
     let memtables = memtable_mgr
         .get_readable_by_table(db, table_name)
         .into_iter()
@@ -97,9 +238,17 @@ pub fn scan_memtables(
     // = (rows ever appended to the store) - (rows still in live memtables); the
     // leading rows below that watermark have been flushed and are served by the
     // segment scan, so the gather here skips them. This prefix invariant holds
-    // for the single-active-partition ingestion pattern (e.g. today's ticks).
+    // for the single-active-partition ingestion pattern.
     let has_live_memtable_data = memtables.iter().any(|mt| mt.row_count() > 0);
-    if has_live_memtable_data && spec.reader_txn_id == 0 {
+    // The shortcut below replaces the memtable scan with hot-store rows above
+    // the watermark, which is only equivalent while every live memtable row is
+    // hot-fed. A committed transaction delta (or any other bypass write) lives
+    // in a memtable the store never mirrored; with one present, fall through
+    // to the plain memtable scan so those rows stay visible.
+    if has_live_memtable_data
+        && spec.reader_txn_id == 0
+        && memtable_mgr.hot_table_fully_mirrored(db, table_name)
+    {
         if let Some(store) = hot_mgr.get(db, table_name) {
             let (_, watermark) = live_memtables_and_watermark(
                 memtable_mgr,
@@ -109,7 +258,7 @@ pub fn scan_memtables(
                 &store,
             );
             if let Some(batch) = scan_hot_store_by_key(&store, spec, watermark) {
-                return vec![batch];
+                return Ok(vec![batch]);
             }
         }
     }
@@ -117,13 +266,54 @@ pub fn scan_memtables(
     let mut batches = Vec::new();
 
     for mt in &memtables {
+        // Deferred in-transaction DELETE/UPDATE tombstones for this memtable:
+        // the transaction's own readers must not see the doomed rows.
+        let txn_positions = if spec.reader_txn_id != 0 {
+            memtable_mgr
+                .txn_mutations()
+                .and_then(|registry| registry.memtable_positions(spec.reader_txn_id, mt.id()))
+        } else {
+            None
+        };
         if let Some(mt_batch) = mt
             .read_with(|source| {
                 if source.num_rows() == 0 {
                     return None;
                 }
 
-                let filtered = if spec.has_predicates() {
+                // Exactly one materialization per path: the txn-filtered
+                // batch is owned when present; the no-predicate path moves it
+                // (or clones the source once). The old code deep-cloned the
+                // source up front and cloned it again below.
+                let txn_filtered = match &txn_positions {
+                    Some(positions) => {
+                        match crate::storage::core::txn_mutations::filter_batch_excluding_positions(
+                            source, positions,
+                        ) {
+                            Ok(filtered) => Some(filtered),
+                            Err(e) => return Some(Err(e)),
+                        }
+                    }
+                    None => None,
+                };
+                let filtered = if let Some(txn_filtered) = txn_filtered {
+                    if spec.has_predicates() {
+                        match super::row_filter::apply_predicates(
+                            &txn_filtered,
+                            &spec.eq_predicates,
+                            &spec.range_predicates,
+                            &spec.in_predicates,
+                            spec.remaining_predicate.as_ref(),
+                        ) {
+                            Ok(filtered) => filtered,
+                            // Propagate: a failed predicate used to drop the
+                            // whole memtable batch from the result.
+                            Err(e) => return Some(Err(e)),
+                        }
+                    } else {
+                        txn_filtered
+                    }
+                } else if spec.has_predicates() {
                     match super::row_filter::apply_predicates(
                         source,
                         &spec.eq_predicates,
@@ -132,10 +322,7 @@ pub fn scan_memtables(
                         spec.remaining_predicate.as_ref(),
                     ) {
                         Ok(filtered) => filtered,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "memtable predicate evaluation failed");
-                            return None;
-                        }
+                        Err(e) => return Some(Err(e)),
                     }
                 } else {
                     source.clone()
@@ -146,14 +333,15 @@ pub fn scan_memtables(
                 }
 
                 let ordered = apply_order_if_cluster_prefix_matches(filtered, spec);
-                Some(if let Some(proj) = &spec.projection {
+                Some(Ok(if let Some(proj) = &spec.projection {
                     apply_projection(&ordered, proj)
                 } else {
                     ordered
-                })
+                }))
             })
             .flatten()
         {
+            let mt_batch = mt_batch?;
             if mt_batch.num_rows() == 0 {
                 continue;
             }
@@ -161,7 +349,7 @@ pub fn scan_memtables(
         }
     }
 
-    batches
+    Ok(batches)
 }
 
 /// Per-value inverted-index gather fast path. Triggered when the scan carries
@@ -332,10 +520,40 @@ pub fn count_memtable_rows(
     let mut total: u64 = 0;
 
     for mt in &memtables {
+        let txn_positions = if spec.reader_txn_id != 0 {
+            memtable_mgr
+                .txn_mutations()
+                .and_then(|registry| registry.memtable_positions(spec.reader_txn_id, mt.id()))
+        } else {
+            None
+        };
         if let Some(count) = mt.read_with(|mt_batch| {
             if mt_batch.num_rows() == 0 {
                 return 0;
             }
+
+            // Counting is read-only: work through a reference. The old
+            // committed-read branch deep-cloned the whole batch (all
+            // columns of every memtable, every count query) only to then
+            // use it by reference.
+            let filtered_holder;
+            let mt_batch: &RecordBatch = match &txn_positions {
+                Some(positions) => {
+                    match crate::storage::core::txn_mutations::filter_batch_excluding_positions(
+                        mt_batch, positions,
+                    ) {
+                        Ok(filtered) => {
+                            filtered_holder = filtered;
+                            &filtered_holder
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "memtable overlay filter failed");
+                            return 0;
+                        }
+                    }
+                }
+                None => mt_batch,
+            };
 
             if spec.eq_predicates.len() == 1
                 && spec.range_predicates.is_empty()

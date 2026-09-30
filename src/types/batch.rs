@@ -34,6 +34,11 @@ pub struct ColumnDef {
     pub column_id: u32,
     #[serde(default)]
     pub previous_names: Vec<String>,
+    /// Wall-clock instant (micros) the column was added by ALTER TABLE;
+    /// DEFAULT CURRENT_TIMESTAMP backfill for pre-existing rows pins to it
+    /// so repeated reads return the same value instead of "now".
+    #[serde(default)]
+    pub added_at_micros: Option<i64>,
 }
 
 impl ColumnDef {
@@ -46,6 +51,7 @@ impl ColumnDef {
             precision: 0,
             auto_increment: false,
             primary_key: false,
+            added_at_micros: None,
             default_value: None,
             column_id: 0,
             previous_names: Vec::new(),
@@ -204,6 +210,15 @@ impl RecordBatch {
             }
         }
         Ok(Self { schema, columns })
+    }
+
+    /// Materialize the selected rows (by absolute row positions) into a new
+    /// batch carrying this batch's schema. The single constructor for
+    /// change-event row images (deleted rows, post-update images) and the
+    /// deferred-DML row batches, so every path produces identical batches.
+    pub fn take_rows(&self, indices: &[u32]) -> Result<RecordBatch> {
+        let columns = self.columns.iter().map(|col| col.take(indices)).collect();
+        RecordBatch::try_new(self.schema.clone(), columns)
     }
 
     /// Returns the number of rows (assumes all columns have the same length).

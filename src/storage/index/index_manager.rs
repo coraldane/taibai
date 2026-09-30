@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -28,6 +29,13 @@ pub struct IndexManager {
     segment_mgr: Arc<SegmentManager>,
     data_dir: PathBuf,
     unique_index_compaction: Mutex<UniqueIndexCompactionSchedule>,
+    /// Unique/PK keys that explicit-transaction INSERT statements published
+    /// at statement time. Entries become visible to constraint probes before
+    /// COMMIT, so ROLLBACK must retract exactly these keys — otherwise the
+    /// next INSERT of the same key sees a phantom duplicate until the next
+    /// snapshot refresh. COMMIT only drops the record.
+    txn_published:
+        Mutex<HashMap<u64, HashMap<(String, String), Vec<(String, Vec<Vec<ScalarValue>>)>>>>,
 }
 
 #[derive(Default)]
@@ -48,6 +56,91 @@ impl IndexManager {
             segment_mgr,
             data_dir,
             unique_index_compaction: Mutex::new(UniqueIndexCompactionSchedule::default()),
+            txn_published: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Records the unique-index/PK keys a transactional INSERT just published,
+    /// so ROLLBACK can retract them (see `discard_txn_published_entries_at_rollback`).
+    pub fn record_txn_published_keys(
+        &self,
+        txn_id: u64,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        keys: Vec<Vec<ScalarValue>>,
+    ) {
+        if txn_id == 0 || keys.is_empty() {
+            return;
+        }
+        let mut guard = self.txn_published.lock().unwrap();
+        let per_table = guard.entry(txn_id).or_default();
+        let per_index = per_table
+            .entry((db.to_string(), table.to_string()))
+            .or_default();
+        if let Some(existing) = per_index.iter_mut().find(|(name, _)| name == index_name) {
+            existing.1.extend(keys);
+        } else {
+            per_index.push((index_name.to_string(), keys));
+        }
+    }
+
+    /// COMMIT path: the published entries are now authoritative, drop the
+    /// rollback record.
+    pub fn forget_txn_published_entries(&self, txn_id: u64) {
+        if txn_id == 0 {
+            return;
+        }
+        self.txn_published.lock().unwrap().remove(&txn_id);
+    }
+
+    /// Removes keys from the in-memory primary-key existence cache. Returns
+    /// false when the cache is absent or a key cannot be encoded, so callers
+    /// can fall back to dropping the whole cache.
+    pub fn remove_primary_keys(&self, db: &str, table: &str, keys: &[Vec<ScalarValue>]) -> bool {
+        let cache_key = format!("{}\0{}", db, table);
+        let mut indexes = self.primary_key_indexes.write().unwrap();
+        let Some(current) = indexes.get_mut(&cache_key) else {
+            return false;
+        };
+        for key in keys {
+            let Ok(encoded) = encode_unique_key(key) else {
+                return false;
+            };
+            current.remove(&encoded);
+        }
+        true
+    }
+
+    /// ROLLBACK path: retract the index entries this transaction published at
+    /// statement time. Key removal is precise and persisted (delta removal
+    /// records); when a snapshot cannot be maintained it is invalidated so
+    /// probes fall back to a full scan until the next rebuild — slow, never
+    /// wrong.
+    pub fn discard_txn_published_entries_at_rollback(&self, txn_id: u64) {
+        if txn_id == 0 {
+            return;
+        }
+        let Some(per_table) = self.txn_published.lock().unwrap().remove(&txn_id) else {
+            return;
+        };
+        for ((db, table), per_index) in per_table {
+            for (index_name, keys) in per_index {
+                let is_primary = index_name == PRIMARY_LOCATION_INDEX_NAME;
+                if is_primary && !self.remove_primary_keys(&db, &table, &keys) {
+                    self.invalidate_primary_key_cache(&db, &table);
+                }
+                match self.remove_unique_index_keys(&db, &table, &index_name, &keys) {
+                    Ok(true) => {}
+                    _ => {
+                        if is_primary {
+                            self.invalidate_primary_key_index(&db, &table);
+                        } else {
+                            self.invalidate_unique_index_snapshot(&db, &table, &index_name);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -84,10 +177,10 @@ impl IndexManager {
         self.persist_prepared_unique_index_data(db, table, index_name, data)
     }
 
-    /// Persist an already-prepared snapshot (entries and encoded keys aligned,
-    /// blocks built) without re-encoding or re-cloning it. Refresh and delta
-    /// compaction rewrite large snapshots through this path to keep peak
-    /// memory at one materialized copy plus the encoded bytes.
+    /// Persist an already-prepared snapshot (entries and encoded keys aligned)
+    /// by streaming it into the on-demand base format, then install a state
+    /// that reads that file lazily. Peak memory stays at the caller's prepared
+    /// snapshot; nothing re-encodes the whole index into one buffer.
     fn persist_prepared_unique_index_data(
         &self,
         db: &str,
@@ -101,17 +194,32 @@ impl IndexManager {
         let data_path = dir.join(format!("{}.keys.tbi", base));
         let data_tmp = data_path.with_extension("keys.tbi.tmp");
         let invalid_path = dir.join(format!("{}.invalid", base));
-        let data_bytes = encode_unique_index_data(&data)?;
-        std::fs::write(&data_tmp, data_bytes)?;
-        std::fs::rename(data_tmp, data_path)?;
+        let file = std::fs::File::create(&data_tmp)?;
+        let mut writer = UniqueIndexBaseWriter::new(
+            std::io::BufWriter::new(file),
+            db,
+            table,
+            index_name,
+            data.columns.clone(),
+        )?;
+        for (encoded, entry) in data.encoded_keys.iter().zip(&data.entries) {
+            writer.push_entry(encoded, &entry.location)?;
+        }
+        let buffered = writer.finish(data.flush_epoch, &data.segment_watermarks)?;
+        let file = buffered
+            .into_inner()
+            .map_err(|error| TaibaiError::Storage(error.to_string()))?;
+        file.sync_all()?;
+        std::fs::rename(&data_tmp, &data_path)?;
         let delta_path = dir.join(format!("{}.delta.tbi", base));
         let _ = std::fs::remove_file(delta_path);
         let _ = std::fs::remove_file(dir.join(format!("{}.progress.tbi", base)));
         let _ = std::fs::remove_file(invalid_path);
+        let base_reader = UniqueIndexBase::open(&data_path)?;
         self.unique_indexes.write().unwrap().insert(
             unique_index_key(db, table, index_name),
             Arc::new(UniqueIndexState::new(
-                data,
+                base_reader,
                 UniqueIndexDeltaState::default(),
             )),
         );
@@ -133,7 +241,7 @@ impl IndexManager {
             table: state.base.table.clone(),
             index_name: state.base.index_name.clone(),
             columns: state.base.columns.clone(),
-            key_count: state.base.entries.len() + delta.entry_count as usize,
+            key_count: state.base.entry_count + delta.entry_count as usize,
         }))
     }
 
@@ -147,6 +255,8 @@ impl IndexManager {
         if let Some(state) = self.unique_indexes.read().unwrap().get(&cache_key).cloned() {
             return Ok(Some(state));
         }
+        let t_load = std::time::Instant::now();
+        log_index_profile("load_state_cache_miss", 0, std::time::Duration::ZERO);
         let base = sanitize_file_component(index_name);
         let dir = self.unique_index_dir(db, table);
         if dir.join(format!("{}.invalid", base)).exists() {
@@ -156,13 +266,7 @@ impl IndexManager {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = std::fs::read(path)?;
-        let Some(mut data) = decode_unique_index_data(&bytes)? else {
-            return Ok(None);
-        };
-        if data.encoded_keys.len() != data.entries.len() {
-            prepare_unique_index_data(&mut data)?;
-        }
+        let base_reader = self.open_unique_index_base(&path)?;
         let delta_path = self
             .unique_index_dir(db, table)
             .join(format!("{}.delta.tbi", base));
@@ -174,9 +278,13 @@ impl IndexManager {
         let progress_path = dir.join(format!("{}.progress.tbi", base));
         let state = if progress_path.exists() {
             let progress = decode_unique_index_progress(&std::fs::read(progress_path)?);
-            Arc::new(UniqueIndexState::with_progress(data, delta, progress))
+            Arc::new(UniqueIndexState::with_progress(
+                base_reader,
+                delta,
+                progress,
+            ))
         } else {
-            Arc::new(UniqueIndexState::new(data, delta))
+            Arc::new(UniqueIndexState::new(base_reader, delta))
         };
         let current = self
             .unique_indexes
@@ -185,43 +293,33 @@ impl IndexManager {
             .entry(cache_key)
             .or_insert_with(|| Arc::clone(&state))
             .clone();
+        log_index_profile("load_state_full_decode", 0, t_load.elapsed());
         Ok(Some(current))
     }
 
-    fn materialize_unique_index_state(
-        &self,
-        db: &str,
-        table: &str,
-        index_name: &str,
-        state: &UniqueIndexState,
-    ) -> Result<UniqueIndexData> {
-        let (tombstones, removed_keys) = {
-            let delta = state.delta.read().unwrap();
-            (delta.tombstones.clone(), delta.removed_keys.clone())
+    /// Open a persisted base snapshot. On-demand (V6) files parse their
+    /// header and footer only, so a 500 MB index loads in microseconds and
+    /// stays resident at one small directory; legacy (V5) files fall back to
+    /// a full in-memory decode until the next compaction rewrites them.
+    fn open_unique_index_base(&self, path: &Path) -> Result<UniqueIndexBase> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let mut magic = [0u8; 8];
+        file.read_exact(&mut magic)?;
+        drop(file);
+        if magic == *UNIQUE_INDEX_MAGIC_V6 {
+            return UniqueIndexBase::open(path);
+        }
+        let bytes = std::fs::read(path)?;
+        let Some(mut data) = decode_unique_index_data(&bytes)? else {
+            return Err(TaibaiError::Storage(
+                "unsupported unique index version".to_string(),
+            ));
         };
-        let dir = self.unique_index_dir(db, table);
-        let base = sanitize_file_component(index_name);
-        let delta_path = dir.join(format!("{}.delta.tbi", base));
-        let delta_bytes = if delta_path.exists() {
-            std::fs::read(&delta_path)?
-        } else {
-            Vec::new()
-        };
-        materialize_unique_index_state_parts(&state.base, &delta_bytes, &tombstones, &removed_keys)
-    }
-
-    pub fn load_unique_index_data(
-        &self,
-        db: &str,
-        table: &str,
-        index_name: &str,
-    ) -> Result<Option<Arc<UniqueIndexData>>> {
-        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
-            return Ok(None);
-        };
-        Ok(Some(Arc::new(self.materialize_unique_index_state(
-            db, table, index_name, &state,
-        )?)))
+        if data.encoded_keys.len() != data.entries.len() {
+            prepare_unique_index_data(&mut data)?;
+        }
+        Ok(UniqueIndexBase::from_decoded(data))
     }
 
     pub fn unique_index_columns(
@@ -277,6 +375,7 @@ impl IndexManager {
         table: &str,
         keys: &[Vec<ScalarValue>],
     ) -> Result<bool> {
+        let t0 = std::time::Instant::now();
         let cache_key = format!("{}\0{}", db, table);
         let mut indexes = self.primary_key_indexes.write().unwrap();
         let Some(current) = indexes.get_mut(&cache_key) else {
@@ -285,6 +384,7 @@ impl IndexManager {
         for key in keys {
             current.insert(encode_unique_key(key)?);
         }
+        log_index_profile("append_pk_insert", keys.len(), t0.elapsed());
         Ok(true)
     }
 
@@ -300,19 +400,22 @@ impl IndexManager {
         self.invalidate_unique_index_snapshot_if_present(db, table, PRIMARY_LOCATION_INDEX_NAME);
     }
 
-    pub fn unique_key_exists(
+    /// Load the index state for a probe, incrementally refreshing it first
+    /// when it went stale against the table's memtable-flush epoch (a flush
+    /// after the snapshot was built may have moved rows into segments
+    /// without index entries). `Ok(None)` — no state, or the incremental
+    /// refresh could not run — makes the caller fall back to its
+    /// no-snapshot behavior. See `unique_keys_exist_if_current` for the
+    /// deliberately refresh-free variant used by the bulk write path.
+    fn fresh_unique_index_state(
         &self,
         db: &str,
         table: &str,
         index_name: &str,
-        key: &[ScalarValue],
-    ) -> Result<Option<bool>> {
+    ) -> Result<Option<Arc<UniqueIndexState>>> {
         let Some(mut state) = self.load_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
-        // Same staleness guard as unique_key_locations: a snapshot built
-        // before rows reached segments (memtable flush or direct append)
-        // misses live keys, so refresh it before probing.
         if state.progress_epoch() != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
             let Some(refreshed) =
                 self.refresh_stale_unique_index_state(db, table, index_name, &state)?
@@ -321,6 +424,19 @@ impl IndexManager {
             };
             state = refreshed;
         }
+        Ok(Some(state))
+    }
+
+    pub fn unique_key_exists(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        key: &[ScalarValue],
+    ) -> Result<Option<bool>> {
+        let Some(state) = self.fresh_unique_index_state(db, table, index_name)? else {
+            return Ok(None);
+        };
         let encoded = encode_unique_key(key)?;
         Ok(Some(unique_index_state_contains_key(
             &self.segment_mgr,
@@ -380,14 +496,25 @@ impl IndexManager {
                 })
                 .cloned());
         }
+        let prof_start = std::time::Instant::now();
         let progress_watermarks = state.progress_watermarks();
         let mut additions = Vec::new();
         let mut watermarks = HashMap::new();
+        let mut prof_scanned_rows: u64 = 0;
         let table_dir = self.data_dir.join(db).join(table);
         if table_dir.exists() {
             for seg_path in SegmentManager::discover_segments(&table_dir)? {
+                let reader_t = std::time::Instant::now();
                 let reader = self.segment_mgr.open_reader_cached(&seg_path)?;
                 let current_rows = reader.row_count();
+                let reader_open_us = reader_t.elapsed().as_micros() as u64;
+                if reader_open_us > 1000 {
+                    log_index_profile(
+                        "stale_reader_open",
+                        current_rows as usize,
+                        std::time::Duration::from_micros(reader_open_us),
+                    );
+                }
                 let segment_path = seg_path.to_string_lossy().to_string();
                 let watermark = progress_watermarks.get(&segment_path).copied().unwrap_or(0);
                 watermarks.insert(segment_path, current_rows);
@@ -415,7 +542,17 @@ impl IndexManager {
                     if rg_start + rg_rows <= watermark {
                         continue;
                     }
+                    let rg_t = std::time::Instant::now();
                     let batch = reader.read_row_group_with_projection(rg_idx, &indices)?;
+                    prof_scanned_rows += batch.num_rows() as u64;
+                    let rg_us = rg_t.elapsed().as_micros() as u64;
+                    if rg_us > 5000 {
+                        log_index_profile(
+                            "stale_rg_read",
+                            batch.num_rows(),
+                            std::time::Duration::from_micros(rg_us),
+                        );
+                    }
                     let delete_bitmap = reader.delete_bitmap();
                     for row_idx in 0..batch.num_rows() {
                         let row_id = rg_start + row_idx as u64;
@@ -436,11 +573,24 @@ impl IndexManager {
                 }
             }
         }
+        log_index_profile(
+            "stale_scan_total",
+            prof_scanned_rows as usize,
+            prof_start.elapsed(),
+        );
+        let prep_t = std::time::Instant::now();
         let prepared_additions = self.prepare_unique_index_entries(additions)?;
+        log_index_profile("stale_prepare", prepared_additions.len(), prep_t.elapsed());
         let delta_path = self
             .unique_index_dir(db, table)
             .join(format!("{}.delta.tbi", sanitize_file_component(index_name)));
+        let delta_t = std::time::Instant::now();
         append_prepared_unique_index_delta(&delta_path, &prepared_additions)?;
+        log_index_profile(
+            "stale_delta_append",
+            prepared_additions.len(),
+            delta_t.elapsed(),
+        );
         let delta_count = {
             let mut delta = state.delta.write().unwrap();
             for addition in prepared_additions {
@@ -456,9 +606,20 @@ impl IndexManager {
                 .saturating_add(delta.tombstones.len() as u64)
         };
         let needs_compaction =
-            unique_index_delta_needs_compaction(delta_count, state.base.entries.len());
+            unique_index_delta_needs_compaction(delta_count, state.base.entry_count);
         state.set_progress(Some(epoch_before), watermarks);
+        let prog_t = std::time::Instant::now();
         self.persist_unique_index_progress(db, table, index_name)?;
+        log_index_profile(
+            "stale_progress_persist",
+            delta_count as usize,
+            prog_t.elapsed(),
+        );
+        log_index_profile(
+            "stale_needs_compaction",
+            if needs_compaction { 1 } else { 0 },
+            std::time::Duration::ZERO,
+        );
         drop(_mutation_guard);
         if needs_compaction {
             self.try_dispatch_unique_index_compaction(db, table, index_name, state);
@@ -496,42 +657,40 @@ impl IndexManager {
         table: &str,
         index_name: &str,
     ) -> Result<()> {
+        let t0 = std::time::Instant::now();
         let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
+            log_index_profile("refresh_no_state", 0, t0.elapsed());
             return Ok(());
         };
         if state.progress_epoch() == Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
+            log_index_profile("refresh_current", 0, t0.elapsed());
             return Ok(());
         }
+        let t1 = std::time::Instant::now();
         self.refresh_stale_unique_index_state(db, table, index_name, &state)?;
+        log_index_profile("refresh_stale", 0, t1.elapsed());
         Ok(())
     }
 
-    pub fn unique_key_locations(
+    /// `keys` is generic so callers can pass a slice, a `HashSet` of keys, or
+    /// an empty iterator without cloning the key set into a `Vec` first.
+    pub fn unique_key_locations<I>(
         &self,
         db: &str,
         table: &str,
         index_name: &str,
-        keys: &[Vec<ScalarValue>],
-    ) -> Result<Option<Vec<UniqueRowLocation>>> {
-        let Some(mut state) = self.load_unique_index_state(db, table, index_name)? else {
+        keys: I,
+    ) -> Result<Option<Vec<UniqueRowLocation>>>
+    where
+        I: IntoIterator,
+        I::Item: std::borrow::Borrow<Vec<ScalarValue>>,
+    {
+        let Some(state) = self.fresh_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
-        // A memtable flush after this snapshot was built may have moved rows
-        // into segments without index entries. Incrementally refresh the
-        // snapshot (scanning only rows appended past its per-segment
-        // watermarks) instead of forcing a full rebuild; fall back to the
-        // rebuild path only when the incremental refresh is not possible.
-        if state.progress_epoch() != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
-            let Some(refreshed) =
-                self.refresh_stale_unique_index_state(db, table, index_name, &state)?
-            else {
-                return Ok(None);
-            };
-            state = refreshed;
-        }
         let encoded_keys = keys
-            .iter()
-            .map(|key| encode_unique_key(key))
+            .into_iter()
+            .map(|key| encode_unique_key(key.borrow()))
             .collect::<Result<Vec<_>>>()?;
         let mut locations = {
             let delta = state.delta.read().unwrap();
@@ -551,26 +710,12 @@ impl IndexManager {
                             .cloned(),
                     );
                 }
-                let Ok(mut idx) = state
-                    .base
-                    .encoded_keys
-                    .binary_search_by(|value| value.as_slice().cmp(encoded))
-                else {
-                    continue;
-                };
-                while idx > 0 && state.base.encoded_keys[idx - 1] == *encoded {
-                    idx -= 1;
-                }
-                while idx < state.base.encoded_keys.len()
-                    && state.base.encoded_keys[idx] == *encoded
-                {
-                    let location = &state.base.entries[idx].location;
+                for location in state.base.find_locations(encoded)? {
                     if !location.segment_path.is_empty()
-                        && !unique_index_tombstones_contains(&delta.tombstones, location)
+                        && !unique_index_tombstones_contains(&delta.tombstones, &location)
                     {
-                        locations.push(location.clone());
+                        locations.push(location);
                     }
-                    idx += 1;
                 }
             }
             locations
@@ -605,35 +750,64 @@ impl IndexManager {
         Ok(Some(locations))
     }
 
-    pub fn unique_keys_exist(
+    /// Generic for the same reason as [`unique_key_locations`].
+    pub fn unique_keys_exist<I>(
         &self,
         db: &str,
         table: &str,
         index_name: &str,
-        keys: &[Vec<ScalarValue>],
-    ) -> Result<Option<bool>> {
-        let Some(mut state) = self.load_unique_index_state(db, table, index_name)? else {
+        keys: I,
+    ) -> Result<Option<bool>>
+    where
+        I: IntoIterator,
+        I::Item: std::borrow::Borrow<Vec<ScalarValue>>,
+    {
+        let Some(state) = self.fresh_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
-        // Same staleness guard as unique_key_locations, resolved by the same
-        // incremental refresh; a full rebuild is only needed when the refresh
-        // cannot run.
+        Self::state_contains_any_encoded_key(&self.segment_mgr, state, keys)
+    }
+
+    pub fn unique_keys_exist_if_current<I>(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        keys: I,
+    ) -> Result<Option<bool>>
+    where
+        I: IntoIterator,
+        I::Item: std::borrow::Borrow<Vec<ScalarValue>>,
+    {
+        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
+            return Ok(None);
+        };
         if state.progress_epoch() != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
-            let Some(refreshed) =
-                self.refresh_stale_unique_index_state(db, table, index_name, &state)?
-            else {
-                return Ok(None);
-            };
-            state = refreshed;
+            // Stale state: a synchronous refresh can cost a full-table
+            // scan, which a bulk import must not pay on its write path.
+            // Post-write index refresh keeps uniqueness tracked either way.
+            return Ok(None);
         }
+        Self::state_contains_any_encoded_key(&self.segment_mgr, state, keys)
+    }
+
+    fn state_contains_any_encoded_key<I>(
+        segment_mgr: &SegmentManager,
+        state: Arc<UniqueIndexState>,
+        keys: I,
+    ) -> Result<Option<bool>>
+    where
+        I: IntoIterator,
+        I::Item: std::borrow::Borrow<Vec<ScalarValue>>,
+    {
         let mut encoded_keys = keys
-            .iter()
-            .map(|key| encode_unique_key(key))
+            .into_iter()
+            .map(|key| encode_unique_key(key.borrow()))
             .collect::<Result<Vec<_>>>()?;
         encoded_keys.sort();
         encoded_keys.dedup();
         Ok(Some(unique_index_state_contains_any_key(
-            &self.segment_mgr,
+            segment_mgr,
             &state,
             &encoded_keys,
         )?))
@@ -702,7 +876,7 @@ impl IndexManager {
                     .entry_count
                     .saturating_add(delta.tombstones.len() as u64)
             };
-            unique_index_delta_needs_compaction(delta_count, state.base.entries.len())
+            unique_index_delta_needs_compaction(delta_count, state.base.entry_count)
         };
         if needs_compaction {
             self.try_dispatch_unique_index_compaction(db, table, index_name, &state);
@@ -763,7 +937,7 @@ impl IndexManager {
             };
             unique_index_delta_needs_compaction(
                 delta_count.0.saturating_add(delta_count.1),
-                state.base.entries.len(),
+                state.base.entry_count,
             )
         };
         if needs_compaction {
@@ -832,7 +1006,7 @@ impl IndexManager {
                     .entry_count
                     .saturating_add(delta.tombstones.len() as u64)
             };
-            unique_index_delta_needs_compaction(delta_count, state.base.entries.len())
+            unique_index_delta_needs_compaction(delta_count, state.base.entry_count)
         };
         if needs_compaction {
             self.try_dispatch_unique_index_compaction(db, table, index_name, &state);
@@ -925,5 +1099,16 @@ impl Default for IndexManager {
         let segment_mgr = SegmentManager::new(std::path::Path::new("/tmp/taibai_default"))
             .expect("failed to create default SegmentManager");
         Self::new(Arc::new(segment_mgr))
+    }
+}
+
+fn log_index_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
+    if crate::common::config::insert_profile_enabled() {
+        println!(
+            "[insert-profile] stage=index_{} rows={} elapsed_us={}",
+            stage,
+            rows,
+            elapsed.as_micros()
+        );
     }
 }

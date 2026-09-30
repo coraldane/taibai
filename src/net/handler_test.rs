@@ -1,5 +1,6 @@
 use super::*;
 use crate::storage::segment_manager::SegmentManager;
+use std::sync::atomic::AtomicBool;
 
 #[test]
 fn heartbeat_query_classifier_only_matches_select_one() {
@@ -26,6 +27,12 @@ fn heartbeat_query_classifier_only_matches_select_one() {
 
 #[test]
 fn query_log_classifier_only_tracks_result_set_queries() {
+    // The classifier short-circuits when the query log is disabled; enable a
+    // throwaway log so the classification logic is exercised.
+    let log_dir = tempfile::TempDir::new().expect("temp dir");
+    crate::common::query_log::init(&log_dir.path().join("queries.log"), 16)
+        .expect("init query log");
+
     for sql in [
         "SELECT * FROM metrics",
         "select * from metrics",
@@ -122,7 +129,9 @@ fn streaming_query_stops_when_chunk_receiver_is_dropped() {
     let responses = handler
         .handle_message_cancellable(
             Message::new(MSG_TYPE_QUERY, Bytes::from(payload)),
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::common::query_cancel::QueryContext::new(Arc::new(
+                AtomicBool::new(false),
+            ))),
             Some(sender),
         )
         .unwrap();
@@ -166,7 +175,9 @@ fn streaming_query_emits_chunks_and_end_marker() {
     let responses = handler
         .handle_message_cancellable(
             Message::new(MSG_TYPE_QUERY, Bytes::from(payload)),
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::common::query_cancel::QueryContext::new(Arc::new(
+                AtomicBool::new(false),
+            ))),
             Some(sender),
         )
         .unwrap();
@@ -448,8 +459,8 @@ fn bulk_import_mode_is_reference_counted_across_connections() {
     let dir = tempfile::TempDir::new().unwrap();
     let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
     let config = Arc::new(ServerConfig::default());
-    let mut first = logged_in_handler(Arc::clone(&config), Arc::clone(&engine), "first");
-    let mut second = logged_in_handler(config, Arc::clone(&engine), "second");
+    let mut first = logged_in_handler(Arc::clone(&config), Arc::clone(&engine), "root");
+    let mut second = logged_in_handler(config, Arc::clone(&engine), "admin");
 
     ok_rows(&first.handle_start_bulk_import("START BULK IMPORT").unwrap());
     assert!(engine.is_bulk_mode());
@@ -482,8 +493,8 @@ fn bulk_import_disconnect_releases_only_that_connection() {
     let dir = tempfile::TempDir::new().unwrap();
     let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
     let config = Arc::new(ServerConfig::default());
-    let mut first = logged_in_handler(Arc::clone(&config), Arc::clone(&engine), "first");
-    let mut second = logged_in_handler(config, Arc::clone(&engine), "second");
+    let mut first = logged_in_handler(Arc::clone(&config), Arc::clone(&engine), "root");
+    let mut second = logged_in_handler(config, Arc::clone(&engine), "admin");
 
     ok_rows(&first.handle_start_bulk_import("START BULK IMPORT").unwrap());
     ok_rows(
@@ -1130,6 +1141,12 @@ fn prepare_insert_returns_decimal_target_scale() {
 
 impl Handler {
     pub fn handle_message(&mut self, msg: Message) -> Result<Vec<Message>> {
-        self.handle_message_cancellable(msg, Arc::new(AtomicBool::new(false)), None)
+        self.handle_message_cancellable(
+            msg,
+            Arc::new(crate::common::query_cancel::QueryContext::new(Arc::new(
+                AtomicBool::new(false),
+            ))),
+            None,
+        )
     }
 }

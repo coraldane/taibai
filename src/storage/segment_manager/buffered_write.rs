@@ -1,20 +1,10 @@
 impl SegmentManager {
-    pub fn bulk_insert_batch(
-        &self,
-        db: &str,
-        table: &str,
-        batch: RecordBatch,
-    ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_owned_inner(db, table, "", batch, true)
+    pub fn bulk_insert_batch(&self, db: &str, table: &str, batch: RecordBatch) -> Result<u64> {
+        self.bulk_insert_batch_with_partition_owned_inner(db, table, "", batch, true, false)
     }
 
-    pub fn bulk_insert_batch_ref(
-        &self,
-        db: &str,
-        table: &str,
-        batch: &RecordBatch,
-    ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_inner(db, table, "", batch, true)
+    pub fn bulk_insert_batch_ref(&self, db: &str, table: &str, batch: &RecordBatch) -> Result<u64> {
+        self.bulk_insert_batch_with_partition_inner(db, table, "", batch, true, false)
     }
 
     pub fn bulk_insert_batch_with_partition(
@@ -30,6 +20,7 @@ impl SegmentManager {
             partition_key,
             batch,
             true,
+            false,
         )
     }
 
@@ -40,6 +31,7 @@ impl SegmentManager {
         partition_key: &str,
         batch: RecordBatch,
         flush_immediately: bool,
+        pubsub_deferred: bool,
     ) -> Result<u64> {
         let row_count = batch.num_rows() as u64;
         if row_count == 0 {
@@ -49,7 +41,9 @@ impl SegmentManager {
         std::fs::create_dir_all(&table_dir)?;
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
-        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        let partition_lock = partition_mutation_lock_arc(&state, partition_key);
+        let _partition_guard =
+            acquire_partition_mutation_lock(&state, &partition_lock, &key, partition_key)?;
         ensure_state_not_retired(&state, db, table)?;
 
         self.append_batch_with_partition_owned_locked(
@@ -58,8 +52,9 @@ impl SegmentManager {
             partition_key,
             batch,
             flush_immediately,
+            pubsub_deferred,
         )?;
-        self.note_direct_segment_append(db, table);
+        self.note_segments_changed(db, table);
         Ok(row_count)
     }
 
@@ -70,6 +65,7 @@ impl SegmentManager {
         partition_key: &str,
         batch: &RecordBatch,
         flush_immediately: bool,
+        pubsub_deferred: bool,
     ) -> Result<u64> {
         let row_count = batch.num_rows() as u64;
         if row_count == 0 {
@@ -79,7 +75,9 @@ impl SegmentManager {
         std::fs::create_dir_all(&table_dir)?;
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
-        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        let partition_lock = partition_mutation_lock_arc(&state, partition_key);
+        let _partition_guard =
+            acquire_partition_mutation_lock(&state, &partition_lock, &key, partition_key)?;
         ensure_state_not_retired(&state, db, table)?;
 
         self.append_batch_with_partition_locked(
@@ -88,9 +86,10 @@ impl SegmentManager {
             partition_key,
             batch,
             flush_immediately,
+            pubsub_deferred,
         )?;
 
-        self.note_direct_segment_append(db, table);
+        self.note_segments_changed(db, table);
         Ok(row_count)
     }
 
@@ -115,7 +114,9 @@ impl SegmentManager {
 
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
-        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        let partition_lock = partition_mutation_lock_arc(&state, partition_key);
+        let _partition_guard =
+            acquire_partition_mutation_lock(&state, &partition_lock, &key, partition_key)?;
         ensure_state_not_retired(&state, db, table)?;
         self.flush_memtable_batch_under_table_lock_inner(
             db,
@@ -160,12 +161,17 @@ impl SegmentManager {
         }
 
         let unsealed = if partition_key.is_empty() {
-            Self::find_unsealed_segment(&table_dir, self.min_segment_seal_size())?
+            Self::find_unsealed_segment(
+                &table_dir,
+                self.min_segment_seal_size(),
+                &state.sealing_paths(),
+            )?
         } else {
             Self::find_unsealed_partition_segment(
                 &table_dir,
                 partition_key,
                 self.min_segment_seal_size(),
+                &state.sealing_paths(),
             )?
         };
         if let Some((seg_path, existing_schema, existing_rows)) = unsealed {
@@ -181,9 +187,7 @@ impl SegmentManager {
         path.file_name()
             .and_then(|name| name.to_str())
             .map(str::to_string)
-            .ok_or_else(|| {
-                TaibaiError::Storage("active segment path has no file name".into())
-            })
+            .ok_or_else(|| TaibaiError::Storage("active segment path has no file name".into()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -223,7 +227,7 @@ impl SegmentManager {
         partition_key: &str,
         batch: &RecordBatch,
         _txn_id: u64,
-        state: &TableSegmentState,
+        state: &Arc<TableSegmentState>,
         should_write: impl FnOnce() -> bool,
         on_written: impl FnOnce(),
     ) -> Result<bool> {
@@ -234,7 +238,14 @@ impl SegmentManager {
         let table_dir = self.data_dir.join(db).join(table);
         std::fs::create_dir_all(&table_dir)?;
         let _visibility = state.flush_visibility.write().unwrap();
-        self.append_batch_with_partition_locked(&table_dir, state, partition_key, batch, true)?;
+        self.append_batch_with_partition_locked(
+            &table_dir,
+            state,
+            partition_key,
+            batch,
+            true,
+            false,
+        )?;
         Self::sleep_flush_transition_delay();
         on_written();
         Ok(true)
@@ -243,11 +254,13 @@ impl SegmentManager {
     fn append_batch_with_partition_locked(
         &self,
         table_dir: &Path,
-        state: &TableSegmentState,
+        state: &Arc<TableSegmentState>,
         partition_key: &str,
         batch: &RecordBatch,
         flush_immediately: bool,
+        pubsub_deferred: bool,
     ) -> Result<()> {
+        let mut pending_seal = None;
         {
             let mut active_guard = state.active_segments.lock().unwrap();
             self.get_or_create_active_segment_for_partition_locked(
@@ -255,14 +268,17 @@ impl SegmentManager {
                 &batch.schema,
                 partition_key,
                 &mut active_guard,
+                &state.sealing_paths(),
             )?;
 
             let seg = active_guard.get_mut(partition_key).unwrap();
-            seg.append_batch(batch, &|path| self.invalidate_reader(path))?;
+            seg.append_batch(batch, pubsub_deferred, &|path| self.invalidate_reader(path))?;
 
             if seg.current_size >= self.max_segment_size() {
-                seg.seal(&|path| self.invalidate_reader(path))?;
-                active_guard.remove(partition_key);
+                if let Some(seg) = active_guard.remove(partition_key) {
+                    state.register_sealing_segment(partition_key, seg.path.clone());
+                    pending_seal = Some(PendingSeal::new(Arc::clone(state), partition_key, seg));
+                }
             } else if flush_immediately && (seg.buffered_rows > 0 || seg.total_rows > 0) {
                 seg.flush_buffer(&|path| self.invalidate_reader(path))?;
                 seg.flush_meta(&|path| self.invalidate_reader(path))?;
@@ -277,6 +293,14 @@ impl SegmentManager {
                 seg.flush_visible_footer(&|path| self.invalidate_reader(path))?;
             }
         }
+        if let Some(mut pending) = pending_seal {
+            let result = pending.writer.seal(&|path| self.invalidate_reader(path));
+            if result.is_ok() {
+                self.emit_segment_update_final_path(&pending.writer.path);
+            }
+            drop(pending.token);
+            result?;
+        }
         Ok(())
     }
 
@@ -286,18 +310,20 @@ impl SegmentManager {
         schema: &Schema,
         partition_key: &str,
         active_guard: &mut std::sync::MutexGuard<HashMap<String, ActiveSegmentWriter>>,
+        sealing: &HashSet<PathBuf>,
     ) -> Result<()> {
         if active_guard.contains_key(partition_key) {
             return Ok(());
         }
 
         let unsealed = if partition_key.is_empty() {
-            Self::find_unsealed_segment(table_dir, self.min_segment_seal_size())?
+            Self::find_unsealed_segment(table_dir, self.min_segment_seal_size(), sealing)?
         } else {
             Self::find_unsealed_partition_segment(
                 table_dir,
                 partition_key,
                 self.min_segment_seal_size(),
+                sealing,
             )?
         };
 
@@ -367,6 +393,10 @@ impl SegmentManager {
             sidecar_row_groups_flushed: 0,
             last_write_at: Instant::now(),
             row_group_target_rows: self.config.row_group_target_rows.max(1),
+            pubsub: self.pubsub(),
+            pending_publish: Vec::new(),
+            pubsub_deferred_ranges: Vec::new(),
+            compression_level: self.table_compression_level_for_path(table_dir)?,
         })
     }
 
@@ -398,11 +428,20 @@ impl SegmentManager {
             buffered_rows: 0,
             dirty_meta: false,
             data_end: SEGMENT_HEADER_SIZE as u64,
+            pubsub: None,
+            pending_publish: Vec::new(),
+            pubsub_deferred_ranges: Vec::new(),
             sidecar_row_groups_flushed: 0,
             last_write_at: Instant::now(),
             row_group_target_rows: self.config.row_group_target_rows.max(1),
+            compression_level: self.table_compression_level_for_path(path)?,
         };
-        writer.append_batch(batch, &|segment_path| self.invalidate_reader(segment_path))?;
+        writer.append_batch(batch, false, &|segment_path| {
+            self.invalidate_reader(segment_path)
+        })?;
+        // NOTE: no replication emission here - this writer writes a TMP file
+        // that the caller renames; the flush sites emit the SegmentUpdate
+        // with the final name after the rename.
         writer.seal(&|segment_path| self.invalidate_reader(segment_path))?;
         Ok(())
     }
@@ -410,38 +449,50 @@ impl SegmentManager {
     fn append_batch_with_partition_owned_locked(
         &self,
         table_dir: &Path,
-        state: &TableSegmentState,
+        state: &Arc<TableSegmentState>,
         partition_key: &str,
         batch: RecordBatch,
         flush_immediately: bool,
+        pubsub_deferred: bool,
     ) -> Result<()> {
         let schema = batch.schema.clone();
-        let mut active_guard = state.active_segments.lock().unwrap();
-        self.get_or_create_active_segment_for_partition_locked(
-            table_dir,
-            &schema,
-            partition_key,
-            &mut active_guard,
-        )?;
+        let mut pending_seal = None;
+        {
+            let mut active_guard = state.active_segments.lock().unwrap();
+            self.get_or_create_active_segment_for_partition_locked(
+                table_dir,
+                &schema,
+                partition_key,
+                &mut active_guard,
+                &state.sealing_paths(),
+            )?;
 
-        let seg = active_guard.get_mut(partition_key).unwrap();
-        seg.append_batch_owned(batch, &|path| self.invalidate_reader(path))?;
+            let seg = active_guard.get_mut(partition_key).unwrap();
+            seg.append_batch_owned(batch, pubsub_deferred, &|path| self.invalidate_reader(path))?;
 
-        if seg.current_size >= self.max_segment_size() {
-            seg.seal(&|path| self.invalidate_reader(path))?;
-            active_guard.remove(partition_key);
-        } else if flush_immediately && (seg.buffered_rows > 0 || seg.total_rows > 0) {
-            seg.flush_buffer(&|path| self.invalidate_reader(path))?;
-            seg.flush_meta(&|path| self.invalidate_reader(path))?;
-        } else if !flush_immediately {
-            if seg.buffered_rows > 0 {
+            if seg.current_size >= self.max_segment_size() {
+                if let Some(seg) = active_guard.remove(partition_key) {
+                    state.register_sealing_segment(partition_key, seg.path.clone());
+                    pending_seal = Some(PendingSeal::new(Arc::clone(state), partition_key, seg));
+                }
+            } else if flush_immediately && (seg.buffered_rows > 0 || seg.total_rows > 0) {
                 seg.flush_buffer(&|path| self.invalidate_reader(path))?;
+                seg.flush_meta(&|path| self.invalidate_reader(path))?;
+            } else if !flush_immediately {
+                if seg.buffered_rows > 0 {
+                    seg.flush_buffer(&|path| self.invalidate_reader(path))?;
+                }
+            } else if seg.buffered_rows > 0 {
+                seg.flush_buffer(&|path| self.invalidate_reader(path))?;
+                seg.flush_visible_footer(&|path| self.invalidate_reader(path))?;
+            } else {
+                seg.flush_visible_footer(&|path| self.invalidate_reader(path))?;
             }
-        } else if seg.buffered_rows > 0 {
-            seg.flush_buffer(&|path| self.invalidate_reader(path))?;
-            seg.flush_visible_footer(&|path| self.invalidate_reader(path))?;
-        } else {
-            seg.flush_visible_footer(&|path| self.invalidate_reader(path))?;
+        }
+        if let Some(mut pending) = pending_seal {
+            let result = pending.writer.seal(&|path| self.invalidate_reader(path));
+            drop(pending.token);
+            result?;
         }
         Ok(())
     }
@@ -450,17 +501,19 @@ impl SegmentManager {
         table_dir: &Path,
         partition_key: &str,
         min_seal_size: u64,
+        exclude: &HashSet<PathBuf>,
     ) -> Result<Option<(PathBuf, Schema, u64)>> {
-        let _pattern = format!("p{}_*", partition_key);
+        let prefix = format!("p{}_", partition_key);
         let segments: Vec<PathBuf> = if let Ok(entries) = std::fs::read_dir(table_dir) {
             entries
                 .filter_map(|e| e.ok())
                 .filter(|e| {
                     let file_name = e.file_name();
                     let name = file_name.to_string_lossy();
-                    name.starts_with(&format!("p{}", partition_key))
-                        && name.ends_with(".dat")
-                        && name.contains('_')
+                    // The `_` separator is load-bearing: without it partition
+                    // "1" matches partition "10"'s segment (p1 vs p10) and
+                    // recovers a file another writer owns.
+                    name.starts_with(&prefix) && name.ends_with(".dat")
                 })
                 .map(|e| e.path())
                 .collect()
@@ -469,6 +522,9 @@ impl SegmentManager {
         };
 
         for seg_path in segments.iter().rev() {
+            if exclude.contains(seg_path) {
+                continue;
+            }
             let file_len = match std::fs::metadata(seg_path) {
                 Ok(m) => m.len(),
                 Err(_) => continue,
@@ -508,7 +564,11 @@ impl SegmentManager {
         let reader = SegmentReader::open_owned(seg_path)?;
         let data_end = reader.data_end();
 
-        let row_groups = reader.footer_row_groups_info();
+        // Recovery rehydrates the writer's row-group metadata once per
+        // recovered segment — the deep clone is fine here (not per row-group
+        // read); use the borrowed accessor and clone only what the writer
+        // takes ownership of.
+        let row_groups = reader.footer_row_groups().to_vec();
 
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -542,6 +602,10 @@ impl SegmentManager {
             sidecar_row_groups_flushed: 0,
             last_write_at: Instant::now(),
             row_group_target_rows: self.config.row_group_target_rows.max(1),
+            pubsub: self.pubsub(),
+            pending_publish: Vec::new(),
+            pubsub_deferred_ranges: Vec::new(),
+            compression_level: self.table_compression_level_for_path(seg_path)?,
         }))
     }
 }

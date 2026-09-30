@@ -6,11 +6,12 @@ members = [
     "examples/prepare_test",
     "examples/hot_insert",
     "examples/query_bench",
+    "examples/pubsub_demo",
 ]
 
 [package]
 name = "taibai"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 autotests = false
 description = "An experimental Rust columnar database server for analytical workloads"
@@ -31,6 +32,18 @@ path = "src/main.rs"
 name = "segment"
 path = "src/bin/segment_checker.rs"
 
+[[bin]]
+name = "migrate"
+path = "src/bin/migrate.rs"
+
+[[bin]]
+name = "backup"
+path = "src/bin/backup.rs"
+
+[[test]]
+name = "replication_test"
+path = "tests/replication_test.rs"
+
 
 
 [dependencies]
@@ -44,7 +57,7 @@ uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 serde_yaml = "0.9"
 crc32fast = "1.4"
@@ -59,6 +72,10 @@ rayon = "1.10"
 chrono = "0.4"
 windows-service = "0.7"
 csv = "1"
+# Password credential hashing (Argon2id, PHC string format).
+argon2 = "0.5"
+# Salt generation for argon2 (OsRng needs the getrandom feature).
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -71,8 +88,16 @@ name = "concurrency_stability_test"
 path = "tests/concurrency_stability_test.rs"
 
 [[test]]
+name = "transaction_dml_test"
+path = "tests/transaction_dml_test.rs"
+
+[[test]]
 name = "constraints_test"
 path = "tests/constraints_test.rs"
+
+[[test]]
+name = "cte_set_operations_test"
+path = "tests/cte_set_operations_test.rs"
 
 [[test]]
 name = "data_types_test"
@@ -115,6 +140,10 @@ name = "segment_sidecar_meta_test"
 path = "tests/segment_sidecar_meta_test.rs"
 
 [[test]]
+name = "update_test"
+path = "tests/update_test.rs"
+
+[[test]]
 name = "topn_offset_test"
 path = "tests/topn_offset_test.rs"
 
@@ -123,12 +152,16 @@ name = "transaction_integration_test"
 path = "tests/transaction_integration_test.rs"
 
 [[test]]
-name = "dml_modify_integration_test"
-path = "tests/update_test.rs"
-
-[[test]]
 name = "hot_store_fast_path_test"
 path = "tests/hot_store_fast_path_test.rs"
+
+[[test]]
+name = "hybrid_hot_mirror_test"
+path = "tests/hybrid_hot_mirror_test.rs"
+
+[[test]]
+name = "hybrid_bench_test"
+path = "tests/hybrid_bench_test.rs"
 
 [[test]]
 name = "aggregate_streaming_test"
@@ -170,4 +203,69 @@ path = "tests/subquery_derived_table_test.rs"
 name = "realtime_write_scaling_test"
 path = "tests/realtime_write_scaling_test.rs"
 
+[[test]]
+name = "vectorized_expr_bench_test"
+path = "tests/vectorized_expr_bench_test.rs"
 
+[[test]]
+name = "aggregate_group_bench_test"
+path = "tests/aggregate_group_bench_test.rs"
+
+[[test]]
+name = "join_probe_bench_test"
+path = "tests/join_probe_bench_test.rs"
+
+[[test]]
+name = "asof_join_test"
+path = "tests/asof_join_test.rs"
+
+[[test]]
+name = "cluster_composite_test"
+path = "tests/cluster_composite_test.rs"
+
+[[test]]
+name = "ttl_purge_test"
+path = "tests/ttl_purge_test.rs"
+
+[[test]]
+name = "window_function_test"
+path = "tests/window_function_test.rs"
+
+[[test]]
+name = "hot_store_bench_test"
+path = "tests/hot_store_bench_test.rs"
+
+[[test]]
+name = "bulk_encoding_bench_test"
+path = "tests/bulk_encoding_bench_test.rs"
+
+
+
+[[test]]
+name = "pubsub_test"
+path = "tests/pubsub_test.rs"
+
+[[test]]
+name = "pubsub_v2_test"
+path = "tests/pubsub_v2_test.rs"
+
+[[test]]
+name = "pubsub_overhead_bench_test"
+path = "tests/pubsub_overhead_bench_test.rs"
+
+[[test]]
+name = "pubsub_delivery_test"
+path = "tests/pubsub_delivery_test.rs"
+
+[[test]]
+name = "run_intersection_aggregate_test"
+path = "tests/run_intersection_aggregate_test.rs"
+
+
+[[test]]
+name = "direct_bulk_multi_session_test"
+path = "tests/direct_bulk_multi_session_test.rs"
+
+[[test]]
+name = "join_fast_path_test"
+path = "tests/join_fast_path_test.rs"
