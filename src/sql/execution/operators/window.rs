@@ -84,7 +84,7 @@ impl ExecutionOp for WindowExec {
         } else if batches.len() == 1 {
             batches.remove(0)
         } else {
-            concat_batches(&batches, num_rows)?
+            concat_batches(batches, num_rows)?
         };
 
         let mut columns = batch.columns.clone();
@@ -110,18 +110,25 @@ impl ExecutionOp for WindowExec {
     }
 }
 
-fn concat_batches(batches: &[RecordBatch], num_rows: usize) -> Result<RecordBatch> {
+/// Concatenates the materialized input batches, MOVING each column out of its
+/// batch: the previous clone-per-column kept every batch's data alive twice
+/// (input vec + concatenated result) at peak.
+fn concat_batches(mut batches: Vec<RecordBatch>, num_rows: usize) -> Result<RecordBatch> {
     let ncols = batches[0].num_columns();
+    let schema = batches[0].schema.clone();
     let mut columns: Vec<ColumnArray> = Vec::with_capacity(ncols);
     for col_idx in 0..ncols {
         let mut column =
-            ColumnArray::with_capacity(batches[0].schema.columns[col_idx].data_type, num_rows);
-        for batch in batches {
-            column.append_owned(batch.columns[col_idx].clone())?;
+            ColumnArray::with_capacity(schema.columns[col_idx].data_type, num_rows);
+        for batch in batches.iter_mut() {
+            let taken = std::mem::replace(
+                &mut batch.columns[col_idx],
+                ColumnArray::empty(schema.columns[col_idx].data_type),
+            );
+            column.append_owned(taken)?;
         }
         columns.push(column);
     }
-    let schema = batches[0].schema.clone();
     RecordBatch::try_new(schema, columns)
         .map_err(|e| crate::common::error::TaibaiError::Internal(e.to_string()))
 }
@@ -259,6 +266,18 @@ fn compute_func(
                 Some(arg) => Some(eval_expr_column(arg, batch)?),
                 None => None,
             };
+            // AVG over DECIMAL accumulates raw scaled i64 and must divide the
+            // scale back out at finalize, exactly like HashAggregateExec's
+            // Accumulator::Avg. The scale comes from the argument column.
+            let decimal_scale = match (func, arg.as_deref()) {
+                (AggFunc::Avg, Some(LogicalExpr::Column(idx))) => batch
+                    .schema
+                    .columns
+                    .get(*idx)
+                    .filter(|col| col.data_type == DataType::Decimal)
+                    .map(|col| col.scale),
+                _ => None,
+            };
             // Default frame (RANGE UNBOUNDED PRECEDING -> CURRENT ROW, incl.
             // peers) reduces to a running prefix aggregate: O(1) per row
             // instead of re-materializing the whole frame per row.
@@ -271,6 +290,7 @@ fn compute_func(
                     &partition_cols,
                     num_rows,
                     result_type,
+                    decimal_scale,
                 );
             }
             // Result-column type drives the value domain: Decimal sums must
@@ -306,7 +326,7 @@ fn compute_func(
                             .collect(),
                     };
                     let row = order[pos_in_group] as usize;
-                    values[row] = aggregate_frame(func, &frame, arg_type);
+                    values[row] = aggregate_frame(func, &frame, arg_type, decimal_scale);
                 }
                 group_start = group_end;
             }
@@ -568,6 +588,7 @@ fn compute_running_aggregate(
     partition_cols: &[Vec<ScalarValue>],
     num_rows: usize,
     result_type: DataType,
+    decimal_scale: Option<i32>,
 ) -> Result<Vec<ScalarValue>> {
     let mut values = vec![ScalarValue::Int64(None); num_rows];
     // Running state mirrors aggregate_frame's domains; initialized in the
@@ -661,6 +682,7 @@ fn compute_running_aggregate(
                 has_float,
                 &best,
                 result_type,
+                decimal_scale,
             );
             for &row in &order[pos..peer_end] {
                 values[row as usize] = current.clone();
@@ -684,6 +706,7 @@ fn running_value(
     has_float: bool,
     best: &Option<ScalarValue>,
     result_type: DataType,
+    decimal_scale: Option<i32>,
 ) -> ScalarValue {
     match func {
         AggFunc::Count => ScalarValue::Int64(Some(count)),
@@ -709,7 +732,12 @@ fn running_value(
                 } else {
                     sum_i as f64
                 };
-                ScalarValue::Float64(Some(total / count as f64))
+                // Decimal sums accumulate in the raw scaled domain; divide
+                // the scale back out (missing step made AVG 10^scale too
+                // large, diverging from HashAggregateExec).
+                let scale_divisor =
+                    decimal_scale.map_or(1.0, |sc| 10f64.powi(sc));
+                ScalarValue::Float64(Some(total / count as f64 / scale_divisor))
             }
         }
         AggFunc::Min | AggFunc::Max => best
@@ -732,8 +760,14 @@ fn order_key_equal(
 }
 
 /// Aggregate one frame's values with plain (non-distinct) semantics matching
-/// the hash aggregate operator's finalize behavior.
-fn aggregate_frame(func: &AggFunc, frame: &[ScalarValue], arg_type: DataType) -> ScalarValue {
+/// the hash aggregate operator's finalize behavior. `decimal_scale` carries
+/// the argument column's DECIMAL scale for AVG's finalize division.
+fn aggregate_frame(
+    func: &AggFunc,
+    frame: &[ScalarValue],
+    arg_type: DataType,
+    decimal_scale: Option<i32>,
+) -> ScalarValue {
     match func {
         AggFunc::Count => {
             let count = frame.iter().filter(|v| !v.is_null()).count();
@@ -783,15 +817,33 @@ fn aggregate_frame(func: &AggFunc, frame: &[ScalarValue], arg_type: DataType) ->
             }
         }
         AggFunc::Avg => {
-            let vals: Vec<f64> = frame
-                .iter()
-                .filter(|v| !v.is_null())
-                .filter_map(|v| v.numeric_f64())
-                .collect();
-            if vals.is_empty() {
-                ScalarValue::Float64(None)
+            if arg_type == DataType::Decimal {
+                // Raw scaled i64 domain: divide the scale back out at
+                // finalize (same contract as Accumulator::Avg).
+                let vals: Vec<f64> = frame
+                    .iter()
+                    .filter(|v| !v.is_null())
+                    .filter_map(|v| v.integer_i128().map(|i| i as f64))
+                    .collect();
+                if vals.is_empty() {
+                    ScalarValue::Float64(None)
+                } else {
+                    let scale_divisor = decimal_scale.map_or(1.0, |sc| 10f64.powi(sc));
+                    ScalarValue::Float64(Some(
+                        vals.iter().sum::<f64>() / vals.len() as f64 / scale_divisor,
+                    ))
+                }
             } else {
-                ScalarValue::Float64(Some(vals.iter().sum::<f64>() / vals.len() as f64))
+                let vals: Vec<f64> = frame
+                    .iter()
+                    .filter(|v| !v.is_null())
+                    .filter_map(|v| v.numeric_f64())
+                    .collect();
+                if vals.is_empty() {
+                    ScalarValue::Float64(None)
+                } else {
+                    ScalarValue::Float64(Some(vals.iter().sum::<f64>() / vals.len() as f64))
+                }
             }
         }
         AggFunc::Min => extremum(frame, Ordering::Less, arg_type),

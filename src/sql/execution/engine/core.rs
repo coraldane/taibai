@@ -279,6 +279,16 @@ impl Engine {
         if stmts.is_empty() {
             return Err(TaibaiError::Sql("empty query".into()));
         }
+        // `execute` is the shared entry for the network and embedded APIs,
+        // which carry one statement per call; silently dropping the trailing
+        // statements of a multi-statement string would lose writes.
+        if stmts.len() > 1 {
+            return Err(TaibaiError::Sql(format!(
+                "multi-statement strings are not supported here ({} statements); \
+                 send them one at a time",
+                stmts.len()
+            )));
+        }
         let result = self.execute_stmt(session, &stmts[0]);
         // DDL/auth statements mutate the catalog or auth store in place; a
         // replication primary ships a full snapshot so standbys reload.
@@ -393,32 +403,30 @@ impl Engine {
                         session.active_txn_id(),
                     );
                     if let Ok(ref _r) = result {
-                        // Only cache plan if statement has no placeholders (params won't change structure)
-                        if !has_placeholders {
+                        // Cache the plan only for placeholder-free,
+                        // subquery-free SELECTs. A cached plan cannot carry
+                        // subqueries: resolved subquery literals would freeze
+                        // one execution's result into every later one, and
+                        // correlated plans embed snapshot ids from a
+                        // query-private registry that no later execution can
+                        // satisfy (second EXECUTE used to fail permanently).
+                        // Skipping the resolve pass here also removes the
+                        // cache-fill double execution of non-correlated
+                        // subqueries.
+                        if !has_placeholders
+                            && !super::query::statement_contains_subquery(&stmt)
+                        {
                             let table_schemas =
                                 self.gather_table_schemas(&session.database, &stmt)?;
-                            // Plan caching is best-effort: statements whose
-                            // subqueries cannot be eagerly resolved (e.g.
-                            // correlated subqueries) simply re-resolve on
-                            // every execution.
-                            if let Ok(planned_stmt) = super::query::resolve_in_subqueries(
-                                self,
-                                &session.database,
-                                &stmt,
-                            ) {
-                                if let Ok(plan) = crate::sql::planner::plan_select(
-                                    &planned_stmt,
-                                    &table_schemas,
-                                ) {
-                                    prepared.cached_plan =
-                                        Some(crate::sql::optimizer::optimize(plan));
-                                    prepared.planned_database =
-                                        Some(session.database.clone());
-                                    prepared.planned_schema_fingerprint = self
-                                        .gather_table_schemas(&session.database, &stmt)
-                                        .ok()
-                                        .map(|schemas| schema_fingerprint(&schemas));
-                                }
+                            if let Ok(plan) = crate::sql::planner::plan_select(&stmt, &table_schemas) {
+                                prepared.cached_plan =
+                                    Some(crate::sql::optimizer::optimize(plan));
+                                prepared.planned_database =
+                                    Some(session.database.clone());
+                                prepared.planned_schema_fingerprint = self
+                                    .gather_table_schemas(&session.database, &stmt)
+                                    .ok()
+                                    .map(|schemas| schema_fingerprint(&schemas));
                             }
                         }
                     }

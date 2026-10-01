@@ -650,25 +650,30 @@ pub fn eval_expr_for_row(
         Expr::BinaryOp { left, op, right } => {
             let left_val = eval_expr_for_row(left, batch, row_idx, schema)?;
             let right_val = eval_expr_for_row(right, batch, row_idx, schema)?;
-            match op {
-                BinOp::Add => match (&left_val, &right_val) {
-                    (ScalarValue::Int64(Some(a)), ScalarValue::Int64(Some(b))) => {
-                        Ok(ScalarValue::Int64(Some(a + b)))
-                    }
-                    _ => Ok(left_val),
-                },
-                BinOp::Sub => match (&left_val, &right_val) {
-                    (ScalarValue::Int64(Some(a)), ScalarValue::Int64(Some(b))) => {
-                        Ok(ScalarValue::Int64(Some(a - b)))
-                    }
-                    _ => Ok(left_val),
-                },
-                _ => Ok(left_val),
-            }
+            // Delegate to the engine's single scalar binary implementation:
+            // this arm used to handle only Int64+Int64 Add/Sub and return the
+            // LEFT operand for every other shape (Mul/Div/Mod, floats, Int32
+            // columns), silently mis-filtering DML WHERE rows.
+            Ok(super::operators::filter::eval_binary_scalar(
+                &left_val,
+                op,
+                &right_val,
+            ))
         }
-        Expr::IsNull(inner) => eval_expr_for_row(inner, batch, row_idx, schema),
-        Expr::IsNotNull(inner) => eval_expr_for_row(inner, batch, row_idx, schema),
-        Expr::UnaryNot(inner) => eval_expr_for_row(inner, batch, row_idx, schema),
+        Expr::IsNull(inner) => Ok(ScalarValue::Bool(Some(
+            eval_expr_for_row(inner, batch, row_idx, schema)?.is_null(),
+        ))),
+        Expr::IsNotNull(inner) => Ok(ScalarValue::Bool(Some(
+            !eval_expr_for_row(inner, batch, row_idx, schema)?.is_null(),
+        ))),
+        Expr::UnaryNot(inner) => match eval_expr_for_row(inner, batch, row_idx, schema)? {
+            ScalarValue::Bool(Some(b)) => Ok(ScalarValue::Bool(Some(!b))),
+            value if value.is_null() => Ok(ScalarValue::Bool(None)),
+            other => Err(TaibaiError::Sql(format!(
+                "NOT requires a boolean operand, got {:?}",
+                other.data_type()
+            ))),
+        },
         Expr::QualifiedColumn { column, .. } => {
             let col_idx = schema
                 .index_of(column)
@@ -1116,17 +1121,12 @@ pub fn eval_expr_to_scalar_with_scale_timezone(
                 Ok(ScalarValue::Timestamp(Some(parse_timestamp_from_int(*n))))
             }
             (DataType::Date, ScalarValue::VarChar(Some(s))) => {
-                // Parse date string to days since epoch
-                // Format: YYYY-MM-DD
-                use crate::sql::execution::functions::date::parse_datetime_string;
-                match parse_datetime_string(s, timezone_offset_hours) {
-                    Some(ts) => {
-                        // Convert timestamp (seconds) to days
-                        let days = (ts / 86400) as i32;
-                        Ok(ScalarValue::Date(Some(days)))
-                    }
-                    None => Ok(ScalarValue::Date(None)),
-                }
+                // Single string→DATE conversion point (micros → days).
+                use crate::sql::execution::functions::date::datetime_string_to_days;
+                Ok(ScalarValue::Date(datetime_string_to_days(
+                    s,
+                    timezone_offset_hours,
+                )))
             }
             (DataType::Date, ScalarValue::Int64(Some(n))) => {
                 // Interpret as days directly
@@ -1471,16 +1471,26 @@ impl ChangeEventBuffer {
 /// planners (they used to carry drifting per-module duplicates).
 pub(crate) fn segment_may_match(
     reader: &crate::storage::segment::SegmentReader,
+    table_schema: &Schema,
     predicate: Option<&crate::storage::segment::RowGroupPredicate>,
 ) -> bool {
     let Some(predicate) = predicate else {
         return true;
     };
+    // The predicate's column indices are catalog-space; zone maps live in the
+    // segment's footer order. After a DROP/RENAME COLUMN the two drift, and
+    // testing catalog indices against footer zone maps prunes (or keeps) the
+    // WRONG segments — re-anchor the predicate onto this segment first.
+    let Ok(aligned) = reader.align_row_group_predicate(table_schema, predicate) else {
+        // A referenced column is absent from this older segment entirely: no
+        // row in it can carry a value for the clause, so it cannot match.
+        return false;
+    };
     let segment_zone_maps = reader.segment_zone_maps();
     if !segment_zone_maps.is_empty() {
-        return predicate.matches_row_group(segment_zone_maps);
+        return aligned.matches_row_group(segment_zone_maps);
     }
-    (0..reader.num_row_groups()).any(|rg_idx| predicate.matches_row_group(reader.zone_maps(rg_idx)))
+    (0..reader.num_row_groups()).any(|rg_idx| aligned.matches_row_group(reader.zone_maps(rg_idx)))
 }
 
 #[cfg(test)]

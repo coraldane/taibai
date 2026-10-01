@@ -1,5 +1,25 @@
 static FLUSH_TRANSITION_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Striped mutexes serializing per-table flush-epoch file persistence outside
+/// the global epoch lock. Hashing the table key to one of N stripes keeps
+/// same-table writes ordered while unrelated tables usually proceed in
+/// parallel; the critical section is one small tmp+rename, so stripe sharing
+/// between different tables is immaterial. Instance-local semantics are not
+/// needed: the persisted value is re-read from the owning manager's memory
+/// inside the stripe lock (see `persist_flush_epoch`).
+fn flush_epoch_persist_lock(key: &str) -> &std::sync::Mutex<()> {
+    const STRIPES: usize = 16;
+    static LOCKS: std::sync::OnceLock<Vec<std::sync::Mutex<()>>> = std::sync::OnceLock::new();
+    let locks = LOCKS.get_or_init(|| (0..STRIPES).map(|_| std::sync::Mutex::new(())).collect());
+    // FNV-1a: stable, allocation-free stripe selection for short table keys.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    &locks[(hash as usize) % locks.len()]
+}
+
 impl SegmentManager {
     pub fn set_flush_transition_delay_for_tests(&self, ms: u64) {
         FLUSH_TRANSITION_DELAY_MS.store(ms, Ordering::Release);
@@ -437,34 +457,63 @@ impl SegmentManager {
     /// installs, and removal-only paths do not). Unique index snapshots
     /// stamped with the previous epoch are potentially incomplete and must
     /// be refreshed before probing.
+    ///
+    /// The global epoch lock only covers the in-memory bump — the file write
+    /// runs outside it, serialized per table through a stripe lock — so one
+    /// table's `fsync` no longer blocks every other table's epoch reads.
     pub fn note_segments_changed(&self, db: &str, table: &str) {
         let key = table_key(db, table);
         let path = self.flush_epoch_file_path(db, table);
-        let mut epochs = self.flush_epochs.write().unwrap();
-        let current = epochs
-            .get(&key)
+        {
+            let mut epochs = self.flush_epochs.write().unwrap();
+            let current = epochs
+                .get(&key)
+                .copied()
+                .unwrap_or_else(|| read_flush_epoch_file(&path));
+            let next = current.saturating_add(1);
+            epochs.insert(key.clone(), next);
+        }
+        self.persist_flush_epoch(&key, &path);
+    }
+
+    /// Persist the table's epoch file outside the global epoch lock.
+    ///
+    /// Same-table persistence is serialized by a stripe mutex, and the value
+    /// written is re-read from memory INSIDE that mutex, so a concurrent
+    /// newer bump always wins and the file never regresses (a bump's own
+    /// value may be superseded before it reaches disk — persisting the newer
+    /// one implies it). Losing the very last persistence to a crash is
+    /// acceptable by design: restart restores the epoch from the file, the
+    /// only lost value is the in-memory maximum, and the sole consequence is
+    /// one extra index-snapshot invalidation after the next write.
+    fn persist_flush_epoch(&self, key: &str, path: &Path) {
+        let _stripe = flush_epoch_persist_lock(key).lock().unwrap_or_else(|p| {
+            p.into_inner()
+        });
+        let value = self
+            .flush_epochs
+            .read()
+            .unwrap()
+            .get(key)
             .copied()
-            .unwrap_or_else(|| read_flush_epoch_file(&path));
-        let next = current.saturating_add(1);
+            .unwrap_or_else(|| read_flush_epoch_file(path));
         if let Some(parent) = path.parent() {
             // tmp+rename: a torn in-place overwrite of the epoch file made
             // it fall back to 0 on read, wrongly marking index snapshots as
             // stale (or fresh) after a crash.
             let tmp = path.with_extension("epoch.tmp");
             if let Err(error) = std::fs::create_dir_all(parent).and_then(|_| {
-                std::fs::write(&tmp, next.to_string())?;
+                std::fs::write(&tmp, value.to_string())?;
                 std::fs::rename(&tmp, &path)
             }) {
                 let _ = std::fs::remove_file(&tmp);
                 tracing::error!(
-                    db,
-                    table,
+                    key,
                     error = %error,
                     "failed to persist memtable flush epoch; in-memory epoch still advanced"
                 );
             }
         }
-        epochs.insert(key, next);
     }
 
     /// Bump the content epoch for the table owning `path`, derived from the
@@ -772,7 +821,17 @@ impl SegmentManager {
             let reader = std::sync::Arc::new(self.open_mutable_reader_owned(path)?);
             let mut cache = self.mutable_reader_cache.lock().unwrap();
             if cache.len() >= reader_cache_capacity().max(1) * 4 {
-                cache.clear();
+                // Evict ONE entry instead of clearing the whole cache: a full
+                // clear made every other active segment's next read pay a
+                // full reopen + footer parse at once. The cache field is a
+                // plain `HashMap` (defined with the struct, no order kept),
+                // so the victim is the first entry in iteration order — any
+                // single eviction bounds growth, and cache correctness never
+                // depended on the choice: `invalidate_reader` evicts on every
+                // visibility change regardless.
+                if let Some(victim) = cache.keys().next().cloned() {
+                    cache.remove(&victim);
+                }
             }
             cache.insert(path.to_path_buf(), reader.clone());
             return Ok(reader);
@@ -1437,30 +1496,25 @@ impl SegmentManager {
         batches: &[std::sync::Arc<RecordBatch>],
         compression_level: i32,
     ) -> Result<()> {
-        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
-        let mut combined = RecordBatch::with_capacity(schema.clone(), total_rows);
+        // Validate up front so a malformed batch cannot leave a half-written
+        // segment behind (the merge-based version validated before creating
+        // the file).
         for batch in batches {
-            if batch.num_columns() != combined.num_columns() {
+            if batch.num_columns() != schema.num_columns() {
                 return Err(TaibaiError::Storage(format!(
                     "replacement batch has {} columns, expected {}",
                     batch.num_columns(),
-                    combined.num_columns()
+                    schema.num_columns()
                 )));
             }
-            for column_idx in 0..combined.num_columns() {
-                combined
-                    .column_mut(column_idx)
-                    .expect("validated replacement column")
-                    .extend(
-                        batch
-                            .column(column_idx)
-                            .expect("validated replacement source column"),
-                    )?;
-            }
         }
+        // Feed the batches to the writer one by one: `write_batch` buffers a
+        // partially-filled row group across calls, so the row-group layout is
+        // identical to the old merge-everything-first approach, without the
+        // full-payload copy into a combined batch.
         let mut writer = SegmentWriter::create(path, schema, row_group_size, compression_level)?;
-        if combined.num_rows() > 0 {
-            writer.write_batch(&combined)?;
+        for batch in batches {
+            writer.write_batch(batch)?;
         }
         writer.seal()?;
         Ok(())

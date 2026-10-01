@@ -168,9 +168,21 @@ pub fn exec_union_with_txn(
     }
 
     let mut rows: Vec<Vec<ScalarValue>> = Vec::new();
+    let mut set_op_bytes = 0usize;
+    let set_op_limit = crate::common::query_memory::result_memory_limit_bytes();
     for batch in left_batches.iter().chain(right_batches.iter()) {
         if batch.num_columns() == 0 {
             continue;
+        }
+        // Cancel + memory accounting inside the row loop: a large UNION used
+        // to be neither interruptible nor bounded during materialization.
+        crate::common::query_cancel::check()?;
+        set_op_bytes = set_op_bytes.saturating_add(batch.estimated_size_bytes());
+        if set_op_bytes > set_op_limit {
+            return Err(TaibaiError::ResourceBusy(format!(
+                "set operation exceeded memory limit of {} MB; add filters or LIMIT",
+                set_op_limit / (1024 * 1024)
+            )));
         }
         for row_idx in 0..batch.num_rows() {
             rows.push(
@@ -181,13 +193,20 @@ pub fn exec_union_with_txn(
         }
     }
 
+    // Dedup/set keys use the join hash table's compact typed key: hashing the
+    // row itself cloned every cell a second time into the HashSet (a third
+    // copy for INTERSECT/EXCEPT), while the key holds one boxed enum per row.
+    fn row_key(row: &[ScalarValue]) -> Vec<super::join_hashtable::ScalarValueHashable> {
+        row.iter().map(super::join_hashtable::ScalarValueHashable::from_scalar).collect()
+    }
+
     match op {
         crate::sql::parser::ast::SetOp::Union => {
             if !*all {
                 // Typed keys: the old to_string-joined key could collide when a
                 // value contained the separator, silently dropping distinct rows.
                 let mut seen = std::collections::HashSet::new();
-                rows.retain(|row| seen.insert(row.clone()));
+                rows.retain(|row| seen.insert(row_key(row)));
             }
         }
         // INTERSECT / EXCEPT apply set semantics: both operands are
@@ -197,17 +216,17 @@ pub fn exec_union_with_txn(
             let mut right_keys = std::collections::HashSet::new();
             let right_row_start = left_rows_count(&left_batches);
             for row in rows.iter().skip(right_row_start) {
-                right_keys.insert(row.clone());
+                right_keys.insert(row_key(row));
             }
             rows.truncate(right_row_start);
             let mut seen = std::collections::HashSet::new();
             let keep = matches!(op, crate::sql::parser::ast::SetOp::Intersect);
             rows.retain(|row| {
-                seen.insert(row.clone())
+                seen.insert(row_key(row))
                     && if keep {
-                        right_keys.contains(row)
+                        right_keys.contains(&row_key(row))
                     } else {
-                        !right_keys.contains(row)
+                        !right_keys.contains(&row_key(row))
                     }
             });
         }
@@ -644,6 +663,9 @@ fn exec_table_select_materialized(
     let mut table_batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>> = HashMap::new();
     let mut fully_applied_scan_filters: HashMap<String, bool> = HashMap::new();
     let mut scan_seeds: HashMap<String, ScanProfileSeed> = HashMap::new();
+    // Cumulative scanned input held in `table_batches`, enforced against the
+    // per-query memory budget alongside the result-side accounting.
+    let mut input_memory_bytes = 0usize;
 
     for table_ref in table_refs {
         if table_ref.database == DERIVED_DB {
@@ -670,15 +692,31 @@ fn exec_table_select_materialized(
         }
 
         let scan_start = std::time::Instant::now();
+        crate::common::query_cancel::check()?;
         let batches = executor.execute()?;
+        let scanned_bytes: usize = batches.iter().map(RecordBatch::estimated_size_bytes).sum();
         let metadata_answered = executor.metadata_answered();
         scan_seeds.insert(
             table_name.clone(),
             ScanProfileSeed {
                 elapsed: scan_start.elapsed(),
-                peak_memory_bytes: batches.iter().map(RecordBatch::estimated_size_bytes).sum(),
+                peak_memory_bytes: scanned_bytes,
             },
         );
+        // Input-side memory accounting: table_batches keeps every scanned row
+        // resident for the rest of the query (joins, subqueries, set ops), so
+        // the scanned input must respect the same per-query budget the result
+        // side enforces — the old path capped only the output and let a large
+        // JOIN materialize unbounded input memory.
+        let input_limit = crate::common::query_memory::result_memory_limit_bytes();
+        input_memory_bytes = input_memory_bytes.saturating_add(scanned_bytes);
+        if input_memory_bytes > input_limit {
+            return Err(TaibaiError::ResourceBusy(format!(
+                "query input exceeded memory limit of {} MB while materializing table '{}'; add filters or LIMIT",
+                input_limit / (1024 * 1024),
+                table_ref.table
+            )));
+        }
         fully_applied_scan_filters.insert(
             table_name.clone(),
             spec.has_predicates() && spec.remaining_predicate.is_none(),
@@ -796,6 +834,135 @@ fn exec_table_select_materialized(
         schema,
         batches: result_batches,
     })
+}
+
+/// True when the statement contains any subquery anywhere: scalar/IN/EXISTS
+/// expressions (resolved or correlated) or derived tables in FROM. Prepared
+/// SELECT plan caching is restricted to subquery-free statements — a cached
+/// plan embeds either resolved subquery literals (re-executing them on the
+/// cache-fill pass and freezing their result) or correlated snapshot ids
+/// from a query-private registry that no later execution can satisfy.
+pub(crate) fn statement_contains_subquery(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Select {
+            select_list,
+            from,
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            select_list.iter().any(
+                |item| matches!(item, SelectItem::Expr(expr, _) if expr_contains_subquery(expr)),
+            ) || from.as_ref().is_some_and(from_contains_subquery)
+                || where_clause.as_ref().is_some_and(expr_contains_subquery)
+                || group_by.iter().any(expr_contains_subquery)
+                || having.as_ref().is_some_and(expr_contains_subquery)
+                || order_by.iter().any(|item| expr_contains_subquery(&item.expr))
+                || limit.as_ref().is_some_and(expr_contains_subquery)
+                || offset.as_ref().is_some_and(expr_contains_subquery)
+        }
+        Statement::Union {
+            left,
+            right,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            statement_contains_subquery(left)
+                || statement_contains_subquery(right)
+                || order_by.iter().any(|item| expr_contains_subquery(&item.expr))
+                || limit.as_ref().is_some_and(expr_contains_subquery)
+                || offset.as_ref().is_some_and(expr_contains_subquery)
+        }
+        Statement::InsertSelect { query, .. } | Statement::ReplaceSelect { query, .. } => {
+            statement_contains_subquery(query)
+        }
+        Statement::Update {
+            assignments,
+            where_clause,
+            ..
+        } => {
+            assignments.iter().any(|assign| expr_contains_subquery(&assign.value))
+                || where_clause.as_ref().is_some_and(expr_contains_subquery)
+        }
+        Statement::Delete { where_clause, .. } => {
+            where_clause.as_ref().is_some_and(expr_contains_subquery)
+        }
+        _ => false,
+    }
+}
+
+fn from_contains_subquery(from: &FromClause) -> bool {
+    match from {
+        FromClause::Table(table_ref) => table_ref_contains_subquery(table_ref),
+        FromClause::Join(join) => {
+            from_contains_subquery(&join.left)
+                || join.joins.iter().any(|clause| {
+                    table_ref_contains_subquery(&clause.right)
+                        || clause
+                            .condition
+                            .as_ref()
+                            .is_some_and(expr_contains_subquery)
+                })
+        }
+    }
+}
+
+fn table_ref_contains_subquery(table_ref: &TableRef) -> bool {
+    match table_ref {
+        TableRef::Table { .. } => false,
+        TableRef::Subquery { query, .. } => statement_contains_subquery(query),
+    }
+}
+
+fn expr_contains_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::Exists(_) | Expr::Subquery(_) | Expr::Correlated(_) => true,
+        Expr::In { expr, values, .. } => {
+            expr_contains_subquery(expr) || values.iter().any(expr_contains_subquery)
+        }
+        Expr::Between { expr, low, high, .. } => {
+            expr_contains_subquery(expr)
+                || expr_contains_subquery(low)
+                || expr_contains_subquery(high)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_subquery(left) || expr_contains_subquery(right)
+        }
+        Expr::UnaryNot(inner) | Expr::UnaryMinus(inner) => expr_contains_subquery(inner),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => expr_contains_subquery(inner),
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            operand.as_deref().is_some_and(expr_contains_subquery)
+                || when_clauses
+                    .iter()
+                    .any(|(when, then)| expr_contains_subquery(when) || expr_contains_subquery(then))
+                || else_clause.as_deref().is_some_and(expr_contains_subquery)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_contains_subquery(expr) || expr_contains_subquery(pattern)
+        }
+        Expr::Function { args, .. } => args.iter().any(expr_contains_subquery),
+        Expr::WindowFunction {
+            partition_by,
+            order_by,
+            ..
+        } => {
+            partition_by.iter().any(expr_contains_subquery)
+                || order_by.iter().any(|item| expr_contains_subquery(&item.expr))
+        }
+        Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) | Expr::QualifiedColumn { .. } => {
+            false
+        }
+    }
 }
 
 pub(crate) fn resolve_in_subqueries(
@@ -1142,7 +1309,18 @@ pub(crate) fn execute_exists_subquery(
     db: &str,
     subquery: &Statement,
 ) -> Result<bool> {
-    let ExecResult::Query { batches, .. } = exec_select(engine, db, subquery)? else {
+    // EXISTS only cares whether any row comes back: inject LIMIT 1 when the
+    // subquery has none, so limit pushdown stops the scan at the first row
+    // instead of materializing the whole subquery result. An existing LIMIT
+    // is kept (LIMIT 0 legitimately yields EXISTS=false).
+    let mut bounded = subquery.clone();
+    match &mut bounded {
+        Statement::Select { limit, .. } if limit.is_none() => {
+            *limit = Some(Expr::Literal(ScalarValue::Int64(Some(1))));
+        }
+        _ => {}
+    }
+    let ExecResult::Query { batches, .. } = exec_select(engine, db, &bounded)? else {
         return Err(TaibaiError::Sql("EXISTS subquery must be a SELECT".into()));
     };
     Ok(batches.iter().any(|batch| batch.num_rows() > 0))

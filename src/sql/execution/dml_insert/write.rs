@@ -903,6 +903,7 @@ pub(crate) fn rebuild_table_location_indexes_from(
             memtables,
             &table_dir,
             table,
+            schema,
             &indices,
             "segment rewrite auto rebuild",
         )?;

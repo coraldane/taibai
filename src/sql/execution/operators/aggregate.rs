@@ -660,9 +660,10 @@ impl ExecutionOp for HashAggregateExec {
         // `groups` maps the stringified key to its accumulators; `group_keys`
         // preserves insertion order alongside the original (typed) group-by
         // scalar values so the output keeps the correct column types.
-        let mut groups: HashMap<Vec<u8>, Vec<Accumulator>> = HashMap::new();
+        let mut groups: HashMap<Vec<u8>, Vec<Accumulator>> = HashMap::with_capacity(1024);
         let mut group_keys: Vec<(Vec<u8>, Vec<ScalarValue>)> = Vec::new();
         let mut estimated_group_bytes = 0usize;
+        let mut batch_refresh_counter = 0usize;
         let mut spills = Vec::new();
         let mut memory = MemoryManager::reservation();
         let mut key_buf: Vec<u8> = Vec::new();
@@ -811,33 +812,39 @@ impl ExecutionOp for HashAggregateExec {
                 }
             }
 
-            // Deep memory refresh once per batch (matching the no-GROUP-BY
-            // path): DISTINCT sets and MIN/MAX values grow per row, but
-            // re-estimating on every row dominated grouped-query profiles.
-            estimated_group_bytes = group_keys
-                .iter()
-                .map(|(key, scalars)| {
-                    key.len() + scalars.len() * std::mem::size_of::<ScalarValue>()
-                })
-                .sum::<usize>()
-                + groups
-                    .values()
-                    .map(|accums| {
-                        accums
-                            .iter()
-                            .map(Accumulator::estimated_size_bytes)
-                            .sum::<usize>()
+            // Deep memory refresh: DISTINCT sets and MIN/MAX values grow per
+            // row, but re-estimating every group on every batch made grouped
+            // queries O(batches × groups). New-group growth is accounted
+            // incrementally at insert; the full sweep (which catches
+            // accumulator growth) runs periodically.
+            batch_refresh_counter += 1;
+            if batch_refresh_counter >= 64 {
+                batch_refresh_counter = 0;
+                estimated_group_bytes = group_keys
+                    .iter()
+                    .map(|(key, scalars)| {
+                        key.len() + scalars.len() * std::mem::size_of::<ScalarValue>()
                     })
-                    .sum::<usize>();
-            super::profile::record_current_peak_memory(estimated_group_bytes);
-            if estimated_group_bytes >= self.memory_limit_bytes
-                || !memory.try_resize(estimated_group_bytes)
-            {
-                spills.push(spill_group_run(&groups, &group_keys, spill_rows)?);
-                groups.clear();
-                group_keys.clear();
-                estimated_group_bytes = 0;
-                memory.release();
+                    .sum::<usize>()
+                    + groups
+                        .values()
+                        .map(|accums| {
+                            accums
+                                .iter()
+                                .map(Accumulator::estimated_size_bytes)
+                                .sum::<usize>()
+                        })
+                        .sum::<usize>();
+                super::profile::record_current_peak_memory(estimated_group_bytes);
+                if estimated_group_bytes >= self.memory_limit_bytes
+                    || !memory.try_resize(estimated_group_bytes)
+                {
+                    spills.push(spill_group_run(&groups, &group_keys, spill_rows)?);
+                    groups.clear();
+                    group_keys.clear();
+                    estimated_group_bytes = 0;
+                    memory.release();
+                }
             }
         }
 
@@ -1867,7 +1874,7 @@ fn apply_having(
     // but operates on the aggregated result schema
     let remapped = remap_expr_for_batch(predicate, logical_schema, &batch.schema);
     let mask = crate::sql::execution::operators::filter::eval_filter(&remapped, &batch)?;
-    Ok(super::apply_filter_mask(&batch, &mask))
+    Ok(super::apply_filter_mask(batch, &mask))
 }
 
 #[cfg(test)]

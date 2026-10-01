@@ -816,12 +816,11 @@ fn parse_timestamp_string_fast(value: FastValue<'_>, timezone_offset_hours: i32)
 }
 
 /// `'2024-01-01'`-style DATE literals as days since epoch, mirroring the
-/// standard path's `parse_datetime_string` conversion.
+/// standard path's conversion (single conversion point in
+/// `functions::date::datetime_string_to_days`).
 fn parse_date_string_fast(value: FastValue<'_>, timezone_offset_hours: i32) -> Option<i32> {
     let text = parse_text_fast(value).ok()?;
-    let ts =
-        crate::sql::execution::functions::date::parse_datetime_string(text, timezone_offset_hours)?;
-    Some((ts / 86400) as i32)
+    crate::sql::execution::functions::date::datetime_string_to_days(text, timezone_offset_hours)
 }
 
 fn parse_owned_string_fast(value: FastValue<'_>) -> Result<String> {

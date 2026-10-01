@@ -125,15 +125,18 @@ impl ExecutionOp for DistinctExec {
     }
 }
 
-pub fn apply_filter_mask(batch: &RecordBatch, mask: &[bool]) -> RecordBatch {
+/// Applies a boolean filter mask to an owned batch. Takes the batch by value
+/// so the all-true case (common when the scan already pushed the predicate
+/// down) returns it unchanged instead of deep-copying every column.
+pub fn apply_filter_mask(batch: RecordBatch, mask: &[bool]) -> RecordBatch {
     if mask.iter().all(|&m| m) {
-        return batch.clone();
+        return batch;
     }
     let selection = crate::types::selection::SelectionVector::from_mask(mask);
     if selection.is_empty() {
         return RecordBatch::new(batch.schema.clone());
     }
-    selection.apply(batch)
+    selection.apply(&batch)
 }
 
 pub fn build_pipeline(

@@ -993,3 +993,94 @@ fn tail_last_lsn_tracks_frames_and_tolerates_torn_tail() {
         "crc mismatch must not yield an lsn"
     );
 }
+
+/// The commit thread and the direct-write helpers must draw LSNs from the
+/// SAME monotonic channel. Drive both concurrently — direct `append`s racing
+/// the committer's group-commit window — and assert every frame on disk
+/// carries a unique LSN (the old thread-local counter handed out duplicates
+/// to direct writes that landed mid-group) and that each channel stays
+/// append-ordered.
+#[test]
+fn commit_thread_and_direct_writes_allocate_unique_monotonic_lsns() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let table_dir = temp.path().to_path_buf();
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let commit_id = Uuid::new_v4();
+    let direct_id = Uuid::new_v4();
+
+    let committer = TailCommitter::start(true);
+
+    // Direct-path channel: one fsynced frame per append, from this thread.
+    let direct_dir = table_dir.clone();
+    let direct_schema = schema.clone();
+    let direct = std::thread::spawn(move || -> Result<()> {
+        for value in 0..24i64 {
+            let mut batch = RecordBatch::new(direct_schema.clone());
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(value)))?;
+            append(&direct_dir, direct_id, "", &batch)?;
+        }
+        Ok(())
+    });
+
+    // Commit-path channel: submit a burst without waiting so several frames
+    // share one group-commit window, interleaved with the direct appends.
+    // Half of the commands use the lazy (commit-thread-encoded) variant.
+    let mut tickets = Vec::new();
+    for value in 0..24i64 {
+        let mut batch = RecordBatch::new(schema.clone());
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(1000 + value)))?;
+        let prepared = if value % 2 == 0 {
+            PreparedTailAppend::new(&batch)?
+        } else {
+            PreparedTailAppend::from_shared_batch(std::sync::Arc::new(batch))
+        };
+        tickets.push(committer.submit(table_dir.clone(), commit_id, "".into(), prepared));
+    }
+    for ticket in tickets {
+        ticket.wait()?;
+    }
+    direct.join().unwrap()?;
+    committer.barrier(&table_dir)?;
+    committer.stop();
+
+    fn frame_lsns(path: &Path, schema: &Schema) -> Result<Vec<u64>> {
+        let bytes = fs::read(path)?;
+        let (_, _, frames) = decode_tail_with_meta(&bytes, schema)?;
+        Ok(frames.into_iter().map(|meta| meta.lsn).collect())
+    }
+
+    let tail_dir = table_dir.join(TAIL_DIR);
+    let commit_path = newest_live_tail_path(&tail_dir, commit_id)?.expect("commit tail exists");
+    let direct_path = newest_live_tail_path(&tail_dir, direct_id)?.expect("direct tail exists");
+    let commit_lsns = frame_lsns(&commit_path, &schema)?;
+    let direct_lsns = frame_lsns(&direct_path, &schema)?;
+
+    assert_eq!(commit_lsns.len(), 24, "one frame per committed append");
+    assert_eq!(direct_lsns.len(), 24, "one frame per direct append");
+    // Single commit thread + single direct thread: each channel's LSNs are
+    // allocated in write order.
+    assert!(
+        commit_lsns.windows(2).all(|w| w[0] < w[1]),
+        "commit-channel LSNs must be append-ordered"
+    );
+    assert!(
+        direct_lsns.windows(2).all(|w| w[0] < w[1]),
+        "direct-channel LSNs must be append-ordered"
+    );
+
+    let mut all = commit_lsns;
+    all.extend_from_slice(&direct_lsns);
+    let unique = all.iter().collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        unique.len(),
+        all.len(),
+        "every durable frame must carry a unique LSN across both channels"
+    );
+    Ok(())
+}

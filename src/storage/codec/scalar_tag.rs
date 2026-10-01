@@ -129,8 +129,8 @@ pub fn decode_scalar_with_tag(cursor: &mut std::io::Cursor<&[u8]>) -> Result<Sca
         return Ok(null_for_dtype(dtype));
     }
     let v = match dtype {
-        DataType::Bool => ScalarValue::Bool(Some(read_u8(cursor).unwrap_or(0) != 0)),
-        DataType::Int8 => ScalarValue::Int8(Some(read_u8(cursor).unwrap_or(0) as i8)),
+        DataType::Bool => ScalarValue::Bool(Some(read_u8(cursor)? != 0)),
+        DataType::Int8 => ScalarValue::Int8(Some(read_u8(cursor)? as i8)),
         DataType::Int16 => {
             let mut b = [0u8; 2];
             cursor.read_exact(&mut b)?;
@@ -146,7 +146,7 @@ pub fn decode_scalar_with_tag(cursor: &mut std::io::Cursor<&[u8]>) -> Result<Sca
             cursor.read_exact(&mut b)?;
             ScalarValue::Int64(Some(i64::from_le_bytes(b)))
         }
-        DataType::UInt8 => ScalarValue::UInt8(Some(read_u8(cursor).unwrap_or(0))),
+        DataType::UInt8 => ScalarValue::UInt8(Some(read_u8(cursor)?)),
         DataType::UInt16 => {
             let mut b = [0u8; 2];
             cursor.read_exact(&mut b)?;
@@ -199,18 +199,34 @@ pub fn decode_scalar_with_tag(cursor: &mut std::io::Cursor<&[u8]>) -> Result<Sca
         }
         DataType::VarChar => {
             let len = read_u32_le(cursor)? as usize;
+            // Validate before allocating: a corrupt length prefix must not
+            // zero-fill up to 4GB from a truncated stream.
+            if len > cursor.get_ref().len().saturating_sub(cursor.position() as usize) {
+                return Err(TaibaiError::Storage("scalar varchar: truncated value".into()));
+            }
             let mut b = vec![0u8; len];
             cursor.read_exact(&mut b)?;
             ScalarValue::VarChar(Some(String::from_utf8_lossy(&b).into_owned()))
         }
         DataType::Blob => {
             let len = read_u32_le(cursor)? as usize;
+            if len > cursor.get_ref().len().saturating_sub(cursor.position() as usize) {
+                return Err(TaibaiError::Storage("scalar blob: truncated value".into()));
+            }
             let mut b = vec![0u8; len];
             cursor.read_exact(&mut b)?;
             ScalarValue::Blob(Some(b))
         }
         DataType::Vector => {
             let len = read_u32_le(cursor)? as usize;
+            // Validate before allocating: a corrupt length prefix must not
+            // preallocate up to 16GB of floats from a truncated stream.
+            let len_bytes = len.checked_mul(4).ok_or_else(|| {
+                TaibaiError::Storage("scalar vector: element count overflow".into())
+            })?;
+            if len_bytes > cursor.get_ref().len().saturating_sub(cursor.position() as usize) {
+                return Err(TaibaiError::Storage("scalar vector: truncated value".into()));
+            }
             let mut v = Vec::with_capacity(len);
             for _ in 0..len {
                 let mut b = [0u8; 4];

@@ -67,7 +67,7 @@ impl ExecutionOp for FilterExec {
                     .unwrap_or(&self.predicate)
             };
             let mask = eval_filter_with(predicate, &batch, self.subqueries.as_ref())?;
-            let filtered = super::apply_filter_mask(&batch, &mask);
+            let filtered = super::apply_filter_mask(batch, &mask);
             if filtered.num_rows() > 0 {
                 return Ok(Some(filtered));
             }
@@ -273,16 +273,27 @@ pub fn eval_filter_with(
         LogicalExpr::BinaryOp { left, op, right } => match op {
             BinOp::And => {
                 let left_mask = eval_filter_with(left, batch, subqueries)?;
-                let right_mask = eval_filter_with(right, batch, subqueries)?;
-                for i in 0..num_rows {
-                    mask[i] = left_mask[i] && right_mask[i];
+                // Short-circuit: when the left arm already excludes every
+                // row, the right arm cannot change the result — skipping it
+                // avoids paying for an expensive arm (subqueries, functions)
+                // behind a provably false conjunct.
+                if left_mask.iter().any(|m| *m) {
+                    let right_mask = eval_filter_with(right, batch, subqueries)?;
+                    for i in 0..num_rows {
+                        mask[i] = left_mask[i] && right_mask[i];
+                    }
                 }
+                // else: mask stays all-false.
             }
             BinOp::Or => {
                 let left_mask = eval_filter_with(left, batch, subqueries)?;
-                let right_mask = eval_filter_with(right, batch, subqueries)?;
-                for i in 0..num_rows {
-                    mask[i] = left_mask[i] || right_mask[i];
+                if left_mask.iter().any(|m| !m) {
+                    let right_mask = eval_filter_with(right, batch, subqueries)?;
+                    for i in 0..num_rows {
+                        mask[i] = left_mask[i] || right_mask[i];
+                    }
+                } else {
+                    mask.copy_from_slice(&left_mask);
                 }
             }
             _ => {
@@ -341,12 +352,12 @@ pub fn eval_filter_with(
             let has_null_candidate = values.iter().any(|candidate| candidate.is_null());
             // Hash-set prefilter for wide lists; the linear scan stays as
             // the fallback for cross-type equality the exact-match set
-            // cannot see.
+            // cannot see. The set borrows the (per-statement constant)
+            // candidates instead of cloning them on every batch.
             let fast_set = (values.len() >= 8).then(|| {
                 values
                     .iter()
-                    .cloned()
-                    .collect::<std::collections::HashSet<_>>()
+                    .collect::<std::collections::HashSet<&ScalarValue>>()
             });
             for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
                 if vals[i].is_null() {
@@ -730,11 +741,21 @@ pub fn eval_expr_column_with(
         LogicalExpr::CorrelatedSubquery(node) => {
             crate::sql::execution::subquery_runtime::eval_correlated_column(node, batch, subqueries)
         }
-        _ => Ok(vec![ScalarValue::Int64(None); num_rows]),
+        // Unresolved subquery shapes and Wildcard must never reach an
+        // evaluator: the previous fallback returned a column of NULLs, so any
+        // upstream resolution gap silently turned the missing expression into
+        // "all NULL" instead of an error.
+        other => Err(crate::common::error::TaibaiError::Internal(format!(
+            "unsupported expression shape in filter evaluation: {other:?}"
+        ))),
     }
 }
 
-fn eval_binary_scalar(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> ScalarValue {
+/// Single scalar binary-operator implementation shared by the vectorized
+/// filter path and the DML row-wise evaluator (helpers::eval_expr_for_row) —
+/// a previous private copy in helpers silently returned the left operand for
+/// every uncovered arithmetic shape, mis-filtering UPDATE/DELETE rows.
+pub(crate) fn eval_binary_scalar(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> ScalarValue {
     use BinOp::*;
     if left.is_null() || right.is_null() {
         return match op {

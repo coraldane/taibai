@@ -694,6 +694,10 @@ impl IndexManager {
             .collect::<Result<Vec<_>>>()?;
         let mut locations = {
             let delta = state.delta.read().unwrap();
+            // Build the tombstone probe index once for the whole key loop:
+            // per-location linear scans made many-key probes quadratic in the
+            // tombstone count.
+            let tombstone_index = UniqueTombstoneIndex::build(&delta.tombstones);
             let mut locations = Vec::new();
             for encoded in &encoded_keys {
                 if let Some(matches) = delta.key_locations.get(encoded) {
@@ -702,18 +706,13 @@ impl IndexManager {
                             .iter()
                             .filter(|location| {
                                 !location.segment_path.is_empty()
-                                    && !unique_index_tombstones_contains(
-                                        &delta.tombstones,
-                                        location,
-                                    )
+                                    && !tombstone_index.contains(location)
                             })
                             .cloned(),
                     );
                 }
                 for location in state.base.find_locations(encoded)? {
-                    if !location.segment_path.is_empty()
-                        && !unique_index_tombstones_contains(&delta.tombstones, &location)
-                    {
+                    if !location.segment_path.is_empty() && !tombstone_index.contains(&location) {
                         locations.push(location);
                     }
                 }

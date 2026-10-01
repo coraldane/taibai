@@ -1085,7 +1085,11 @@ impl HashJoinExec {
         Ok(None)
     }
 
-    /// Advance to the next probe batch on the left input (lazily collected).
+    /// Advance to the next probe batch on the left input. Streaming: only the
+    /// ACTIVE batch is retained — the fast path emits from the current batch
+    /// and is always drained before the next fetch, so keeping earlier
+    /// batches resident materialized the whole probe side outside the memory
+    /// budget for no benefit. (The scalar row path uses its own cursor.)
     fn next_left_probe_batch(&mut self) -> Result<Option<usize>> {
         loop {
             let idx = self.probe_state.left_batch_idx;
@@ -1096,7 +1100,11 @@ impl HashJoinExec {
             match self.left.next_batch() {
                 Ok(Some(batch)) => {
                     if batch.num_rows() > 0 {
+                        // Single-slot: the drained predecessor is dropped.
+                        self.probe_state.left_batches.clear();
+                        self.probe_state.left_batch_idx = 0;
                         self.probe_state.left_batches.push(batch);
+                        continue;
                     }
                 }
                 Ok(None) => return Ok(None),

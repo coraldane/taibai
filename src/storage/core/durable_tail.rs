@@ -71,29 +71,66 @@ fn async_quiesce_delay(sync_cost: Duration) -> Duration {
         .min(ASYNC_FSYNC_MAX_DELAY)
 }
 
-/// A WAL frame prepared by the request thread. Serialization and zstd level 3
-/// compression therefore happen in parallel and outside the table mutation
-/// lock; the tail writer only performs sequential file I/O and durability.
+/// A WAL frame heading for the tail log. Two preparation variants feed the
+/// same commit thread, and both keep the design intent that serialization and
+/// zstd level 3 compression never run under the table mutation lock; the tail
+/// writer only performs sequential file I/O and durability:
+///
+/// * eager (`new`): the request thread serializes before acquiring the lock
+///   (single auto-commit INSERTs), so the lock only sees the ready payload;
+/// * lazy (`from_shared_batch`): the COMMIT fan-out already holds the table
+///   mutation lock, so it only clones the memtable batch's `Arc` and defers
+///   serialize + compress to the commit thread's `finish`.
 pub(crate) struct PreparedTailAppend {
-    wal_payload: Vec<u8>,
+    /// Eager variant's serialized payload, consumed by `finish`.
+    wal_payload: Option<Vec<u8>>,
+    /// Lazy variant's shared source batch, dropped once the frame exists.
+    batch: Option<Arc<RecordBatch>>,
     frame: Option<Vec<u8>>,
     rows: u64,
 }
 
 impl PreparedTailAppend {
+    /// Eager variant: serialize now, on the request thread, before the table
+    /// mutation lock is taken.
     pub(crate) fn new(batch: &RecordBatch) -> Result<Self> {
         Ok(Self {
-            wal_payload: prepare_batch_for_wal(batch)?,
+            wal_payload: Some(prepare_batch_for_wal(batch)?),
+            batch: None,
             frame: None,
             rows: batch.num_rows() as u64,
         })
     }
 
+    /// Lazy variant: hold a shared reference to the memtable's batch and
+    /// encode on the commit thread. Infallible by design — the caller holding
+    /// the table mutation lock only pays an `Arc` clone here, and an encoding
+    /// failure is reported later against this single command (it must fail
+    /// the command, not poison the commit thread).
+    pub(crate) fn from_shared_batch(batch: Arc<RecordBatch>) -> Self {
+        Self {
+            wal_payload: None,
+            rows: batch.num_rows() as u64,
+            batch: Some(batch),
+            frame: None,
+        }
+    }
+
+    /// Byte size charged against the group-commit window. Before the frame is
+    /// encoded this is an estimate: the raw (uncompressed) payload, which
+    /// upper-bounds the compressed frame, so the window's byte bound never
+    /// under-estimates. After `finish` it is the exact frame size.
     fn encoded_len(&self) -> usize {
-        self.frame
+        if let Some(frame) = self.frame.as_ref() {
+            return frame.len();
+        }
+        if let Some(payload) = self.wal_payload.as_ref() {
+            return payload.len();
+        }
+        self.batch
             .as_ref()
-            .map(Vec::len)
-            .unwrap_or(self.wal_payload.len())
+            .map(|batch| batch.estimated_size_bytes())
+            .unwrap_or(0)
     }
 
     fn finish(
@@ -103,7 +140,19 @@ impl PreparedTailAppend {
         commit_ts_micros: i64,
     ) -> Result<()> {
         if self.frame.is_none() {
-            let raw = std::mem::take(&mut self.wal_payload);
+            // Serialize the lazy variant here, on the commit thread, then
+            // compress either variant once. Runs at most once per command.
+            let raw = match self.wal_payload.take() {
+                Some(raw) => raw,
+                None => {
+                    let batch = self.batch.as_deref().ok_or_else(|| {
+                        TaibaiError::Internal(
+                            "tail append carries neither payload nor source batch".into(),
+                        )
+                    })?;
+                    prepare_batch_for_wal(batch)?
+                }
+            };
             let payload = compress_prepared_batch_for_wal_with(compressor, raw)?;
             self.frame = Some(encode_tail_frame_payload(
                 &payload,
@@ -111,6 +160,9 @@ impl PreparedTailAppend {
                 lsn,
                 commit_ts_micros,
             ));
+            // The encoded frame now owns the durable representation; drop the
+            // shared batch reference.
+            self.batch = None;
         }
         Ok(())
     }
@@ -522,15 +574,18 @@ fn tail_commit_loop(
     let mut last_sync = Instant::now();
     let mut last_activity = Instant::now();
     let mut sync_cost = Duration::ZERO;
-    let mut next_lsn = {
+    // Seed the LSN high-water from the wall clock so LSNs minted after a
+    // restart sort after every LSN already on disk. There is deliberately NO
+    // thread-local counter on top of this: every frame — commit-thread and
+    // direct-write alike — allocates from `TAIL_LSN_HIGH_WATER.fetch_add`,
+    // the single LSN channel.
+    {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
-        TAIL_LSN_HIGH_WATER
-            .fetch_max(now, Ordering::AcqRel)
-            .max(now)
-    };
+        TAIL_LSN_HIGH_WATER.fetch_max(now, Ordering::AcqRel);
+    }
     loop {
         if async_fsync && !dirty_tails.is_empty() {
             let quiesced = last_activity.elapsed() >= async_quiesce_delay(sync_cost);
@@ -637,8 +692,7 @@ fn tail_commit_loop(
                 }
                 last_group_size = group.len();
 
-                let written = write_append_group(&mut files, &mut compressor, group, &mut next_lsn);
-                TAIL_LSN_HIGH_WATER.fetch_max(next_lsn, Ordering::AcqRel);
+                let written = write_append_group(&mut files, &mut compressor, group);
 
                 if async_fsync {
                     // Tail-append replication events are published INLINE on
@@ -768,7 +822,6 @@ fn write_append_group(
     files: &mut TailFileSet,
     compressor: &mut zstd::bulk::Compressor<'_>,
     group: Vec<AppendCommand>,
-    next_lsn: &mut u64,
 ) -> Vec<WrittenTailGroup> {
     if crate::common::config::insert_profile_enabled() {
         let bytes = group
@@ -782,24 +835,28 @@ fn write_append_group(
         );
     }
     // Frames of one group commit together, so they share the commit
-    // timestamp (taken at write time, the durable-commit moment); the LSN
-    // is per frame and densely allocated on the single commit thread.
+    // timestamp (taken at write time, the durable-commit moment). The LSN is
+    // per frame, allocated from the same global high-water the direct-write
+    // helpers use — the single LSN channel — so a direct append racing this
+    // group-commit window can never observe a duplicate LSN (only a gap).
     let commit_ts_micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0);
     let mut by_tail = HashMap::<TailKey, TailGroupAccumulator>::new();
     for mut command in group {
-        let frame_bytes = command.prepared.encoded_len();
         // Frame-encoding failure (payload beyond the WAL u32 length field)
         // fails this request like a write error instead of poisoning the
         // committer thread.
-        let lsn = *next_lsn;
-        *next_lsn = next_lsn.saturating_add(1);
+        let lsn = TAIL_LSN_HIGH_WATER.fetch_add(1, Ordering::AcqRel) + 1;
         if let Err(error) = command.prepared.finish(compressor, lsn, commit_ts_micros) {
             command.completion.finish(Err(error.to_string()));
             continue;
         }
+        // Charge the exact frame size only after encoding: the pre-encoding
+        // estimate is the raw payload, which would over-state the bytes the
+        // async-fsync window must bound.
+        let frame_bytes = command.prepared.encoded_len();
         match files.append(&command) {
             Ok(key) => {
                 let (db, table) = db_table_from_dir(&command.table_dir);

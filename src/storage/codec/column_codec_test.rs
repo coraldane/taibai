@@ -394,8 +394,11 @@ fn adaptive_encoding_tag(encoded: &[u8]) -> EncodingType {
 fn bitpacked_roundtrip(values: &[i64]) {
     let payload =
         crate::storage::codec::column_codec::encode_i64_bitpacked_payload(values).unwrap();
-    let decoded =
-        crate::storage::codec::column_codec::decode_i64_bitpacked_payload(&payload).unwrap();
+    let decoded = crate::storage::codec::column_codec::decode_i64_bitpacked_payload(
+        &payload,
+        values.len(),
+    )
+    .unwrap();
     assert_eq!(decoded, values);
 }
 
@@ -579,9 +582,11 @@ fn bitpacked_payload_roundtrip_all_widths() {
                     // Blocks too wide for the 56-bit cap are declined wholesale.
                     None => continue,
                 };
-            let decoded =
-                crate::storage::codec::column_codec::decode_i64_bitpacked_payload(&payload)
-                    .unwrap();
+            let decoded = crate::storage::codec::column_codec::decode_i64_bitpacked_payload(
+                &payload,
+                values.len(),
+            )
+            .unwrap();
             assert_eq!(decoded, values, "width {} len {}", width, len);
         }
     }
@@ -594,8 +599,11 @@ fn bitpacked_payload_truncated_stream_is_error_not_panic() {
         crate::storage::codec::column_codec::encode_i64_bitpacked_payload(&values).unwrap();
     for cut in [0, 5, 17, payload.len() / 2, payload.len() - 1] {
         assert!(
-            crate::storage::codec::column_codec::decode_i64_bitpacked_payload(&payload[..cut])
-                .is_err(),
+            crate::storage::codec::column_codec::decode_i64_bitpacked_payload(
+                &payload[..cut],
+                values.len()
+            )
+            .is_err(),
             "truncation at {} must be rejected",
             cut
         );
@@ -868,8 +876,11 @@ fn bitpacked_decode_throughput_bench() {
             + 1;
         let payload = &adaptive[tag_pos..];
         let t2 = Instant::now();
-        let unpacked =
-            crate::storage::codec::column_codec::decode_i64_bitpacked_payload(payload).unwrap();
+        let unpacked = crate::storage::codec::column_codec::decode_i64_bitpacked_payload(
+            payload,
+            n,
+        )
+        .unwrap();
         let unpack_us = t2.elapsed().as_micros().max(1);
         assert_eq!(unpacked.len(), n);
 
@@ -1130,4 +1141,29 @@ fn count_eq_from_raw_supports_delta_rle_and_bitpacked() {
         .filter(|(i, v)| **v == all_rows[13] && !flags[*i])
         .count() as u64;
     assert_eq!(counted, reference, "BitPacked must exclude null rows");
+}
+
+#[test]
+fn blob_decode_truncated_value_is_error_not_zero_fill() {
+    // Regression: the blob decoder used to swallow the read error of a
+    // truncated value and decode zero-filled bytes instead of surfacing it.
+    let blobs: Vec<Vec<u8>> = vec![b"alpha".to_vec(), b"beta!!".to_vec(), b"gamma".to_vec()];
+    let col = ColumnArray::Blob {
+        data: blobs.into(),
+        bitmap: NullBitmap::new_valid(3),
+    };
+    let (encoded, _) = encode_column_ex(&col, 0, 3).unwrap();
+    let decoded = decode_column(&encoded, 3, &col_def(DataType::Blob), false).unwrap();
+    assert_eq!(decoded.len(), 3);
+
+    // Cut into the last blob's value bytes: decode must fail instead of
+    // silently producing a zero-filled blob.
+    for cut in [1usize, 2, 3] {
+        let truncated = &encoded[..encoded.len() - cut];
+        assert!(
+            decode_column(truncated, 3, &col_def(DataType::Blob), false).is_err(),
+            "truncation of {} bytes must be rejected",
+            cut
+        );
+    }
 }

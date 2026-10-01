@@ -690,12 +690,16 @@ impl BatchWriter {
         {
             return Ok(None);
         }
-        // Share the memtable's batch instead of deep-copying it; the tail
-        // append only reads through the Arc and drops it after submit.
+        // Share the memtable's batch instead of deep-copying it, and let the
+        // commit thread do the encoding: this runs under the table mutation
+        // lock (COMMIT fan-out), so the lock only pays an `Arc` clone plus a
+        // channel send — serialize+zstd happen in the committer thread (see
+        // `PreparedTailAppend`'s design comment). An encoding failure later
+        // fails this command's ticket, never the commit thread.
         let Some(batch) = memtable.read_snapshot_arc() else {
             return Ok(None);
         };
-        let prepared = PreparedTailAppend::new(&batch)?;
+        let prepared = PreparedTailAppend::from_shared_batch(batch);
         let ticket = self.tail_committer.submit(
             self.segment_mgr.table_dir(memtable.db(), memtable.table()),
             memtable.id(),
@@ -999,8 +1003,20 @@ impl BatchWriter {
         {
             return Ok(());
         }
+        let table_dir = self.segment_mgr.table_dir(memtable.db(), memtable.table());
+        // Drain the commit thread's queued appends for this table and close
+        // its cached tail handles first — the same protocol as the
+        // clear/rename paths. `persist` writes a fresh full-tail generation
+        // and removes the older ones, so frames still queued for those
+        // generations must be written (or failed) before the removal, and
+        // their open handles must be gone or the Windows rename/removal
+        // races the commit thread. The barrier only waits for the commit
+        // thread to drain its queue — it acquires no table lock — so calling
+        // it under the caller's table mutation lock cannot deadlock; a slow
+        // drain surfaces as the barrier's bounded-timeout error.
+        self.tail_committer.barrier(&table_dir)?;
         crate::storage::core::durable_tail::persist(
-            &self.segment_mgr.table_dir(memtable.db(), memtable.table()),
+            &table_dir,
             memtable.id(),
             memtable.partition_key(),
             batch,

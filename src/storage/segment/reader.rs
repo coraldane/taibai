@@ -232,6 +232,108 @@ impl SegmentReader {
         self.footer.row_groups[row_group].row_count
     }
 
+    /// Footer index for one catalog column, resolved by its current name or
+    /// any recorded previous name (RENAME COLUMN). `None` when the segment
+    /// predates the column (ADD COLUMN after the segment was written).
+    pub fn footer_column_index_for_names(&self, names: &[String]) -> Option<usize> {
+        names
+            .iter()
+            .find_map(|name| self.footer.schema.index_of(name))
+    }
+
+    /// Translate catalog column indices into footer column indices by name.
+    ///
+    /// Segments written before an ALTER keep the pre-DDL physical layout in
+    /// their footer, and DROP/RENAME COLUMN shifts catalog positions without
+    /// rewriting data: positional use of catalog indices silently read (and
+    /// rewrote) the WRONG column. Every read that crosses the catalog→segment
+    /// boundary must go through here.
+    pub fn align_indices(
+        &self,
+        table_schema: &crate::types::batch::Schema,
+        indices: &[usize],
+    ) -> Result<Vec<usize>> {
+        align_indices_against_schema(table_schema, &self.footer.schema, indices)
+    }
+
+    /// Re-anchor a catalog-space row-group predicate onto this segment's
+    /// footer column order, so `matches_row_group(zone_maps)` indexes the
+    /// zone maps of the columns the clauses actually reference instead of
+    /// whatever happens to sit at the same positional index.
+    pub fn align_row_group_predicate(
+        &self,
+        table_schema: &crate::types::batch::Schema,
+        predicate: &crate::storage::partition::pruning::RowGroupPredicate,
+    ) -> Result<crate::storage::partition::pruning::RowGroupPredicate> {
+        if predicate.clauses.is_empty() {
+            return Ok(predicate.clone());
+        }
+        let indices: Vec<usize> = predicate
+            .clauses
+            .iter()
+            .map(|clause| clause.column_index)
+            .collect();
+        let aligned = self.align_indices(table_schema, &indices)?;
+        let clauses = predicate
+            .clauses
+            .iter()
+            .zip(aligned)
+            .map(|(clause, column_index)| crate::storage::partition::pruning::RangeClause {
+                column_index,
+                op: clause.op,
+                value: clause.value.clone(),
+            })
+            .collect();
+        Ok(crate::storage::partition::pruning::RowGroupPredicate::new(
+            clauses,
+        ))
+    }
+
+    /// Read the requested catalog columns (by name, returned in request
+    /// order) from one row group — the name-based counterpart of
+    /// `read_row_group_with_projection` for callers holding catalog indices.
+    ///
+    /// The returned batch carries the CATALOG column defs of the requested
+    /// columns, so downstream name-based evaluation (WHERE masks) and
+    /// positional use of catalog indices both stay correct even when this
+    /// segment's footer predates a DROP/RENAME COLUMN.
+    pub fn read_row_group_columns(
+        &self,
+        row_group: usize,
+        table_schema: &crate::types::batch::Schema,
+        indices: &[usize],
+    ) -> Result<crate::types::batch::RecordBatch> {
+        let footer_indices = self.align_indices(table_schema, indices)?;
+        let batch = self.read_row_group_with_projection(row_group, &footer_indices)?;
+        batch_with_catalog_defs(batch, table_schema, indices)
+    }
+
+    /// Read ALL catalog columns of one row group, in catalog order — the
+    /// read primitive for whole-row-group rewrites (UPDATE Pass B). Columns
+    /// this segment predates (ADD COLUMN after the segment was written) are
+    /// materialized as the column's DEFAULT value (or typed NULL when it has
+    /// none), matching what a SELECT over the same segment returns, so
+    /// batches from segments of different ages share one catalog-ordered
+    /// shape and can be merged column-wise safely.
+    pub fn read_row_group_columns_aligned(
+        &self,
+        row_group: usize,
+        table_schema: &crate::types::batch::Schema,
+    ) -> Result<crate::types::batch::RecordBatch> {
+        let rg_rows = self.row_group_rows(row_group) as usize;
+        let mut columns = Vec::with_capacity(table_schema.num_columns());
+        for col_def in &table_schema.columns {
+            let mut names = Vec::with_capacity(col_def.previous_names.len() + 1);
+            names.push(col_def.name.clone());
+            names.extend(col_def.previous_names.iter().cloned());
+            match self.footer_column_index_for_names(&names) {
+                Some(footer_idx) => columns.push(self.read_column(row_group, footer_idx)?),
+                None => columns.push(default_value_column(col_def, rg_rows)?),
+            }
+        }
+        crate::types::batch::RecordBatch::try_new(table_schema.clone(), columns)
+    }
+
     /// Attach a transaction's composed delete bitmap (footer ∪ deferred
     /// tombstones of the owning transaction). Only fresh per-scan instances
     /// receive this — the cached readers are shared across sessions.
@@ -886,7 +988,8 @@ impl SegmentReader {
         }
         let mut skipped = 0usize;
         let mut row_start: u64 = 0;
-        let bitmap_active = !self.footer.delete_bitmap.is_empty();
+        let delete_bitmap = self.delete_bitmap();
+        let bitmap_active = !delete_bitmap.is_empty();
         for rg_idx in 0..total {
             let rg_rows = self.footer.row_groups[rg_idx].row_count;
             let rg_first_row = row_start;
@@ -924,8 +1027,7 @@ impl SegmentReader {
             };
             if bitmap_active {
                 let before = batch.num_rows();
-                batch =
-                    delete_bitmap::filter_batch(&batch, rg_first_row, &self.footer.delete_bitmap)?;
+                batch = delete_bitmap::filter_batch(batch, rg_first_row, delete_bitmap)?;
                 if let Some(s) = stats.as_deref_mut() {
                     s.rows_filtered_by_delete_bitmap += (before - batch.num_rows()) as u64;
                 }
@@ -958,7 +1060,11 @@ impl SegmentReader {
 
     pub fn count_matching_rows_fast(&self, column_idx: usize, value: &ScalarValue) -> Result<u64> {
         let mut total_count: u64 = 0;
-        let bitmap_active = !self.footer.delete_bitmap.is_empty();
+        // Composed bitmap (footer + transaction overlay): the overlay exists
+        // precisely so in-txn deferred deletes are visible to scans, and the
+        // manager opens COUNT readers with the overlay installed.
+        let delete_bitmap = self.delete_bitmap();
+        let bitmap_active = !delete_bitmap.is_empty();
 
         for (rg_idx, rg) in self.footer.row_groups.iter().enumerate() {
             if let Some(bf) = rg.bloom_filters.get(column_idx).and_then(|b| b.as_ref()) {
@@ -988,14 +1094,8 @@ impl SegmentReader {
                 if raw_count == 0 {
                     continue;
                 }
-                let rg_start_row = self
-                    .footer
-                    .row_groups
-                    .iter()
-                    .take(rg_idx)
-                    .map(|r| r.row_count)
-                    .sum::<u64>();
-                let deleted = col.count_eq_deleted(value, rg_start_row, &self.footer.delete_bitmap);
+                let rg_start_row = self.row_group_start_row(rg_idx);
+                let deleted = col.count_eq_deleted(value, rg_start_row, delete_bitmap);
                 raw_count.saturating_sub(deleted)
             } else {
                 self.count_eq_raw(rg_idx, column_idx, value)?
@@ -1016,16 +1116,11 @@ impl SegmentReader {
         let rg = &self.footer.row_groups[row_group];
         let col_def = &self.footer.schema.columns[column_idx];
 
-        let mut col_offset = rg.offset as usize;
-        for i in 0..column_idx {
-            col_offset += rg.column_compressed_sizes[i] as usize;
-        }
-        let col_len = rg.column_compressed_sizes[column_idx] as usize;
-
-        let data = self.data.as_slice();
-        let compressed = &data[col_offset..col_offset + col_len];
-
-        let decompressed = Self::decompress_column_block(compressed)?;
+        // Route through read_column_raw so the COUNT path gets the same
+        // footer-offset bounds checking and block CRC verification as every
+        // other read: the previous inline slice panicked on a corrupted
+        // offset and skipped checksums entirely.
+        let decompressed = self.read_column_raw(row_group, column_idx)?;
 
         crate::storage::codec::predicate_scan::count_eq_from_raw(
             &decompressed,
@@ -1034,6 +1129,114 @@ impl SegmentReader {
             value,
         )
     }
+}
+
+/// Translate catalog column indices into the column indices of the given
+/// segment (footer) schema by name — the schema-parameterized core of
+/// [`SegmentReader::align_indices`]. Callers that prune against sidecar
+/// metadata (whose per-column arrays follow the same footer order but have
+/// no `SegmentReader` at hand) use this directly.
+pub fn align_indices_against_schema(
+    table_schema: &crate::types::batch::Schema,
+    footer_schema: &crate::types::batch::Schema,
+    indices: &[usize],
+) -> Result<Vec<usize>> {
+    indices
+        .iter()
+        .map(|&catalog_idx| {
+            let column = table_schema.columns.get(catalog_idx).ok_or_else(|| {
+                TaibaiError::Internal(format!(
+                    "catalog column index {catalog_idx} out of range"
+                ))
+            })?;
+            let mut names = Vec::with_capacity(column.previous_names.len() + 1);
+            names.push(column.name.clone());
+            names.extend(column.previous_names.iter().cloned());
+            names
+                .iter()
+                .find_map(|name| footer_schema.index_of(name))
+                .ok_or_else(|| {
+                    TaibaiError::Storage(format!(
+                        "column '{}' not found in segment schema",
+                        column.name
+                    ))
+                })
+        })
+        .collect()
+}
+
+/// Re-wrap a projected batch read from a segment with the CATALOG column
+/// defs of the requested columns. Column order (and therefore every
+/// positional mapping over the request list) is unchanged; only the schema
+/// names/metadata are re-anchored, so downstream WHERE evaluation resolves
+/// columns by their current catalog names even when the footer predates a
+/// RENAME COLUMN.
+fn batch_with_catalog_defs(
+    batch: crate::types::batch::RecordBatch,
+    table_schema: &crate::types::batch::Schema,
+    indices: &[usize],
+) -> Result<crate::types::batch::RecordBatch> {
+    let same_defs = indices
+        .iter()
+        .zip(batch.schema.columns.iter())
+        .all(|(&idx, def)| table_schema.columns.get(idx) == Some(def));
+    if same_defs {
+        return Ok(batch);
+    }
+    let col_defs = indices
+        .iter()
+        .map(|&idx| {
+            table_schema.columns.get(idx).cloned().ok_or_else(|| {
+                TaibaiError::Internal(format!(
+                    "catalog column index {idx} out of range"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    crate::types::batch::RecordBatch::try_new(
+        crate::types::batch::Schema::new(col_defs),
+        batch.columns,
+    )
+}
+
+/// One column's worth of the value rows written before an ALTER ADD COLUMN
+/// logically carry: the column's DEFAULT (CurrentTimestamp pinned to the
+/// ALTER instant, like the SELECT-side default fill), or typed NULL when the
+/// column declares no default. Used by the whole-row-group aligned read so a
+/// segment rewrite does not silently turn defaulted columns into NULLs.
+pub(crate) fn default_value_column(
+    col_def: &crate::types::batch::ColumnDef,
+    row_count: usize,
+) -> Result<crate::types::array::ColumnArray> {
+    let value = match &col_def.default_value {
+        Some(crate::types::batch::ColumnDefaultValue::Literal(value)) => value.clone(),
+        Some(crate::types::batch::ColumnDefaultValue::CurrentTimestamp) => {
+            ScalarValue::Timestamp(Some(
+                col_def
+                    .added_at_micros
+                    .unwrap_or_else(now_micros_for_default),
+            ))
+        }
+        None => ScalarValue::null_for_type(col_def.data_type),
+    };
+    let mut column = crate::types::array::ColumnArray::empty(col_def.data_type);
+    if value.is_null() {
+        for _ in 0..row_count {
+            column.push_null_value();
+        }
+    } else {
+        for _ in 0..row_count {
+            column.push(&value)?;
+        }
+    }
+    Ok(column)
+}
+
+fn now_micros_for_default() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64
 }
 
 fn split_batch(

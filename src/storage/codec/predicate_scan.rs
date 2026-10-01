@@ -16,6 +16,13 @@ pub fn selected_eq_rows_from_raw(
 ) -> Result<Vec<usize>> {
     let mut cursor = Cursor::new(data);
     let bitmap_len = read_u32_le(&mut cursor)? as usize;
+    // Bound the preallocation by the actual block size: a corrupt length
+    // prefix must not drive a multi-GB zero-fill.
+    if bitmap_len > data.len().saturating_sub(4) {
+        return Err(TaibaiError::Storage(
+            "null bitmap length exceeds column block".into(),
+        ));
+    }
     let mut bitmap_data = vec![0u8; bitmap_len];
     cursor.read_exact(&mut bitmap_data)?;
     let bitmap = NullBitmap::from_bytes(&bitmap_data, row_count);
@@ -41,6 +48,13 @@ pub fn count_eq_from_raw(
 ) -> Result<u64> {
     let mut cursor = Cursor::new(data);
     let bitmap_len = read_u32_le(&mut cursor)? as usize;
+    // Bound the preallocation by the actual block size: a corrupt length
+    // prefix must not drive a multi-GB zero-fill.
+    if bitmap_len > data.len().saturating_sub(4) {
+        return Err(TaibaiError::Storage(
+            "null bitmap length exceeds column block".into(),
+        ));
+    }
     let mut bitmap_data = vec![0u8; bitmap_len];
     cursor.read_exact(&mut bitmap_data)?;
     let bitmap = NullBitmap::from_bytes(&bitmap_data, row_count);
@@ -51,7 +65,7 @@ pub fn count_eq_from_raw(
         return count_eq_adaptive(remaining, row_count, col_def, &bitmap, value);
     }
 
-    let count = match (&col_def.data_type, value) {
+    match (&col_def.data_type, value) {
         (DataType::Int64, ScalarValue::Int64(Some(v))) => {
             count_eq_fixed_le8(remaining, &bitmap, row_count, *v)
         }
@@ -94,10 +108,8 @@ pub fn count_eq_from_raw(
         (DataType::VarChar, ScalarValue::VarChar(Some(v))) => {
             count_eq_varchar(remaining, &bitmap, row_count, v)
         }
-        _ => return Ok(0),
-    };
-
-    Ok(count)
+        _ => Ok(0),
+    }
 }
 
 fn selected_eq_rows_adaptive(
@@ -306,7 +318,12 @@ fn scalar_values_equal(left: &ScalarValue, right: &ScalarValue) -> bool {
     }
 }
 
-fn count_eq_fixed_le8(data: &[u8], bitmap: &NullBitmap, row_count: usize, target: i64) -> u64 {
+fn count_eq_fixed_le8(
+    data: &[u8],
+    bitmap: &NullBitmap,
+    row_count: usize,
+    target: i64,
+) -> Result<u64> {
     let mut count: u64 = 0;
     let mut offset = 0usize;
     for i in 0..row_count {
@@ -314,7 +331,7 @@ fn count_eq_fixed_le8(data: &[u8], bitmap: &NullBitmap, row_count: usize, target
             continue;
         }
         if offset + 8 > data.len() {
-            break;
+            return Err(TaibaiError::Storage("fixed column scan exceeds data".into()));
         }
         let val = i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
         if val == target {
@@ -322,10 +339,15 @@ fn count_eq_fixed_le8(data: &[u8], bitmap: &NullBitmap, row_count: usize, target
         }
         offset += 8;
     }
-    count
+    Ok(count)
 }
 
-fn count_eq_fixed_le4(data: &[u8], bitmap: &NullBitmap, row_count: usize, target: i32) -> u64 {
+fn count_eq_fixed_le4(
+    data: &[u8],
+    bitmap: &NullBitmap,
+    row_count: usize,
+    target: i32,
+) -> Result<u64> {
     let mut count: u64 = 0;
     let mut offset = 0usize;
     for i in 0..row_count {
@@ -333,7 +355,7 @@ fn count_eq_fixed_le4(data: &[u8], bitmap: &NullBitmap, row_count: usize, target
             continue;
         }
         if offset + 4 > data.len() {
-            break;
+            return Err(TaibaiError::Storage("fixed column scan exceeds data".into()));
         }
         let val = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
         if val == target {
@@ -341,10 +363,15 @@ fn count_eq_fixed_le4(data: &[u8], bitmap: &NullBitmap, row_count: usize, target
         }
         offset += 4;
     }
-    count
+    Ok(count)
 }
 
-fn count_eq_fixed_le2(data: &[u8], bitmap: &NullBitmap, row_count: usize, target: i16) -> u64 {
+fn count_eq_fixed_le2(
+    data: &[u8],
+    bitmap: &NullBitmap,
+    row_count: usize,
+    target: i16,
+) -> Result<u64> {
     let mut count: u64 = 0;
     let mut offset = 0usize;
     for i in 0..row_count {
@@ -352,7 +379,7 @@ fn count_eq_fixed_le2(data: &[u8], bitmap: &NullBitmap, row_count: usize, target
             continue;
         }
         if offset + 2 > data.len() {
-            break;
+            return Err(TaibaiError::Storage("fixed column scan exceeds data".into()));
         }
         let val = i16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
         if val == target {
@@ -360,10 +387,15 @@ fn count_eq_fixed_le2(data: &[u8], bitmap: &NullBitmap, row_count: usize, target
         }
         offset += 2;
     }
-    count
+    Ok(count)
 }
 
-fn count_eq_fixed_le1(data: &[u8], bitmap: &NullBitmap, row_count: usize, target: i8) -> u64 {
+fn count_eq_fixed_le1(
+    data: &[u8],
+    bitmap: &NullBitmap,
+    row_count: usize,
+    target: i8,
+) -> Result<u64> {
     let mut count: u64 = 0;
     let mut offset = 0usize;
     for i in 0..row_count {
@@ -371,17 +403,22 @@ fn count_eq_fixed_le1(data: &[u8], bitmap: &NullBitmap, row_count: usize, target
             continue;
         }
         if offset + 1 > data.len() {
-            break;
+            return Err(TaibaiError::Storage("fixed column scan exceeds data".into()));
         }
         if data[offset] as i8 == target {
             count += 1;
         }
         offset += 1;
     }
-    count
+    Ok(count)
 }
 
-fn count_eq_fixed_le8f(data: &[u8], bitmap: &NullBitmap, row_count: usize, target: f64) -> u64 {
+fn count_eq_fixed_le8f(
+    data: &[u8],
+    bitmap: &NullBitmap,
+    row_count: usize,
+    target: f64,
+) -> Result<u64> {
     let mut count: u64 = 0;
     let mut offset = 0usize;
     for i in 0..row_count {
@@ -389,7 +426,7 @@ fn count_eq_fixed_le8f(data: &[u8], bitmap: &NullBitmap, row_count: usize, targe
             continue;
         }
         if offset + 8 > data.len() {
-            break;
+            return Err(TaibaiError::Storage("fixed column scan exceeds data".into()));
         }
         let val = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
         if val == target {
@@ -397,10 +434,15 @@ fn count_eq_fixed_le8f(data: &[u8], bitmap: &NullBitmap, row_count: usize, targe
         }
         offset += 8;
     }
-    count
+    Ok(count)
 }
 
-fn count_eq_fixed_le4f(data: &[u8], bitmap: &NullBitmap, row_count: usize, target: f32) -> u64 {
+fn count_eq_fixed_le4f(
+    data: &[u8],
+    bitmap: &NullBitmap,
+    row_count: usize,
+    target: f32,
+) -> Result<u64> {
     let mut count: u64 = 0;
     let mut offset = 0usize;
     for i in 0..row_count {
@@ -408,7 +450,7 @@ fn count_eq_fixed_le4f(data: &[u8], bitmap: &NullBitmap, row_count: usize, targe
             continue;
         }
         if offset + 4 > data.len() {
-            break;
+            return Err(TaibaiError::Storage("fixed column scan exceeds data".into()));
         }
         let val = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
         if val == target {
@@ -416,10 +458,15 @@ fn count_eq_fixed_le4f(data: &[u8], bitmap: &NullBitmap, row_count: usize, targe
         }
         offset += 4;
     }
-    count
+    Ok(count)
 }
 
-fn count_eq_varchar(data: &[u8], bitmap: &NullBitmap, row_count: usize, target: &str) -> u64 {
+fn count_eq_varchar(
+    data: &[u8],
+    bitmap: &NullBitmap,
+    row_count: usize,
+    target: &str,
+) -> Result<u64> {
     let target_bytes = target.as_bytes();
     let mut count: u64 = 0;
     let mut pos = 0usize;
@@ -428,19 +475,21 @@ fn count_eq_varchar(data: &[u8], bitmap: &NullBitmap, row_count: usize, target: 
             continue;
         }
         if pos + 4 > data.len() {
-            break;
+            return Err(TaibaiError::Storage(
+                "variable column length prefix truncated".into(),
+            ));
         }
         let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
         if pos + len > data.len() {
-            break;
+            return Err(TaibaiError::Storage("variable column value truncated".into()));
         }
         if &data[pos..pos + len] == target_bytes {
             count += 1;
         }
         pos += len;
     }
-    count
+    Ok(count)
 }
 
 fn count_eq_adaptive(
@@ -464,7 +513,10 @@ fn count_eq_adaptive(
             count_eq_rle_raw(payload, row_count, col_def, bitmap, value)
         }
         crate::storage::codec::encoding::EncodingType::Delta => {
-            let values = crate::storage::codec::column_codec::decode_i64_delta_payload(payload)?;
+            let values = crate::storage::codec::column_codec::decode_i64_delta_payload(
+                payload,
+                row_count.saturating_sub(bitmap.null_count()),
+            )?;
             count_eq_numeric_from_i64(&values, row_count, col_def, bitmap, value)
         }
         crate::storage::codec::encoding::EncodingType::DeltaRle => {
@@ -474,8 +526,10 @@ fn count_eq_adaptive(
             count_eq_numeric_from_i64(&values, row_count, col_def, bitmap, value)
         }
         crate::storage::codec::encoding::EncodingType::BitPacked => {
-            let values =
-                crate::storage::codec::column_codec::decode_i64_bitpacked_payload(payload)?;
+            let values = crate::storage::codec::column_codec::decode_i64_bitpacked_payload(
+                payload,
+                row_count.saturating_sub(bitmap.null_count()),
+            )?;
             count_eq_numeric_from_i64(&values, row_count, col_def, bitmap, value)
         }
         crate::storage::codec::encoding::EncodingType::Dictionary
@@ -484,7 +538,10 @@ fn count_eq_adaptive(
             count_eq_varchar_dictionary(payload, row_count, bitmap, value)
         }
         crate::storage::codec::encoding::EncodingType::DeltaOfDelta => {
-            let values = crate::storage::codec::column_codec::decode_i64_dod_payload(payload)?;
+            let values = crate::storage::codec::column_codec::decode_i64_dod_payload(
+                payload,
+                row_count.saturating_sub(bitmap.null_count()),
+            )?;
             count_eq_numeric_from_i64(&values, row_count, col_def, bitmap, value)
         }
         crate::storage::codec::encoding::EncodingType::GorillaXor => {
@@ -515,6 +572,13 @@ fn count_eq_rle_raw(
 
     let mut cursor = Cursor::new(payload);
     let run_count = read_u32_le(&mut cursor)? as usize;
+    // Each run costs 12 bytes on the wire (i64 value + u32 len): reject a
+    // count the remaining payload cannot back before preallocating.
+    if run_count > payload.len().saturating_sub(4) / 12 {
+        return Err(TaibaiError::Storage(
+            "RLE run count exceeds payload size".into(),
+        ));
+    }
     let mut runs = Vec::with_capacity(run_count);
     for _ in 0..run_count {
         let mut value_buf = [0u8; 8];
@@ -594,7 +658,11 @@ fn count_eq_gorilla(
     let Some(target) = target else {
         return Ok(0);
     };
-    let bits = crate::storage::codec::column_codec::decode_gorilla_xor_payload(payload, width)?;
+    let bits = crate::storage::codec::column_codec::decode_gorilla_xor_payload(
+        payload,
+        width,
+        row_count.saturating_sub(bitmap.null_count()),
+    )?;
     let mut count: u64 = 0;
     let mut val_pos = 0usize;
     for row in 0..row_count {
@@ -622,9 +690,19 @@ fn count_eq_varchar_dictionary(
 
     let mut cursor = Cursor::new(payload);
     let dict_count = read_u32_le(&mut cursor)? as usize;
+    // Each dictionary entry costs at least its 4-byte length prefix: reject
+    // a count the remaining payload cannot back before preallocating.
+    if dict_count > payload.len().saturating_sub(4) / 4 {
+        return Err(TaibaiError::Storage(
+            "dictionary count exceeds payload size".into(),
+        ));
+    }
     let mut dict = Vec::with_capacity(dict_count);
     for _ in 0..dict_count {
         let len = read_u32_le(&mut cursor)? as usize;
+        if len > payload.len().saturating_sub(cursor.position() as usize) {
+            return Err(TaibaiError::Storage("dictionary value truncated".into()));
+        }
         let mut bytes = vec![0u8; len];
         cursor.read_exact(&mut bytes)?;
         dict.push(String::from_utf8_lossy(&bytes).into_owned());
@@ -647,7 +725,7 @@ fn count_eq_varchar_dictionary(
             continue;
         }
         if val_pos < index_count {
-            let idx = read_u32_le(&mut cursor).unwrap_or(u32::MAX);
+            let idx = read_u32_le(&mut cursor)?;
             if let Some(target_idx) = match_dict_idx {
                 if idx == target_idx {
                     count += 1;
@@ -833,6 +911,10 @@ pub fn fold_runs_from_raw(data: &[u8], predicates: &[RunPredicate]) -> Option<Re
     if data.len() < 4 + bitmap_len {
         return None;
     }
+    // Runs only encode non-null values, and the bitmap is word-padded to
+    // cover every row of the block, so its byte length bounds the rows the
+    // runs may claim in total.
+    let max_rows = bitmap_len.saturating_mul(8);
     let values = &data[4 + bitmap_len..];
     if values.len() < COLUMN_ENCODING_MAGIC.len() + 1 || !values.starts_with(COLUMN_ENCODING_MAGIC)
     {
@@ -846,24 +928,40 @@ pub fn fold_runs_from_raw(data: &[u8], predicates: &[RunPredicate]) -> Option<Re
     let payload = &values[COLUMN_ENCODING_MAGIC.len() + 1..];
     match encoding {
         crate::storage::codec::encoding::EncodingType::Rle => {
-            Some(fold_plain_rle_runs(payload, predicates))
+            Some(fold_plain_rle_runs(payload, predicates, max_rows))
         }
         crate::storage::codec::encoding::EncodingType::DeltaRle => {
-            Some(fold_delta_rle_runs(payload, predicates))
+            Some(fold_delta_rle_runs(payload, predicates, max_rows))
         }
         _ => None,
     }
 }
 
-fn fold_plain_rle_runs(payload: &[u8], predicates: &[RunPredicate]) -> Result<RunFold> {
+fn fold_plain_rle_runs(
+    payload: &[u8],
+    predicates: &[RunPredicate],
+    max_rows: usize,
+) -> Result<RunFold> {
     let mut cursor = Cursor::new(payload);
     let run_count = read_u32_le(&mut cursor)? as usize;
     let mut fold = RunFold::default();
+    let mut covered: u64 = 0;
     for _ in 0..run_count {
         let mut value_buf = [0u8; 8];
         cursor.read_exact(&mut value_buf)?;
         let value = i64::from_le_bytes(value_buf);
         let len = read_u32_le(&mut cursor)? as u64;
+        // The runs must cover the block's non-null rows: reject a payload
+        // whose run lengths outrun the bitmap's row capacity (or overflow).
+        covered = covered.checked_add(len).ok_or_else(|| {
+            TaibaiError::Storage("RLE run lengths overflow row coverage".into())
+        })?;
+        if covered > max_rows as u64 {
+            return Err(TaibaiError::Storage(format!(
+                "run lengths cover {} rows, exceeding the block's bitmap capacity of {}",
+                covered, max_rows
+            )));
+        }
         if predicates.iter().all(|p| p.matches(value)) {
             fold.add_run(value, len);
         }
@@ -871,15 +969,30 @@ fn fold_plain_rle_runs(payload: &[u8], predicates: &[RunPredicate]) -> Result<Ru
     Ok(fold)
 }
 
-fn fold_delta_rle_runs(payload: &[u8], predicates: &[RunPredicate]) -> Result<RunFold> {
+fn fold_delta_rle_runs(
+    payload: &[u8],
+    predicates: &[RunPredicate],
+    max_rows: usize,
+) -> Result<RunFold> {
     let mut cursor = Cursor::new(payload);
     let run_count = read_u32_le(&mut cursor)? as usize;
     let mut fold = RunFold::default();
     let mut prev = 0i64;
+    let mut covered: u64 = 0;
     for _ in 0..run_count {
         let delta = zigzag_decode(read_varint(&mut cursor)?);
         prev = prev.wrapping_add(delta);
         let len = read_varint(&mut cursor)? as u64;
+        // Same total-coverage bound as the plain RLE fold.
+        covered = covered.checked_add(len).ok_or_else(|| {
+            TaibaiError::Storage("delta-RLE run lengths overflow row coverage".into())
+        })?;
+        if covered > max_rows as u64 {
+            return Err(TaibaiError::Storage(format!(
+                "run lengths cover {} rows, exceeding the block's bitmap capacity of {}",
+                covered, max_rows
+            )));
+        }
         if predicates.iter().all(|p| p.matches(prev)) {
             fold.add_run(prev, len);
         }
@@ -1122,4 +1235,94 @@ pub fn debug_run_stats_from_raw(data: &[u8]) -> Option<(u64, u64)> {
         _ => return None,
     }
     Some((run_count, rows))
+}
+
+#[cfg(test)]
+mod count_eq_tests {
+    use super::*;
+
+    fn col_def(data_type: DataType) -> ColumnDef {
+        ColumnDef::new("c", data_type)
+    }
+
+    /// Full column block (`[bitmap_len][bitmap][values]`) for the plain,
+    /// non-adaptive decode paths.
+    fn raw_block(bitmap: &NullBitmap, values: &[u8]) -> Vec<u8> {
+        let bitmap_bytes = bitmap.to_bytes();
+        let mut raw = Vec::with_capacity(4 + bitmap_bytes.len() + values.len());
+        raw.extend_from_slice(&(bitmap_bytes.len() as u32).to_le_bytes());
+        raw.extend_from_slice(&bitmap_bytes);
+        raw.extend_from_slice(values);
+        raw
+    }
+
+    #[test]
+    fn count_eq_fixed_truncated_payload_is_error_not_partial_count() {
+        // Regression: the fixed-width count kernels used to stop at the
+        // truncation ("break") and return a partial count instead of
+        // surfacing the corruption like the selected_eq_rows_* family.
+        let rows = 4usize;
+        let mut payload = Vec::new();
+        for v in [7i64, 7, 9, 7] {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+        let bitmap = NullBitmap::new_valid(rows);
+        let def = col_def(DataType::Int64);
+        let target = ScalarValue::Int64(Some(7));
+
+        let counted =
+            count_eq_from_raw(&raw_block(&bitmap, &payload), rows, &def, &target).unwrap();
+        assert_eq!(counted, 3);
+
+        // Drop the last row's final bytes: the count must fail, not report 2.
+        let truncated = &payload[..payload.len() - 4];
+        assert!(count_eq_from_raw(&raw_block(&bitmap, truncated), rows, &def, &target).is_err());
+    }
+
+    #[test]
+    fn count_eq_varchar_truncated_payload_is_error_not_partial_count() {
+        let rows = 3usize;
+        let mut payload = Vec::new();
+        for s in ["ab", "ab", "cd"] {
+            payload.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            payload.extend_from_slice(s.as_bytes());
+        }
+        let bitmap = NullBitmap::new_valid(rows);
+        let def = col_def(DataType::VarChar);
+        let target = ScalarValue::VarChar(Some("ab".into()));
+
+        let counted =
+            count_eq_from_raw(&raw_block(&bitmap, &payload), rows, &def, &target).unwrap();
+        assert_eq!(counted, 2);
+
+        // Cut into the last value: must fail, not return a partial count.
+        let truncated = &payload[..payload.len() - 1];
+        assert!(count_eq_from_raw(&raw_block(&bitmap, truncated), rows, &def, &target).is_err());
+    }
+
+    #[test]
+    fn count_eq_varchar_dictionary_truncated_index_is_error_not_mismatch() {
+        // Regression: a truncated dictionary index stream used to read as
+        // u32::MAX and silently mismatch instead of surfacing the corruption.
+        let rows = 2usize;
+        let mut values = Vec::new();
+        values.extend_from_slice(COLUMN_ENCODING_MAGIC);
+        values.push(crate::storage::codec::encoding::EncodingType::Dictionary.to_u8());
+        values.extend_from_slice(&1u32.to_le_bytes()); // dict_count
+        values.extend_from_slice(&2u32.to_le_bytes()); // "ab"
+        values.extend_from_slice(b"ab");
+        values.extend_from_slice(&2u32.to_le_bytes()); // index_count
+        values.extend_from_slice(&0u32.to_le_bytes()); // row 0's index
+        // Row 1's index bytes are missing.
+
+        let bitmap = NullBitmap::new_valid(rows);
+        let def = col_def(DataType::VarChar);
+        assert!(count_eq_from_raw(
+            &raw_block(&bitmap, &values),
+            rows,
+            &def,
+            &ScalarValue::VarChar(Some("ab".into()))
+        )
+        .is_err());
+    }
 }

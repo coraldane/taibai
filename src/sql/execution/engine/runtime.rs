@@ -954,9 +954,16 @@ impl Engine {
                         };
                         let first_row_id = reader.row_group_start_row(rg);
                         let batch = if has_deletes {
-                            match delete_bitmap::filter_batch(&batch, first_row_id, del_bitmap) {
+                            match delete_bitmap::filter_batch(batch, first_row_id, del_bitmap) {
                                 Ok(b) => b,
-                                Err(_) => batch,
+                                Err(e) => {
+                                    // Cannot guarantee which rows are live:
+                                    // skip this row group instead of feeding
+                                    // possibly-deleted rows into the hot store.
+                                    tracing::warn!(error = %e, "warmup: delete-bitmap filter failed");
+                                    segment_loaded = false;
+                                    continue;
+                                }
                             }
                         } else {
                             batch

@@ -120,6 +120,21 @@ impl BloomFilter {
 
     pub fn merge(&mut self, other: &BloomFilter) {
         if self.num_bits != other.num_bits {
+            // Merging filters of different sizes would silently drop every
+            // source bit (the loop below clips at self.bits.len()). Callers
+            // outside this module discard our return value, so surface the
+            // mismatch loudly instead of quietly ignoring the source data.
+            debug_assert!(
+                self.num_bits == other.num_bits,
+                "bloom filter merge: num_bits mismatch ({} vs {}), source ignored",
+                self.num_bits,
+                other.num_bits
+            );
+            tracing::warn!(
+                "bloom filter merge: num_bits mismatch ({} vs {}), source ignored",
+                self.num_bits,
+                other.num_bits
+            );
             return;
         }
 
@@ -252,6 +267,11 @@ impl BloomFilter {
         buf
     }
 
+    /// Upper bound on hash functions accepted from serialized metadata: the
+    /// optimal k is single-digit for sane false-positive rates, and a corrupt
+    /// count would otherwise drive that many bit probes per lookup.
+    const MAX_DESERIALIZED_HASHES: usize = 32;
+
     pub fn deserialize(data: &[u8]) -> Option<Self> {
         if data.len() < 16 {
             return None;
@@ -259,6 +279,11 @@ impl BloomFilter {
 
         let num_bits = u64::from_le_bytes(data[0..8].try_into().ok()?) as usize;
         let num_hashes = u64::from_le_bytes(data[8..16].try_into().ok()?) as usize;
+        // A zero num_bits would panic on the `% num_bits` in might_contain,
+        // and an unbounded num_hashes would degrade every lookup.
+        if num_bits == 0 || num_hashes == 0 || num_hashes > Self::MAX_DESERIALIZED_HASHES {
+            return None;
+        }
         let bits_len = num_bits.div_ceil(8);
 
         if data.len() < 16 + bits_len {

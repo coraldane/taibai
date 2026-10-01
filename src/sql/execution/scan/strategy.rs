@@ -378,6 +378,7 @@ pub fn read_row_group_with_strategy(
                 .expect("cluster key bounds present for cluster key strategy");
             row_filter::cluster_key_range_read(
                 reader,
+                table_schema,
                 rg_idx,
                 bounds,
                 &plan.projection_cols,
@@ -390,6 +391,7 @@ pub fn read_row_group_with_strategy(
         }
         RowGroupReadStrategy::PredicateFirstRead => row_filter::predicate_first_read(
             reader,
+            table_schema,
             rg_idx,
             &plan.predicate_cols,
             &plan.projection_cols,
@@ -446,7 +448,7 @@ pub fn read_plain_row_group(
         // in the row-group count for bitmap segments.
         let rg_start_row: u64 = reader.row_group_start_row(rg_idx);
         batch = crate::storage::segment::delete_bitmap::filter_batch(
-            &batch,
+            batch,
             rg_start_row,
             reader.delete_bitmap(),
         )?;
@@ -532,7 +534,7 @@ fn apply_delete_bitmap(
     // O(1) prefix sum instead of cloning the whole footer per row group.
     let rg_start_row: u64 = reader.row_group_start_row(rg_idx);
     crate::storage::segment::delete_bitmap::filter_batch(
-        &batch,
+        batch,
         rg_start_row,
         reader.delete_bitmap(),
     )

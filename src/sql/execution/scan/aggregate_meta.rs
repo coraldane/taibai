@@ -126,9 +126,16 @@ pub fn compute_simple_aggregate(
             .map(|m| m.deleted_row_count)
             .unwrap_or(u64::MAX);
         let meta_rows = meta.as_ref().map(|m| m.row_count).unwrap_or(0);
-        let pruned = meta.as_ref().is_some_and(|m| {
-            !row_group::prune_segment_by_zone_map(&predicate, &m.segment_zone_maps)
-        });
+        let pruned = match meta.as_ref() {
+            Some(m) => {
+                // Sidecar zone maps follow the segment's footer column
+                // order; re-index the predicate onto it before comparing.
+                let aligned_predicate =
+                    row_filter::align_predicate_to_footer(table_schema, &m.schema, &predicate)?;
+                !row_group::prune_segment_by_zone_map(&aligned_predicate, &m.segment_zone_maps)
+            }
+            None => false,
+        };
         if pruned {
             continue;
         }
@@ -150,6 +157,28 @@ pub fn compute_simple_aggregate(
         if super::strategy::reader_schema_differs(reader.schema(), table_schema) {
             return Ok(None);
         }
+        // Everything below indexes footer-space metadata (zone maps, bloom
+        // filters, value sets, col_sums) with catalog column numbers. The
+        // gate above normally makes this a no-op; translating by name keeps
+        // the fold exact if the gate is ever relaxed for drifted segments.
+        let footer_schema = reader.schema();
+        let aligned_checks = row_filter::align_prune_checks_to_footer(
+            table_schema,
+            footer_schema,
+            &predicate,
+            &bloom_checks,
+            &in_checks,
+            &set_checks,
+            &set_in_checks,
+        )?;
+        let mut aggregate_cols: Vec<usize> = Vec::new();
+        for column in aggregate_columns.iter().flatten() {
+            if !aggregate_cols.contains(column) {
+                aggregate_cols.push(*column);
+            }
+        }
+        let column_map =
+            row_filter::align_column_map(table_schema, footer_schema, &aggregate_cols)?;
         let footer_sums = if let Some(first) = meta.as_ref().and_then(|m| m.row_groups.first()) {
             first.col_sums.len() == first.zone_maps.len()
         } else {
@@ -184,6 +213,7 @@ pub fn compute_simple_aggregate(
                 aggregates_foldable_from_metadata(
                     &accumulators,
                     &aggregate_columns,
+                    &column_map,
                     &m.segment_zone_maps,
                 )
             }) {
@@ -198,7 +228,13 @@ pub fn compute_simple_aggregate(
         };
         if let Some(cached) = &sum_cache {
             if let Some(m) = &meta {
-                fold_metadata(&mut accumulators, &m.segment_zone_maps, m.row_count, &[])?;
+                fold_metadata(
+                    &mut accumulators,
+                    &column_map,
+                    &m.segment_zone_maps,
+                    m.row_count,
+                    &[],
+                )?;
             }
             let mut sum_idx = 0usize;
             for accumulator in accumulators.iter_mut() {
@@ -229,11 +265,13 @@ pub fn compute_simple_aggregate(
             && aggregates_foldable_from_metadata(
                 &accumulators,
                 &aggregate_columns,
+                &column_map,
                 reader.segment_zone_maps(),
             )
         {
             fold_metadata(
                 &mut accumulators,
+                &column_map,
                 reader.segment_zone_maps(),
                 reader.row_count(),
                 &[],
@@ -250,21 +288,21 @@ pub fn compute_simple_aggregate(
         let candidate_indices = if let Some(meta) = &meta {
             row_group::prune_row_group_meta(
                 &meta.row_groups,
-                &predicate,
-                &bloom_checks,
-                &in_checks,
-                &set_checks,
-                &set_in_checks,
+                &aligned_checks.predicate,
+                &aligned_checks.bloom_checks,
+                &aligned_checks.in_check_refs(),
+                &aligned_checks.set_checks,
+                &aligned_checks.set_in_check_refs(),
             )
             .candidate_indices
         } else {
             row_group::prune_row_groups(
                 &reader,
-                &predicate,
-                &bloom_checks,
-                &in_checks,
-                &set_checks,
-                &set_in_checks,
+                &aligned_checks.predicate,
+                &aligned_checks.bloom_checks,
+                &aligned_checks.in_check_refs(),
+                &aligned_checks.set_checks,
+                &aligned_checks.set_in_check_refs(),
                 reader.segment_zone_maps(),
             )
             .candidate_indices
@@ -317,7 +355,11 @@ pub fn compute_simple_aggregate(
 
             let predicate_match =
                 if spec.in_predicates.is_empty() && spec.remaining_predicate.is_none() {
-                    predicate.classify_row_group(&row_group_meta.zone_maps)
+                    // Clauses were re-indexed onto this footer's column
+                    // order, so they classify against the right zone maps.
+                    aligned_checks
+                        .predicate
+                        .classify_row_group(&row_group_meta.zone_maps)
                 } else {
                     crate::storage::partition::pruning::PredicateMatch::Partial
                 };
@@ -338,6 +380,7 @@ pub fn compute_simple_aggregate(
                 && aggregates_foldable_from_metadata(
                     &accumulators,
                     &aggregate_columns,
+                    &column_map,
                     &row_group_meta.zone_maps,
                 )
                 && (!has_sum && !has_avg || rg_sums_available)
@@ -354,14 +397,20 @@ pub fn compute_simple_aggregate(
             // Classify each clause against this row group's zone maps: All
             // clauses are vacuous (every row satisfies them — no mask work,
             // no predicate column read), Partial clauses must share one
-            // column to be run-foldable.
+            // column to be run-foldable. Clauses keep their catalog indices
+            // for the fold column; the zone-map lookup uses the footer index.
             let mut fold_column: Option<usize> = None;
             let mut run_predicates: Vec<RunPredicate> = Vec::new();
             let mut discriminating = false;
             let mut classifiable = clause_vacuity_ok;
             if clause_vacuity_ok {
-                for clause in &predicate.clauses {
-                    let Some(zone_map) = row_group_meta.zone_maps.get(clause.column_index) else {
+                for (clause, aligned_clause) in predicate
+                    .clauses
+                    .iter()
+                    .zip(aligned_checks.predicate.clauses.iter())
+                {
+                    let Some(zone_map) = row_group_meta.zone_maps.get(aligned_clause.column_index)
+                    else {
                         classifiable = false;
                         break;
                     };
@@ -404,6 +453,7 @@ pub fn compute_simple_aggregate(
                     &aggregate_columns,
                     &accumulators,
                     table_schema,
+                    &column_map,
                     &row_group_meta.zone_maps,
                     &reader,
                 );
@@ -453,7 +503,13 @@ pub fn compute_simple_aggregate(
         }
 
         for (zone_maps, row_count, col_sums) in meta_folds {
-            fold_metadata(&mut accumulators, zone_maps, row_count, col_sums)?;
+            fold_metadata(
+                &mut accumulators,
+                &column_map,
+                zone_maps,
+                row_count,
+                col_sums,
+            )?;
         }
 
         let delete_bitmap_is_empty = reader.delete_bitmap().is_empty();
@@ -481,11 +537,22 @@ pub fn compute_simple_aggregate(
                             return folded.map(RgOutcome::Runs);
                         }
                     }
-                    let mut batch = reader
-                        .read_row_group_with_projection(fold.row_group_index, &fold.read_columns)?;
+                    // fold.read_columns carries catalog indices: translate
+                    // onto this segment's footer layout for the physical
+                    // read. The batch keeps the request order, so the
+                    // positional mapping in `fold.positions` still holds.
+                    let aligned_read_columns = row_filter::align_indices_to_footer(
+                        table_schema,
+                        reader.schema(),
+                        &fold.read_columns,
+                    )?;
+                    let mut batch = reader.read_row_group_with_projection(
+                        fold.row_group_index,
+                        &aligned_read_columns,
+                    )?;
                     if !delete_bitmap_is_empty {
                         batch = delete_bitmap::filter_batch(
-                            &batch,
+                            batch,
                             fold.row_start,
                             reader.delete_bitmap(),
                         )?;
@@ -628,12 +695,13 @@ fn aggregate_source_columns(spec: &ScanSpec, aggregate_columns: &[Option<usize>]
 
 fn fold_metadata(
     accumulators: &mut [AggAccum],
+    column_map: &std::collections::HashMap<usize, usize>,
     zone_maps: &[crate::storage::partition::pruning::ZoneMap],
     row_count: u64,
     col_sums: &[i64],
 ) -> Result<()> {
     for accumulator in accumulators {
-        accumulator.fold_metadata(zone_maps, row_count, col_sums)?;
+        accumulator.fold_metadata(zone_maps, row_count, col_sums, column_map)?;
     }
     Ok(())
 }
@@ -649,13 +717,16 @@ fn fold_metadata(
 fn aggregates_foldable_from_metadata(
     accumulators: &[AggAccum],
     aggregate_columns: &[Option<usize>],
+    column_map: &std::collections::HashMap<usize, usize>,
     zone_maps: &[crate::storage::partition::pruning::ZoneMap],
 ) -> bool {
     accumulators
         .iter()
         .zip(aggregate_columns)
         .all(|(_, column)| match column {
-            Some(col) => zone_maps.get(*col).is_some_and(ZoneMap::is_computed),
+            Some(col) => zone_maps
+                .get(row_filter::mapped_column(column_map, *col))
+                .is_some_and(ZoneMap::is_computed),
             None => true,
         })
 }
@@ -719,6 +790,7 @@ fn plan_vacuous_run_fold(
     aggregate_columns: &[Option<usize>],
     accumulators: &[AggAccum],
     table_schema: &Schema,
+    column_map: &std::collections::HashMap<usize, usize>,
     zone_maps: &[ZoneMap],
     reader: &SegmentReader,
 ) -> Option<RunFoldPlan> {
@@ -736,7 +808,8 @@ fn plan_vacuous_run_fold(
         return None;
     }
     let has_count_star = accumulators.iter().any(|a| a.column.is_none());
-    if has_count_star && zone_maps.get(column)?.null_count != 0 {
+    let footer_column = row_filter::mapped_column(column_map, column);
+    if has_count_star && zone_maps.get(footer_column)?.null_count != 0 {
         return None;
     }
     let segment_column = reader
@@ -908,6 +981,7 @@ impl AggAccum {
         zone_maps: &[crate::storage::partition::pruning::ZoneMap],
         row_count: u64,
         col_sums: &[i64],
+        column_map: &std::collections::HashMap<usize, usize>,
     ) -> Result<()> {
         let Some(column) = self.column else {
             if self.func == AggFunc::Count {
@@ -915,7 +989,10 @@ impl AggAccum {
             }
             return Ok(());
         };
-        let Some(zone_map) = zone_maps.get(column) else {
+        // zone_maps / col_sums are indexed by the segment's footer column
+        // order: resolve the catalog argument column onto it by name.
+        let footer_column = row_filter::mapped_column(column_map, column);
+        let Some(zone_map) = zone_maps.get(footer_column) else {
             return Ok(());
         };
         // An all-null row group contributes nothing to SUM/AVG — its footer
@@ -933,12 +1010,12 @@ impl AggAccum {
                 self.merge_max(zone_map.max_value.clone())
             }
             AggFunc::Sum if has_values => {
-                if let Some(&sum) = col_sums.get(column) {
+                if let Some(&sum) = col_sums.get(footer_column) {
                     self.add_i64(sum)?;
                 }
             }
             AggFunc::Avg if has_values => {
-                if let Some(&sum) = col_sums.get(column) {
+                if let Some(&sum) = col_sums.get(footer_column) {
                     self.avg_sum_f = Some(self.avg_sum_f.unwrap_or(0.0) + sum as f64);
                     self.avg_count += row_count.saturating_sub(zone_map.null_count);
                 }
@@ -1313,7 +1390,7 @@ pub fn compute_distinct_column(
             let mut batch = reader.read_row_group_with_projection(rg_idx, &[col_idx])?;
             if !bitmap_is_empty {
                 let row_start = reader.row_group_start_row(rg_idx);
-                batch = delete_bitmap::filter_batch(&batch, row_start, bitmap)?;
+                batch = delete_bitmap::filter_batch(batch, row_start, bitmap)?;
             }
             let Some(column) = batch.column(0) else {
                 return Ok(None);

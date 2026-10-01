@@ -307,7 +307,7 @@ pub(crate) fn exec_delete_in_txn(
                 continue;
             }
             if let Some(ref pred) = predicate {
-                if !super::helpers::segment_may_match(&reader, Some(pred)) {
+                if !super::helpers::segment_may_match(&reader, &table_schema, Some(pred)) {
                     continue;
                 }
             }
@@ -319,11 +319,12 @@ pub(crate) fn exec_delete_in_txn(
             // evaluated.
             let outcome = super::dml_delete::match_segment_for_delete(
                 &reader,
+                table_schema,
                 predicate,
                 resolved_where_clause.as_ref(),
                 &prior_ids,
                 resolved_where_clause.is_some(),
-                |reader, rg_idx| reader.read_row_group(rg_idx),
+                |reader, rg_idx| reader.read_row_group_columns_aligned(rg_idx, table_schema),
                 |batch, matched| {
                     if !publish_deletes {
                         return Ok(());
@@ -526,7 +527,7 @@ pub(crate) fn exec_update_in_txn(
 
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
-            if !super::helpers::segment_may_match(&reader, predicate) {
+            if !super::helpers::segment_may_match(&reader, &table_schema, predicate) {
                 continue;
             }
             let prior_ids = engine
@@ -537,7 +538,13 @@ pub(crate) fn exec_update_in_txn(
 
             for rg_idx in 0..reader.num_row_groups() {
                 if let Some(ref pred) = predicate {
-                    if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
+                    // Footer zone maps follow the segment's own column order;
+                    // re-anchor the catalog-space predicate per segment.
+                    let Ok(aligned) = reader.align_row_group_predicate(&table_schema, pred)
+                    else {
+                        break; // referenced column absent from this segment
+                    };
+                    if !aligned.matches_row_group(reader.zone_maps(rg_idx)) {
                         continue;
                     }
                 }
@@ -551,7 +558,8 @@ pub(crate) fn exec_update_in_txn(
                 if !mask.iter().any(|m| *m) {
                     continue;
                 }
-                let batch = reader.read_row_group(rg_idx)?;
+                // Catalog-ordered read: `assigned` maps catalog indices.
+                let batch = reader.read_row_group_columns_aligned(rg_idx, &table_schema)?;
                 let start_row = reader.row_group_start_row(rg_idx);
                 let footer_bitmap = reader.delete_bitmap();
                 let mut matched: Vec<u32> = Vec::new();

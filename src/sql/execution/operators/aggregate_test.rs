@@ -258,6 +258,9 @@ fn decode_key_scalar_round_trips_encode_key_at() {
             vec![
                 ScalarValue::Float32(Some(-1.5)),
                 ScalarValue::Float32(Some(0.25)),
+                // -0.0 encodes as the canonical +0.0 (SQL `=` semantics), and
+                // Rust's f32 equality agrees, so the round trip still holds.
+                ScalarValue::Float32(Some(-0.0)),
             ],
         ),
         (
@@ -455,4 +458,21 @@ fn grouped_sum_overflow_errors_instead_of_wrapping() {
     );
     let error = exec.next_batch().unwrap_err().to_string();
     assert!(error.contains("SUM overflow"), "got: {error}");
+}
+
+#[test]
+fn nan_keys_share_one_canonical_encoding() {
+    use crate::types::array::ColumnArray;
+    use crate::types::batch::{ColumnDef, Schema};
+    use crate::protocol::types::DataType as Dt;
+    let schema = Schema::new(vec![ColumnDef::new("f", Dt::Float64)]);
+    let mut col = ColumnArray::empty(Dt::Float64);
+    for v in [f64::NAN, -f64::NAN] {
+        col.push(&crate::types::scalar::ScalarValue::Float64(Some(v))).unwrap();
+    }
+    let mut k1 = Vec::new();
+    col.encode_key_at(0, &mut k1);
+    let mut k2 = Vec::new();
+    col.encode_key_at(1, &mut k2);
+    assert_eq!(k1, k2, "all NaN payloads must fold to one canonical key");
 }

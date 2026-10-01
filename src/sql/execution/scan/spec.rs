@@ -51,6 +51,16 @@ pub struct ScanSpec {
     /// DISTINCT fast path target column (name in the table schema). Set only
     /// for single-column, predicate-free `SELECT DISTINCT` scans.
     pub distinct_column: Option<String>,
+
+    /// The catalog schema this spec was compiled against. Every column index
+    /// in the spec (predicates, projection, index columns) is an index into
+    /// THIS schema, while per-segment structures (footer zone maps, bloom
+    /// filters, physical column blocks) follow each segment's own footer
+    /// order — after a DROP/RENAME COLUMN the two drift apart. Readers
+    /// translate between the two spaces per segment via
+    /// `SegmentReader::align_indices` using this schema. Empty for
+    /// hand-built specs (tests): consumers then assume identity mapping.
+    pub table_schema: Schema,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +109,7 @@ impl ScanSpec {
             hot_mirror_bound: None,
             simple_metadata_aggregates: None,
             distinct_column: None,
+            table_schema: Schema::empty(),
         }
     }
 
@@ -160,6 +171,7 @@ pub fn compile_scan_spec(
     table_meta: &TableMeta,
 ) -> ScanSpec {
     let mut spec = ScanSpec::new(table_name);
+    spec.table_schema = table_schema.clone();
 
     if let LogicalPlan::Scan(scan) = plan {
         spec.distinct_column = scan.distinct_column.clone();

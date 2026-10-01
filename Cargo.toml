@@ -269,3 +269,7 @@ path = "tests/direct_bulk_multi_session_test.rs"
 [[test]]
 name = "join_fast_path_test"
 path = "tests/join_fast_path_test.rs"
+
+[[test]]
+name = "alter_column_drift_test"
+path = "tests/alter_column_drift_test.rs"

@@ -118,13 +118,23 @@ fn count_with_single_eq(
 
     for seg_path in segment_files {
         if let Some(meta) = segment_mgr.segment_meta(seg_path)? {
-            if !row_group::prune_segment_by_zone_map(&pred, &meta.segment_zone_maps) {
+            // Sidecar zone maps follow the segment's footer column order;
+            // re-index the predicate onto it before comparing.
+            let aligned_pred =
+                row_filter::align_predicate_to_footer(&spec.table_schema, &meta.schema, &pred)?;
+            if !row_group::prune_segment_by_zone_map(&aligned_pred, &meta.segment_zone_maps) {
                 continue;
             }
         }
         let reader = segment_mgr.open_scan_reader(seg_path, spec.reader_txn_id)?;
 
-        match reader.count_matching_rows_fast(col_idx, value) {
+        // count_matching_rows_fast probes bloom filters / zone maps / raw
+        // blocks by footer column number: col_idx is a catalog index and
+        // must be translated per segment (DROP/RENAME COLUMN drift).
+        let footer_idx =
+            row_filter::align_indices_to_footer(&spec.table_schema, reader.schema(), &[col_idx])?
+                [0];
+        match reader.count_matching_rows_fast(footer_idx, value) {
             Ok(count) => *total_rows += count,
             Err(e) => return Err(e),
         }
@@ -156,21 +166,46 @@ fn count_with_predicates(
         // exists; re-running the same pruning through the reader footer (the
         // old behavior) doubled the metadata walk for every segment. Keep the
         // reader fallback only for segments without meta.
-        let meta_candidates = (|| {
-            let meta = segment_mgr.segment_meta(seg_path).ok()??;
-            if !row_group::prune_segment_by_zone_map(pred, &meta.segment_zone_maps) {
-                return Some(Vec::new());
+        //
+        // Both the sidecar meta and the reader footer index their zone maps /
+        // bloom filters / value sets by the segment's own footer column
+        // order, while the predicate and check lists carry catalog indices:
+        // translate them onto each segment before pruning.
+        let meta_snapshot = segment_mgr.segment_meta(seg_path).ok().flatten();
+        let meta_candidates = match meta_snapshot {
+            Some(meta) => {
+                let aligned = row_filter::align_prune_checks_to_footer(
+                    &spec.table_schema,
+                    &meta.schema,
+                    pred,
+                    bloom_checks,
+                    in_checks,
+                    set_checks,
+                    set_in_checks,
+                )?;
+                if !row_group::prune_segment_by_zone_map(
+                    &aligned.predicate,
+                    &meta.segment_zone_maps,
+                ) {
+                    Some(Vec::new())
+                } else {
+                    let in_refs = aligned.in_check_refs();
+                    let set_in_refs = aligned.set_in_check_refs();
+                    Some(
+                        row_group::prune_row_group_meta(
+                            &meta.row_groups,
+                            &aligned.predicate,
+                            &aligned.bloom_checks,
+                            &in_refs,
+                            &aligned.set_checks,
+                            &set_in_refs,
+                        )
+                        .candidate_indices,
+                    )
+                }
             }
-            let prune_result = row_group::prune_row_group_meta(
-                &meta.row_groups,
-                pred,
-                bloom_checks,
-                in_checks,
-                set_checks,
-                set_in_checks,
-            );
-            Some(prune_result.candidate_indices)
-        })();
+            None => None,
+        };
 
         if let Some(candidates) = &meta_candidates {
             if candidates.is_empty() {
@@ -184,29 +219,57 @@ fn count_with_predicates(
             Some(candidates) => super::row_group::RowGroupPruneResult {
                 candidate_indices: candidates,
             },
-            None => row_group::prune_row_groups(
-                &reader,
-                pred,
-                bloom_checks,
-                in_checks,
-                set_checks,
-                set_in_checks,
-                reader.segment_zone_maps(),
-            ),
+            None => {
+                let aligned = row_filter::align_prune_checks_to_footer(
+                    &spec.table_schema,
+                    reader.schema(),
+                    pred,
+                    bloom_checks,
+                    in_checks,
+                    set_checks,
+                    set_in_checks,
+                )?;
+                let in_refs = aligned.in_check_refs();
+                let set_in_refs = aligned.set_in_check_refs();
+                row_group::prune_row_groups(
+                    &reader,
+                    &aligned.predicate,
+                    &aligned.bloom_checks,
+                    &in_refs,
+                    &aligned.set_checks,
+                    &set_in_refs,
+                    reader.segment_zone_maps(),
+                )
+            }
         };
 
         for rg_idx in &prune_result.candidate_indices {
             let mut batch = if filter_columns.is_empty() {
-                reader.read_row_group(*rg_idx)?
+                if super::strategy::reader_schema_differs(reader.schema(), &spec.table_schema)
+                    && spec.table_schema.num_columns() > 0
+                {
+                    // Drifted footer: read every catalog column in catalog
+                    // order (defaults for columns this segment predates) so
+                    // the catalog-space predicates below evaluate the right
+                    // columns.
+                    reader.read_row_group_columns_aligned(*rg_idx, &spec.table_schema)?
+                } else {
+                    reader.read_row_group(*rg_idx)?
+                }
             } else {
-                reader.read_row_group_with_projection(*rg_idx, &filter_columns)?
+                let aligned_filter = row_filter::align_indices_to_footer(
+                    &spec.table_schema,
+                    reader.schema(),
+                    &filter_columns,
+                )?;
+                reader.read_row_group_with_projection(*rg_idx, &aligned_filter)?
             };
             let bitmap_active = !reader.delete_bitmap().is_empty();
             if bitmap_active {
                 // O(1) prefix sum; the old clone-the-whole-footer sum was
                 // quadratic in the row-group count for bitmap segments.
                 let rg_start_row: u64 = reader.row_group_start_row(*rg_idx);
-                batch = delete_bitmap::filter_batch(&batch, rg_start_row, reader.delete_bitmap())?;
+                batch = delete_bitmap::filter_batch(batch, rg_start_row, reader.delete_bitmap())?;
             }
 
             let filtered = if filter_columns.is_empty() {

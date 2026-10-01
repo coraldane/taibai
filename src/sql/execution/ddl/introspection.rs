@@ -783,7 +783,7 @@ pub fn exec_analyze_table(engine: &Engine, db: &str, table: &str) -> Result<Exec
                         let mut batch = reader.read_row_group(row_group)?;
                         if !reader.delete_bitmap().is_empty() {
                             batch = crate::storage::segment::delete_bitmap::filter_batch(
-                                &batch,
+                                batch,
                                 reader.row_group_start_row(row_group),
                                 reader.delete_bitmap(),
                             )?;

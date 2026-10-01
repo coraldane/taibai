@@ -119,11 +119,20 @@ pub fn collect_unique_index_entries(
     indices: &[usize],
     reason: &str,
 ) -> Result<Vec<UniqueIndexEntry>> {
+    let schema = engine
+        .catalogs()
+        .read()
+        .unwrap()
+        .get(db)
+        .and_then(|catalog| catalog.get_table_shared(table))
+        .map(|meta| crate::types::batch::Schema::new(meta.columns.clone()))
+        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
     collect_unique_index_entries_from(
         engine.segment_mgr(),
         &engine.memtable_manager().get_by_table(db, table),
         &engine.data_dir().join(db).join(table),
         table,
+        &schema,
         indices,
         reason,
     )
@@ -134,6 +143,7 @@ pub(crate) fn collect_unique_index_entries_from(
     memtables: &[std::sync::Arc<crate::storage::core::memtable::MemTable>],
     table_dir: &std::path::Path,
     table: &str,
+    table_schema: &crate::types::batch::Schema,
     indices: &[usize],
     reason: &str,
 ) -> Result<Vec<UniqueIndexEntry>> {
@@ -142,8 +152,13 @@ pub(crate) fn collect_unique_index_entries_from(
     if table_dir.exists() {
         for seg_path in SegmentManager::discover_segments(table_dir)? {
             let reader = segment_mgr.open_reader_cached(&seg_path)?;
+            // Name-based read: catalog indices hit the wrong physical column
+            // on segments whose footer predates a DROP/RENAME COLUMN.
+            let batch_per_rg = |rg_idx: usize| -> Result<crate::types::batch::RecordBatch> {
+                reader.read_row_group_columns(rg_idx, table_schema, indices)
+            };
             for rg_idx in 0..reader.num_row_groups() {
-                let batch = reader.read_row_group_with_projection(rg_idx, indices)?;
+                let batch = batch_per_rg(rg_idx)?;
                 let rg_start = reader.row_group_start_row(rg_idx);
                 let delete_bitmap = reader.delete_bitmap();
                 let projected_indices: Vec<usize> = (0..batch.num_columns()).collect();
@@ -170,8 +185,24 @@ pub(crate) fn collect_unique_index_entries_from(
     }
     for memtable in memtables {
         if let Some(batch) = memtable.read() {
+            // Memtable batches keep their insert-time layout; resolve the key
+            // columns by name against the batch's own schema.
+            let local_indices: Vec<usize> = indices
+                .iter()
+                .filter_map(|&catalog_idx| {
+                    table_schema
+                        .columns
+                        .get(catalog_idx)
+                        .and_then(|column| batch.schema.index_of(&column.name))
+                })
+                .collect();
+            if local_indices.len() != indices.len() {
+                continue;
+            }
             for row_idx in 0..batch.num_rows() {
-                let Some(key) = unique_key_for_row(&batch, row_idx, indices, &batch.schema) else {
+                let Some(key) =
+                    unique_key_for_row(&batch, row_idx, &local_indices, &batch.schema)
+                else {
                     continue;
                 };
                 entries.push(UniqueIndexEntry {

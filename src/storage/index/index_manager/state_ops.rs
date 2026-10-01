@@ -79,6 +79,9 @@ pub(super) fn stream_merge_unique_index_base<W: Write>(
         removed_keys,
         tombstones,
     } = replayed;
+    // One index build for the whole merge: emit() probes tombstones once per
+    // candidate entry, which used to be a linear scan per entry.
+    let tombstone_index = UniqueTombstoneIndex::build(&tombstones);
     let mut delta_keys: Vec<(Vec<u8>, Vec<UniqueRowLocation>)> = additions.into_iter().collect();
     delta_keys.sort_by(|left, right| left.0.cmp(&right.0));
     let mut delta_pos = 0usize;
@@ -90,10 +93,10 @@ pub(super) fn stream_merge_unique_index_base<W: Write>(
         writer: &mut UniqueIndexBaseWriter<W>,
         key: &[u8],
         location: &UniqueRowLocation,
-        tombstones: &HashSet<UniqueRowLocation>,
+        tombstones: &UniqueTombstoneIndex,
         placeholder_seen: &mut HashSet<Vec<u8>>,
     ) -> Result<()> {
-        if unique_index_tombstones_contains(tombstones, location) {
+        if tombstones.contains(location) {
             return Ok(());
         }
         if location.segment_path.is_empty() && !placeholder_seen.insert(key.to_vec()) {
@@ -117,7 +120,7 @@ pub(super) fn stream_merge_unique_index_base<W: Write>(
                         writer,
                         delta_key,
                         location,
-                        &tombstones,
+                        &tombstone_index,
                         &mut placeholder_seen,
                     )?;
                 }
@@ -130,7 +133,7 @@ pub(super) fn stream_merge_unique_index_base<W: Write>(
                 // for the same key still merge in.
                 if delta_key_is_current {
                     for location in &delta_keys[delta_pos].1 {
-                        emit(writer, key, location, &tombstones, &mut placeholder_seen)?;
+                        emit(writer, key, location, &tombstone_index, &mut placeholder_seen)?;
                     }
                     delta_pos += 1;
                 }
@@ -140,12 +143,12 @@ pub(super) fn stream_merge_unique_index_base<W: Write>(
                 writer,
                 key,
                 &block.locations[entry_idx],
-                &tombstones,
+                &tombstone_index,
                 &mut placeholder_seen,
             )?;
             if delta_key_is_current {
                 for location in &delta_keys[delta_pos].1 {
-                    emit(writer, key, location, &tombstones, &mut placeholder_seen)?;
+                    emit(writer, key, location, &tombstone_index, &mut placeholder_seen)?;
                 }
                 delta_pos += 1;
             }
@@ -159,7 +162,7 @@ pub(super) fn stream_merge_unique_index_base<W: Write>(
                 writer,
                 delta_key,
                 location,
-                &tombstones,
+                &tombstone_index,
                 &mut placeholder_seen,
             )?;
         }
@@ -198,10 +201,14 @@ pub(super) fn unique_index_state_contains_any_key(
         return Ok(false);
     }
     let delta = state.delta.read().unwrap();
+    // One O(tombstones) index build answers every probe below in O(1); the
+    // previous per-location linear scan made large tombstone sets quadratic
+    // across the probed keys.
+    let tombstone_index = UniqueTombstoneIndex::build(&delta.tombstones);
     for encoded in sorted_encoded_keys {
         if let Some(locations) = delta.key_locations.get(encoded.as_slice()) {
             for location in locations {
-                if !unique_index_tombstones_contains(&delta.tombstones, location)
+                if !tombstone_index.contains(location)
                     && unique_index_entry_location_is_live(segment_mgr, location)?
                 {
                     return Ok(true);
@@ -209,14 +216,12 @@ pub(super) fn unique_index_state_contains_any_key(
             }
         }
     }
-    let tombstones = &delta.tombstones;
-    let base = &state.base;
     for encoded in sorted_encoded_keys {
         if delta.removed_keys.contains(encoded.as_slice()) {
             continue;
         }
-        for location in base.find_locations(encoded)? {
-            if !unique_index_tombstones_contains(tombstones, &location)
+        for location in state.base.find_locations(encoded)? {
+            if !tombstone_index.contains(&location)
                 && unique_index_entry_location_is_live(segment_mgr, &location)?
             {
                 return Ok(true);
@@ -232,9 +237,10 @@ pub(super) fn unique_index_state_contains_key(
     encoded_key: &[u8],
 ) -> Result<bool> {
     let delta = state.delta.read().unwrap();
+    let tombstone_index = UniqueTombstoneIndex::build(&delta.tombstones);
     if let Some(locations) = delta.key_locations.get(encoded_key) {
         for location in locations {
-            if !unique_index_tombstones_contains(&delta.tombstones, location)
+            if !tombstone_index.contains(location)
                 && unique_index_entry_location_is_live(segment_mgr, location)?
             {
                 return Ok(true);
@@ -244,9 +250,8 @@ pub(super) fn unique_index_state_contains_key(
     if delta.removed_keys.contains(encoded_key) {
         return Ok(false);
     }
-    let tombstones = &delta.tombstones;
     for location in state.base.find_locations(encoded_key)? {
-        if !unique_index_tombstones_contains(tombstones, &location)
+        if !tombstone_index.contains(&location)
             && unique_index_entry_location_is_live(segment_mgr, &location)?
         {
             return Ok(true);
@@ -289,18 +294,45 @@ pub(super) fn build_unique_index_blocks(encoded_keys: &[Vec<u8>]) -> Vec<UniqueI
     blocks
 }
 
-pub(super) fn unique_index_tombstones_contains(
-    tombstones: &HashSet<UniqueRowLocation>,
-    location: &UniqueRowLocation,
-) -> bool {
-    tombstones.contains(location)
-        || tombstones.iter().any(|tombstone| {
-            tombstone.row_id == location.row_id
-                && (normalize_unique_segment_path(&tombstone.segment_path)
-                    == normalize_unique_segment_path(&location.segment_path)
-                    || unique_segment_file_name(&tombstone.segment_path)
-                        == unique_segment_file_name(&location.segment_path))
-        })
+/// O(1) probe index over a tombstone set, keyed exactly the way the previous
+/// linear tombstone scan (`tombstones.contains(loc) || tombstones.iter().any`)
+/// matched: (normalized segment path, row id) plus (file name, row id) — a
+/// location is tombstoned when a tombstone recorded the same row id under
+/// either identity. Built once per operation instead of paying a linear
+/// `.any()` scan per probed location.
+pub(super) struct UniqueTombstoneIndex {
+    by_path: HashSet<(String, u64)>,
+    by_name: HashSet<(String, u64)>,
+}
+
+impl UniqueTombstoneIndex {
+    pub(super) fn build(tombstones: &HashSet<UniqueRowLocation>) -> Self {
+        let mut by_path = HashSet::with_capacity(tombstones.len());
+        let mut by_name = HashSet::with_capacity(tombstones.len());
+        for tombstone in tombstones {
+            by_path.insert((
+                normalize_unique_segment_path(&tombstone.segment_path),
+                tombstone.row_id,
+            ));
+            by_name.insert((
+                unique_segment_file_name(&tombstone.segment_path).unwrap_or_default(),
+                tombstone.row_id,
+            ));
+        }
+        Self { by_path, by_name }
+    }
+
+    pub(super) fn contains(&self, location: &UniqueRowLocation) -> bool {
+        self.by_path
+            .contains(&(
+                normalize_unique_segment_path(&location.segment_path),
+                location.row_id,
+            ))
+            || self.by_name.contains(&(
+                unique_segment_file_name(&location.segment_path).unwrap_or_default(),
+                location.row_id,
+            ))
+    }
 }
 
 pub(super) fn normalize_unique_segment_path(path: &str) -> String {
@@ -324,7 +356,10 @@ pub(super) fn unique_index_entry_location_is_live(
     if !path.exists() {
         return Ok(false);
     }
-    let reader = segment_mgr.open_reader(path)?;
+    // The cached reader (same infrastructure `unique_key_locations` uses)
+    // avoids a full footer re-parse per probed location; every visibility
+    // change invalidates the cache, so liveness answers stay current.
+    let reader = segment_mgr.open_reader_cached(path)?;
     if location.row_id >= reader.row_count() {
         return Ok(false);
     }

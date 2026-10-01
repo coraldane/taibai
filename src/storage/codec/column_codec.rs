@@ -586,7 +586,10 @@ fn encode_i64_bitpacked_payload(values: &[i64]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-pub(crate) fn decode_i64_bitpacked_payload(payload: &[u8]) -> Result<Vec<i64>> {
+pub(crate) fn decode_i64_bitpacked_payload(
+    payload: &[u8],
+    expected_rows: usize,
+) -> Result<Vec<i64>> {
     let mut cursor = Cursor::new(payload);
     let count = read_u32_le(&mut cursor)? as usize;
     if count == 0 {
@@ -602,6 +605,14 @@ pub(crate) fn decode_i64_bitpacked_payload(payload: &[u8]) -> Result<Vec<i64>> {
         return Err(TaibaiError::Storage(
             "bitpacked block size must be positive".into(),
         ));
+    }
+    // Same pre-expansion bound as decode_i64_rle_payload: a corrupt count
+    // must not drive the with_capacity below.
+    if count > expected_rows {
+        return Err(TaibaiError::Storage(format!(
+            "bitpacked value count {} exceeds the row group's {}",
+            count, expected_rows
+        )));
     }
 
     let mut values = Vec::with_capacity(count);
@@ -783,7 +794,7 @@ fn bit_window64(packed: &[u8], byte_pos: usize, shift: u32) -> Option<u64> {
     Some((lo >> shift) | (hi << (64 - shift)))
 }
 
-pub(crate) fn decode_i64_dod_payload(payload: &[u8]) -> Result<Vec<i64>> {
+pub(crate) fn decode_i64_dod_payload(payload: &[u8], expected_rows: usize) -> Result<Vec<i64>> {
     let mut cursor = Cursor::new(payload);
     let count = read_u32_le(&mut cursor)? as usize;
     if count == 0 {
@@ -792,6 +803,13 @@ pub(crate) fn decode_i64_dod_payload(payload: &[u8]) -> Result<Vec<i64>> {
     let mut base_buf = [0u8; 8];
     cursor.read_exact(&mut base_buf)?;
     let mut prev = i64::from_le_bytes(base_buf);
+    // Same pre-expansion bound as decode_i64_rle_payload.
+    if count > expected_rows {
+        return Err(TaibaiError::Storage(format!(
+            "delta-of-delta value count {} exceeds the row group's {}",
+            count, expected_rows
+        )));
+    }
     let mut values = Vec::with_capacity(count);
     values.push(prev);
     if count == 1 {
@@ -849,7 +867,11 @@ fn encode_gorilla_xor_payload(bits: &[u64], width: u32) -> Vec<u8> {
     out
 }
 
-pub(crate) fn decode_gorilla_xor_payload(payload: &[u8], width: u32) -> Result<Vec<u64>> {
+pub(crate) fn decode_gorilla_xor_payload(
+    payload: &[u8],
+    width: u32,
+    expected_rows: usize,
+) -> Result<Vec<u64>> {
     let mut cursor = Cursor::new(payload);
     let count = read_u32_le(&mut cursor)? as usize;
     if count == 0 {
@@ -866,6 +888,13 @@ pub(crate) fn decode_gorilla_xor_payload(payload: &[u8], width: u32) -> Result<V
     };
     let bitstream = &payload[cursor.position() as usize..];
     let mut reader = BitReader::new(bitstream);
+    // Same pre-expansion bound as decode_i64_rle_payload.
+    if count > expected_rows {
+        return Err(TaibaiError::Storage(format!(
+            "gorilla xor value count {} exceeds the row group's {}",
+            count, expected_rows
+        )));
+    }
     let mut values = Vec::with_capacity(count);
     let mut prev = first;
     values.push(prev);
@@ -1008,6 +1037,13 @@ pub fn decode_column_with_runs(
 ) -> Result<ColumnArray> {
     let mut cursor = Cursor::new(data);
     let bitmap_len = read_u32_le(&mut cursor)? as usize;
+    // Bound the preallocation by the actual block size: a corrupt length
+    // prefix must not drive a multi-GB zero-fill.
+    if bitmap_len > data.len().saturating_sub(4) {
+        return Err(TaibaiError::Storage(
+            "null bitmap length exceeds column block".into(),
+        ));
+    }
     let mut bitmap_data = vec![0u8; bitmap_len];
     cursor.read_exact(&mut bitmap_data)?;
     let bitmap = NullBitmap::from_bytes(&bitmap_data, row_count);
@@ -1128,9 +1164,14 @@ pub fn decode_column_with_runs(
                 if bitmap.is_null(i) {
                     vals.push(Vec::new());
                 } else {
-                    let len = read_u32_le(&mut dc).unwrap_or(0) as usize;
+                    let len = read_u32_le(&mut dc)? as usize;
+                    // Validate before allocating: a truncated block used to
+                    // silently decode into zero-filled blobs of up to 4GB.
+                    if len > remaining_data.len().saturating_sub(dc.position() as usize) {
+                        return Err(TaibaiError::Storage("blob decode: truncated value".into()));
+                    }
                     let mut v = vec![0u8; len];
-                    dc.read_exact(&mut v).unwrap_or(());
+                    dc.read_exact(&mut v)?;
                     vals.push(v);
                 }
             }
@@ -1145,11 +1186,17 @@ pub fn decode_column_with_runs(
                 if bitmap.is_null(i) {
                     vals.push(Vec::new());
                 } else {
-                    let count = read_u32_le(&mut dc).unwrap_or(0) as usize;
+                    let count = read_u32_le(&mut dc)? as usize;
+                    let len_bytes = count.checked_mul(4).ok_or_else(|| {
+                        TaibaiError::Storage("vector decode: element count overflow".into())
+                    })?;
+                    if len_bytes > remaining_data.len().saturating_sub(dc.position() as usize) {
+                        return Err(TaibaiError::Storage("vector decode: truncated value".into()));
+                    }
                     let mut v = Vec::with_capacity(count);
                     for _ in 0..count {
                         let mut b = [0u8; 4];
-                        dc.read_exact(&mut b).unwrap_or(());
+                        dc.read_exact(&mut b)?;
                         v.push(f32::from_le_bytes(b));
                     }
                     vals.push(v);
@@ -1218,15 +1265,18 @@ pub(crate) fn decode_adaptive_column_with_runs(
             build_numeric_column_from_i64(values, row_count, col_def, bitmap)
         }
         EncodingType::Delta => {
-            let values = decode_i64_delta_payload(payload)?;
+            let values =
+                decode_i64_delta_payload(payload, row_count.saturating_sub(bitmap.null_count()))?;
             build_numeric_column_from_i64(values, row_count, col_def, bitmap)
         }
         EncodingType::DeltaOfDelta => {
-            let values = decode_i64_dod_payload(payload)?;
+            let values =
+                decode_i64_dod_payload(payload, row_count.saturating_sub(bitmap.null_count()))?;
             build_numeric_column_from_i64(values, row_count, col_def, bitmap)
         }
         EncodingType::BitPacked => {
-            let values = decode_i64_bitpacked_payload(payload)?;
+            let values =
+                decode_i64_bitpacked_payload(payload, row_count.saturating_sub(bitmap.null_count()))?;
             build_numeric_column_from_i64(values, row_count, col_def, bitmap)
         }
         EncodingType::GorillaXor => {
@@ -1240,7 +1290,11 @@ pub(crate) fn decode_adaptive_column_with_runs(
                     )))
                 }
             };
-            let bits = decode_gorilla_xor_payload(payload, width)?;
+            let bits = decode_gorilla_xor_payload(
+                payload,
+                width,
+                row_count.saturating_sub(bitmap.null_count()),
+            )?;
             build_column_from_bits(bits, row_count, col_def, bitmap)
         }
         EncodingType::Dictionary if col_def.data_type == DataType::VarChar => {
@@ -1258,6 +1312,13 @@ pub(crate) fn decode_adaptive_column_with_runs(
 fn parse_i64_runs_plain_rle(payload: &[u8]) -> Result<Vec<(i64, u32)>> {
     let mut cursor = Cursor::new(payload);
     let run_count = read_u32_le(&mut cursor)? as usize;
+    // Each run costs 12 bytes on the wire (i64 value + u32 len): reject a
+    // count the remaining payload cannot back before preallocating.
+    if run_count > payload.len().saturating_sub(4) / 12 {
+        return Err(TaibaiError::Storage(
+            "RLE run count exceeds payload size".into(),
+        ));
+    }
     let mut runs = Vec::with_capacity(run_count);
     for _ in 0..run_count {
         let mut value_buf = [0u8; 8];
@@ -1273,6 +1334,13 @@ fn parse_i64_runs_plain_rle(payload: &[u8]) -> Result<Vec<(i64, u32)>> {
 fn parse_i64_runs_delta_rle(payload: &[u8]) -> Result<Vec<(i64, u32)>> {
     let mut cursor = Cursor::new(payload);
     let run_count = read_u32_le(&mut cursor)? as usize;
+    // Each run costs at least 2 bytes on the wire (two varints): reject a
+    // count the remaining payload cannot back before preallocating.
+    if run_count > payload.len().saturating_sub(4) / 2 {
+        return Err(TaibaiError::Storage(
+            "delta-RLE run count exceeds payload size".into(),
+        ));
+    }
     let mut runs = Vec::with_capacity(run_count);
     let mut prev = 0i64;
     for _ in 0..run_count {
@@ -1326,7 +1394,7 @@ pub(crate) fn decode_i64_rle_payload(payload: &[u8], expected_rows: usize) -> Re
     Ok(values)
 }
 
-pub(crate) fn decode_i64_delta_payload(payload: &[u8]) -> Result<Vec<i64>> {
+pub(crate) fn decode_i64_delta_payload(payload: &[u8], expected_rows: usize) -> Result<Vec<i64>> {
     let mut cursor = Cursor::new(payload);
     let count = read_u32_le(&mut cursor)? as usize;
     if count == 0 {
@@ -1334,6 +1402,13 @@ pub(crate) fn decode_i64_delta_payload(payload: &[u8]) -> Result<Vec<i64>> {
     }
     let mut base_buf = [0u8; 8];
     cursor.read_exact(&mut base_buf)?;
+    // Same pre-expansion bound as decode_i64_rle_payload.
+    if count > expected_rows {
+        return Err(TaibaiError::Storage(format!(
+            "delta value count {} exceeds the row group's {}",
+            count, expected_rows
+        )));
+    }
     let mut values = Vec::with_capacity(count);
     let mut prev = i64::from_le_bytes(base_buf);
     values.push(prev);
@@ -1632,6 +1707,13 @@ pub fn decode_column_selected(
 ) -> Result<ColumnArray> {
     let mut cursor = Cursor::new(data);
     let bitmap_len = read_u32_le(&mut cursor)? as usize;
+    // Bound the preallocation by the actual block size: a corrupt length
+    // prefix must not drive a multi-GB zero-fill.
+    if bitmap_len > data.len().saturating_sub(4) {
+        return Err(TaibaiError::Storage(
+            "null bitmap length exceeds column block".into(),
+        ));
+    }
     let mut bitmap_data = vec![0u8; bitmap_len];
     cursor.read_exact(&mut bitmap_data)?;
     let bitmap = NullBitmap::from_bytes(&bitmap_data, row_count);

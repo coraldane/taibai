@@ -108,6 +108,10 @@ pub fn eval_correlated_column(
     let num_rows = batch.num_rows();
     let mut values = Vec::with_capacity(num_rows);
     for row in 0..num_rows {
+        // Cheap cancellation point: a cache-miss row runs a full inner query,
+        // so a high-cardinality correlation key made one batch arbitrarily
+        // long and KILL QUERY could not act until the batch boundary.
+        crate::common::query_cancel::check()?;
         let params: Vec<ScalarValue> = node
             .params
             .iter()
@@ -150,9 +154,7 @@ fn eval_row(
         }
         (CorrelatedKind::In { negated }, Some(CachedResult::InList(list))) => {
             let lhs = lhs.expect("IN subquery carries a lhs expression");
-            return Ok(ScalarValue::Bool(Some(in_list_contains(
-                list, lhs, *negated,
-            ))));
+            return Ok(ScalarValue::Bool(in_list_contains(list, lhs, *negated)));
         }
         _ => {}
     }
@@ -177,48 +179,70 @@ fn eval_row(
 
     let plan = optimize(crate::sql::planner::plan_select(&stmt, &snapshot.schemas)?);
     let mut pipeline = build_pipeline_with_subqueries(plan, &snapshot.batches, None)?;
-    let mut batches = Vec::new();
-    while let Some(batch) = pipeline.next_batch()? {
-        batches.push(batch);
-    }
 
     let result = match node.kind {
         CorrelatedKind::Exists { .. } => {
-            let found = batches.iter().any(|batch| batch.num_rows() > 0);
+            // EXISTS only needs to know whether any row comes back: stop at
+            // the first non-empty batch instead of draining the whole inner
+            // pipeline.
+            let mut found = false;
+            while let Some(batch) = pipeline.next_batch()? {
+                if batch.num_rows() > 0 {
+                    found = true;
+                    break;
+                }
+            }
             CachedResult::Exists(found)
         }
-        CorrelatedKind::Scalar => {
-            let mut rows = 0usize;
-            let mut first: Option<ScalarValue> = None;
-            for batch in &batches {
-                if batch.num_columns() == 0 {
-                    continue;
-                }
-                for row_idx in 0..batch.num_rows() {
-                    rows += 1;
-                    if first.is_none() {
-                        first = Some(batch.scalar(row_idx, 0).unwrap_or(ScalarValue::Int64(None)));
+        CorrelatedKind::Scalar | CorrelatedKind::In { .. } => {
+            let mut batches = Vec::new();
+            while let Some(batch) = pipeline.next_batch()? {
+                batches.push(batch);
+            }
+            match node.kind {
+                CorrelatedKind::Scalar => {
+                    let mut rows = 0usize;
+                    let mut first: Option<ScalarValue> = None;
+                    for batch in &batches {
+                        if batch.num_columns() == 0 {
+                            continue;
+                        }
+                        for row_idx in 0..batch.num_rows() {
+                            rows += 1;
+                            if first.is_none() {
+                                first = Some(
+                                    batch
+                                        .scalar(row_idx, 0)
+                                        .unwrap_or(ScalarValue::Int64(None)),
+                                );
+                            }
+                        }
                     }
+                    if rows > 1 {
+                        return Err(TaibaiError::Sql(format!(
+                            "scalar subquery returned more than one row ({rows})"
+                        )));
+                    }
+                    CachedResult::Scalar(first.unwrap_or(ScalarValue::Int64(None)))
                 }
-            }
-            if rows > 1 {
-                return Err(TaibaiError::Sql(format!(
-                    "scalar subquery returned more than one row ({rows})"
-                )));
-            }
-            CachedResult::Scalar(first.unwrap_or(ScalarValue::Int64(None)))
-        }
-        CorrelatedKind::In { .. } => {
-            let mut list = Vec::new();
-            for batch in &batches {
-                if batch.num_columns() == 0 {
-                    continue;
+                CorrelatedKind::In { .. } => {
+                    let mut list = Vec::new();
+                    for batch in &batches {
+                        if batch.num_columns() == 0 {
+                            continue;
+                        }
+                        for row_idx in 0..batch.num_rows() {
+                            list.push(
+                                batch
+                                    .scalar(row_idx, 0)
+                                    .unwrap_or(ScalarValue::Int64(None)),
+                            );
+                        }
+                    }
+                    CachedResult::InList(list)
                 }
-                for row_idx in 0..batch.num_rows() {
-                    list.push(batch.scalar(row_idx, 0).unwrap_or(ScalarValue::Int64(None)));
-                }
+                _ => unreachable!("kind matched outer arm"),
             }
-            CachedResult::InList(list)
         }
     };
 
@@ -229,31 +253,52 @@ fn eval_row(
         (CorrelatedKind::Scalar, CachedResult::Scalar(value)) => value.clone(),
         (CorrelatedKind::In { negated }, CachedResult::InList(list)) => {
             let lhs = lhs.expect("IN subquery carries a lhs expression");
-            ScalarValue::Bool(Some(in_list_contains(list, lhs, *negated)))
+            ScalarValue::Bool(in_list_contains(list, lhs, *negated))
         }
         _ => unreachable!("cached/result kind mismatch"),
     };
     // Memoization is a best-effort accelerator, not a guarantee: bound the
     // per-node cache so high-cardinality correlation keys cannot grow it
-    // (and every cached IN list) without limit.
+    // (and every cached IN list) without limit. Evict a single entry instead
+    // of clearing the whole table — clear-all threw every hot correlation
+    // key out at once, collapsing the hit rate whenever the cap cycled.
     if snapshot.cache.len() >= 65536 {
-        snapshot.cache.clear();
+        if let Some(victim) = snapshot.cache.keys().next().cloned() {
+            snapshot.cache.remove(&victim);
+        }
     }
     snapshot.cache.insert(key, result);
     Ok(value)
 }
 
-/// Two-valued IN semantics, matching the existing literal `IN` evaluation
-/// (NULL never matches; NOT IN of a NULL lhs is true).
-fn in_list_contains(list: &[ScalarValue], lhs: &ScalarValue, negated: bool) -> bool {
-    let found = list
-        .iter()
-        .any(|candidate| super::operators::filter::values_equal(candidate, lhs));
-    if negated {
-        !found
-    } else {
-        found
+/// Three-valued IN semantics, matching the literal `IN` evaluation in
+/// helpers::eval_where_clause3: a NULL lhs is UNKNOWN (never "not in"), and a
+/// list containing NULL makes a non-matching lhs UNKNOWN — `x NOT IN (1,
+/// NULL)` must exclude every row, not keep them. `None` maps to Bool(None).
+fn in_list_contains(list: &[ScalarValue], lhs: &ScalarValue, negated: bool) -> Option<bool> {
+    if lhs.is_null() {
+        return None;
     }
+    let mut found = false;
+    let mut saw_null = false;
+    for candidate in list {
+        if candidate.is_null() {
+            saw_null = true;
+            continue;
+        }
+        if super::operators::filter::values_equal(candidate, lhs) {
+            found = true;
+            break;
+        }
+    }
+    let inner = if found {
+        Some(true)
+    } else if saw_null {
+        None
+    } else {
+        Some(false)
+    };
+    inner.map(|b| if negated { !b } else { b })
 }
 
 fn cache_key(params: &[ScalarValue]) -> String {

@@ -448,3 +448,51 @@ fn redrive_commit_durability_flushes_committed_txn_memtables() -> Result<()> {
     writer.stop();
     Ok(())
 }
+
+/// `persist_memtable_tail_batch` must drain the tail commit thread BEFORE
+/// writing its full-tail generation (the same barrier protocol the
+/// clear/rename paths use): queued group-commit frames for the memtable's
+/// older tail generation must be settled and their cached handles closed, or
+/// the generation rename/removal races the committer on Windows. Recovery
+/// must then see exactly the persisted post-statement image.
+#[test]
+fn persist_memtable_tail_batch_drains_queued_tail_appends_first() -> Result<()> {
+    let temp = tempfile::tempdir().unwrap();
+    let table_dir = temp.path().join(TEST_DB).join(TEST_TABLE);
+    std::fs::create_dir_all(&table_dir)?;
+    let schema = test_schema();
+    let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+    let mut config = test_config(10_000);
+    // Async mode keeps the tail handle open and releases the ack early —
+    // the exact state the barrier must defuse.
+    config.tail_async_fsync = true;
+    let mut writer = BatchWriter::new(config, Arc::clone(&segment_mgr), None);
+
+    // INSERT rows land as a queued group-commit tail append.
+    writer.write_columns(
+        TEST_DB,
+        TEST_TABLE,
+        "2026",
+        make_batch(&schema, 1, 3)?,
+        schema.clone(),
+        true,
+    )?;
+
+    let memtables = writer.memtable_mgr.get_by_table(TEST_DB, TEST_TABLE);
+    assert_eq!(memtables.len(), 1);
+    let memtable = &memtables[0];
+
+    // Post-statement image (the persisted generation replaces the older
+    // ones); persist must return Ok with the commit thread racing.
+    writer.persist_memtable_tail_batch(memtable, &make_batch(&schema, 1, 4)?)?;
+
+    let recovered = crate::storage::core::durable_tail::recover(&table_dir, &schema)?;
+    assert_eq!(
+        recovered.len(),
+        1,
+        "exactly the persisted generation stays live"
+    );
+    assert_eq!(recovered[0].batch.num_rows(), 4);
+    writer.stop();
+    Ok(())
+}

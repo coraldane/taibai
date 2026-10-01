@@ -388,6 +388,7 @@ impl SegmentManager {
             deleted_row_count: 0,
             buffered_batch: None,
             buffered_rows: 0,
+            flushed_buffer_prefix: 0,
             dirty_meta: false,
             data_end: SEGMENT_HEADER_SIZE as u64,
             sidecar_row_groups_flushed: 0,
@@ -426,6 +427,7 @@ impl SegmentManager {
             deleted_row_count: 0,
             buffered_batch: None,
             buffered_rows: 0,
+            flushed_buffer_prefix: 0,
             dirty_meta: false,
             data_end: SEGMENT_HEADER_SIZE as u64,
             pubsub: None,
@@ -491,6 +493,12 @@ impl SegmentManager {
         }
         if let Some(mut pending) = pending_seal {
             let result = pending.writer.seal(&|path| self.invalidate_reader(path));
+            if result.is_ok() {
+                // Same replication emission as the borrowed variant: the
+                // sealed segment must reach the change feed with its final
+                // name regardless of which append variant triggered the seal.
+                self.emit_segment_update_final_path(&pending.writer.path);
+            }
             drop(pending.token);
             result?;
         }
@@ -597,6 +605,7 @@ impl SegmentManager {
             deleted_row_count: reader.deleted_row_count(),
             buffered_batch: None,
             buffered_rows: 0,
+            flushed_buffer_prefix: 0,
             dirty_meta: true,
             data_end,
             sidecar_row_groups_flushed: 0,

@@ -85,142 +85,102 @@ macro_rules! cmp_vec_fn {
     };
 }
 
-impl ColumnArray {
-    pub fn count_eq(&self, value: &ScalarValue) -> u64 {
-        let num_rows = self.len();
-        let bitmap = self.bitmap();
-        match (self, value) {
-            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Int16 { data, .. }, ScalarValue::Int16(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Int8 { data, .. }, ScalarValue::Int8(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::UInt64 { data, .. }, ScalarValue::UInt64(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::UInt32 { data, .. }, ScalarValue::UInt32(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::UInt16 { data, .. }, ScalarValue::UInt16(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::UInt8 { data, .. }, ScalarValue::UInt8(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Float64 { data, .. }, ScalarValue::Float64(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Float32 { data, .. }, ScalarValue::Float32(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Decimal { data, .. }, ScalarValue::Decimal(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Date { data, .. }, ScalarValue::Date(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Timestamp { data, .. }, ScalarValue::Timestamp(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Time { data, .. }, ScalarValue::Time(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Interval { data, .. }, ScalarValue::Interval(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Bool { data, .. }, ScalarValue::Bool(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && (data[i] != 0) == *v)
-                .count()
-                as u64,
-            _ => 0,
-        }
-    }
+// One type table drives BOTH equality-count functions. The deleted
+// variant used to cover only Int64/Int32/VarChar while count_eq covered
+// every type, so the COUNT fast path's `raw - deleted` arithmetic silently
+// counted deleted rows for every other column type.
+macro_rules! impl_eq_counts {
 
-    pub fn count_eq_deleted(
-        &self,
-        value: &ScalarValue,
-        rg_start_row: u64,
-        delete_bitmap: &[u8],
-    ) -> u64 {
-        let num_rows = self.len();
-        let bitmap = self.bitmap();
-        let mut deleted_count: u64 = 0;
-        match (self, value) {
-            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => {
-                for (i, item) in data.iter().enumerate().take(num_rows) {
-                    if !bitmap.is_null(i) && *item == *v {
-                        let row_id = rg_start_row + i as u64;
-                        let byte = (row_id / 8) as usize;
-                        let bit = (row_id % 8) as u8;
-                        if delete_bitmap
-                            .get(byte)
-                            .is_some_and(|b| (b & (1u8 << bit)) != 0)
-                        {
-                            deleted_count += 1;
+        ($($variant:ident => $scalar:ident),+ $(,)?) => {
+            pub fn count_eq(&self, value: &ScalarValue) -> u64 {
+                let num_rows = self.len();
+                let bitmap = self.bitmap();
+                match (self, value) {
+                    $(
+                        (ColumnArray::$variant { data, .. }, ScalarValue::$scalar(Some(v))) => {
+                            (0..num_rows)
+                                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                                .count() as u64
                         }
-                    }
+                    )+
+                    (ColumnArray::Bool { data, .. }, ScalarValue::Bool(Some(v))) => (0..num_rows)
+                        .filter(|&i| !bitmap.is_null(i) && (data[i] != 0) == *v)
+                        .count() as u64,
+                    _ => 0,
                 }
             }
-            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => {
-                for (i, item) in data.iter().enumerate().take(num_rows) {
-                    if !bitmap.is_null(i) && *item == *v {
-                        let row_id = rg_start_row + i as u64;
-                        let byte = (row_id / 8) as usize;
-                        let bit = (row_id % 8) as u8;
-                        if delete_bitmap
-                            .get(byte)
-                            .is_some_and(|b| (b & (1u8 << bit)) != 0)
-                        {
-                            deleted_count += 1;
+
+            /// Count `count_eq`-matching rows whose absolute row id is marked
+            /// deleted. Type coverage MUST stay identical to [`Self::count_eq`]
+            /// — both are generated from the same table above for that reason.
+            pub fn count_eq_deleted(
+                &self,
+                value: &ScalarValue,
+                rg_start_row: u64,
+                delete_bitmap: &[u8],
+            ) -> u64 {
+                let num_rows = self.len();
+                let bitmap = self.bitmap();
+                let mut deleted_count: u64 = 0;
+                match (self, value) {
+                    $(
+                        (ColumnArray::$variant { data, .. }, ScalarValue::$scalar(Some(v))) => {
+                            for i in 0..num_rows {
+                                if !bitmap.is_null(i) && data[i] == *v {
+                                    let row_id = rg_start_row + i as u64;
+                                    let byte = (row_id / 8) as usize;
+                                    let bit = (row_id % 8) as u8;
+                                    if delete_bitmap
+                                        .get(byte)
+                                        .is_some_and(|b| (b & (1u8 << bit)) != 0)
+                                    {
+                                        deleted_count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    )+
+                    (ColumnArray::Bool { data, .. }, ScalarValue::Bool(Some(v))) => {
+                        for i in 0..num_rows {
+                            if !bitmap.is_null(i) && (data[i] != 0) == *v {
+                                let row_id = rg_start_row + i as u64;
+                                let byte = (row_id / 8) as usize;
+                                let bit = (row_id % 8) as u8;
+                                if delete_bitmap
+                                    .get(byte)
+                                    .is_some_and(|b| (b & (1u8 << bit)) != 0)
+                                {
+                                    deleted_count += 1;
+                                }
+                            }
                         }
                     }
+                    _ => {}
                 }
+                deleted_count
             }
-            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => {
-                for (i, item) in data.iter().enumerate().take(num_rows) {
-                    if !bitmap.is_null(i) && *item == *v {
-                        let row_id = rg_start_row + i as u64;
-                        let byte = (row_id / 8) as usize;
-                        let bit = (row_id % 8) as u8;
-                        if delete_bitmap
-                            .get(byte)
-                            .is_some_and(|b| (b & (1u8 << bit)) != 0)
-                        {
-                            deleted_count += 1;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        deleted_count
-    }
+        };
+}
+
+impl ColumnArray {
+    impl_eq_counts!(
+        Int64 => Int64,
+        Int32 => Int32,
+        Int16 => Int16,
+        Int8 => Int8,
+        UInt64 => UInt64,
+        UInt32 => UInt32,
+        UInt16 => UInt16,
+        UInt8 => UInt8,
+        VarChar => VarChar,
+        Float64 => Float64,
+        Float32 => Float32,
+        Decimal => Decimal,
+        Date => Date,
+        Timestamp => Timestamp,
+        Time => Time,
+        Interval => Interval,
+    );
 
     /// Column-wide minimum over non-null values (vectorized, no per-cell boxing).
     /// Returns None when the column has no non-null values.

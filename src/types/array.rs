@@ -590,10 +590,10 @@ impl ColumnArray {
             ColumnArray::UInt32 { data, .. } => bytes!(data),
             ColumnArray::UInt64 { data, .. } => bytes!(data),
             ColumnArray::Float32 { data, .. } => {
-                out.extend_from_slice(&data[row].to_bits().to_le_bytes())
+                out.extend_from_slice(&crate::types::scalar::float32_key_bits(data[row]).to_le_bytes())
             }
             ColumnArray::Float64 { data, .. } => {
-                out.extend_from_slice(&data[row].to_bits().to_le_bytes())
+                out.extend_from_slice(&crate::types::scalar::float_key_bits(data[row]).to_le_bytes())
             }
             ColumnArray::VarChar { data, .. } => {
                 let value = data.value(row);

@@ -259,6 +259,31 @@ impl fmt::Display for ScalarValue {
     }
 }
 
+/// Canonical bit pattern for using a float as an equality/hash key (hot-store
+/// point lookup, join and GROUP BY keys). SQL `=` treats `-0.0 == 0.0`, so the
+/// sign bit of zero is folded away; every NaN payload folds to the canonical
+/// quiet NaN so NaN rows group together instead of splitting per bit pattern.
+/// Raw `to_bits()` keys made `WHERE k = 0.0` miss `-0.0` rows in the hot store.
+#[inline]
+pub fn float_key_bits(v: f64) -> u64 {
+    if v.is_nan() {
+        0x7ff8_0000_0000_0000
+    } else {
+        (v + 0.0).to_bits()
+    }
+}
+
+/// f32-domain twin of [`float_key_bits`] for 4-byte key formats (the
+/// `encode_key_at` payload width must stay f32-sized for Float32 columns).
+#[inline]
+pub fn float32_key_bits(v: f32) -> u32 {
+    if v.is_nan() {
+        0x7fc0_0000
+    } else {
+        (v + 0.0).to_bits()
+    }
+}
+
 #[cfg(test)]
 #[path = "scalar_test.rs"]
 mod tests;

@@ -215,7 +215,7 @@ enum ValueKey {
     Bool(bool),
     Int(i64),
     UInt(u64),
-    Float(u64), // IEEE-754 bit pattern; NaN folds to a single canonical entry
+    Float(u64), // canonical bits via `float_key_bits` (-0.0/NaN folded)
     Str(u32),   // interned id, resolved via StringPool
 }
 
@@ -260,8 +260,8 @@ fn scalar_to_key(sv: &ScalarValue, pool: &StringPool) -> Result<Option<ValueKey>
         UInt16(Some(v)) => ValueKey::Int(*v as i64),
         UInt32(Some(v)) => ValueKey::Int(*v as i64),
         UInt64(Some(v)) => ValueKey::UInt(*v),
-        Float32(Some(v)) => ValueKey::Float((*v as f64).to_bits()),
-        Float64(Some(v)) => ValueKey::Float(v.to_bits()),
+        Float32(Some(v)) => ValueKey::Float(crate::types::scalar::float_key_bits(*v as f64)),
+        Float64(Some(v)) => ValueKey::Float(crate::types::scalar::float_key_bits(*v)),
         Decimal(Some(v)) => ValueKey::Int(*v),
         Date(Some(v)) => ValueKey::Int(*v as i64),
         Time(Some(v)) | Timestamp(Some(v)) | Interval(Some(v)) => ValueKey::Int(*v),
@@ -414,9 +414,13 @@ impl<'a> KeySource<'a> {
             Self::UInt32 { data, bm } => key_or_null(bm, i, || ValueKey::Int(data[i] as i64)),
             Self::UInt64 { data, bm } => key_or_null(bm, i, || ValueKey::UInt(data[i])),
             Self::Float32 { data, bm } => {
-                key_or_null(bm, i, || ValueKey::Float((data[i] as f64).to_bits()))
+                key_or_null(bm, i, || {
+                    ValueKey::Float(crate::types::scalar::float_key_bits(data[i] as f64))
+                })
             }
-            Self::Float64 { data, bm } => key_or_null(bm, i, || ValueKey::Float(data[i].to_bits())),
+            Self::Float64 { data, bm } => {
+                key_or_null(bm, i, || ValueKey::Float(crate::types::scalar::float_key_bits(data[i])))
+            }
             Self::Decimal { data, bm } => key_or_null(bm, i, || ValueKey::Int(data[i])),
             Self::Date { data, bm } => key_or_null(bm, i, || ValueKey::Int(data[i] as i64)),
             Self::Time { data, bm } => key_or_null(bm, i, || ValueKey::Int(data[i])),

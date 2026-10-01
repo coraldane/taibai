@@ -338,6 +338,7 @@ fn zone_map_proves_clause(
 #[allow(clippy::too_many_arguments)]
 pub fn predicate_first_read(
     reader: &crate::storage::segment::SegmentReader,
+    table_schema: &Schema,
     rg_idx: usize,
     predicate_cols: &[usize],
     projection_cols: &[usize],
@@ -353,6 +354,32 @@ pub fn predicate_first_read(
     // free. IN / remaining predicates may reference the same columns, so
     // they disable the elimination.
     let can_eliminate = in_predicates.is_empty() && remaining_predicate.is_none();
+    // Zone maps, physical column blocks, and footer defs all live in the
+    // segment's footer layout, while predicate indices and the output column
+    // order stay in catalog space. Translate every touched column once (by
+    // name, so DROP/RENAME-drifted footers resolve correctly) and map back
+    // to catalog indices wherever the output contract needs them.
+    let mut touch_cols: Vec<usize> = Vec::new();
+    for (column, _) in eq_predicates {
+        if !touch_cols.contains(column) {
+            touch_cols.push(*column);
+        }
+    }
+    for clause in range_predicates {
+        if !touch_cols.contains(&clause.column_index) {
+            touch_cols.push(clause.column_index);
+        }
+    }
+    for column in predicate_cols.iter().chain(projection_cols.iter()) {
+        if !touch_cols.contains(column) {
+            touch_cols.push(*column);
+        }
+    }
+    let aligned_touch = reader.align_indices(table_schema, &touch_cols)?;
+    let footer_lookup: std::collections::HashMap<usize, usize> =
+        touch_cols.iter().copied().zip(aligned_touch).collect();
+    let footer_index =
+        |column: usize| -> usize { footer_lookup.get(&column).copied().unwrap_or(column) };
     let zone_maps = reader.zone_maps(rg_idx);
     let eq_predicates: Vec<&(usize, ScalarValue)> = eq_predicates
         .iter()
@@ -360,7 +387,7 @@ pub fn predicate_first_read(
             !can_eliminate
                 || !zone_map_proves_clause(
                     zone_maps,
-                    *column,
+                    footer_index(*column),
                     crate::storage::partition::pruning::RangeOp::Eq,
                     value,
                 )
@@ -370,7 +397,12 @@ pub fn predicate_first_read(
         .iter()
         .filter(|clause| {
             !can_eliminate
-                || !zone_map_proves_clause(zone_maps, clause.column_index, clause.op, &clause.value)
+                || !zone_map_proves_clause(
+                    zone_maps,
+                    footer_index(clause.column_index),
+                    clause.op,
+                    &clause.value,
+                )
         })
         .collect();
 
@@ -393,25 +425,32 @@ pub fn predicate_first_read(
     }
 
     let row_count = reader.row_group_rows(rg_idx) as usize;
+    let aligned_projection: Vec<usize> = projection_cols.iter().map(|&c| footer_index(c)).collect();
     if eval_cols.is_empty() {
         // Every predicate is vacuous: the whole row group matches modulo the
         // delete bitmap. No predicate column needs decoding at all.
         if reader.delete_bitmap().is_empty() {
-            return reader.read_columns_fast_allow_dictionary(rg_idx, projection_cols, true);
+            return reader.read_columns_fast_allow_dictionary(rg_idx, &aligned_projection, true);
         }
         let rg_start_row = reader.row_group_start_row(rg_idx);
         let selected_rows: Vec<usize> = (0..row_count)
             .filter(|row| !reader.is_row_deleted(rg_start_row + *row as u64))
             .collect();
         if selected_rows.is_empty() {
-            return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+            return Ok(empty_with_projection(table_schema, projection_cols));
         }
         let mut columns_by_idx: std::collections::HashMap<usize, ColumnArray> =
             std::collections::HashMap::with_capacity(projection_cols.len());
-        for (column, col) in
-            reader.read_columns_filtered(rg_idx, projection_cols, &selected_rows)?
-        {
-            columns_by_idx.insert(column, col);
+        // read_columns_filtered keys its pairs by the footer indices it was
+        // given: route each column back to its catalog index by position.
+        let mut read_by_footer: std::collections::HashMap<usize, ColumnArray> = reader
+            .read_columns_filtered(rg_idx, &aligned_projection, &selected_rows)?
+            .into_iter()
+            .collect();
+        for (&catalog_idx, &footer_idx) in projection_cols.iter().zip(&aligned_projection) {
+            if let Some(col) = read_by_footer.remove(&footer_idx) {
+                columns_by_idx.insert(catalog_idx, col);
+            }
         }
         let mut columns = Vec::with_capacity(projection_cols.len());
         for &column in projection_cols {
@@ -425,16 +464,17 @@ pub fn predicate_first_read(
         let proj_schema = crate::types::batch::Schema::new(
             projection_cols
                 .iter()
-                .map(|&idx| reader.schema().columns[idx].clone())
+                .map(|&idx| table_schema.columns[idx].clone())
                 .collect(),
         );
         return crate::types::batch::RecordBatch::try_new(proj_schema, columns)
             .map_err(|e| crate::common::error::TaibaiError::Internal(e.to_string()));
     }
 
-    let pred_batch = reader.read_columns_fast(rg_idx, &eval_cols)?;
+    let aligned_eval_cols: Vec<usize> = eval_cols.iter().map(|&c| footer_index(c)).collect();
+    let pred_batch = reader.read_columns_fast(rg_idx, &aligned_eval_cols)?;
     if pred_batch.num_rows() == 0 {
-        return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+        return Ok(empty_with_projection(table_schema, projection_cols));
     }
 
     let mut mask: Vec<bool> = if reader.delete_bitmap().is_empty() {
@@ -446,7 +486,7 @@ pub fn predicate_first_read(
             .collect()
     };
     if mask.iter().all(|m| !m) {
-        return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+        return Ok(empty_with_projection(table_schema, projection_cols));
     }
 
     let pred_to_batch_pos =
@@ -462,7 +502,7 @@ pub fn predicate_first_read(
             }
         }
         if mask.iter().all(|m| !m) {
-            return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+            return Ok(empty_with_projection(table_schema, projection_cols));
         }
     }
 
@@ -482,7 +522,7 @@ pub fn predicate_first_read(
             }
         }
         if mask.iter().all(|m| !m) {
-            return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+            return Ok(empty_with_projection(table_schema, projection_cols));
         }
     }
 
@@ -502,7 +542,7 @@ pub fn predicate_first_read(
             }
         }
         if mask.iter().all(|m| !m) {
-            return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+            return Ok(empty_with_projection(table_schema, projection_cols));
         }
     }
 
@@ -518,12 +558,12 @@ pub fn predicate_first_read(
 
     let match_count = mask.iter().filter(|&&m| m).count();
     if match_count == 0 {
-        return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+        return Ok(empty_with_projection(table_schema, projection_cols));
     }
     if match_count == pred_batch.num_rows() {
         // Whole row group matched: keep dictionary-encoded projections as
         // (ids, dict) so downstream grouped aggregation consumes u32 ids.
-        return reader.read_columns_fast_allow_dictionary(rg_idx, projection_cols, true);
+        return reader.read_columns_fast_allow_dictionary(rg_idx, &aligned_projection, true);
     }
 
     let selected_rows: Vec<usize> = mask
@@ -549,8 +589,15 @@ pub fn predicate_first_read(
         cols_to_read.push(col_idx);
     }
 
-    for (col_idx, col) in reader.read_columns_filtered(rg_idx, &cols_to_read, &selected_rows)? {
-        columns_by_idx.insert(col_idx, col);
+    let aligned_cols_to_read: Vec<usize> = cols_to_read.iter().map(|&c| footer_index(c)).collect();
+    let mut read_by_footer: std::collections::HashMap<usize, ColumnArray> = reader
+        .read_columns_filtered(rg_idx, &aligned_cols_to_read, &selected_rows)?
+        .into_iter()
+        .collect();
+    for (&catalog_idx, &footer_idx) in cols_to_read.iter().zip(&aligned_cols_to_read) {
+        if let Some(col) = read_by_footer.remove(&footer_idx) {
+            columns_by_idx.insert(catalog_idx, col);
+        }
     }
 
     let mut columns = Vec::with_capacity(projection_cols.len());
@@ -566,7 +613,7 @@ pub fn predicate_first_read(
     let proj_schema = crate::types::batch::Schema::new(
         projection_cols
             .iter()
-            .map(|&idx| reader.schema().columns[idx].clone())
+            .map(|&idx| table_schema.columns[idx].clone())
             .collect(),
     );
     crate::types::batch::RecordBatch::try_new(proj_schema, columns)
@@ -576,6 +623,7 @@ pub fn predicate_first_read(
 #[allow(clippy::too_many_arguments)]
 pub fn cluster_key_range_read(
     reader: &crate::storage::segment::SegmentReader,
+    table_schema: &Schema,
     rg_idx: usize,
     bounds: &ClusterKeyBounds,
     projection_cols: &[usize],
@@ -595,14 +643,25 @@ pub fn cluster_key_range_read(
             in_predicates,
             remaining_predicate,
         ) {
-            return cluster_key_eq_read(reader, rg_idx, key_col_idx, eq_value, projection_cols);
+            return cluster_key_eq_read(
+                reader,
+                table_schema,
+                rg_idx,
+                key_col_idx,
+                eq_value,
+                projection_cols,
+            );
         }
     }
 
+    // The binary search reads the key columns in `key_cols_idx` (catalog)
+    // order; translate them onto the segment's footer layout by name so the
+    // read hits the right physical blocks when the orders have drifted.
     let key_cols_idx = bounds.key_column_indices();
-    let key_batch = reader.read_columns_fast(rg_idx, &key_cols_idx)?;
+    let aligned_key_cols = reader.align_indices(table_schema, &key_cols_idx)?;
+    let key_batch = reader.read_columns_fast(rg_idx, &aligned_key_cols)?;
     if key_batch.num_rows() == 0 {
-        return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+        return Ok(empty_with_projection(table_schema, projection_cols));
     }
 
     let key_cols: Vec<&ColumnArray> = key_cols_idx
@@ -618,6 +677,7 @@ pub fn cluster_key_range_read(
     if !key_tuple_is_sorted(&key_cols) {
         return predicate_first_read(
             reader,
+            table_schema,
             rg_idx,
             predicate_cols,
             projection_cols,
@@ -651,12 +711,12 @@ pub fn cluster_key_range_read(
         None => key_batch.num_rows(),
     };
     if start >= end {
-        return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+        return Ok(empty_with_projection(table_schema, projection_cols));
     }
 
     let selected_rows = selected_live_rows(reader, rg_idx, start, end);
     if selected_rows.is_empty() {
-        return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+        return Ok(empty_with_projection(table_schema, projection_cols));
     }
 
     let union_cols = union_columns(projection_cols, predicate_cols);
@@ -684,8 +744,15 @@ pub fn cluster_key_range_read(
         }
     }
 
-    for (col_idx, col) in reader.read_columns_filtered(rg_idx, &cols_to_read, &selected_rows)? {
-        columns_by_idx.insert(col_idx, col);
+    let aligned_cols_to_read = reader.align_indices(table_schema, &cols_to_read)?;
+    let mut read_by_footer: std::collections::HashMap<usize, ColumnArray> = reader
+        .read_columns_filtered(rg_idx, &aligned_cols_to_read, &selected_rows)?
+        .into_iter()
+        .collect();
+    for (&catalog_idx, &footer_idx) in cols_to_read.iter().zip(&aligned_cols_to_read) {
+        if let Some(col) = read_by_footer.remove(&footer_idx) {
+            columns_by_idx.insert(catalog_idx, col);
+        }
     }
 
     let mut union_columns_data = Vec::with_capacity(union_cols.len());
@@ -701,7 +768,7 @@ pub fn cluster_key_range_read(
     let union_schema = Schema::new(
         union_cols
             .iter()
-            .map(|&idx| reader.schema().columns[idx].clone())
+            .map(|&idx| table_schema.columns[idx].clone())
             .collect(),
     );
     let union_batch = RecordBatch::try_new(union_schema, union_columns_data)
@@ -768,13 +835,18 @@ fn simple_cluster_eq_value<'a>(
 
 fn cluster_key_eq_read(
     reader: &crate::storage::segment::SegmentReader,
+    table_schema: &Schema,
     rg_idx: usize,
     key_col_idx: usize,
     value: &ScalarValue,
     projection_cols: &[usize],
 ) -> crate::common::error::Result<RecordBatch> {
-    let raw = reader.read_column_raw(rg_idx, key_col_idx)?;
-    let col_def = &reader.schema().columns[key_col_idx];
+    // The raw block and its decoding def live in footer space; the pinned
+    // value and the output projection stay in catalog space.
+    let aligned_key = reader.align_indices(table_schema, &[key_col_idx])?;
+    let footer_key = aligned_key[0];
+    let raw = reader.read_column_raw(rg_idx, footer_key)?;
+    let col_def = &reader.schema().columns[footer_key];
     let mut selected_rows =
         selected_eq_rows_from_raw(&raw, reader.row_group_rows(rg_idx) as usize, col_def, value)?;
     if !reader.delete_bitmap().is_empty() {
@@ -782,7 +854,7 @@ fn cluster_key_eq_read(
         selected_rows.retain(|row| !reader.is_row_deleted(rg_start_row + *row as u64));
     }
     if selected_rows.is_empty() {
-        return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+        return Ok(empty_with_projection(table_schema, projection_cols));
     }
 
     let cols_to_read: Vec<usize> = projection_cols
@@ -800,8 +872,15 @@ fn cluster_key_eq_read(
         );
     }
 
-    for (col_idx, col) in reader.read_columns_filtered(rg_idx, &cols_to_read, &selected_rows)? {
-        columns_by_idx.insert(col_idx, col);
+    let aligned_cols_to_read = reader.align_indices(table_schema, &cols_to_read)?;
+    let mut read_by_footer: std::collections::HashMap<usize, ColumnArray> = reader
+        .read_columns_filtered(rg_idx, &aligned_cols_to_read, &selected_rows)?
+        .into_iter()
+        .collect();
+    for (&catalog_idx, &footer_idx) in cols_to_read.iter().zip(&aligned_cols_to_read) {
+        if let Some(col) = read_by_footer.remove(&footer_idx) {
+            columns_by_idx.insert(catalog_idx, col);
+        }
     }
 
     let mut columns = Vec::with_capacity(projection_cols.len());
@@ -818,7 +897,7 @@ fn cluster_key_eq_read(
     let schema = Schema::new(
         projection_cols
             .iter()
-            .map(|&idx| reader.schema().columns[idx].clone())
+            .map(|&idx| table_schema.columns[idx].clone())
             .collect(),
     );
     RecordBatch::try_new(schema, columns)
@@ -1231,18 +1310,174 @@ fn empty_like(batch: &RecordBatch) -> RecordBatch {
     RecordBatch::new(batch.schema.clone())
 }
 
+/// Empty batch shaped like `projection_cols`. The column defs come from the
+/// catalog schema (request order), not the segment footer: the output of a
+/// read is addressed by catalog position downstream, so a drifted footer
+/// must not lend it stale names or metadata.
 fn empty_with_projection(
-    reader: &crate::storage::segment::SegmentReader,
-    _rg_idx: usize,
+    table_schema: &crate::types::batch::Schema,
     projection_cols: &[usize],
 ) -> RecordBatch {
     let proj_schema = crate::types::batch::Schema::new(
         projection_cols
             .iter()
-            .map(|&idx| reader.schema().columns[idx].clone())
+            .map(|&idx| table_schema.columns[idx].clone())
             .collect(),
     );
     RecordBatch::new(proj_schema)
+}
+
+/// Translate catalog column indices into one segment's footer column space
+/// by name (current name, then previous names). Hand-built specs (tests)
+/// carry an empty catalog schema and keep identity mapping.
+pub(super) fn align_indices_to_footer(
+    table_schema: &Schema,
+    footer_schema: &Schema,
+    indices: &[usize],
+) -> crate::common::error::Result<Vec<usize>> {
+    if table_schema.num_columns() == 0 {
+        return Ok(indices.to_vec());
+    }
+    crate::storage::segment::reader::align_indices_against_schema(
+        table_schema,
+        footer_schema,
+        indices,
+    )
+}
+
+/// Re-index a row-group predicate from catalog space onto one segment's
+/// footer column order, so zone-map pruning indexes the columns the clauses
+/// actually reference instead of whatever sits at the same position.
+pub(super) fn align_predicate_to_footer(
+    table_schema: &Schema,
+    footer_schema: &Schema,
+    predicate: &crate::storage::partition::pruning::RowGroupPredicate,
+) -> crate::common::error::Result<crate::storage::partition::pruning::RowGroupPredicate> {
+    if predicate.clauses.is_empty() || table_schema.num_columns() == 0 {
+        return Ok(predicate.clone());
+    }
+    let indices: Vec<usize> = predicate
+        .clauses
+        .iter()
+        .map(|clause| clause.column_index)
+        .collect();
+    let aligned = align_indices_to_footer(table_schema, footer_schema, &indices)?;
+    let clauses = predicate
+        .clauses
+        .iter()
+        .zip(aligned)
+        .map(
+            |(clause, column_index)| crate::storage::partition::pruning::RangeClause {
+                column_index,
+                op: clause.op,
+                value: clause.value.clone(),
+            },
+        )
+        .collect();
+    Ok(crate::storage::partition::pruning::RowGroupPredicate::new(
+        clauses,
+    ))
+}
+
+/// Row-group prune inputs (predicate + bloom/set check lists) re-indexed
+/// onto one segment's footer column order. The check lists index footer
+/// zone maps, bloom filters, and value sets positionally, exactly like the
+/// predicate clauses do.
+pub(super) struct FooterPruneChecks {
+    pub predicate: crate::storage::partition::pruning::RowGroupPredicate,
+    pub bloom_checks: Vec<(usize, ScalarValue)>,
+    pub in_checks: Vec<InPredicate>,
+    pub set_checks: Vec<(usize, ScalarValue)>,
+    pub set_in_checks: Vec<InPredicate>,
+}
+
+impl FooterPruneChecks {
+    pub fn in_check_refs(&self) -> Vec<&InPredicate> {
+        self.in_checks.iter().collect()
+    }
+
+    pub fn set_in_check_refs(&self) -> Vec<&InPredicate> {
+        self.set_in_checks.iter().collect()
+    }
+}
+
+/// Translate the full prune input set onto `footer_schema` by name.
+pub(super) fn align_prune_checks_to_footer(
+    table_schema: &Schema,
+    footer_schema: &Schema,
+    predicate: &crate::storage::partition::pruning::RowGroupPredicate,
+    bloom_checks: &[(usize, ScalarValue)],
+    in_checks: &[&InPredicate],
+    set_checks: &[(usize, ScalarValue)],
+    set_in_checks: &[&InPredicate],
+) -> crate::common::error::Result<FooterPruneChecks> {
+    let aligned_bloom =
+        align_indices_to_footer(table_schema, footer_schema, &check_columns(bloom_checks))?;
+    let aligned_in = align_indices_to_footer(
+        table_schema,
+        footer_schema,
+        &in_checks.iter().map(|p| p.column_index).collect::<Vec<_>>(),
+    )?;
+    let aligned_set =
+        align_indices_to_footer(table_schema, footer_schema, &check_columns(set_checks))?;
+    let aligned_set_in = align_indices_to_footer(
+        table_schema,
+        footer_schema,
+        &set_in_checks
+            .iter()
+            .map(|p| p.column_index)
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(FooterPruneChecks {
+        predicate: align_predicate_to_footer(table_schema, footer_schema, predicate)?,
+        bloom_checks: bloom_checks
+            .iter()
+            .zip(aligned_bloom)
+            .map(|((_, value), column)| (column, value.clone()))
+            .collect(),
+        in_checks: in_checks
+            .iter()
+            .zip(aligned_in)
+            .map(|(pred, column_index)| InPredicate {
+                column_index,
+                values: pred.values.clone(),
+            })
+            .collect(),
+        set_checks: set_checks
+            .iter()
+            .zip(aligned_set)
+            .map(|((_, value), column)| (column, value.clone()))
+            .collect(),
+        set_in_checks: set_in_checks
+            .iter()
+            .zip(aligned_set_in)
+            .map(|(pred, column_index)| InPredicate {
+                column_index,
+                values: pred.values.clone(),
+            })
+            .collect(),
+    })
+}
+
+fn check_columns(checks: &[(usize, ScalarValue)]) -> Vec<usize> {
+    checks.iter().map(|(column, _)| *column).collect()
+}
+
+/// Catalog→footer index map for `columns` on one segment. Consumers use
+/// [`mapped_column`] for the lookup, which falls back to identity so
+/// hand-built specs (empty catalog schema) keep working unchanged.
+pub(super) fn align_column_map(
+    table_schema: &Schema,
+    footer_schema: &Schema,
+    columns: &[usize],
+) -> crate::common::error::Result<std::collections::HashMap<usize, usize>> {
+    let aligned = align_indices_to_footer(table_schema, footer_schema, columns)?;
+    Ok(columns.iter().copied().zip(aligned).collect())
+}
+
+/// Footer-space index for `column` under `map` (identity fallback).
+pub(super) fn mapped_column(map: &std::collections::HashMap<usize, usize>, column: usize) -> usize {
+    map.get(&column).copied().unwrap_or(column)
 }
 
 #[cfg(test)]

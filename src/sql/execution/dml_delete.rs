@@ -166,6 +166,7 @@ pub(crate) struct SegmentDeleteMatch {
 /// (in-group index, absolute row id) pairs against the read batch.
 pub(crate) fn match_segment_for_delete(
     reader: &crate::storage::segment::SegmentReader,
+    table_schema: &Schema,
     predicate: Option<&crate::storage::segment::RowGroupPredicate>,
     where_clause: Option<&Expr>,
     seed_tombstones: &[u64],
@@ -182,6 +183,20 @@ pub(crate) fn match_segment_for_delete(
     for row_id in seed_tombstones {
         delete_bitmap::mark_deleted(&mut new_bitmap, *row_id);
     }
+    // Re-anchor the catalog-space predicate onto this segment's footer zone
+    // maps — positional use after a DROP/RENAME COLUMN prunes the WRONG row
+    // groups. A column absent from this older segment cannot match.
+    let aligned_predicate = match predicate {
+        Some(pred) => match reader.align_row_group_predicate(table_schema, pred) {
+            Ok(aligned) => Some(aligned),
+            Err(_) => return Ok(SegmentDeleteMatch {
+                footer_bitmap,
+                new_bitmap,
+                matched_ids: Vec::new(),
+            }),
+        },
+        None => None,
+    };
 
     let mut matched_ids = Vec::new();
     let mut row_id: u64 = 0;
@@ -191,7 +206,7 @@ pub(crate) fn match_segment_for_delete(
             row_id += rg_rows;
             continue;
         }
-        if let Some(pred) = predicate {
+        if let Some(pred) = &aligned_predicate {
             if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
                 row_id += rg_rows;
                 continue;
@@ -624,14 +639,18 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
         let mut newly_deleted = 0u64;
         let segment_name = seg_path.to_string_lossy().to_string();
         let direct_rows_in_segment = direct_rows.get(&seg_path);
-        let direct_rows_in_segment = direct_rows_in_segment.as_ref().map(|rows| {
+        // HashSet: the fallback scan below probes this set for EVERY row of
+        // EVERY row group, and the old Vec::contains made that O(rows ×
+        // direct candidates) — 10^10 comparisons at 1M rows × 10k candidates,
+        // under the table mutation lock.
+        let direct_rows_in_segment = direct_rows_in_segment.map(|rows| {
             rows.iter()
                 .copied()
                 .filter(|row_id| *row_id < total_rows)
-                .collect::<Vec<_>>()
+                .collect::<std::collections::HashSet<u64>>()
         });
         let direct_row_sets = direct_rows_in_segment
-            .as_deref()
+            .as_ref()
             .map(|rows| (rows, &verify_positions));
         for rg_idx in 0..reader.num_row_groups() {
             let rg_start = reader.row_group_start_row(rg_idx);
@@ -648,7 +667,8 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
                 if candidates.is_empty() {
                     continue;
                 }
-                let batch = reader.read_row_group_with_projection(rg_idx, &verify_indices)?;
+                let batch =
+                    reader.read_row_group_columns(rg_idx, &schema, &verify_indices)?;
                 for row_id in candidates {
                     let row_idx = (row_id - rg_start) as usize;
                     if !replace_row_conflicts(&batch, row_idx, positions) {
@@ -679,7 +699,8 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
             {
                 continue;
             }
-            let batch = reader.read_row_group_with_projection(rg_idx, &projected_indices)?;
+            let batch =
+                reader.read_row_group_columns(rg_idx, &schema, &projected_indices)?;
             for row_idx in 0..batch.num_rows() {
                 let absolute_row = rg_start + row_idx as u64;
                 if delete_bitmap::is_deleted(&new_bitmap, absolute_row) {
@@ -1279,7 +1300,7 @@ pub fn exec_delete(
                     continue;
                 }
                 if let Some(ref pred) = predicate {
-                    if !super::helpers::segment_may_match(&reader, Some(pred)) {
+                    if !super::helpers::segment_may_match(&reader, table_schema, Some(pred)) {
                         continue;
                     }
                 }
@@ -1290,15 +1311,19 @@ pub fn exec_delete(
                 let maintaining = index_maintenance.still_maintaining();
                 let outcome = match_segment_for_delete(
                     &reader,
+                    table_schema,
                     predicate,
                     resolved_where_clause.as_ref(),
                     &[],
                     publish_deletes || maintaining,
                     |reader, rg_idx| {
+                        // Name-based read: the batch carries catalog defs in
+                        // request order, so key positions and WHERE evaluation
+                        // stay correct on pre-DDL footers.
                         if key_projection.is_empty() {
-                            reader.read_row_group(rg_idx)
+                            reader.read_row_group_columns_aligned(rg_idx, table_schema)
                         } else {
-                            reader.read_row_group_with_projection(rg_idx, &key_projection)
+                            reader.read_row_group_columns(rg_idx, table_schema, &key_projection)
                         }
                     },
                     |batch, matched| {

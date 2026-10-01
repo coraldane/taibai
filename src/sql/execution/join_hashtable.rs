@@ -76,8 +76,12 @@ impl ScalarValueHashable {
             ColumnArray::UInt16 { data, .. } => Self::UInt16(Some(data[row])),
             ColumnArray::UInt32 { data, .. } => Self::UInt32(Some(data[row])),
             ColumnArray::UInt64 { data, .. } => Self::UInt64(Some(data[row])),
-            ColumnArray::Float32 { data, .. } => Self::FloatToI64(Some(data[row].to_bits() as i64)),
-            ColumnArray::Float64 { data, .. } => Self::FloatToI64(Some(data[row].to_bits() as i64)),
+            ColumnArray::Float32 { data, .. } => {
+                Self::FloatToI64(Some(crate::types::scalar::float_key_bits(data[row] as f64) as i64))
+            }
+            ColumnArray::Float64 { data, .. } => {
+                Self::FloatToI64(Some(crate::types::scalar::float_key_bits(data[row]) as i64))
+            }
             ColumnArray::VarChar { data, .. } => Self::VarChar(Some(data.value(row).to_owned())),
             ColumnArray::Date { data, .. } => Self::Date(Some(data[row])),
             ColumnArray::Time { data, .. } => Self::Time(Some(data[row])),
@@ -99,10 +103,10 @@ impl ScalarValueHashable {
             ScalarValue::UInt32(i) => ScalarValueHashable::UInt32(*i),
             ScalarValue::UInt64(i) => ScalarValueHashable::UInt64(*i),
             ScalarValue::Float32(f) => {
-                ScalarValueHashable::FloatToI64(f.map(|v| v.to_bits() as i64))
+                ScalarValueHashable::FloatToI64(f.map(|v| crate::types::scalar::float_key_bits(v as f64) as i64))
             }
             ScalarValue::Float64(f) => {
-                ScalarValueHashable::FloatToI64(f.map(|v| v.to_bits() as i64))
+                ScalarValueHashable::FloatToI64(f.map(|v| crate::types::scalar::float_key_bits(v) as i64))
             }
             ScalarValue::VarChar(s) => ScalarValueHashable::VarChar(s.clone()),
             ScalarValue::Date(d) => ScalarValueHashable::Date(*d),

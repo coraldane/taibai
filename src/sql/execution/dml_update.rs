@@ -165,7 +165,7 @@ pub fn exec_update(
         //   whole segment.
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
-            if !super::helpers::segment_may_match(&reader, predicate) {
+            if !super::helpers::segment_may_match(&reader, &table_schema, predicate) {
                 continue;
             }
 
@@ -213,7 +213,14 @@ pub fn exec_update(
             let mut written_rows = 0usize;
             let rewrite_result = (|| -> Result<()> {
                 for (rg_idx, mask_opt) in rg_masks.into_iter().enumerate() {
-                    let mut batch = reader.read_row_group(rg_idx)?;
+                    // Catalog-ordered whole-row-group read: `assigned` maps
+                    // catalog column indices, and the pending batches must
+                    // extend column-wise across segments of different ages —
+                    // both only hold when every batch is in catalog order
+                    // (positional reads hit the wrong physical column after
+                    // a DROP/RENAME COLUMN).
+                    let mut batch =
+                        reader.read_row_group_columns_aligned(rg_idx, &table_schema)?;
                     match mask_opt {
                         Some(mask) if mask.iter().any(|m| *m) => {
                             // Surviving rows keep their order; matched survivors
@@ -252,7 +259,7 @@ pub fn exec_update(
                             // minus rows a previous DELETE already tombstoned.
                             if !reader.delete_bitmap().is_empty() {
                                 batch = crate::storage::segment::delete_bitmap::filter_batch(
-                                    &batch,
+                                    batch,
                                     reader.row_group_start_row(rg_idx),
                                     reader.delete_bitmap(),
                                 )?;
@@ -277,31 +284,38 @@ pub fn exec_update(
                     };
                     let pending_rows = pending.as_ref().expect("just set").num_rows();
                     if pending_rows >= row_group_target {
-                        let writer = writer.get_or_insert_with(|| {
-                            crate::storage::segment::SegmentWriter::create(
+                        if writer.is_none() {
+                            // Disk-full or permission errors must fail the
+                            // statement (the caller cleans the temp file) —
+                            // not panic while holding the table lock.
+                            writer = Some(crate::storage::segment::SegmentWriter::create(
                                 &tmp_path,
                                 pending.as_ref().expect("just set").schema.clone(),
                                 row_group_target,
                                 compression_level,
-                            )
-                            .expect("replacement segment writer")
-                        });
-                        writer.write_batch(pending.as_ref().expect("just set"))?;
+                            )?);
+                        }
+                        writer
+                            .as_mut()
+                            .expect("created above")
+                            .write_batch(pending.as_ref().expect("just set"))?;
                         written_rows += pending_rows;
                         pending = None;
                     }
                 }
                 if let Some(pending) = pending.take() {
-                    let writer = writer.get_or_insert_with(|| {
-                        crate::storage::segment::SegmentWriter::create(
+                    if writer.is_none() {
+                        writer = Some(crate::storage::segment::SegmentWriter::create(
                             &tmp_path,
                             pending.schema.clone(),
                             row_group_target,
                             compression_level,
-                        )
-                        .expect("replacement segment writer")
-                    });
-                    writer.write_batch(&pending)?;
+                        )?);
+                    }
+                    writer
+                        .as_mut()
+                        .expect("created above")
+                        .write_batch(&pending)?;
                     written_rows += pending.num_rows();
                 }
                 Ok(())
@@ -388,10 +402,13 @@ pub fn exec_update(
                 }
                 let reader = mgr.open_reader(&seg_path)?;
                 for rg_idx in 0..reader.num_row_groups() {
-                    let mut batch = reader.read_row_group_with_projection(rg_idx, &needed)?;
+                    // Name-based read: `needed` is catalog-space and old
+                    // segments keep pre-DDL footers.
+                    let mut batch =
+                        reader.read_row_group_columns(rg_idx, &table_schema, &needed)?;
                     if !reader.delete_bitmap().is_empty() {
                         batch = crate::storage::segment::delete_bitmap::filter_batch(
-                            &batch,
+                            batch,
                             reader.row_group_start_row(rg_idx),
                             reader.delete_bitmap(),
                         )?;
@@ -403,6 +420,8 @@ pub fn exec_update(
             }
             // Staged replacement segments (already sealed, not yet swapped
             // in): read their key columns straight from the temp files.
+            // Staged batches were written catalog-ordered by Pass B, so the
+            // projection matches directly.
             for (_, tmp_path, _) in &staged_segments {
                 let tmp_reader = crate::storage::segment::SegmentReader::open(tmp_path)?;
                 for rg_idx in 0..tmp_reader.num_row_groups() {
@@ -570,15 +589,24 @@ pub fn exec_update(
         Ok(updated_count)
     };
 
-    let updated_count = match target_partition_key
+    let update_outcome = match target_partition_key
         .as_deref()
         .filter(|key| !key.is_empty())
     {
         Some(partition) => {
-            mgr.with_partition_set_mutation_lock(db, table, &[partition], update_body)?
+            mgr.with_partition_set_mutation_lock(db, table, &[partition], update_body)
         }
-        None => mgr.with_table_mutation_lock(db, table, update_body)?,
+        None => mgr.with_table_mutation_lock(db, table, update_body),
     };
+    // Rows may already be rewritten when a later step of the statement fails
+    // (partial segment swap, mid-loop memtable swap). The resident hot store
+    // is append-only and must never serve pre-update rows after any rewrite
+    // happened, so retire it on the error path too — the old early-return
+    // skipped the invalidation and left stale mirror rows resident.
+    if update_outcome.is_err() {
+        engine.invalidate_hot_store(db, table);
+    }
+    let updated_count = update_outcome?;
 
     if updated_count == 0 {
         return Ok(ExecResult::Ok { rows_affected: 0 });
@@ -647,7 +675,13 @@ pub(crate) fn update_memtable_batch(
     batch: &RecordBatch,
 ) -> Result<(Option<RecordBatch>, u64, Vec<u32>)> {
     let mask = if let Some(where_expr) = where_clause.as_ref() {
-        eval_where_clause_batch(where_expr, batch, table_schema)?
+        // Resolve against the batch's OWN schema first: a resident memtable
+        // written before a DROP/RENAME COLUMN keeps its insert-time column
+        // order, and name-based resolution (index_of follows previous_names)
+        // keeps the predicate on the right physical column. The table schema
+        // stays as the fallback for hand-built batches.
+        eval_where_clause_batch(where_expr, batch, &batch.schema)
+            .or_else(|_| eval_where_clause_batch(where_expr, batch, table_schema))?
     } else {
         vec![true; batch.num_rows()]
     };
@@ -662,7 +696,20 @@ pub(crate) fn update_memtable_batch(
         return Ok((None, 0, Vec::new()));
     }
 
-    let assigned = precompute_assigned_values(assignments, table_schema)?;
+    // Assignments resolve against THIS batch's column layout: the catalog
+    // index of a column and its index inside an older memtable's batch can
+    // disagree after a DROP/RENAME COLUMN, and writing by catalog position
+    // would corrupt the neighboring physical column.
+    let mut assigned = HashMap::new();
+    for assign in assignments {
+        if let Some(local_idx) = batch.schema.index_of(&assign.column) {
+            let col_type = batch.schema.columns[local_idx].data_type;
+            if !assigned.contains_key(&local_idx) {
+                let value = eval_expr_to_scalar(&assign.value, &col_type)?;
+                assigned.insert(local_idx, value);
+            }
+        }
+    }
     let all_rows: Vec<u32> = (0..batch.num_rows() as u32).collect();
     let mut new_columns = Vec::with_capacity(batch.num_columns());
     for (col_idx, column) in batch.columns.iter().enumerate() {
@@ -784,10 +831,15 @@ pub(crate) fn build_update_mask(
     table_schema: &Schema,
 ) -> Result<Vec<bool>> {
     let mut mask = if let Some(where_expr) = where_clause.as_ref() {
+        // Name-based read: the batch carries the CATALOG defs of the
+        // requested columns in request order, so evaluation by catalog
+        // position stays correct even when this segment's footer predates a
+        // DROP/RENAME COLUMN (positional projection reads silently hit the
+        // wrong physical column after the DDL).
         let predicate_batch = if predicate_projection.is_empty() {
-            reader.read_row_group(row_group_idx)?
+            reader.read_row_group_columns_aligned(row_group_idx, table_schema)?
         } else {
-            reader.read_row_group_with_projection(row_group_idx, predicate_projection)?
+            reader.read_row_group_columns(row_group_idx, table_schema, predicate_projection)?
         };
         eval_where_clause_batch(where_expr, &predicate_batch, &predicate_batch.schema)
             .or_else(|_| eval_where_clause_batch(where_expr, &predicate_batch, table_schema))?

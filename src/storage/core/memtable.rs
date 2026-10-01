@@ -18,6 +18,14 @@ pub enum MemTableState {
     /// it stays readable until an explicit close-of-day clears it. This realises
     /// the design's "checkpoint flush copies (does not move) and keeps the data
     /// resident" semantics for tables that are NOT accelerated by a hot store.
+    ///
+    /// RESERVED VALUE: no production path writes this state today (grep for
+    /// `MemTableState::Archived` — the only writers are `rename_table`, which
+    /// merely propagates an already-Archived state to its replacement, and
+    /// the `state()` byte mapping below). Do NOT remove the variant: the
+    /// u8 encoding is part of the state byte surface (`state()`/`set_state`)
+    /// and preserved for serialization compatibility; a future close-of-day
+    /// checkpoint flush is expected to take this value up again.
     Archived,
 }
 
@@ -287,6 +295,17 @@ impl MemTable {
         }
         let guard = self.batch.read().unwrap();
         guard.as_ref().map(|batch| batch.as_ref().clone())
+    }
+
+    /// Owned-batch view without the deep copy: the same snapshot as `read()`
+    /// shared through its `Arc`. The memtable's mutators go through
+    /// `Arc::make_mut`, so the returned snapshot is frozen even if the
+    /// memtable appends or is replaced afterwards. Prefer this over `read()`
+    /// in new call sites that only read the batch — the deep clone of
+    /// `read()` is only worth paying when the caller needs to mutate the
+    /// batch.
+    pub fn read_arc(&self) -> Option<Arc<RecordBatch>> {
+        self.read_snapshot_arc()
     }
 
     pub fn read_with<R>(&self, f: impl FnOnce(&RecordBatch) -> R) -> Option<R> {
@@ -1055,8 +1074,10 @@ impl MemTableManager {
     /// Drop REPLACE key indexes whose memtables are no longer registered.
     fn prune_replace_key_indexes(&self) {
         let memtables = self.memtables.read().unwrap();
+        let live_ids: std::collections::HashSet<Uuid> =
+            memtables.iter().map(|mt| mt.id()).collect();
         let mut indexes = self.replace_key_indexes.write().unwrap();
-        indexes.retain(|id, _| memtables.iter().any(|mt| mt.id() == *id));
+        indexes.retain(|id, _| live_ids.contains(id));
     }
 
     pub fn get_readable_by_table(&self, db: &str, table: &str) -> Vec<Arc<MemTable>> {
