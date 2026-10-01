@@ -1104,6 +1104,11 @@ pub fn exec_alter_table(
     // anywhere in the section leaves the consistent pre-DDL state on disk —
     // the flush protocol retires tails and folds pending sidecars with its
     // own crash safety, so no stale-layout hot state can outlive the ALTER.
+    //
+    // Replication inherits the same ordering: the flush's segment-retirement
+    // events enqueue during execute_stmt, and the CatalogSnapshot event is
+    // enqueued only after the statement succeeds (engine execute), so a
+    // standby retires the stale tails before it reloads the new catalog.
     let width_changing = operations.iter().any(|operation| {
         matches!(
             operation,

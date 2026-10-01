@@ -1481,16 +1481,72 @@ pub(crate) fn segment_may_match(
     // segment's footer order. After a DROP/RENAME COLUMN the two drift, and
     // testing catalog indices against footer zone maps prunes (or keeps) the
     // WRONG segments — re-anchor the predicate onto this segment first.
-    let Ok(aligned) = reader.align_row_group_predicate(table_schema, predicate) else {
-        // A referenced column is absent from this older segment entirely: no
-        // row in it can carry a value for the clause, so it cannot match.
-        return false;
+    //
+    // Clauses on columns the footer predates cannot consult a zone map, but
+    // under the default-fill semantics every row carries the column's
+    // DEFAULT: the clause reduces to one constant comparison, which prunes
+    // precisely. The old blanket "absent column cannot match" silently
+    // skipped rows a DELETE was required to remove while UPDATE already
+    // matched them. Undecidable constants keep the segment; the row-wise
+    // evaluation on default-filled batches decides.
+    let mut present_clauses = Vec::new();
+    for clause in &predicate.clauses {
+        if crate::storage::segment::reader::any_column_absent_in_schema(
+            table_schema,
+            reader.schema(),
+            &[clause.column_index],
+        ) {
+            let Some(column) = table_schema.columns.get(clause.column_index) else {
+                return true;
+            };
+            match default_clause_decision(column, &clause.op, &clause.value) {
+                Some(true) => {}
+                Some(false) => return false,
+                None => {}
+            }
+        } else {
+            present_clauses.push(clause.clone());
+        }
+    }
+    if present_clauses.is_empty() {
+        return true;
+    }
+    let reduced = crate::storage::partition::pruning::RowGroupPredicate::new(present_clauses);
+    // Every remaining clause's column exists in the footer, so alignment can
+    // only fail on an out-of-range catalog index: keep the segment and let
+    // the row-wise evaluation surface the error.
+    let Ok(aligned) = reader.align_row_group_predicate(table_schema, &reduced) else {
+        return true;
     };
     let segment_zone_maps = reader.segment_zone_maps();
     if !segment_zone_maps.is_empty() {
         return aligned.matches_row_group(segment_zone_maps);
     }
     (0..reader.num_row_groups()).any(|rg_idx| aligned.matches_row_group(reader.zone_maps(rg_idx)))
+}
+
+/// Decide one range clause against the constant value a pre-ALTER segment's
+/// rows carry for `column`. `None` keeps the segment (undecidable).
+fn default_clause_decision(
+    column: &crate::types::batch::ColumnDef,
+    op: &crate::storage::partition::pruning::RangeOp,
+    value: &crate::types::scalar::ScalarValue,
+) -> Option<bool> {
+    use crate::storage::index::sort_key::compare_scalars_for_sort;
+    use crate::storage::partition::pruning::RangeOp;
+    let default = crate::storage::segment::reader::column_default_value(column);
+    if default.is_null() {
+        // NULL compares UNKNOWN against everything: no row matches.
+        return Some(false);
+    }
+    let ordering = compare_scalars_for_sort(&default, value);
+    Some(match op {
+        RangeOp::Eq => ordering == std::cmp::Ordering::Equal,
+        RangeOp::Lt => ordering == std::cmp::Ordering::Less,
+        RangeOp::Le => ordering != std::cmp::Ordering::Greater,
+        RangeOp::Gt => ordering == std::cmp::Ordering::Greater,
+        RangeOp::Ge => ordering != std::cmp::Ordering::Less,
+    })
 }
 
 #[cfg(test)]

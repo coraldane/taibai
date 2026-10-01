@@ -822,12 +822,14 @@ impl BatchWriter {
         partition_key: &str,
     ) -> Result<()> {
         self.wait_out_table_flush_io(db, table);
-        let mts = self
-            .memtable_mgr
-            .get_by_table(db, table)
-            .into_iter()
-            .filter(|memtable| memtable.partition_key() == partition_key)
-            .collect::<Vec<_>>();
+        let mts = Self::flushable_under_lock(
+            &self.memtable_mgr,
+            self.memtable_mgr
+                .get_by_table(db, table)
+                .into_iter()
+                .filter(|memtable| memtable.partition_key() == partition_key)
+                .collect::<Vec<_>>(),
+        );
         for group in Self::group_memtables_for_flush(mts) {
             Self::flush_memtable_group(
                 &self.segment_mgr,
@@ -841,9 +843,35 @@ impl BatchWriter {
         Ok(())
     }
 
+    /// Memtables eligible for a caller-lock-held flush: the same exclusions
+    /// as the background selection (`flush_table`/`get_all_pending`). A
+    /// transaction's memtable reaches segments only at COMMIT — flushing it
+    /// here would publish another session's uncommitted rows, which a
+    /// subsequent ROLLBACK cannot retract. A deferred-DML pin means a live
+    /// transaction still needs the batch positions stable for its deferred
+    /// removal (the registry documents that flush must skip pinned
+    /// memtables).
+    fn flushable_under_lock(
+        memtable_mgr: &MemTableManager,
+        mts: Vec<Arc<crate::storage::core::memtable::MemTable>>,
+    ) -> Vec<Arc<crate::storage::core::memtable::MemTable>> {
+        let txn_mutations = memtable_mgr.txn_mutations();
+        mts.into_iter()
+            .filter(|mt| {
+                !mt.is_transactional()
+                    && !txn_mutations
+                        .as_ref()
+                        .is_some_and(|registry| registry.is_memtable_pinned(mt.id()))
+            })
+            .collect()
+    }
+
     pub(crate) fn flush_table_under_table_lock(&self, db: &str, table: &str) -> Result<()> {
         self.wait_out_table_flush_io(db, table);
-        let mts = self.memtable_mgr.get_by_table(db, table);
+        let mts = Self::flushable_under_lock(
+            &self.memtable_mgr,
+            self.memtable_mgr.get_by_table(db, table),
+        );
         for group in Self::group_memtables_for_flush(mts) {
             Self::flush_memtable_group(
                 &self.segment_mgr,

@@ -41,6 +41,11 @@ migrate --data /var/lib/taibai --deep
 
 `wal` 顶级目录是保留名，SQL 与数据库扫描不会把它当作用户数据库。
 
+**PITR 重放的注意点**：同一归档目录里会并存 ALTER ADD/DROP COLUMN 前后两种列布局的
+tail 日志（tail 帧不携带 schema）。重放器必须按每个日志自身的帧列数解码，再对齐到目标
+catalog（缺列按 DEFAULT 填充），不能一律用当前 catalog schema 解码——否则列数不匹配的
+日志会解码失败或静默错列。
+
 ## 代码索引
 
 | 行为 | 位置 |

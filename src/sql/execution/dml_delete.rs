@@ -185,16 +185,31 @@ pub(crate) fn match_segment_for_delete(
     }
     // Re-anchor the catalog-space predicate onto this segment's footer zone
     // maps — positional use after a DROP/RENAME COLUMN prunes the WRONG row
-    // groups. A column absent from this older segment cannot match.
+    // groups. A column absent from this older segment carries its DEFAULT on
+    // every row (default-fill semantics, shared with UPDATE/SELECT/COUNT):
+    // zone maps cannot decide such clauses, so keep every row group a
+    // candidate and let the row-wise mask on default-filled batches decide —
+    // the silent "no match" used here dropped rows a DELETE had to remove.
     let aligned_predicate = match predicate {
-        Some(pred) => match reader.align_row_group_predicate(table_schema, pred) {
-            Ok(aligned) => Some(aligned),
-            Err(_) => return Ok(SegmentDeleteMatch {
-                footer_bitmap,
-                new_bitmap,
-                matched_ids: Vec::new(),
-            }),
-        },
+        Some(pred) => {
+            let clause_columns: Vec<usize> =
+                pred.clauses.iter().map(|clause| clause.column_index).collect();
+            if crate::storage::segment::reader::any_column_absent_in_schema(
+                table_schema,
+                reader.schema(),
+                &clause_columns,
+            ) {
+                None
+            } else {
+                match reader.align_row_group_predicate(table_schema, pred) {
+                    Ok(aligned) => Some(aligned),
+                    // Out-of-range catalog index is an internal error, not a
+                    // provable no-match: fail loudly instead of skipping the
+                    // segment silently.
+                    Err(error) => return Err(error),
+                }
+            }
+        }
         None => None,
     };
 
@@ -1291,6 +1306,10 @@ pub fn exec_delete(
             } else {
                 key_projection.clone()
             });
+        // Key positions of the FULL catalog-order batch: the fallback read
+        // for a segment whose footer predates a projected (WHERE/key) column.
+        let full_schema_key_positions = index_maintenance
+            .projected_key_positions(&(0..table_schema.columns.len()).collect::<Vec<_>>());
         let mut first_rewrite_error: Option<crate::common::error::TaibaiError> = None;
         for seg_path in segment_files {
             let (new_bitmap, new_deleted_count, prev_deleted) = {
@@ -1304,6 +1323,21 @@ pub fn exec_delete(
                         continue;
                     }
                 }
+                // A footer predating a projected column cannot serve the
+                // narrow read: degrade this segment to the full aligned read
+                // (defaults filled) and map index keys to their catalog
+                // positions.
+                let segment_drifts = !key_projection.is_empty()
+                    && crate::storage::segment::reader::any_column_absent_in_schema(
+                        table_schema,
+                        reader.schema(),
+                        &key_projection,
+                    );
+                let key_positions = if segment_drifts {
+                    &full_schema_key_positions
+                } else {
+                    &projected_key_positions
+                };
                 let segment_id = index_maintenance
                     .still_maintaining()
                     .then(|| index_maintenance.intern_segment(&seg_path.to_string_lossy()));
@@ -1320,7 +1354,7 @@ pub fn exec_delete(
                         // Name-based read: the batch carries catalog defs in
                         // request order, so key positions and WHERE evaluation
                         // stay correct on pre-DDL footers.
-                        if key_projection.is_empty() {
+                        if key_projection.is_empty() || segment_drifts {
                             reader.read_row_group_columns_aligned(rg_idx, table_schema)
                         } else {
                             reader.read_row_group_columns(rg_idx, table_schema, &key_projection)
@@ -1339,7 +1373,7 @@ pub fn exec_delete(
                                     *absolute,
                                     batch,
                                     *idx as usize,
-                                    &projected_key_positions,
+                                    key_positions,
                                 );
                             }
                         }

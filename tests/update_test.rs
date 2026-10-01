@@ -578,11 +578,14 @@ fn scattered_inserts_materialize_only_at_row_group_target() {
     assert_eq!(segments.len(), 1);
     // The scattered row's durable-tail frame is written by the background
     // flush, not synchronously by the INSERT — poll for it instead of
-    // racing the flush (this read used to flake under load).
+    // racing the flush (this read used to flake under load). A fresh
+    // deadline: reusing the segment poll's deadline left this loop with the
+    // leftover time only, failing under parallel-suite load.
+    let tail_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let tails = loop {
         let tails =
             durable_tail::recover(&table_dir, &schema).expect("recover partial durable tail");
-        if !tails.is_empty() || std::time::Instant::now() >= deadline {
+        if !tails.is_empty() || std::time::Instant::now() >= tail_deadline {
             break tails;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));

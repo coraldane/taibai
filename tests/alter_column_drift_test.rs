@@ -305,3 +305,36 @@ fn resident_memtable_predating_drop_column_reads_surviving_columns() {
         vec![vec!["1"]]
     );
 }
+
+/// DELETE's segment matching follows the default-fill semantics: a WHERE on
+/// a column a segment predates must remove the rows carrying the DEFAULT.
+/// UPDATE already matched them through aligned reads — the two used to
+/// diverge, leaving rows UPDATE could change but DELETE could not see.
+#[test]
+fn delete_where_added_column_matches_default_rows_on_old_segments() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    exec(&engine, &mut session, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    exec(&engine, &mut session, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
+    exec(&engine, &mut session, "FLUSH TABLE t");
+    exec(&engine, &mut session, "ALTER TABLE t ADD COLUMN score INT DEFAULT 7");
+    // A post-ALTER row with a non-default value keeps the statement honest.
+    exec(&engine, &mut session, "INSERT INTO t VALUES (4, 40, 8)");
+
+    exec(&engine, &mut session, "DELETE FROM t WHERE score = 7");
+    let mut rows = query_all(&engine, &mut session, "SELECT id, v, score FROM t");
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![vec!["4", "40", "8"]],
+        "old default rows deleted; the non-default row survives"
+    );
+
+    // The mirror shape: a non-matching comparison removes nothing.
+    exec(&engine, &mut session, "INSERT INTO t VALUES (5, 50, 7)");
+    exec(&engine, &mut session, "DELETE FROM t WHERE score = 99");
+    assert_eq!(
+        query_all(&engine, &mut session, "SELECT COUNT(*) FROM t"),
+        vec![vec!["2"]]
+    );
+    engine.segment_mgr().shutdown();
+}
