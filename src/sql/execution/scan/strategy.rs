@@ -739,11 +739,11 @@ fn default_column_for_missing_schema_col(
         }
         None => ScalarValue::null_for_type(col_def.data_type),
     };
-    let mut column = ColumnArray::empty(col_def.data_type);
-    for _ in 0..row_count {
-        column.push(&value)?;
-    }
-    Ok(column)
+    // Same constant-column construction the segment-side aligned read uses
+    // (Rle single-run build, flattened before return): keeps the SELECT-side
+    // fill byte-identical to `default_value_column`'s output while dropping
+    // the per-row push loop.
+    crate::storage::segment::reader::constant_column(col_def.data_type, &value, row_count)
 }
 
 pub fn apply_ttl_filter_and_projection(

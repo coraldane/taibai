@@ -288,11 +288,19 @@ impl Compactor {
             &[]
         };
         let output_row_group_rows = self.segment_mgr.row_group_target_rows();
+        // C11: seal BEFORE taking the table-wide mutation lock. The seal's
+        // footer fsync is IO; running it inside the wide gate froze every
+        // queued DDL/DML latch on the table for the duration of the flush.
+        // This mirrors the checkpoint path (`seal_table_active`): writers are
+        // extracted under the short active-segments lock and sealed outside
+        // any mutation lock. Writes racing between the seal and the gate can
+        // create a fresh active segment — it is simply left for the next
+        // compaction round (the old in-lock seal raced identically against
+        // writers already queued on the gate).
+        if seal_active {
+            self.segment_mgr.seal_table_active(db, table)?;
+        }
         let partition_groups = self.segment_mgr.with_table_mutation_lock(db, table, || {
-            if seal_active {
-                self.segment_mgr
-                    .seal_table_active_under_table_lock(db, table)?;
-            }
             let segment_files = self
                 .segment_mgr
                 .discover_inactive_segments(db, table, &table_dir)?;

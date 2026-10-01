@@ -453,9 +453,17 @@ impl Engine {
             return Ok(ExecResult::Ok { rows_affected: 0 });
         }
 
-        let (table, columns, is_replace) = match &prepared.stmt {
-            Statement::Insert { table, columns, .. } => (table.clone(), columns.clone(), false),
-            Statement::Replace { table, columns, .. } => (table.clone(), columns.clone(), true),
+        let (table, columns, values_template, is_replace) = match &prepared.stmt {
+            Statement::Insert {
+                table,
+                columns,
+                values,
+            } => (table.clone(), columns.clone(), values.clone(), false),
+            Statement::Replace {
+                table,
+                columns,
+                values,
+            } => (table.clone(), columns.clone(), values.clone(), true),
             _ => {
                 return Err(TaibaiError::Sql(
                     "prepared batch fast path only supports INSERT and REPLACE".into(),
@@ -463,7 +471,7 @@ impl Engine {
             }
         };
 
-        let mut values = Vec::with_capacity(batch.len());
+        let mut values = Vec::with_capacity(batch.len().saturating_mul(values_template.len()));
         for (row_idx, params) in batch.iter().enumerate() {
             if params.len() != prepared.param_count {
                 return Err(TaibaiError::Sql(format!(
@@ -473,7 +481,28 @@ impl Engine {
                     params.len()
                 )));
             }
-            let mut bound = prepared.stmt.clone();
+            // Only `values` need rebinding per parameter row, so clone the
+            // pre-extracted values template (C14) instead of the whole
+            // Statement (table + columns + values) on every row.
+            // `bind_params`' Insert/Replace arm rewrites only `values`, so
+            // the binding shell below carries empty table/columns; the
+            // bound rows are spliced into the real statement built after
+            // the loop, yielding exactly the values the previous
+            // clone-whole-tree-per-row loop produced (same placeholder
+            // substitution, same literals, coercion happens downstream).
+            let mut bound = if is_replace {
+                Statement::Replace {
+                    table: crate::sql::parser::ast::ObjectName::bare(String::new()),
+                    columns: Vec::new(),
+                    values: values_template.clone(),
+                }
+            } else {
+                Statement::Insert {
+                    table: crate::sql::parser::ast::ObjectName::bare(String::new()),
+                    columns: Vec::new(),
+                    values: values_template.clone(),
+                }
+            };
             crate::sql::execution::prepared::bind_params(&mut bound, params).map_err(|error| {
                 TaibaiError::Sql(format!("row {} parameter bind failed: {}", row_idx, error))
             })?;

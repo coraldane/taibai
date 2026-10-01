@@ -1603,7 +1603,7 @@ impl BatchWriter {
         // Every fallible step below (barrier, tail probing, merging, the
         // protocol-specific flushes) restores the frozen members on the way
         // out.
-        let _guard = FlushGroupGuard::new(frozen.iter().map(|(mt, _)| mt));
+        let mut guard = FlushGroupGuard::new(frozen.iter().map(|(mt, _)| mt));
         tail_committer.barrier(&table_dir)?;
 
         let ids = frozen.iter().map(|(mt, _)| mt.id()).collect::<Vec<_>>();
@@ -1652,12 +1652,36 @@ impl BatchWriter {
             );
         }
 
-        let flush_result = segment_mgr.flush_memtable_batch_if_under_table_lock(
+        // The untaken-tail branch covers both never-tailed memtables and
+        // torn-tail fallbacks (`needs_segment_flush`). The old sequence —
+        // append, then `durable_tail::clear` per memtable, with NO flush
+        // intent — left a crash window where the published segment rows and
+        // a still-live torn tail (its valid prefix frames) were both
+        // replayed at recovery: double-counted rows. Writing begin_flush
+        // intents under the append's own lock, then finishing them, gives
+        // this branch the same protocol as the durable path: recovery
+        // suppresses the tail exactly when the segment provably holds the
+        // rows (flush_intent_satisfied).
+        let mut intents: Vec<crate::storage::core::durable_tail::FlushIntent> = Vec::new();
+        let flush_result = segment_mgr.flush_memtable_batch_with_intents_under_table_lock(
             &db,
             &table,
             &partition_key,
             &merged,
             txn_id,
+            &mut |segment_file_name, base_rows| {
+                let mut cumulative = 0u64;
+                for (mt, batch) in frozen {
+                    cumulative += batch.num_rows() as u64;
+                    intents.push(crate::storage::core::durable_tail::begin_flush(
+                        &table_dir,
+                        mt.id(),
+                        segment_file_name,
+                        base_rows + cumulative,
+                    )?);
+                }
+                Ok(())
+            },
             || {
                 frozen
                     .iter()
@@ -1665,19 +1689,27 @@ impl BatchWriter {
             },
             || Self::mark_flushed(frozen.iter().map(|(mt, _)| mt)),
         );
-        let wrote = match flush_result {
-            Ok(wrote) => wrote,
+        guard.intents.extend(intents);
+        let outcome = match flush_result {
+            Ok(outcome) => outcome,
             Err(e) => {
                 return Err(e);
             }
         };
-        if !wrote {
+        if !outcome.wrote {
             // A concurrent winner already carried these rows; drop the copies.
             Self::mark_flushed(frozen.iter().map(|(mt, _)| mt));
             return Ok(());
         }
-        for (mt, _) in frozen {
-            crate::storage::core::durable_tail::clear(&table_dir, mt.id())?;
+        if let Err(error) =
+            crate::storage::core::durable_tail::finish_flush_batch(&table_dir, guard.take_intents())
+        {
+            tracing::warn!(
+                db,
+                table,
+                error = %error,
+                "segment-protocol flush cleanup deferred to recovery"
+            );
         }
         let group_ids: Vec<uuid::Uuid> = frozen.iter().map(|(mt, _)| mt.id()).collect();
         segment_mgr.emit_segment_update(&db, &table, &partition_key, group_ids, None);
@@ -1776,14 +1808,21 @@ impl BatchWriter {
         table_dir: &std::path::Path,
     ) -> Result<()> {
         let mut guard = FlushGroupGuard::new(locked.iter().map(|(mt, _)| mt));
-        let watermark = segment_mgr.durable_active_segment_watermark_under_table_lock(
+        // Path probe only (append to active vs standalone new segment); the
+        // authoritative watermark is recomputed under the append's own lock
+        // below — reading it here and again at the append used to leave a
+        // window where a partition-locked direct writer slipped rows
+        // between the two, and those foreign rows could satisfy our flush
+        // intent at recovery, retiring a tail whose rows never landed (loss
+        // of fsync-acknowledged data).
+        let probe = segment_mgr.durable_active_segment_watermark_under_table_lock(
             db,
             table,
             partition_key,
             &merged.schema,
             merged.num_rows() as u64,
         )?;
-        let Some((segment_file_name, expected_total_rows)) = watermark else {
+        if probe.is_none() {
             return Self::flush_durable_memtable_group_as_new_segment(
                 segment_mgr,
                 locked,
@@ -1794,29 +1833,27 @@ impl BatchWriter {
                 txn_id,
                 table_dir,
             );
-        };
-        let base_rows = expected_total_rows - merged.num_rows() as u64;
-        let mut cumulative = 0u64;
-        for (mt, batch) in locked {
-            cumulative += batch.num_rows() as u64;
-            match crate::storage::core::durable_tail::begin_flush(
-                table_dir,
-                mt.id(),
-                &segment_file_name,
-                base_rows + cumulative,
-            ) {
-                Ok(intent) => guard.intents.push(intent),
-                Err(error) => {
-                    return Err(error);
-                }
-            }
         }
-        let flush_result = segment_mgr.flush_memtable_batch_if_under_table_lock(
+        let mut intents: Vec<crate::storage::core::durable_tail::FlushIntent> = Vec::new();
+        let flush_result = segment_mgr.flush_memtable_batch_with_intents_under_table_lock(
             db,
             table,
             partition_key,
             merged,
             0,
+            &mut |segment_file_name, base_rows| {
+                let mut cumulative = 0u64;
+                for (mt, batch) in locked {
+                    cumulative += batch.num_rows() as u64;
+                    intents.push(crate::storage::core::durable_tail::begin_flush(
+                        table_dir,
+                        mt.id(),
+                        segment_file_name,
+                        base_rows + cumulative,
+                    )?);
+                }
+                Ok(())
+            },
             || {
                 locked
                     .iter()
@@ -1824,13 +1861,16 @@ impl BatchWriter {
             },
             || Self::mark_flushed(locked.iter().map(|(mt, _)| mt)),
         );
-        let wrote = match flush_result {
-            Ok(wrote) => wrote,
+        // Even on failure the already-written intents must join the guard so
+        // its Drop cancels them.
+        guard.intents.extend(intents);
+        let outcome = match flush_result {
+            Ok(outcome) => outcome,
             Err(error) => {
                 return Err(error);
             }
         };
-        if !wrote {
+        if !outcome.wrote {
             // A concurrent winner already carried these rows; drop the
             // copies and the intents (the guard's drop cancels them).
             Self::mark_flushed(locked.iter().map(|(mt, _)| mt));
@@ -1846,6 +1886,8 @@ impl BatchWriter {
                 "durable tail group flush cleanup deferred to recovery"
             );
         }
+        let (segment_file_name, expected_total_rows) =
+            outcome.target.expect("append outcome carries its watermark");
         let group_ids: Vec<uuid::Uuid> = locked.iter().map(|(mt, _)| mt.id()).collect();
         segment_mgr.emit_segment_update(
             db,

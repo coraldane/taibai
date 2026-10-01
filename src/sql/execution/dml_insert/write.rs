@@ -583,10 +583,15 @@ fn exec_materialized_insert_batch(
     } else {
         Vec::new()
     };
-    if publish_unique_index_entries && !primary_key_indices.is_empty() {
+    if publish_unique_index_entries && !primary_keys.is_empty() {
+        // Reuse the once-materialized primary keys instead of re-extracting
+        // them from the batch (C15): PK NULLs were already rejected by the
+        // validation above, so every row yields exactly one entry in batch
+        // order, byte-identical to what `primary_location_entries_for_batch`
+        // produced from a fresh scan.
         unique_index_entries.push((
             crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME.to_string(),
-            primary_location_entries_for_batch(&schema, &batch, &primary_key_indices),
+            primary_location_entries_from_keys(&primary_keys),
         ));
     }
     log_insert_profile(
@@ -682,7 +687,12 @@ fn exec_materialized_insert_batch(
                 .index_manager()
                 .record_txn_published_keys(txn_id, db, table, index_name, keys);
         }
-        if !primary_keys.is_empty() {
+        // The primary location index was already recorded by the loop above
+        // when its entries were published; the standalone record from
+        // primary_keys (one clone instead of two) is only needed by
+        // publish-disabled callers such as REPLACE's internal staging call.
+        // Retraction dedups keys, so recording once is exactly equivalent.
+        if !publish_unique_index_entries && !primary_keys.is_empty() {
             engine.index_manager().record_txn_published_keys(
                 txn_id,
                 db,
@@ -715,8 +725,15 @@ fn exec_materialized_insert_batch(
             db,
             table,
             row_count as i64,
-            !bulk_import_mode && txn_id > 0,
-            !bulk_import_mode && txn_id == 0,
+            // In-transaction INSERTs take the same throttled deferred catalog
+            // save as auto-commit (C4) instead of serializing the whole
+            // catalog JSON per statement: a crash may lose the last ~1s of
+            // auto-increment-next-value persistence inside an open
+            // transaction, the trade-off auto-commit already makes. Bulk
+            // mode stays excluded from both (bulk flushes its dirty
+            // catalogs at bulk end).
+            false,
+            !bulk_import_mode,
         )?;
         // No follow-up persist_auto_increment_next_value call here:
         // record_inserted_rows already writes the counter into the table
@@ -766,6 +783,26 @@ pub(crate) fn build_unique_index_entries_for_batch(
     Ok(result)
 }
 
+/// Primary-key location entries derived from the keys already materialized by
+/// `primary_keys_for_batch` (C15): one entry per row, `row_id` = batch row
+/// index. Valid by construction — primary-key validation upstream rejects
+/// NULLs, so unlike the batch-scanning twin above no row can be skipped.
+fn primary_location_entries_from_keys(
+    primary_keys: &[Vec<ScalarValue>],
+) -> Vec<UniqueIndexEntry> {
+    primary_keys
+        .iter()
+        .enumerate()
+        .map(|(row_idx, key)| UniqueIndexEntry {
+            key: key.clone(),
+            location: UniqueRowLocation {
+                segment_path: String::new(),
+                row_id: row_idx as u64,
+            },
+        })
+        .collect()
+}
+
 /// Pseudo existence entries (empty segment_path) for the primary-key
 /// location index. Keeping this index incrementally maintained on INSERT
 /// and REPLACE avoids a full-table rebuild on the next REPLACE conflict
@@ -797,21 +834,28 @@ pub(crate) fn append_unique_index_entries_after_insert(
     table: &str,
     entries_by_index: Vec<(String, Vec<UniqueIndexEntry>)>,
 ) -> Result<()> {
+    // Encode all indexes' entries first, then hand the whole statement to one
+    // batched append: a single shared lock pass and one fsync per delta file
+    // instead of a full lock/write/sync cycle per index (C3).
+    let mut prepared = Vec::with_capacity(entries_by_index.len());
     for (index_name, entries) in entries_by_index {
-        match engine
-            .index_manager()
-            .append_unique_index_entries(db, table, &index_name, entries)
-        {
-            Ok(_) => {}
-            Err(error) => {
-                engine
-                    .index_manager()
-                    .invalidate_unique_index_snapshot(db, table, &index_name);
-                return Err(error);
-            }
+        prepared.push((
+            index_name,
+            engine.index_manager().prepare_unique_index_entries(entries)?,
+        ));
+    }
+    match engine
+        .index_manager()
+        .append_prepared_unique_index_entries_batch(db, table, prepared)
+    {
+        Ok(()) => Ok(()),
+        Err((index_name, error)) => {
+            engine
+                .index_manager()
+                .invalidate_unique_index_snapshot(db, table, &index_name);
+            Err(error)
         }
     }
-    Ok(())
 }
 
 /// Every location index of a table: named unique indexes plus the implicit

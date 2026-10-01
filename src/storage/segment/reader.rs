@@ -1209,17 +1209,153 @@ pub(crate) fn default_value_column(
     row_count: usize,
 ) -> Result<crate::types::array::ColumnArray> {
     let value = column_default_value(col_def);
-    let mut column = crate::types::array::ColumnArray::empty(col_def.data_type);
+    constant_column(col_def.data_type, &value, row_count)
+}
+
+/// A full-length column whose every row holds the same scalar, built through
+/// the run-length variant: one `(value, row_count)` run instead of a
+/// row-by-row `push` loop. The Rle column is flattened before it leaves this
+/// function — on purpose, not a lost optimization: several consumers of
+/// default-filled columns do not understand `ColumnArray::Rle` and live in
+/// modules this crate cannot change here (the predicate kernels
+/// `eq_vec`/`compare_scalar_at` route through `numeric_i64_at`, which has no
+/// Rle arm and answers `None`, turning predicates into all-false masks; the
+/// delete-bitmap gather `take`/`gather_into` has no Rle arm and panics;
+/// `count_eq` answers 0). `flatten_in_place` expands the single run with a
+/// memset-speed `repeat_n` fill plus a bitmap memcpy, which is still far
+/// cheaper than the old per-row push loop, and callers that never touch the
+/// values pay only the O(1) run construction of the intermediate.
+///
+/// Types the Rle variant cannot represent (Bool, UInt64, floats, VarChar,
+/// Blob, Vector — `expand_runs` covers only the exact-i64-view types) keep
+/// the push-loop construction; a NULL default rides the Rle path with an
+/// all-null bitmap, matching `push_null_value` output exactly after the
+/// flatten.
+pub(crate) fn constant_column(
+    data_type: crate::protocol::types::DataType,
+    value: &ScalarValue,
+    row_count: usize,
+) -> Result<crate::types::array::ColumnArray> {
+    // The RLE fast path requires the TYPE to be expand_runs-representable —
+    // including for NULL values: a NULL default on a VarChar/Float/Bool/…
+    // column used to take the run path and hit expand_runs' unreachable!()
+    // on flatten. scalar_i64_view is consulted on the TYPE pair (a NULL
+    // scalar of a representable type returns Some(0) via the guard below).
+    let run_value = if value.is_null() {
+        null_run_representable(data_type).then_some(0i64)
+    } else {
+        scalar_i64_view(data_type, value)
+    };
+    if let Some(bits) = run_value {
+        if let Ok(run_len) = u32::try_from(row_count) {
+            let bitmap = if value.is_null() {
+                crate::types::bitmap::NullBitmap::from_bools(&vec![true; row_count])
+            } else {
+                crate::types::bitmap::NullBitmap::new_valid(row_count)
+            };
+            let mut column = crate::types::array::ColumnArray::rle(
+                vec![(bits, run_len)],
+                data_type,
+                bitmap,
+                row_count,
+            );
+            column.flatten_in_place();
+            return Ok(column);
+        }
+    }
+    let mut column = crate::types::array::ColumnArray::empty(data_type);
     if value.is_null() {
         for _ in 0..row_count {
             column.push_null_value();
         }
     } else {
         for _ in 0..row_count {
-            column.push(&value)?;
+            column.push(value)?;
         }
     }
     Ok(column)
+}
+
+/// The exact i64 view of a scalar for a run-decodable column type, or `None`
+/// when the (type, scalar) pair has no Rle representation. Only pairs that
+/// `ColumnArray::expand_runs` can rebuild are accepted — anything else would
+/// hit its `unreachable!()` on flatten.
+/// Whether a run of NULLs of this type can be flattened by `expand_runs`
+/// (the payload bits are irrelevant for NULL; only the type matters).
+fn null_run_representable(data_type: crate::protocol::types::DataType) -> bool {
+    use crate::protocol::types::DataType as Dt;
+    matches!(
+        data_type,
+        Dt::Int8
+            | Dt::Int16
+            | Dt::Int32
+            | Dt::Int64
+            | Dt::UInt8
+            | Dt::UInt16
+            | Dt::UInt32
+            | Dt::Decimal
+            | Dt::Date
+            | Dt::Time
+            | Dt::Timestamp
+            | Dt::Interval
+    )
+}
+
+fn scalar_i64_view(
+    data_type: crate::protocol::types::DataType,
+    value: &ScalarValue,
+) -> Option<i64> {
+    match (data_type, value) {
+        (
+            crate::protocol::types::DataType::Int8,
+            ScalarValue::Int8(Some(v)),
+        ) => Some(*v as i64),
+        (
+            crate::protocol::types::DataType::Int16,
+            ScalarValue::Int16(Some(v)),
+        ) => Some(*v as i64),
+        (
+            crate::protocol::types::DataType::Int32,
+            ScalarValue::Int32(Some(v)),
+        ) => Some(*v as i64),
+        (
+            crate::protocol::types::DataType::Int64,
+            ScalarValue::Int64(Some(v)),
+        ) => Some(*v),
+        (
+            crate::protocol::types::DataType::UInt8,
+            ScalarValue::UInt8(Some(v)),
+        ) => Some(*v as i64),
+        (
+            crate::protocol::types::DataType::UInt16,
+            ScalarValue::UInt16(Some(v)),
+        ) => Some(*v as i64),
+        (
+            crate::protocol::types::DataType::UInt32,
+            ScalarValue::UInt32(Some(v)),
+        ) => Some(*v as i64),
+        (
+            crate::protocol::types::DataType::Decimal,
+            ScalarValue::Decimal(Some(v)),
+        ) => Some(*v),
+        (
+            crate::protocol::types::DataType::Date,
+            ScalarValue::Date(Some(v)),
+        ) => Some(*v as i64),
+        (
+            crate::protocol::types::DataType::Time,
+            ScalarValue::Time(Some(v)),
+        ) => Some(*v),
+        (
+            crate::protocol::types::DataType::Timestamp,
+            ScalarValue::Timestamp(Some(v)),
+        ) => Some(*v),
+        (
+            crate::protocol::types::DataType::Interval,
+            ScalarValue::Interval(Some(v)),
+        ) => Some(*v),
+        _ => None,
+    }
 }
 
 /// The scalar every row of a segment predating `col_def` logically carries:

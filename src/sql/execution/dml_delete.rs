@@ -1477,6 +1477,35 @@ pub fn exec_delete(
             }
         }
 
+        // C22: the catalog row_count decrement + save runs INSIDE the table
+        // mutation lock (same order as the partial-error path above: table
+        // lock → catalog write lock), after every segment/memtable operation
+        // of the statement. Doing it after releasing the lock raced DDL's
+        // catalog save — a lost update let row_count drift upward forever.
+        if total_deleted > 0 {
+            let mut catalogs = engine.catalogs().write().unwrap();
+            if let Some(catalog) = catalogs.get_mut(db) {
+                if let Some(meta) = catalog.get_table_mut(table) {
+                    meta.row_count = (meta.row_count - total_deleted as i64).max(0);
+                    let meta_dir = engine.data_dir().join("meta");
+                    // Best-effort persistence (same contract as the partial
+                    // error path above): failing the statement here would
+                    // skip index maintenance and the invalidation fallback
+                    // entirely, leaving unique-index snapshots pointing at
+                    // deleted rows. A missed save only falls behind on disk
+                    // until the next successful one.
+                    if let Err(error) = catalog.save(&meta_dir) {
+                        tracing::warn!(
+                            db,
+                            table,
+                            error = %error,
+                            "catalog row_count save after DELETE deferred (best-effort)"
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(index_maintenance.apply(engine, db, table))
     };
 
@@ -1518,15 +1547,9 @@ pub fn exec_delete(
                 .index_manager()
                 .invalidate_primary_key_cache(db, table);
         }
-
-        let mut catalogs = engine.catalogs().write().unwrap();
-        if let Some(catalog) = catalogs.get_mut(db) {
-            if let Some(meta) = catalog.get_table_mut(table) {
-                meta.row_count = (meta.row_count - total_deleted as i64).max(0);
-                let meta_dir = engine.data_dir().join("meta");
-                catalog.save(&meta_dir)?;
-            }
-        }
+        // The row_count decrement + catalog save itself moved INTO the
+        // mutation-lock window (C22, above in delete_body); only the index
+        // cache work remains here.
     }
 
     Ok(ExecResult::Ok {

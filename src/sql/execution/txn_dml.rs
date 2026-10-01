@@ -60,6 +60,25 @@ pub(crate) fn ensure_txn_dml_supported(table_meta: &TableMeta) -> Result<()> {
     Ok(())
 }
 
+/// C8: charge one newly materialized UPDATE row image against the
+/// transaction's in-memory mutation budget, checking INCREMENTALLY per row
+/// group instead of first materializing everything and only failing at
+/// write-back. The estimate doubles `estimated_size_bytes` to approximate
+/// the gather/clone/append overhead around the raw column bytes. This is an
+/// early checkpoint only — the write path keeps its authoritative charge
+/// against the same budget, unchanged.
+fn charge_updated_image_bytes(total: &mut u64, image: &RecordBatch) -> Result<()> {
+    *total = total.saturating_add((image.estimated_size_bytes() as u64).saturating_mul(2));
+    let budget = crate::storage::core::txn_mutations::txn_mutation_budget_bytes();
+    if *total > budget {
+        return Err(TaibaiError::ResourceBusy(format!(
+            "transaction UPDATE materialized {} bytes of updated row images, exceeding the {} byte in-memory mutation budget before write-back; commit or roll back and split the work",
+            *total, budget
+        )));
+    }
+    Ok(())
+}
+
 /// Write-write conflict gate for auto-commit DML: an open transaction's
 /// deferred mutations pin memtable row positions and segment row ids.
 /// Auto-commit DELETE/UPDATE physically remove memtable rows and rewrite
@@ -440,6 +459,10 @@ pub(crate) fn exec_update_in_txn(
         // New row images per target partition, appended to the transaction's
         // own memtable after the planning pass.
         let mut new_rows: Vec<(String, RecordBatch)> = Vec::new();
+        // C8: running total of the updated-row-image bytes this statement has
+        // materialized so far, checked after every row group (and memtable
+        // image) against the transaction mutation budget.
+        let mut updated_image_bytes: u64 = 0;
 
         // Transactional memtables (this transaction's own INSERTs) update in
         // place — no durable state, ROLLBACK-safe. Committed memtables defer
@@ -456,13 +479,15 @@ pub(crate) fn exec_update_in_txn(
             reader_txn_id,
             narrowed_partition,
             |memtable, _original, batch, live_positions| {
+                // C9: `batch` (the Arc) is consumed — untouched columns move
+                // into the replacement when this closure is the sole owner.
                 let (new_batch, affected, matched_rows, _assigned_pairs) =
                     super::dml_update::update_memtable_batch(
-                    assignments,
-                    &resolved_where_clause,
-                    &table_schema,
-                    &batch,
-                )?;
+                        assignments,
+                        &resolved_where_clause,
+                        &table_schema,
+                        batch,
+                    )?;
                 let Some(new_batch) = new_batch else {
                     return Ok(());
                 };
@@ -491,6 +516,9 @@ pub(crate) fn exec_update_in_txn(
                     absolute_rows.iter().copied(),
                 )?;
                 let updated_rows = new_batch.take_rows(&matched_rows)?;
+                // C8: memtable-sourced images count toward the same
+                // incremental budget as segment-sourced ones.
+                charge_updated_image_bytes(&mut updated_image_bytes, &updated_rows)?;
                 if publish_updates {
                     engine.txn_mutations().defer_update_event(
                         reader_txn_id,
@@ -593,6 +621,10 @@ pub(crate) fn exec_update_in_txn(
                     &matched,
                     &kept_matched,
                 )?;
+                // C8: fail as soon as THIS row group pushes the statement
+                // over the budget, instead of accumulating every remaining
+                // row group first.
+                charge_updated_image_bytes(&mut updated_image_bytes, &image)?;
                 updated_images.push(image);
             }
 

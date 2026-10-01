@@ -712,6 +712,7 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
             engine
                 .segment_mgr()
                 .invalidate_readers_under(&old_table_dir);
+            engine.invalidate_hot_segment_hint(db, name);
             // Sum-cache entries keyed under the old path survive the rename;
             // a future CREATE TABLE reusing this name restarts segment
             // numbering at 1 and could hit them (see drop table).
@@ -1646,6 +1647,7 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
             engine.batch_writer().clear_memtables(db, table);
             engine.segment_mgr().remove_table_state(db, table);
             engine.hot_store_manager().remove(db, table);
+            engine.invalidate_hot_segment_hint(db, table);
             // Reloaded data reuses segment paths from position 1; drop the
             // previous incarnation's cached SUMs (see drop table).
             crate::sql::execution::scan::aggregate_meta::invalidate_segment_sum_cache_under(

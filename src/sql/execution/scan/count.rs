@@ -394,24 +394,30 @@ fn count_with_predicates(
 }
 
 /// COUNT row groups of a segment that predates a predicate column: read
-/// whole row groups in catalog order (defaults filled) and evaluate the
-/// predicates the way the SELECT scan applies them. No zone-map/bloom
-/// pruning — the footer has no entries for the missing column, and the
-/// defaults make the missing-column clauses decidable per row anyway.
+/// only the predicate columns — a narrow name-aligned read for the ones the
+/// footer has, DEFAULT-synthesized full-length columns for the ones it
+/// predates — and evaluate the predicates with the same column map the
+/// regular COUNT path uses. Values (and therefore the resulting count) are
+/// identical to the old whole-row-group aligned read; only the columns no
+/// predicate references are never decoded. No zone-map/bloom pruning — the
+/// footer has no entries for the missing column, and the defaults make the
+/// missing-column clauses decidable per row anyway.
 fn count_predicates_on_default_filled_segment(
     spec: &ScanSpec,
     reader: &crate::storage::segment::SegmentReader,
     total_rows: &mut u64,
     mut stats: Option<&mut HashMap<String, ScanStats>>,
 ) -> Result<()> {
+    let predicate_cols = spec.all_predicate_columns();
     for rg_idx in 0..reader.num_row_groups() {
-        let mut batch = reader.read_row_group_columns_aligned(rg_idx, &spec.table_schema)?;
+        let mut batch = default_filled_predicate_batch(spec, reader, rg_idx, &predicate_cols)?;
         if !reader.delete_bitmap().is_empty() {
             let rg_start_row = reader.row_group_start_row(rg_idx);
             batch = delete_bitmap::filter_batch(batch, rg_start_row, reader.delete_bitmap())?;
         }
-        let filtered = row_filter::apply_predicates(
+        let filtered = row_filter::apply_predicates_with_column_map(
             &batch,
+            &predicate_cols,
             &spec.eq_predicates,
             &spec.range_predicates,
             &spec.in_predicates,
@@ -423,6 +429,77 @@ fn count_predicates_on_default_filled_segment(
         s.entry("count".to_string()).or_default().segments_opened += 1;
     }
     Ok(())
+}
+
+/// The predicate-only batch for one row group of a default-filled segment.
+/// Predicate columns the footer knows (by current or previous name) come
+/// from `read_row_group_columns` (narrow, catalog-def-anchored); predicate
+/// columns the footer predates are synthesized by the very same
+/// `default_value_column` the whole-row-group aligned read uses, so the
+/// values — DEFAULT literal / ALTER-pinned timestamp / typed NULL — can
+/// never disagree with the aligned read this replaces.
+fn default_filled_predicate_batch(
+    spec: &ScanSpec,
+    reader: &crate::storage::segment::SegmentReader,
+    rg_idx: usize,
+    predicate_cols: &[usize],
+) -> Result<RecordBatch> {
+    // Unreachable through the current callers (any_predicate_column_absent
+    // is false for an empty column list); keep the exact old semantics for
+    // that degenerate shape instead of a column-less batch.
+    if predicate_cols.is_empty() {
+        return reader.read_row_group_columns_aligned(rg_idx, &spec.table_schema);
+    }
+
+    let mut present_indices = Vec::with_capacity(predicate_cols.len());
+    let mut missing_positions = Vec::new();
+    for (pos, &catalog_idx) in predicate_cols.iter().enumerate() {
+        let col_def = &spec.table_schema.columns[catalog_idx];
+        let mut names = Vec::with_capacity(col_def.previous_names.len() + 1);
+        names.push(col_def.name.clone());
+        names.extend(col_def.previous_names.iter().cloned());
+        if reader.footer_column_index_for_names(&names).is_some() {
+            present_indices.push(catalog_idx);
+        } else {
+            missing_positions.push(pos);
+        }
+    }
+
+    let rg_rows = reader.row_group_rows(rg_idx) as usize;
+    let present_columns = if present_indices.is_empty() {
+        Vec::new()
+    } else {
+        reader.read_row_group_columns(rg_idx, &spec.table_schema, &present_indices)?
+            .columns
+    };
+
+    // Splice the synthesized columns back into predicate-column order so
+    // `predicate_cols` stays a valid column map for the evaluation below.
+    let mut present_iter = present_columns.into_iter();
+    let mut missing_iter = missing_positions.into_iter();
+    let mut next_missing = missing_iter.next();
+    let mut columns = Vec::with_capacity(predicate_cols.len());
+    let mut col_defs = Vec::with_capacity(predicate_cols.len());
+    for (pos, &catalog_idx) in predicate_cols.iter().enumerate() {
+        let col_def = spec.table_schema.columns[catalog_idx].clone();
+        if next_missing == Some(pos) {
+            columns.push(crate::storage::segment::reader::default_value_column(
+                &col_def,
+                rg_rows,
+            )?);
+            next_missing = missing_iter.next();
+        } else {
+            let column = present_iter.next().ok_or_else(|| {
+                crate::common::error::TaibaiError::Internal(format!(
+                    "predicate column {catalog_idx} missing from narrow read"
+                ))
+            })?;
+            columns.push(column);
+        }
+        col_defs.push(col_def);
+    }
+    RecordBatch::try_new(Schema::new(col_defs), columns)
+        .map_err(|e| crate::common::error::TaibaiError::Internal(e.to_string()))
 }
 
 pub fn build_count_star_result(count: u64) -> super::super::engine::ExecResult {

@@ -151,6 +151,57 @@ fn try_exec_fast_insert_sql_inner(
         None
     };
 
+    // First pass — supportability check only (C20). parse_fast_value and
+    // the separator grammar below are pure functions of the SQL bytes (they
+    // only advance a cursor over borrowed slices), so this walk materializes
+    // no rows and consumes no auto-increment values. Any row the fast path
+    // cannot fully parse bails out to the standard parser BEFORE the first
+    // row is materialized, so a mid-batch fallback can no longer strand
+    // auto-increment values the fast path already consumed.
+    {
+        let mut check_pos = pos;
+        loop {
+            skip_spaces(bytes, &mut check_pos);
+            if check_pos >= bytes.len() {
+                break;
+            }
+            if bytes[check_pos] != b'(' {
+                return FastInsertOutcome::Unsupported;
+            }
+            check_pos += 1;
+            for value_idx in 0..col_indices.len() {
+                skip_spaces(bytes, &mut check_pos);
+                if parse_fast_value(sql, bytes, &mut check_pos).is_none() {
+                    return FastInsertOutcome::Unsupported;
+                }
+                skip_spaces(bytes, &mut check_pos);
+                if value_idx + 1 < col_indices.len() {
+                    if check_pos >= bytes.len() || bytes[check_pos] != b',' {
+                        return FastInsertOutcome::Unsupported;
+                    }
+                    check_pos += 1;
+                }
+            }
+            skip_spaces(bytes, &mut check_pos);
+            if check_pos >= bytes.len() || bytes[check_pos] != b')' {
+                return FastInsertOutcome::Unsupported;
+            }
+            check_pos += 1;
+            skip_spaces(bytes, &mut check_pos);
+            if check_pos >= bytes.len() {
+                break;
+            }
+            if bytes[check_pos] == b',' {
+                check_pos += 1;
+                continue;
+            }
+            return FastInsertOutcome::Unsupported;
+        }
+    }
+
+    // Second pass — materialization. The first pass proved the whole VALUES
+    // list parses, so this loop can no longer hit an Unsupported condition
+    // partway through; coercion errors surface here exactly as before.
     let capacity = estimate_values_rows(bytes, pos).clamp(1, 100_000);
     let mut batch = RecordBatch::with_capacity(schema.clone(), capacity);
     let mut rows = 0usize;

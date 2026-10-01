@@ -1048,13 +1048,11 @@ impl SealedSummary {
                 }
             }
         }
-        // Reclaim zeroed entries: a high-cardinality key stream (one new key
-        // per row) otherwise grows the summary by "distinct keys ever seen"
-        // forever — multi-GB over months, and invisible to the memory
-        // accounting that gates appends. Lookups treat a missing key as 0,
-        // so dropping the zero entries is observationally identical.
-        self.key_rows.retain(|_, rows| *rows > 0);
-        self.key_partition_rows.retain(|_, rows| *rows > 0);
+        // A3: zeroed-entry reclamation (the two `retain` sweeps) is NOT done
+        // here — `compact_prefix` reclaims many chunks per pass and running
+        // the retains per chunk made one compact O(chunks × distinct keys
+        // ever seen). The caller retains once after its loop; lookups treat
+        // a missing key as 0, so intermediate zero entries are invisible.
     }
 }
 
@@ -1714,7 +1712,9 @@ impl HotStore {
             if skipped_by_watermark {
                 // The key was never probed above the watermark. Keep the
                 // None-vs-empty contract: a key that exists only under the
-                // watermark yields Some(empty), never None.
+                // watermark yields Some(empty), never None. The open read
+                // guard was dropped before the gather above, so this
+                // re-acquisition is not recursive.
                 if !self.key_exists_anywhere(&st, &key, partition_key.as_ref()) {
                     return None;
                 }
@@ -1966,6 +1966,16 @@ impl HotStore {
                 }));
             }
         }
+
+        // A3: reclaim the summary's zeroed entries ONCE per compact pass
+        // instead of once per reclaimed chunk. A high-cardinality key stream
+        // (one new key per row) otherwise grows the summary by "distinct
+        // keys ever seen" forever — multi-GB over months, and invisible to
+        // the memory accounting that gates appends. Lookups treat a missing
+        // key as 0, so dropping the zero entries is observationally
+        // identical.
+        summary.key_rows.retain(|_, rows| *rows > 0);
+        summary.key_partition_rows.retain(|_, rows| *rows > 0);
 
         // Open chunk: shared when untouched, trimmed when the cut reaches into
         // it, replaced when fully reclaimed.

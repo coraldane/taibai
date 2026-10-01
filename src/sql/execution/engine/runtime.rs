@@ -21,6 +21,22 @@ impl Drop for HotFeedGuard<'_> {
     }
 }
 
+/// C13: process-wide positive cache of non-partitioned table directories
+/// known to own at least one segment file. "Has a segment" is monotone —
+/// once a table owns a segment it keeps owning one while its table state
+/// exists — so a cached entry short-circuits the `discover_segments`
+/// directory listing that every non-partitioned HOT INSERT would otherwise
+/// pay. Entries are dropped by [`Engine::clear_hot_partition_segments`] and
+/// [`Engine::invalidate_hot_segment_hint`] when the table's data is removed
+/// or moved (DROP / TRUNCATE / RENAME); a stale entry is only ever
+/// conservative (it skips the FullTable resident mark, it never fakes one).
+static HOT_TABLES_WITH_SEGMENTS: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+fn hot_tables_with_segments() -> &'static Mutex<HashSet<PathBuf>> {
+    HOT_TABLES_WITH_SEGMENTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 impl Engine {
     pub(crate) fn performance_baselines(
         &self,
@@ -119,11 +135,21 @@ impl Engine {
 
         let table_dir = self.segment_mgr.table_dir(db, table);
         if !table_meta.is_partitioned() {
-            return if !Self::table_has_any_segment(&table_dir) {
-                HotResidentMark::FullTable
-            } else {
-                HotResidentMark::None
-            };
+            // C13: consult the positive "known to have a segment" cache
+            // before the filesystem: the miss path is a full
+            // `discover_segments` directory listing, paid by every INSERT
+            // of a non-partitioned HOT table once segments exist.
+            if hot_tables_with_segments().lock().unwrap().contains(&table_dir) {
+                return HotResidentMark::None;
+            }
+            if Self::table_has_any_segment(&table_dir) {
+                hot_tables_with_segments()
+                    .lock()
+                    .unwrap()
+                    .insert(table_dir.clone());
+                return HotResidentMark::None;
+            }
+            return HotResidentMark::FullTable;
         }
 
         let partitions = Self::batch_partition_keys(table_meta, batch);
@@ -265,11 +291,26 @@ impl Engine {
     }
 
     /// Drop the cached partition-segment knowledge for one table directory.
+    /// Also drops the C13 table-level "known to have a segment" hint, so a
+    /// same-name recreate re-probes the filesystem (DROP TABLE and the TTL
+    /// purge land here).
     pub fn clear_hot_partition_segments(&self, table_dir: &std::path::Path) {
         self.hot_partition_segments
             .lock()
             .unwrap()
             .remove(table_dir);
+        hot_tables_with_segments().lock().unwrap().remove(table_dir);
+    }
+
+    /// Drop the C13 "known to have a segment" hint for one table. Wire this
+    /// wherever a table's segment files are removed or moved out from under
+    /// its directory (TRUNCATE TABLE, RENAME TABLE) — paths that do not pass
+    /// through [`Self::clear_hot_partition_segments`]. A missed call is only
+    /// a lost FullTable fast path for the recreated table, never a wrong
+    /// mark, so wiring is an optimization, not a correctness requirement.
+    pub fn invalidate_hot_segment_hint(&self, db: &str, table: &str) {
+        let table_dir = self.segment_mgr.table_dir(db, table);
+        hot_tables_with_segments().lock().unwrap().remove(&table_dir);
     }
 
     pub(crate) fn table_has_any_segment(table_dir: &std::path::Path) -> bool {

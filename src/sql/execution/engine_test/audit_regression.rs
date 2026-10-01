@@ -361,3 +361,80 @@ fn left_join_emits_all_unmatched_rows_across_chunks() -> Result<()> {
     assert_eq!(matched, 1);
     Ok(())
 }
+
+/// A4: chunked unmatched-row emission on the SLOW paths too — a residual
+/// (non-equi) condition defeats the fast probe, forcing the scalar-row
+/// probe_left/probe_right drivers. 10k unmatched rows must still drain
+/// across stash chunks exactly once.
+#[test]
+fn slow_path_joins_emit_all_unmatched_rows_across_chunks() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(&mut session, "CREATE TABLE big (id INT64)")?;
+    let mut sql = String::from("INSERT INTO big VALUES ");
+    for i in 0..10_000i64 {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&format!("({})", i + 1));
+    }
+    engine.execute(&mut session, &sql)?;
+    engine.execute(&mut session, "CREATE TABLE small (id INT64, v INT64)")?;
+    engine.execute(&mut session, "INSERT INTO small VALUES (5000, 1)")?;
+
+    // Residual condition keeps the match off every row -> 10 000 unmatched.
+    let left = first_i64(
+        engine.execute(
+            &mut session,
+            "SELECT COUNT(*) FROM big LEFT JOIN small ON big.id = small.id AND small.v > 100 \
+             WHERE small.id IS NULL",
+        )?,
+        0,
+        0,
+    );
+    assert_eq!(left, 10_000, "slow-path LEFT: every row unmatched");
+
+    let right = first_i64(
+        engine.execute(
+            &mut session,
+            "SELECT COUNT(*) FROM small RIGHT JOIN big ON small.id = big.id AND small.v > 100 \
+             WHERE small.id IS NULL",
+        )?,
+        0,
+        0,
+    );
+    assert_eq!(right, 10_000, "slow-path RIGHT: unmatched right side in chunks");
+    Ok(())
+}
+
+/// Adversarial-review repro: the constant-default-column fast path took the
+/// run-length representation for a NULL default regardless of type, and a
+/// NULL default on a VarChar column hit expand_runs' unreachable!() — a
+/// plain `SELECT` after `ADD COLUMN` (no DEFAULT) crashed the engine.
+#[test]
+fn null_default_added_column_selects_without_panic() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(&mut session, "CREATE TABLE t (id INT64)")?;
+    engine.execute(&mut session, "INSERT INTO t VALUES (1), (2)")?;
+    engine.flush_table_buffers("main", "t")?;
+    engine.execute(&mut session, "ALTER TABLE t ADD COLUMN extra VARCHAR")?;
+
+    // Segments predate the column: every `extra` is the NULL default.
+    let counted = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(extra) FROM t WHERE id >= 1")?,
+        0,
+        0,
+    );
+    assert_eq!(counted, 0, "COUNT over an all-NULL column is 0");
+    let rows = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE extra IS NULL")?,
+        0,
+        0,
+    );
+    assert_eq!(rows, 2);
+    Ok(())
+}

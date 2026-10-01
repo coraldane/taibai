@@ -256,7 +256,7 @@ fn apply_in_mask(batch: &RecordBatch, pred: &InPredicate, mask: &mut [bool]) {
     };
     // The hashed probe needs a plain typed column: `from_column` ignores the
     // null bitmap and would flatten Selected/Rle/Dictionary per row, and
-    // Blob/Vector values have no hashable form. Tiny lists also keep the
+    // Blob/Vector values hash by content since the ScalarValueHashable extension (kept excluded here only because the literal coercion path predates it; linear comparison stays correct). Tiny lists also keep the
     // linear probe (no set construction). Anything bigger — a hash join
     // runtime filter injects up to 1024 values — probes a hash set built
     // once per batch: O(rows + values) instead of O(rows × values) scalar

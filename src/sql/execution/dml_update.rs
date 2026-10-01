@@ -116,8 +116,10 @@ pub fn exec_update(
             reader_txn_id,
             narrowed_partition,
             |memtable, _original, batch, _live_positions| {
+                // C9: `batch` (the Arc) is consumed — update_memtable_batch
+                // moves untouched columns out of it when it is the sole owner.
                 let (new_batch, affected, matched_rows, assigned_pairs) =
-                    update_memtable_batch(assignments, where_clause, &table_schema, &batch)?;
+                    update_memtable_batch(assignments, where_clause, &table_schema, batch)?;
                 if let Some(new_batch) = new_batch {
                     updated_count += affected;
                     if publish_updates {
@@ -697,7 +699,7 @@ pub(crate) fn update_memtable_batch(
     assignments: &[Assignment],
     where_clause: &Option<Expr>,
     table_schema: &Schema,
-    batch: &RecordBatch,
+    batch: Arc<RecordBatch>,
 ) -> Result<(
     Option<RecordBatch>,
     u64,
@@ -710,8 +712,8 @@ pub(crate) fn update_memtable_batch(
         // order, and name-based resolution (index_of follows previous_names)
         // keeps the predicate on the right physical column. The table schema
         // stays as the fallback for hand-built batches.
-        eval_where_clause_batch(where_expr, batch, &batch.schema)
-            .or_else(|_| eval_where_clause_batch(where_expr, batch, table_schema))?
+        eval_where_clause_batch(where_expr, &batch, &batch.schema)
+            .or_else(|_| eval_where_clause_batch(where_expr, &batch, table_schema))?
     } else {
         vec![true; batch.num_rows()]
     };
@@ -746,23 +748,44 @@ pub(crate) fn update_memtable_batch(
         .iter()
         .map(|(col_idx, value)| (*col_idx, value.clone()))
         .collect();
-    let all_rows: Vec<u32> = (0..batch.num_rows() as u32).collect();
-    let mut new_columns = Vec::with_capacity(batch.num_columns());
-    for (col_idx, column) in batch.columns.iter().enumerate() {
-        new_columns.push(rebuild_update_column(
-            column,
-            assigned.get(&col_idx),
-            &all_rows,
-            &mask,
-        )?);
-    }
     let affected = matched_rows.len() as u64;
-    Ok((
-        Some(RecordBatch::try_new(batch.schema.clone(), new_columns)?),
-        affected,
-        matched_rows,
-        assigned_pairs,
-    ))
+    // C9: only the ASSIGNED columns pay a rebuild. `rebuild_update_column`
+    // takes `&[u32]`, so keep the single identity-index allocation but pass
+    // it to assigned columns only; untouched columns never walk it.
+    let all_rows: Vec<u32> = if assigned.is_empty() {
+        Vec::new()
+    } else {
+        (0..batch.num_rows() as u32).collect()
+    };
+    let mut new_columns = Vec::with_capacity(batch.num_columns());
+    // C9: untouched columns move straight into the replacement batch when
+    // this statement is the snapshot Arc's sole owner (the transaction view
+    // and schema-aligned copies); when the memtable still shares the Arc a
+    // flat clone is the fallback — still cheaper than the old per-row
+    // identity gather through `rebuild_update_column`, and never taken for
+    // assigned columns (those are rebuilt either way).
+    let new_batch = match Arc::try_unwrap(batch) {
+        Ok(owned) => {
+            let schema = owned.schema;
+            for (col_idx, column) in owned.columns.into_iter().enumerate() {
+                new_columns.push(match assigned.get(&col_idx) {
+                    Some(value) => rebuild_update_column(&column, Some(value), &all_rows, &mask)?,
+                    None => column,
+                });
+            }
+            RecordBatch::try_new(schema, new_columns)?
+        }
+        Err(shared) => {
+            for (col_idx, column) in shared.columns.iter().enumerate() {
+                new_columns.push(match assigned.get(&col_idx) {
+                    Some(value) => rebuild_update_column(column, Some(value), &all_rows, &mask)?,
+                    None => column.clone(),
+                });
+            }
+            RecordBatch::try_new(shared.schema.clone(), new_columns)?
+        }
+    };
+    Ok((Some(new_batch), affected, matched_rows, assigned_pairs))
 }
 
 /// Rebuild a whole batch for the surviving rows of an UPDATE: untouched rows

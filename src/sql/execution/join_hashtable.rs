@@ -141,6 +141,7 @@ impl ScalarValueHashable {
             ScalarValue::Time(t) => ScalarValueHashable::Time(*t),
             ScalarValue::Timestamp(t) => ScalarValueHashable::Timestamp(*t),
             ScalarValue::Decimal(d) => ScalarValueHashable::Int64(*d),
+            ScalarValue::Interval(i) => ScalarValueHashable::Int64(*i),
             ScalarValue::Blob(b) => ScalarValueHashable::Blob(b.clone()),
             ScalarValue::Vector(v) => ScalarValueHashable::Vector(v.as_ref().map(
                 |elements| {
@@ -150,7 +151,6 @@ impl ScalarValueHashable {
                         .collect()
                 },
             )),
-            _ => ScalarValueHashable::Null,
         }
     }
 

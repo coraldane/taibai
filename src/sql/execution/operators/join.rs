@@ -144,10 +144,20 @@ impl HashJoinExec {
             left_key_cols,
             right_key_cols,
             build_left: true,
-            memory_limit_bytes: crate::common::config::query_limits()
-                .query_memory_limit_mb
-                .saturating_mul(1024 * 1024)
-                .min(usize::MAX as u64) as usize,
+            // 0 = explicitly unlimited (same contract as
+            // SemiJoinExec::charge_budget); a literal 0 here would fail the
+            // first batch of every join.
+            // 0 = explicitly unlimited (same contract as
+            // SemiJoinExec::charge_budget); a literal 0 would fail the
+            // first batch of every join.
+            memory_limit_bytes: {
+                let mb = crate::common::config::query_limits().query_memory_limit_mb;
+                if mb == 0 {
+                    usize::MAX
+                } else {
+                    mb.saturating_mul(1024 * 1024).min(usize::MAX as u64) as usize
+                }
+            },
             spill_state: None,
             hash_table: None,
             memory_reservation: None,
@@ -514,6 +524,12 @@ impl HashJoinExec {
                 Some(row) => row,
                 None => {
                     if self.probe_state.finalize_done {
+                        // Chunks of unmatched rows may still be stashed;
+                        // drain_buffer refills from the stash, returning
+                        // None only when it is fully drained.
+                        if !self.probe_state.pending_unmatched.is_empty() {
+                            return self.drain_buffer();
+                        }
                         return Ok(None);
                     }
                     self.emit_unmatched_left()?;
@@ -567,6 +583,12 @@ impl HashJoinExec {
                 Some(row) => row,
                 None => {
                     if self.probe_state.finalize_done {
+                        // Chunks of unmatched rows may still be stashed;
+                        // drain_buffer refills from the stash, returning
+                        // None only when it is fully drained.
+                        if !self.probe_state.pending_unmatched.is_empty() {
+                            return self.drain_buffer();
+                        }
                         return Ok(None);
                     }
                     self.emit_unmatched_right()?;
@@ -620,6 +642,12 @@ impl HashJoinExec {
                 Some(row) => row,
                 None => {
                     if self.probe_state.finalize_done {
+                        // Chunks of unmatched rows may still be stashed;
+                        // drain_buffer refills from the stash, returning
+                        // None only when it is fully drained.
+                        if !self.probe_state.pending_unmatched.is_empty() {
+                            return self.drain_buffer();
+                        }
                         return Ok(None);
                     }
                     self.emit_unmatched_right()?;
@@ -1106,33 +1134,37 @@ impl HashJoinExec {
 
     /// Advance to the next probe batch on the right input; returns its index
     /// in `right_batches`, or `None` when the probe side is exhausted.
+    /// Streaming: only the ACTIVE batch is retained (the mirror of
+    /// `next_left_probe_batch`). The fast path drains `fast_pairs` — which
+    /// reference the current batch — before the next fetch, so the whole
+    /// probe side never has to be resident; the old pre-collection
+    /// materialized it entirely and had to error out over the memory
+    /// budget. `right_collected` flips once the input is exhausted (the
+    /// anti path keys its own finalize on it).
     fn next_right_probe_batch(&mut self) -> Result<Option<usize>> {
-        if !self.probe_state.right_collected {
-            while let Some(batch) = self.right.next_batch()? {
-                if batch.num_rows() > 0 {
-                    self.probe_state.probe_materialized_bytes = self
-                        .probe_state
-                        .probe_materialized_bytes
-                        .saturating_add(batch.estimated_size_bytes() as u64);
-                    if self.probe_state.probe_materialized_bytes as usize
-                        > self.memory_limit_bytes
-                    {
-                        return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
-                            "join probe side materialization exceeded the query memory budget                              ({} > {} bytes); raise query_memory_limit_mb or reduce the probe side",
-                            self.probe_state.probe_materialized_bytes, self.memory_limit_bytes
-                        )));
-                    }
-                    self.probe_state.right_batches.push(batch);
-                }
+        loop {
+            let idx = self.probe_state.right_batch_idx;
+            if idx < self.probe_state.right_batches.len() {
+                self.probe_state.right_batch_idx += 1;
+                return Ok(Some(idx));
             }
-            self.probe_state.right_collected = true;
+            match self.right.next_batch() {
+                Ok(Some(batch)) => {
+                    if batch.num_rows() > 0 {
+                        // Single-slot: the drained predecessor is dropped.
+                        self.probe_state.right_batches.clear();
+                        self.probe_state.right_batch_idx = 0;
+                        self.probe_state.right_batches.push(batch);
+                        continue;
+                    }
+                }
+                Ok(None) => {
+                    self.probe_state.right_collected = true;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            }
         }
-        let idx = self.probe_state.right_batch_idx;
-        if idx < self.probe_state.right_batches.len() {
-            self.probe_state.right_batch_idx += 1;
-            return Ok(Some(idx));
-        }
-        Ok(None)
     }
 
     /// Advance to the next probe batch on the left input. Streaming: only the
@@ -1176,6 +1208,9 @@ impl HashJoinExec {
                 match self.join_type {
                     JoinType::Left => {
                         if self.probe_state.finalize_done {
+                            if !self.probe_state.pending_unmatched.is_empty() {
+                                return self.drain_buffer();
+                            }
                             return Ok(None);
                         }
                         self.emit_unmatched_left()?;
@@ -1187,6 +1222,9 @@ impl HashJoinExec {
                     }
                     JoinType::Right => {
                         if self.probe_state.finalize_done {
+                            if !self.probe_state.pending_unmatched.is_empty() {
+                                return self.drain_buffer();
+                            }
                             return Ok(None);
                         }
                         self.emit_unmatched_right()?;

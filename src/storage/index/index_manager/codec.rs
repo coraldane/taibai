@@ -281,6 +281,21 @@ pub(super) fn append_prepared_unique_index_delta(
     path: &Path,
     entries: &[PreparedUniqueIndexEntry],
 ) -> Result<()> {
+    // Same bytes, then one fsync: the single-index append keeps its original
+    // lock/write/sync semantics on top of the deferred-sync primitive.
+    append_prepared_unique_index_delta_deferred_sync(path, entries)?.sync_all()?;
+    Ok(())
+}
+
+/// Append prepared entries and flush the buffered writes WITHOUT fsyncing;
+/// returns the still-open file so the caller can issue one sync after a
+/// whole batch of index delta files has been written under a shared lock
+/// pass (see `append_prepared_unique_index_entries_batch`). The file format
+/// is byte-for-byte identical to the syncing variant.
+pub(super) fn append_prepared_unique_index_delta_deferred_sync(
+    path: &Path,
+    entries: &[PreparedUniqueIndexEntry],
+) -> Result<std::fs::File> {
     let is_new = !path.exists() || std::fs::metadata(path)?.len() == 0;
     let raw = std::fs::OpenOptions::new()
         .create(true)
@@ -311,8 +326,9 @@ pub(super) fn append_prepared_unique_index_delta(
     let file = file
         .into_inner()
         .map_err(|e| TaibaiError::Storage(format!("unique index delta flush failed: {}", e)))?;
-    file.sync_all()?;
-    Ok(())
+    // No sync_all here: the caller batches one fsync per file after the
+    // whole statement's delta appends are on their way to disk.
+    Ok(file)
 }
 
 pub(super) fn append_unique_index_tombstone_delta(

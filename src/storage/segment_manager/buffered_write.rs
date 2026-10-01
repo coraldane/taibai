@@ -1,3 +1,12 @@
+/// Result of [`SegmentManager::flush_memtable_batch_with_intents_under_table_lock`].
+pub(crate) struct FlushIntentAppendOutcome {
+    pub wrote: bool,
+    /// `(segment file name, expected total rows after the append)` — the
+    /// watermark the intents were stamped with, read under the append's own
+    /// lock.
+    pub target: Option<(String, u64)>,
+}
+
 impl SegmentManager {
     pub fn bulk_insert_batch(&self, db: &str, table: &str, batch: RecordBatch) -> Result<u64> {
         self.bulk_insert_batch_with_partition_owned_inner(db, table, "", batch, true, false)
@@ -191,6 +200,9 @@ impl SegmentManager {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Legacy no-intent entry; production flushes route through
+    /// [`Self::flush_memtable_batch_with_intents_under_table_lock`].
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn flush_memtable_batch_if_under_table_lock(
         &self,
         db: &str,
@@ -201,25 +213,82 @@ impl SegmentManager {
         should_write: impl FnOnce() -> bool,
         on_written: impl FnOnce(),
     ) -> Result<bool> {
-        if batch.num_rows() == 0 {
-            return Ok(false);
-        }
-        let key = table_key(db, table);
-        let state = self.get_or_create_state(&key);
-        ensure_state_not_retired(&state, db, table)?;
-        self.flush_memtable_batch_under_table_lock_inner(
+        self.flush_memtable_batch_with_intents_under_table_lock(
             db,
             table,
             partition_key,
             batch,
             txn_id,
-            &state,
+            &mut |_, _| Ok(()),
             should_write,
             on_written,
         )
+        .map(|outcome| outcome.wrote)
+    }
+
+    /// [`Self::flush_memtable_batch_if_under_table_lock`] whose durable
+    /// flush intents are written by `write_intents` INSIDE the append's
+    /// active_segments critical section, stamped with the authoritative
+    /// pre-append watermark of the very segment receiving the rows. Returns
+    /// the wrote flag plus `(segment_file, expected_total_rows)` for
+    /// logging/recovery bookkeeping.
+    pub(crate) fn flush_memtable_batch_with_intents_under_table_lock(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: &RecordBatch,
+        _txn_id: u64,
+        write_intents: &mut dyn FnMut(&str, u64) -> Result<()>,
+        should_write: impl FnOnce() -> bool,
+        on_written: impl FnOnce(),
+    ) -> Result<FlushIntentAppendOutcome> {
+        if batch.num_rows() == 0 {
+            return Ok(FlushIntentAppendOutcome {
+                wrote: false,
+                target: None,
+            });
+        }
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        ensure_state_not_retired(&state, db, table)?;
+        if !should_write() {
+            return Ok(FlushIntentAppendOutcome {
+                wrote: false,
+                target: None,
+            });
+        }
+        let table_dir = self.data_dir.join(db).join(table);
+        std::fs::create_dir_all(&table_dir)?;
+        let _visibility = state.flush_visibility.write().unwrap();
+        let mut target = None;
+        let result = self.append_batch_partition_locked_with_hook(
+            &table_dir,
+            &state,
+            partition_key,
+            batch,
+            true,
+            false,
+            Some(&mut |file_name: &str, base_rows: u64| {
+                target = Some((file_name.to_string(), base_rows + batch.num_rows() as u64));
+                write_intents(file_name, base_rows)
+            }),
+        );
+        match result {
+            Ok(()) => {
+                Self::sleep_flush_transition_delay();
+                on_written();
+                Ok(FlushIntentAppendOutcome {
+                    wrote: true,
+                    target,
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn flush_memtable_batch_under_table_lock_inner(
         &self,
         db: &str,
@@ -260,6 +329,37 @@ impl SegmentManager {
         flush_immediately: bool,
         pubsub_deferred: bool,
     ) -> Result<()> {
+        self.append_batch_partition_locked_with_hook(
+            table_dir,
+            state,
+            partition_key,
+            batch,
+            flush_immediately,
+            pubsub_deferred,
+            None,
+        )
+    }
+
+    /// [`Self::append_batch_with_partition_locked`] plus a hook that runs
+    /// under the SAME active_segments lock, after the target segment is
+    /// resolved and before the append: the hook receives the segment file
+    /// name and its pre-append row count, which is exactly the watermark a
+    /// durable flush intent must be stamped with. Running watermark + intent
+    /// write + append in one critical section closes the race where a
+    /// partition-locked direct writer slipped rows between a separately
+    /// read watermark and our append — at recovery those foreign rows could
+    /// satisfy our intent and retire a tail whose rows never reached the
+    /// segment (silent loss of fsync-acknowledged data).
+    fn append_batch_partition_locked_with_hook(
+        &self,
+        table_dir: &Path,
+        state: &Arc<TableSegmentState>,
+        partition_key: &str,
+        batch: &RecordBatch,
+        flush_immediately: bool,
+        pubsub_deferred: bool,
+        mut under_lock_hook: Option<&mut dyn FnMut(&str, u64) -> Result<()>>,
+    ) -> Result<()> {
         let mut pending_seal = None;
         {
             let mut active_guard = state.active_segments.lock().unwrap();
@@ -272,6 +372,11 @@ impl SegmentManager {
             )?;
 
             let seg = active_guard.get_mut(partition_key).unwrap();
+            if let Some(hook) = under_lock_hook.as_deref_mut() {
+                let file_name = Self::active_segment_file_name(&seg.path)?;
+                let base_rows = seg.total_rows + seg.buffered_rows as u64;
+                hook(&file_name, base_rows)?;
+            }
             seg.append_batch(batch, pubsub_deferred, &|path| self.invalidate_reader(path))?;
 
             if seg.current_size >= self.max_segment_size() {
