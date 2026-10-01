@@ -266,22 +266,36 @@ impl<'a> ScanPlanner<'a> {
 pub fn prune_segment(spec: &ScanSpec, reader: &SegmentReader) -> Option<RowGroupPruneResult> {
     let pred = spec.to_row_group_predicate();
     let segment_zone_maps = reader.segment_zone_maps();
-    if !row_group::prune_segment_by_zone_map(&pred, segment_zone_maps) {
+    // Re-index the catalog-space predicate and check lists onto this
+    // segment's footer column order — after a DROP/RENAME COLUMN, positional
+    // use prunes the WRONG row groups.
+    let Ok(aligned) = super::row_filter::align_prune_checks_to_footer(
+        &spec.table_schema,
+        reader.schema(),
+        &pred,
+        &row_group::build_bloom_check_list(spec),
+        &row_group::build_in_check_list(spec),
+        &row_group::build_set_check_list(spec),
+        &row_group::build_set_in_check_list(spec),
+    ) else {
+        // A referenced column is absent from this older segment: no row in it
+        // can match the clause.
+        return None;
+    };
+    if !row_group::prune_segment_by_zone_map(&aligned.predicate, segment_zone_maps) {
         return None;
     }
 
-    let bloom_checks = row_group::build_bloom_check_list(spec);
-    let in_checks = row_group::build_in_check_list(spec);
-    let set_checks = row_group::build_set_check_list(spec);
-    let set_in_checks = row_group::build_set_in_check_list(spec);
+    let in_check_refs: Vec<&super::spec::InPredicate> = aligned.in_checks.iter().collect();
+    let set_in_check_refs: Vec<&super::spec::InPredicate> = aligned.set_in_checks.iter().collect();
 
     Some(row_group::prune_row_groups(
         reader,
-        &pred,
-        &bloom_checks,
-        &in_checks,
-        &set_checks,
-        &set_in_checks,
+        &aligned.predicate,
+        &aligned.bloom_checks,
+        &in_check_refs,
+        &aligned.set_checks,
+        &set_in_check_refs,
         segment_zone_maps,
     ))
 }
@@ -308,12 +322,33 @@ fn estimated_match_density(spec: &ScanSpec, reader: &SegmentReader, row_group: u
     let mut selectivity = 1.0f64;
     let value_sets = reader.value_sets(row_group);
     let zone_maps = reader.zone_maps(row_group);
+    // Statistics lookups follow the segment's footer order; the spec's
+    // predicate columns are catalog-space. Misalignment only skews this
+    // cost-based ordering (never correctness), so an unresolvable column
+    // just falls back to the generic 0.1 estimate.
+    let footer =
+        |column: usize| -> Option<usize> {
+            super::row_filter::align_indices_to_footer(
+                &spec.table_schema,
+                reader.schema(),
+                &[column],
+            )
+            .ok()
+            .and_then(|aligned| aligned.first().copied())
+        };
     for (column, value) in &spec.eq_predicates {
-        if let Some(values) = value_sets.get(*column).and_then(|values| values.as_ref()) {
+        let Some(footer_column) = footer(*column) else {
+            selectivity *= 0.1;
+            continue;
+        };
+        if let Some(values) = value_sets
+            .get(footer_column)
+            .and_then(|values| values.as_ref())
+        {
             selectivity *= 1.0 / values.len().max(1) as f64;
             continue;
         }
-        if let Some(zone) = zone_maps.get(*column) {
+        if let Some(zone) = zone_maps.get(footer_column) {
             if zone.min_value == *value && zone.max_value == *value {
                 continue;
             }
@@ -321,8 +356,12 @@ fn estimated_match_density(spec: &ScanSpec, reader: &SegmentReader, row_group: u
         selectivity *= 0.1;
     }
     for predicate in &spec.in_predicates {
+        let Some(footer_column) = footer(predicate.column_index) else {
+            selectivity *= (predicate.values.len() as f64 * 0.1).min(1.0);
+            continue;
+        };
         if let Some(values) = value_sets
-            .get(predicate.column_index)
+            .get(footer_column)
             .and_then(|values| values.as_ref())
         {
             selectivity *=
@@ -332,7 +371,14 @@ fn estimated_match_density(spec: &ScanSpec, reader: &SegmentReader, row_group: u
         }
     }
     for predicate in &spec.range_predicates {
-        let Some(zone) = zone_maps.get(predicate.column_index) else {
+        let footer_column = match footer(predicate.column_index) {
+            Some(column) => column,
+            None => {
+                selectivity *= 0.33;
+                continue;
+            }
+        };
+        let Some(zone) = zone_maps.get(footer_column) else {
             selectivity *= 0.33;
             continue;
         };
