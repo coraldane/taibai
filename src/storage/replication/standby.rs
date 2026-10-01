@@ -484,10 +484,22 @@ async fn apply(
                 .await?
                 {
                     Some(bytes) => bytes,
+                    // The primary proved (via its replication ring) that this
+                    // replacement was itself retired by a later compaction/TTL
+                    // whose events follow this one in the stream. Skipping the
+                    // write converges: the later event ships the newer segment
+                    // and this event's retired-file removals still apply.
+                    // (A hard fetch error below still fails the applier, so a
+                    // missing file without provable retirement cannot silently
+                    // drop rows.)
                     None => {
-                        return Err(TaibaiError::Storage(format!(
-                            "replacement segment {db}.{table}/{segment} vanished on the primary"
-                        )));
+                        tracing::info!(
+                            db = %db,
+                            table = %table,
+                            segment = %segment,
+                            "replacement segment superseded on primary; skipping write"
+                        );
+                        continue;
                     }
                 };
                 let dest = engine.data_dir().join(&db).join(&table).join(segment);
