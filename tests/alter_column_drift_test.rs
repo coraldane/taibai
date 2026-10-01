@@ -132,3 +132,69 @@ fn rename_column_dml_and_select_follow_the_new_name() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0], vec!["1", "10", "21"]);
 }
+
+/// ADD COLUMN is catalog-only metadata: a resident memtable predating the
+/// ALTER keeps its insert-time layout, and the read path used to apply
+/// catalog indices positionally to it — predicates and projections on the
+/// added column silently missed every resident row, and SELECT * came back
+/// at the old width. Scans now align the batch to the catalog and fill the
+/// added column with its DEFAULT, the same semantics as the segment-side
+/// default-fill read.
+#[test]
+fn resident_memtable_predating_add_column_reads_default_fill() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    exec(&engine, &mut session, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    exec(&engine, &mut session, "INSERT INTO t VALUES (1, 10), (2, 20)");
+    // Rows stay resident: no flush before the ALTER.
+    exec(&engine, &mut session, "ALTER TABLE t ADD COLUMN score INT DEFAULT 7");
+
+    // SELECT *: the added column materializes with its DEFAULT.
+    let mut rows = query_all(&engine, &mut session, "SELECT * FROM t");
+    rows.sort();
+    assert_eq!(rows, vec![vec!["1", "10", "7"], vec!["2", "20", "7"]]);
+
+    // Predicates on the added column match the default.
+    assert_eq!(
+        query_all(&engine, &mut session, "SELECT id FROM t WHERE score = 7"),
+        vec![vec!["1"], vec!["2"]]
+    );
+    assert_eq!(
+        query_all(&engine, &mut session, "SELECT id FROM t WHERE score = 8"),
+        Vec::<Vec<String>>::new()
+    );
+    // COUNT(*) fast path over the resident rows.
+    assert_eq!(
+        query_all(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE score = 7"),
+        vec![vec!["2"]]
+    );
+
+    // NOTE: INSERTs written after the ALTER are a separate, write-side
+    // limitation: both the hot-mirror feed and the memtable append reject a
+    // new-width batch while the stale-width memtable/store is still active
+    // ("column count mismatch"), so new rows only land once the stale
+    // memtable rotates out. This test pins the read side.
+}
+
+/// Same drift for DROP COLUMN: the resident batch keeps the dropped column
+/// while catalog indices shift, so reading a surviving column by catalog
+/// position used to return the dropped neighbor's values.
+#[test]
+fn resident_memtable_predating_drop_column_reads_surviving_columns() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    exec(
+        &engine,
+        &mut session,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)",
+    );
+    exec(&engine, &mut session, "INSERT INTO t VALUES (1, 10, 20), (2, 11, 21)");
+    // Rows stay resident: no flush before the ALTER.
+    exec(&engine, &mut session, "ALTER TABLE t DROP COLUMN a");
+
+    let mut rows = query_all(&engine, &mut session, "SELECT id, b FROM t");
+    rows.sort();
+    assert_eq!(rows, vec![vec!["1", "20"], vec!["2", "21"]]);
+    assert_eq!(
+        query_all(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE b = 21"),
+        vec![vec!["1"]]
+    );
+}
