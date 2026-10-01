@@ -104,6 +104,8 @@ pub fn exec_update(
         let mut memtable_updates: Vec<(
             Arc<crate::storage::core::memtable::MemTable>,
             Arc<RecordBatch>,
+            Vec<u32>,
+            Vec<(usize, ScalarValue)>,
         )> = Vec::new();
         let narrowed_partition = target_partition_key;
         super::dml_delete::for_each_visible_memtable(
@@ -113,7 +115,7 @@ pub fn exec_update(
             reader_txn_id,
             narrowed_partition,
             |memtable, _original, batch, _live_positions| {
-                let (new_batch, affected, matched_rows) =
+                let (new_batch, affected, matched_rows, assigned_pairs) =
                     update_memtable_batch(assignments, where_clause, &table_schema, &batch)?;
                 if let Some(new_batch) = new_batch {
                     updated_count += affected;
@@ -122,7 +124,12 @@ pub fn exec_update(
                         // from `new_batch`, not the pre-update snapshot.
                         updated_events.push(&new_batch, &matched_rows);
                     }
-                    memtable_updates.push((memtable, Arc::new(new_batch)));
+                    memtable_updates.push((
+                        memtable,
+                        Arc::new(new_batch),
+                        matched_rows,
+                        assigned_pairs,
+                    ));
                 }
                 Ok(())
             },
@@ -439,8 +446,8 @@ pub fn exec_update(
             {
                 let batch = memtable_updates
                     .iter()
-                    .find(|(updated, _)| Arc::ptr_eq(updated, &memtable))
-                    .map(|(_, batch)| Arc::clone(batch))
+                    .find(|(updated, _, _, _)| Arc::ptr_eq(updated, &memtable))
+                    .map(|(_, batch, _, _)| Arc::clone(batch))
                     .or_else(|| memtable.read_snapshot_arc());
                 if let Some(batch) = batch {
                     if batch.num_rows() > 0 {
@@ -480,18 +487,23 @@ pub fn exec_update(
         }
 
         let mut tail_persist_failed = false;
-        for (memtable, batch) in memtable_updates {
-            // Durable tail BEFORE the in-memory swap: the segment rewrites
+        for (memtable, batch, matched_rows, assigned_pairs) in memtable_updates {
+            // Durable side BEFORE the in-memory swap: the segment rewrites
             // above already committed the new values, so a crash between the
             // two steps must not let recovery restore the pre-update tail
             // next to them. This loop runs under the table/partition
             // mutation lock, so no flush can invalidate `batch` in between.
-            // A tail write failure still swaps in memory and falls back to
-            // the flush below (same degradation as before).
-            if let Err(error) = engine
-                .batch_writer()
-                .persist_memtable_tail_batch(&memtable, &batch)
-            {
+            // The incremental `.upd` sidecar costs O(affected rows) instead
+            // of a whole-tail rewrite (quadratic for repeated small UPDATEs
+            // on a large memtable). A tail write failure still swaps in
+            // memory and falls back to the flush below (same degradation as
+            // before).
+            if let Err(error) = engine.batch_writer().update_memtable_tail_rows(
+                &memtable,
+                &matched_rows,
+                &assigned_pairs,
+                &batch,
+            ) {
                 tail_persist_failed = true;
                 tracing::warn!(
                     db,
@@ -673,7 +685,12 @@ pub(crate) fn update_memtable_batch(
     where_clause: &Option<Expr>,
     table_schema: &Schema,
     batch: &RecordBatch,
-) -> Result<(Option<RecordBatch>, u64, Vec<u32>)> {
+) -> Result<(
+    Option<RecordBatch>,
+    u64,
+    Vec<u32>,
+    Vec<(usize, ScalarValue)>,
+)> {
     let mask = if let Some(where_expr) = where_clause.as_ref() {
         // Resolve against the batch's OWN schema first: a resident memtable
         // written before a DROP/RENAME COLUMN keeps its insert-time column
@@ -693,7 +710,7 @@ pub(crate) fn update_memtable_batch(
         .filter_map(|(row_idx, matches)| matches.then_some(row_idx as u32))
         .collect();
     if matched_rows.is_empty() {
-        return Ok((None, 0, Vec::new()));
+        return Ok((None, 0, Vec::new(), Vec::new()));
     }
 
     // Assignments resolve against THIS batch's column layout: the catalog
@@ -710,6 +727,12 @@ pub(crate) fn update_memtable_batch(
             }
         }
     }
+    // Canonical ascending column order, ready for the durable `.upd` sidecar
+    // (which replays these constants by physical column index).
+    let assigned_pairs: Vec<(usize, ScalarValue)> = assigned
+        .iter()
+        .map(|(col_idx, value)| (*col_idx, value.clone()))
+        .collect();
     let all_rows: Vec<u32> = (0..batch.num_rows() as u32).collect();
     let mut new_columns = Vec::with_capacity(batch.num_columns());
     for (col_idx, column) in batch.columns.iter().enumerate() {
@@ -725,6 +748,7 @@ pub(crate) fn update_memtable_batch(
         Some(RecordBatch::try_new(batch.schema.clone(), new_columns)?),
         affected,
         matched_rows,
+        assigned_pairs,
     ))
 }
 

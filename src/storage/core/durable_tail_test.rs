@@ -858,6 +858,256 @@ fn recover_index_folds_pending_sidecars_into_a_plain_tail() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Update sidecars (`<id>.<seq>.upd`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn update_sidecar_round_trips_through_recovery() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(
+        temp.path(),
+        id,
+        "2026",
+        &test_batch(&schema, &[0, 1, 2, 3, 4, 5])?,
+    )?;
+
+    assert!(update_rows(
+        temp.path(),
+        id,
+        &[1, 3],
+        &[(0, ScalarValue::Int64(Some(100)))]
+    )?);
+    // A sidecar pends: the tail is still there, but no longer "plain"
+    // (a spill must not run over it).
+    assert!(has_tail(temp.path(), id));
+    assert!(!tail_is_plain(temp.path(), id)?);
+
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].batch.num_rows(), 6);
+    let values: Vec<Option<ScalarValue>> = (0..6)
+        .map(|row| recovered[0].batch.scalar(row, 0))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            Some(ScalarValue::Int64(Some(0))),
+            Some(ScalarValue::Int64(Some(100))),
+            Some(ScalarValue::Int64(Some(2))),
+            Some(ScalarValue::Int64(Some(100))),
+            Some(ScalarValue::Int64(Some(4))),
+            Some(ScalarValue::Int64(Some(5))),
+        ]
+    );
+    Ok(())
+}
+
+/// UPDATE never changes row count or order, and a later INSERT appends below
+/// the sidecar's coordinate space: appended rows must keep their own values.
+#[test]
+fn insert_delta_after_update_keeps_values_applied() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
+    update_rows(temp.path(), id, &[0], &[(0, ScalarValue::Int64(Some(99)))])?;
+    append(temp.path(), id, "2026", &test_batch(&schema, &[4])?)?;
+
+    let recovered = recover(temp.path(), &schema)?;
+    let values: Vec<i64> = (0..recovered[0].batch.num_rows())
+        .filter_map(|row| match recovered[0].batch.scalar(row, 0) {
+            Some(ScalarValue::Int64(Some(v))) => Some(v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(values, vec![99, 2, 3, 4]);
+    Ok(())
+}
+
+/// The sidecar chain replays in GENERATION order: an UPDATE recorded after a
+/// DELETE speaks in the post-delete coordinate space (its row ids would be
+/// meaningless against the raw tail), so replaying updates before deletes
+/// would corrupt the recovered batch.
+#[test]
+fn delete_then_update_sidecars_replay_in_generation_order() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(
+        temp.path(),
+        id,
+        "2026",
+        &test_batch(&schema, &[0, 1, 2, 3, 4, 5])?,
+    )?;
+    // Removes original positions 1 and 3 → [0, 2, 4, 5].
+    delete_rows(temp.path(), id, &[1, 3])?;
+    // The UPDATE statement saw [0, 2, 4, 5]: position 1 is the value 2.
+    update_rows(temp.path(), id, &[1], &[(0, ScalarValue::Int64(Some(99)))])?;
+
+    let recovered = recover(temp.path(), &schema)?;
+    let values: Vec<i64> = (0..recovered[0].batch.num_rows())
+        .filter_map(|row| match recovered[0].batch.scalar(row, 0) {
+            Some(ScalarValue::Int64(Some(v))) => Some(v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(values, vec![0, 99, 4, 5]);
+    Ok(())
+}
+
+/// The mirror image: an UPDATE recorded before a DELETE must keep its effect
+/// through the delete replay (values at stable positions), and the delete's
+/// positions speak in the post-update space.
+#[test]
+fn update_then_delete_sidecars_replay_in_generation_order() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(
+        temp.path(),
+        id,
+        "2026",
+        &test_batch(&schema, &[0, 1, 2, 3, 4, 5])?,
+    )?;
+    update_rows(
+        temp.path(),
+        id,
+        &[1, 3],
+        &[(0, ScalarValue::Int64(Some(100)))],
+    )?;
+    // The DELETE statement saw [0, 100, 2, 100, 4, 5]: position 2 removes 2.
+    delete_rows(temp.path(), id, &[2])?;
+
+    let recovered = recover(temp.path(), &schema)?;
+    let values: Vec<i64> = (0..recovered[0].batch.num_rows())
+        .filter_map(|row| match recovered[0].batch.scalar(row, 0) {
+            Some(ScalarValue::Int64(Some(v))) => Some(v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(values, vec![0, 100, 100, 4, 5]);
+    Ok(())
+}
+
+#[test]
+fn update_sidecar_covers_multi_column_null_and_variable_width_values() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![
+        ColumnDef::new("id", DataType::Int32),
+        ColumnDef::new("name", DataType::VarChar),
+        ColumnDef::new("flag", DataType::Bool),
+    ]);
+    let mut batch = RecordBatch::new(schema.clone());
+    let rows: [(i32, &str, bool); 3] = [(1, "alpha", false), (2, "beta", false), (3, "gamma", true)];
+    for (id, name, flag) in rows {
+        batch.column_mut(0).unwrap().push(&ScalarValue::Int32(Some(id)))?;
+        batch.column_mut(1).unwrap().push(&ScalarValue::VarChar(Some(name.into())))?;
+        batch.column_mut(2).unwrap().push(&ScalarValue::Bool(Some(flag)))?;
+    }
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &batch)?;
+
+    // SET name = NULL, flag = true WHERE id = 2 → position 1; id untouched.
+    update_rows(
+        temp.path(),
+        id,
+        &[1],
+        &[
+            (1, ScalarValue::VarChar(None)),
+            (2, ScalarValue::Bool(Some(true))),
+        ],
+    )?;
+
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(
+        recovered[0].batch.scalar(1, 0),
+        Some(ScalarValue::Int32(Some(2))),
+        "unassigned column keeps its value"
+    );
+    assert_eq!(recovered[0].batch.scalar(1, 1), Some(ScalarValue::VarChar(None)));
+    assert_eq!(
+        recovered[0].batch.scalar(1, 2),
+        Some(ScalarValue::Bool(Some(true)))
+    );
+    assert_eq!(
+        recovered[0].batch.scalar(0, 1),
+        Some(ScalarValue::VarChar(Some("alpha".into()))),
+        "unmatched rows are untouched"
+    );
+    Ok(())
+}
+
+#[test]
+fn torn_update_sidecar_fails_recovery_closed() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
+    update_rows(temp.path(), id, &[0], &[(0, ScalarValue::Int64(Some(9)))])?;
+
+    // Simulate on-disk corruption: a truncated sidecar must fail the whole
+    // recovery instead of silently dropping the update.
+    let tail_dir = temp.path().join(TAIL_DIR);
+    let sidecar = std::fs::read_dir(&tail_dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|e| e.to_str()) == Some("upd"))
+        .expect("update sidecar exists");
+    let bytes = std::fs::read(&sidecar)?;
+    std::fs::write(&sidecar, &bytes[..bytes.len() - 3])?;
+
+    assert!(recover(temp.path(), &schema).is_err());
+    Ok(())
+}
+
+#[test]
+fn persist_supersedes_pending_update_sidecars() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
+    update_rows(temp.path(), id, &[0], &[(0, ScalarValue::Int64(Some(9)))])?;
+    // The UPDATE statement's in-memory result, persisted as a fresh
+    // generation: sidecars below it are superseded and must not re-apply
+    // (or stack forever).
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[9, 2, 3])?)?;
+
+    assert!(tail_is_plain(temp.path(), id)?);
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered[0].batch.num_rows(), 3);
+    assert_eq!(
+        recovered[0].batch.scalar(0, 0),
+        Some(ScalarValue::Int64(Some(9)))
+    );
+    Ok(())
+}
+
+#[test]
+fn recover_index_folds_pending_update_sidecars_into_a_plain_tail() -> Result<()> {
+    // Lazy recovery reads only the tail file: a pending update must be
+    // folded in at startup, or the memtable materializes pre-update values.
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
+    update_rows(temp.path(), id, &[1], &[(0, ScalarValue::Int64(Some(42)))])?;
+
+    let indexed = recover_index(temp.path(), &schema)?;
+    assert_eq!(indexed.len(), 1);
+    assert_eq!(indexed[0].rows, 3);
+
+    assert!(tail_is_plain(temp.path(), id)?);
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(
+        recovered[0].batch.scalar(1, 0),
+        Some(ScalarValue::Int64(Some(42)))
+    );
+    Ok(())
+}
+
 /// A tail torn before its first fsync (shorter than the log header) is
 /// discarded by recovery — correctly, since it can hold no committed frame —
 /// and the discard is observable: the file is gone and the damage snapshot

@@ -720,3 +720,106 @@ fn update_with_alias_still_rejects_partition_key_assignment() {
     );
     engine.segment_mgr().shutdown();
 }
+
+/// The memtable UPDATE fast path is incremental now: the statement writes an
+/// `.upd` sidecar instead of rewriting the whole tail. An ABRUPT stop (no
+/// graceful checkpoint) with a delete sidecar stacked UNDER an update sidecar
+/// must replay both in generation order on restart: the update speaks in the
+/// post-delete coordinate space, so replaying deletes after updates (or
+/// dropping either) would corrupt or lose the effect.
+#[test]
+fn abrupt_restart_replays_pending_update_and_delete_sidecars() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(&mut session, "CREATE TABLE t (id INT32, value INT32)")
+            .expect("create table");
+        for id in 1..=6 {
+            engine
+                .execute(&mut session, &format!("INSERT INTO t VALUES ({id}, {id}0)"))
+                .expect("insert row");
+        }
+        engine
+            .execute(&mut session, "UPDATE t SET value = 99 WHERE id <= 2")
+            .expect("update two rows");
+        engine
+            .execute(&mut session, "DELETE FROM t WHERE id = 3")
+            .expect("delete one row");
+        engine
+            .execute(&mut session, "UPDATE t SET value = 77 WHERE id = 4")
+            .expect("update another row");
+        // Simulate a crash: skip Engine's Drop so no shutdown checkpoint
+        // folds the pending sidecars.
+        std::mem::forget(engine);
+    }
+
+    let engine = Engine::new(temp_dir.path(), "main").expect("reopen engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    let mut values = collect_i32(
+        engine
+            .execute(&mut session, "SELECT value FROM t")
+            .expect("select after crash restart"),
+        0,
+    );
+    values.sort_unstable();
+    // id 1,2 → 99; id 3 deleted; id 4 → 77; id 5,6 untouched.
+    assert_eq!(values, vec![50, 60, 77, 99, 99]);
+    engine.segment_mgr().shutdown();
+}
+
+/// Repeated small UPDATEs on a resident memtable must keep the durable cost
+/// proportional to the affected rows (the sidecar chain replays once per
+/// recovery), and every intermediate value must remain query- and
+/// restart-correct.
+#[test]
+fn repeated_small_updates_stay_correct_across_restart() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(&mut session, "CREATE TABLE t (id INT32, value INT32)")
+            .expect("create table");
+        for id in 1..=3 {
+            engine
+                .execute(&mut session, &format!("INSERT INTO t VALUES ({id}, 0)"))
+                .expect("insert row");
+        }
+        for round in 1..=30 {
+            engine
+                .execute(
+                    &mut session,
+                    &format!("UPDATE t SET value = {round} WHERE id = 1"),
+                )
+                .expect("repeat update");
+        }
+        // The restart lands on the sidecar path only when the tail still
+        // holds pending generations; a graceful shutdown folds them, so
+        // assert through an abrupt stop.
+        std::mem::forget(engine);
+    }
+
+    let engine = Engine::new(temp_dir.path(), "main").expect("reopen engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    assert_eq!(
+        collect_i32(
+            engine
+                .execute(&mut session, "SELECT value FROM t WHERE id = 1")
+                .expect("select updated row after restart"),
+            0,
+        ),
+        vec![30]
+    );
+    assert_eq!(
+        collect_i32(
+            engine
+                .execute(&mut session, "SELECT value FROM t WHERE id = 2")
+                .expect("select untouched row after restart"),
+            0,
+        ),
+        vec![0]
+    );
+    engine.segment_mgr().shutdown();
+}

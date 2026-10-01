@@ -10,12 +10,15 @@ use crc32fast::Hasher;
 use uuid::Uuid;
 
 use crate::common::error::{Result, TaibaiError};
+use crate::protocol::types::DataType;
+use crate::sql::execution::dml_update::rebuild_update_column;
 use crate::sql::execution::wal_helper::{
     compress_prepared_batch_for_wal_with, deserialize_batch_from_wal, prepare_batch_for_wal,
     serialize_batch_for_wal,
 };
 use crate::storage::segment::SegmentReader;
 use crate::types::batch::{RecordBatch, Schema};
+use crate::types::scalar::ScalarValue;
 
 const TAIL_MAGIC: u32 = 0x5441_494C;
 /// V2 tail log frames carry the row count in the frame header so recovery can
@@ -1015,6 +1018,27 @@ enum GenerationKind {
     /// O(affected rows) instead of rewriting the whole tail snapshot (which
     /// made repeated small deletes quadratic in the memtable size).
     Delete,
+    /// Update sidecar: matched row positions plus the constant value each
+    /// assigned column takes on them. Appended by UPDATE so changing memtable
+    /// rows costs O(affected rows) instead of a whole-tail rewrite (UPDATE
+    /// never changes row count or row order, so positions stay stable under
+    /// it — the property that makes the sidecar chain replayable).
+    Update,
+}
+
+/// The two sidecar kinds that can sit above a live tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidecarKind {
+    Delete,
+    Update,
+}
+
+/// A sidecar generation seen above the live tail, in walk order
+/// (newest-first). Callers decode and apply them oldest-first.
+#[derive(Clone)]
+struct SidecarFile {
+    kind: SidecarKind,
+    path: PathBuf,
 }
 
 #[derive(Clone)]
@@ -1129,6 +1153,233 @@ fn decode_delete_positions(bytes: &[u8]) -> Result<Vec<u32>> {
         .collect())
 }
 
+const UPDATE_GEN_MAGIC: u32 = 0x5441_4955; // "TAIU"
+
+/// One memtable UPDATE's durable image: the ascending tail-row positions a
+/// statement matched, and the constant value each assigned column takes on
+/// those rows (UPDATE assignments are statement constants, evaluated without
+/// row context). Applied to the tail generations BELOW the sidecar, replayed
+/// oldest sidecar first, exactly like the delete sidecars it shares the
+/// generation arbitration with.
+#[derive(Debug, Clone)]
+pub(crate) struct TailUpdateSet {
+    /// `(physical column index, new value)` pairs in the tail batch's column
+    /// space, ascending by column index.
+    pub assigned: Vec<(usize, ScalarValue)>,
+    /// Ascending, deduplicated row positions in the sidecar's coordinate
+    /// space: the batch state produced by applying every OLDER generation.
+    pub positions: Vec<u32>,
+}
+
+fn read_le_u32(body: &[u8], offset: &mut usize) -> Result<u32> {
+    if body.len() < *offset + 4 {
+        return Err(TaibaiError::Storage(
+            "durable tail update sidecar is truncated".into(),
+        ));
+    }
+    let value = u32::from_le_bytes(body[*offset..*offset + 4].try_into().unwrap());
+    *offset += 4;
+    Ok(value)
+}
+
+fn read_len_prefixed<'a>(body: &'a [u8], offset: &mut usize) -> Result<&'a [u8]> {
+    let len = read_le_u32(body, offset)? as usize;
+    if body.len() < *offset + len {
+        return Err(TaibaiError::Storage(
+            "durable tail update sidecar is truncated".into(),
+        ));
+    }
+    let slice = &body[*offset..*offset + len];
+    *offset += len;
+    Ok(slice)
+}
+
+/// One assigned cell on disk: `[u8 dtype][u8 null][payload]`, payload absent
+/// when the null flag is set and length-prefixed for the variable-width
+/// types. Fixed-width payload layout follows [`ScalarValue`]'s inner repr.
+fn encode_scalar_cell(bytes: &mut Vec<u8>, value: &ScalarValue) {
+    bytes.push(value.data_type() as u8);
+    if value.is_null() {
+        bytes.push(1u8);
+        return;
+    }
+    bytes.push(0u8);
+    match value {
+        ScalarValue::Bool(Some(v)) => bytes.push(*v as u8),
+        ScalarValue::Int8(Some(v)) => bytes.extend_from_slice(&v.to_le_bytes()),
+        ScalarValue::Int16(Some(v)) => bytes.extend_from_slice(&v.to_le_bytes()),
+        ScalarValue::Int32(Some(v)) => bytes.extend_from_slice(&v.to_le_bytes()),
+        ScalarValue::Int64(Some(v)) => bytes.extend_from_slice(&v.to_le_bytes()),
+        ScalarValue::UInt8(Some(v)) => bytes.push(*v),
+        ScalarValue::UInt16(Some(v)) => bytes.extend_from_slice(&v.to_le_bytes()),
+        ScalarValue::UInt32(Some(v)) => bytes.extend_from_slice(&v.to_le_bytes()),
+        ScalarValue::UInt64(Some(v)) => bytes.extend_from_slice(&v.to_le_bytes()),
+        ScalarValue::Float32(Some(v)) => bytes.extend_from_slice(&v.to_bits().to_le_bytes()),
+        ScalarValue::Float64(Some(v)) => bytes.extend_from_slice(&v.to_bits().to_le_bytes()),
+        ScalarValue::Decimal(Some(v)) => bytes.extend_from_slice(&v.to_le_bytes()),
+        ScalarValue::Date(Some(v)) => bytes.extend_from_slice(&v.to_le_bytes()),
+        ScalarValue::Time(Some(v)) => bytes.extend_from_slice(&v.to_le_bytes()),
+        ScalarValue::Timestamp(Some(v)) => bytes.extend_from_slice(&v.to_le_bytes()),
+        ScalarValue::Interval(Some(v)) => bytes.extend_from_slice(&v.to_le_bytes()),
+        ScalarValue::VarChar(Some(v)) => {
+            bytes.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(v.as_bytes());
+        }
+        ScalarValue::Blob(Some(v)) => {
+            bytes.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(v);
+        }
+        ScalarValue::Vector(Some(v)) => {
+            bytes.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            for element in v {
+                bytes.extend_from_slice(&element.to_bits().to_le_bytes());
+            }
+        }
+        // Nulls returned early above; the None arms are unreachable.
+        _ => unreachable!("non-null scalar cell matched a None payload"),
+    }
+}
+
+fn decode_scalar_cell(body: &[u8], offset: &mut usize) -> Result<ScalarValue> {
+    if body.len() < *offset + 2 {
+        return Err(TaibaiError::Storage(
+            "durable tail update sidecar is truncated".into(),
+        ));
+    }
+    let data_type = DataType::from_u8(body[*offset])?;
+    *offset += 1;
+    let is_null = body[*offset] == 1;
+    *offset += 1;
+    if is_null {
+        return Ok(ScalarValue::null_for_type(data_type));
+    }
+    // Fixed-width payloads are raw little-endian bytes; variable-width ones
+    // are u32-length-prefixed (mirroring encode_scalar_cell exactly).
+    let value = match data_type {
+        DataType::Bool => ScalarValue::Bool(Some(read_raw(body, offset, 1)?[0] != 0)),
+        DataType::Int8 => ScalarValue::Int8(Some(read_raw(body, offset, 1)?[0] as i8)),
+        DataType::Int16 => ScalarValue::Int16(Some(i16::from_le_bytes(
+            read_raw(body, offset, 2)?.try_into().unwrap(),
+        ))),
+        DataType::Int32 => ScalarValue::Int32(Some(i32::from_le_bytes(
+            read_raw(body, offset, 4)?.try_into().unwrap(),
+        ))),
+        DataType::Int64 => ScalarValue::Int64(Some(i64::from_le_bytes(
+            read_raw(body, offset, 8)?.try_into().unwrap(),
+        ))),
+        DataType::UInt8 => ScalarValue::UInt8(Some(read_raw(body, offset, 1)?[0])),
+        DataType::UInt16 => ScalarValue::UInt16(Some(u16::from_le_bytes(
+            read_raw(body, offset, 2)?.try_into().unwrap(),
+        ))),
+        DataType::UInt32 => ScalarValue::UInt32(Some(u32::from_le_bytes(
+            read_raw(body, offset, 4)?.try_into().unwrap(),
+        ))),
+        DataType::UInt64 => ScalarValue::UInt64(Some(u64::from_le_bytes(
+            read_raw(body, offset, 8)?.try_into().unwrap(),
+        ))),
+        DataType::Float32 => ScalarValue::Float32(Some(f32::from_bits(u32::from_le_bytes(
+            read_raw(body, offset, 4)?.try_into().unwrap(),
+        )))),
+        DataType::Float64 => ScalarValue::Float64(Some(f64::from_bits(u64::from_le_bytes(
+            read_raw(body, offset, 8)?.try_into().unwrap(),
+        )))),
+        DataType::Decimal => ScalarValue::Decimal(Some(i64::from_le_bytes(
+            read_raw(body, offset, 8)?.try_into().unwrap(),
+        ))),
+        DataType::Date => ScalarValue::Date(Some(i32::from_le_bytes(
+            read_raw(body, offset, 4)?.try_into().unwrap(),
+        ))),
+        DataType::Time => ScalarValue::Time(Some(i64::from_le_bytes(
+            read_raw(body, offset, 8)?.try_into().unwrap(),
+        ))),
+        DataType::Timestamp => ScalarValue::Timestamp(Some(i64::from_le_bytes(
+            read_raw(body, offset, 8)?.try_into().unwrap(),
+        ))),
+        DataType::Interval => ScalarValue::Interval(Some(i64::from_le_bytes(
+            read_raw(body, offset, 8)?.try_into().unwrap(),
+        ))),
+        DataType::VarChar => ScalarValue::VarChar(Some(String::from_utf8(
+            read_len_prefixed(body, offset)?.to_vec(),
+        )
+        .map_err(|_| TaibaiError::Storage("update sidecar VarChar is not UTF-8".into()))?)),
+        DataType::Blob => ScalarValue::Blob(Some(read_len_prefixed(body, offset)?.to_vec())),
+        DataType::Vector => {
+            let count = read_le_u32(body, offset)? as usize;
+            if body.len() < *offset + count * 4 {
+                return Err(TaibaiError::Storage(
+                    "durable tail update sidecar is truncated".into(),
+                ));
+            }
+            let elements = body[*offset..*offset + count * 4]
+                .chunks_exact(4)
+                .map(|chunk| f32::from_bits(u32::from_le_bytes(chunk.try_into().unwrap())))
+                .collect();
+            *offset += count * 4;
+            ScalarValue::Vector(Some(elements))
+        }
+    };
+    Ok(value)
+}
+
+/// A raw fixed-width payload read that verifies the exact width, so a
+/// corrupt-but-CRC-bearing file fails loudly instead of misreading bytes.
+fn read_raw<'a>(body: &'a [u8], offset: &mut usize, width: usize) -> Result<&'a [u8]> {
+    if body.len() < *offset + width {
+        return Err(TaibaiError::Storage(
+            "durable tail update sidecar is truncated".into(),
+        ));
+    }
+    let slice = &body[*offset..*offset + width];
+    *offset += width;
+    Ok(slice)
+}
+
+fn encode_update_set(set: &TailUpdateSet) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(16 + set.assigned.len() * 24 + set.positions.len() * 4);
+    bytes.extend_from_slice(&UPDATE_GEN_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&(set.assigned.len() as u32).to_le_bytes());
+    for (col_idx, value) in &set.assigned {
+        let col_idx = u32::try_from(*col_idx).map_err(|_| {
+            TaibaiError::Storage("update sidecar column index overflows u32".into())
+        })?;
+        bytes.extend_from_slice(&col_idx.to_le_bytes());
+        encode_scalar_cell(&mut bytes, value);
+    }
+    bytes.extend_from_slice(&(set.positions.len() as u32).to_le_bytes());
+    for position in &set.positions {
+        bytes.extend_from_slice(&position.to_le_bytes());
+    }
+    Ok(append_crc(bytes))
+}
+
+fn decode_update_set(raw: &[u8]) -> Result<TailUpdateSet> {
+    let body = verify_crc(raw)?;
+    if body.len() < 8 || u32::from_le_bytes(body[0..4].try_into().unwrap()) != UPDATE_GEN_MAGIC {
+        return Err(TaibaiError::Storage(
+            "durable tail update sidecar is corrupt".into(),
+        ));
+    }
+    let mut offset = 4usize;
+    let assigned_count = read_le_u32(body, &mut offset)? as usize;
+    let mut assigned = Vec::with_capacity(assigned_count);
+    for _ in 0..assigned_count {
+        let col_idx = read_le_u32(body, &mut offset)? as usize;
+        let value = decode_scalar_cell(body, &mut offset)?;
+        assigned.push((col_idx, value));
+    }
+    let position_count = read_le_u32(body, &mut offset)? as usize;
+    if body.len() != offset + position_count * 4 {
+        return Err(TaibaiError::Storage(
+            "durable tail update sidecar length mismatch".into(),
+        ));
+    }
+    let positions = body[offset..]
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    Ok(TailUpdateSet { assigned, positions })
+}
+
 /// Why a generation walk stopped without finding a live tail.
 enum Suppression {
     /// A clear tombstone: the tail was explicitly dropped.
@@ -1139,7 +1390,7 @@ enum Suppression {
 
 /// Result of walking one id's generations under the shared arbitration: the
 /// newest usable tail wins, clear tombstones and satisfied flush intents
-/// suppress everything below, delete sidecars are transparent.
+/// suppress everything below, delete/update sidecars are transparent.
 enum LiveTail {
     Found(PathBuf),
     Suppressed(Suppression),
@@ -1154,14 +1405,14 @@ enum LiveTail {
 /// * `prune_intents` removes unsatisfied flush intents encountered along
 ///   the walk (they prove nothing about the tail below); read-only views
 ///   leave them for the mutation paths.
-/// * `deletions` collects the delete sidecar paths seen above the live
-///   tail, newest-first.
+/// * `sidecars` collects the delete/update sidecar paths seen above the
+///   live tail, newest-first.
 fn resolve_live_tail(
     table_dir: &Path,
     generations: &[Generation],
     validate_tails: bool,
     prune_intents: bool,
-    mut deletions: Option<&mut Vec<PathBuf>>,
+    mut sidecars: Option<&mut Vec<SidecarFile>>,
 ) -> LiveTail {
     for generation in generations {
         match generation.kind {
@@ -1173,9 +1424,15 @@ fn resolve_live_tail(
                 return LiveTail::Found(generation.path.clone());
             }
             GenerationKind::Clear => return LiveTail::Suppressed(Suppression::Clear),
-            GenerationKind::Delete => {
-                if let Some(list) = deletions.as_deref_mut() {
-                    list.push(generation.path.clone());
+            GenerationKind::Delete | GenerationKind::Update => {
+                if let Some(list) = sidecars.as_deref_mut() {
+                    list.push(SidecarFile {
+                        kind: match generation.kind {
+                            GenerationKind::Delete => SidecarKind::Delete,
+                            _ => SidecarKind::Update,
+                        },
+                        path: generation.path.clone(),
+                    });
                 }
             }
             GenerationKind::Flush => {
@@ -1238,12 +1495,69 @@ pub fn delete_rows(table_dir: &Path, id: Uuid, positions: &[u32]) -> Result<bool
     Ok(true)
 }
 
-/// True when no delete sidecars pend above the memtable's live tail. A spill
-/// (which writes a fresh full tail under the existing generation sequence)
-/// must not run while sidecars pend: they would re-apply to unrelated rows.
+/// Durably record a memtable UPDATE without rewriting its tail.
 ///
-/// Not expressed through [`resolve_live_tail`]: a delete sidecar is terminal
-/// here (answers "plain?"), not transparent as in the live-tail searches.
+/// The sidecar generation (`<id>.<seq>.upd`) applies to the tail generations
+/// BELOW it: recovery decodes the tail and replays every generation
+/// oldest-first — appends extend the tail, updates overwrite values in place
+/// at stable positions, deletes remove rows. Each sidecar's positions refer
+/// to the batch state its statement observed, which the ordered replay
+/// reproduces exactly. Repeated small UPDATEs on a large memtable therefore
+/// cost O(affected rows) per statement instead of a whole-tail rewrite
+/// (quadratic). Returns `false` when the memtable has no live tail (caller
+/// falls back to a full `persist` of the updated batch).
+pub fn update_rows(
+    table_dir: &Path,
+    id: Uuid,
+    positions: &[u32],
+    assigned: &[(usize, ScalarValue)],
+) -> Result<bool> {
+    if positions.is_empty() || assigned.is_empty() {
+        return Ok(true);
+    }
+    let mut positions = positions.to_vec();
+    positions.sort_unstable();
+    positions.dedup();
+    // Later assignments to the same column never win (the statement planner
+    // already keeps only the first); normalize to ascending column order so
+    // the on-disk layout is canonical.
+    let mut assigned = assigned.to_vec();
+    assigned.sort_by_key(|(col_idx, _)| *col_idx);
+    assigned.dedup_by_key(|(col_idx, _)| *col_idx);
+    let tail_dir = table_dir.join(TAIL_DIR);
+    if !tail_dir.exists() {
+        return Ok(false);
+    }
+    let mut generations = generations_for_id(&tail_dir, id)?;
+    generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
+    if !matches!(
+        resolve_live_tail(table_dir, &generations, true, true, None),
+        LiveTail::Found(_)
+    ) {
+        return Ok(false);
+    }
+    let set = TailUpdateSet {
+        assigned,
+        positions,
+    };
+    let sequence = next_sequence();
+    let tmp_path = tail_dir.join(format!(".{}.{}.upd.tmp", id.simple(), sequence));
+    let final_path = tail_dir.join(format!("{}.{}.upd", id.simple(), sequence));
+    write_new_synced(&tmp_path, &encode_update_set(&set)?)?;
+    fs::rename(&tmp_path, &final_path)?;
+    // The sidecar must be durable before the statement acks the UPDATE;
+    // otherwise a crash restores the pre-update values.
+    sync_dir_best_effort(&tail_dir);
+    Ok(true)
+}
+
+/// True when no sidecars pend above the memtable's live tail. A spill (which
+/// hands the memtable a lazily-materialized view of the RAW tail file) must
+/// not run while sidecars pend: `ensure_resident` decodes only the tail, so
+/// pending delete/update generations would be silently dropped.
+///
+/// Not expressed through [`resolve_live_tail`]: a sidecar is terminal here
+/// (answers "plain?"), not transparent as in the live-tail searches.
 pub fn tail_is_plain(table_dir: &Path, id: Uuid) -> Result<bool> {
     let tail_dir = table_dir.join(TAIL_DIR);
     if !tail_dir.exists() {
@@ -1255,7 +1569,7 @@ pub fn tail_is_plain(table_dir: &Path, id: Uuid) -> Result<bool> {
         match generation.kind {
             GenerationKind::Tail => return Ok(true),
             GenerationKind::Clear => return Ok(true),
-            GenerationKind::Delete => return Ok(false),
+            GenerationKind::Delete | GenerationKind::Update => return Ok(false),
             GenerationKind::Flush => {
                 let satisfied = fs::read(&generation.path)
                     .ok()
@@ -1436,27 +1750,89 @@ pub fn cancel_flush(intent: FlushIntent) -> Result<()> {
 /// intents) and return the live tail file for every recoverable memtable id.
 /// Shared by `recover` (eager decode) and `recover_index` (metadata only);
 /// performs the same on-disk cleanup as before.
-/// Resolve the live tail for one id, collecting the delete sidecars above it.
-/// Returns `(tail path, deletions oldest-first)`; a corrupt sidecar is an
-/// error (fail closed: applying a partial list would resurrect rows).
-fn live_tail_with_deletions(
+/// One pending sidecar decoded from disk, in application order.
+enum DecodedSidecar {
+    Delete(Vec<u32>),
+    Update(TailUpdateSet),
+}
+
+fn decode_sidecar(file: &SidecarFile) -> Result<DecodedSidecar> {
+    let bytes = fs::read(&file.path)?;
+    match file.kind {
+        SidecarKind::Delete => Ok(DecodedSidecar::Delete(decode_delete_positions(&bytes)?)),
+        SidecarKind::Update => Ok(DecodedSidecar::Update(decode_update_set(&bytes)?)),
+    }
+}
+
+/// Replay decoded sidecars (oldest-first) onto a decoded tail batch: deletes
+/// remove rows, updates overwrite values in place. Each sidecar's positions
+/// refer to the batch state produced by the generations before it, so the
+/// ordered replay reproduces exactly what the statements left in memory.
+fn apply_sidecars(mut batch: RecordBatch, sidecars: &[DecodedSidecar]) -> Result<RecordBatch> {
+    for sidecar in sidecars {
+        batch = match sidecar {
+            DecodedSidecar::Delete(positions) => filter_out_positions(&batch, positions)?,
+            DecodedSidecar::Update(set) => apply_update_set(&batch, set)?,
+        };
+    }
+    Ok(batch)
+}
+
+/// Apply one update sidecar to a decoded tail batch: matched rows take the
+/// assigned constant values, every other row is untouched. Uses the same
+/// image constructor as the UPDATE statement itself so the recovered batch
+/// cannot diverge from the one the statement swapped into memory.
+fn apply_update_set(batch: &RecordBatch, set: &TailUpdateSet) -> Result<RecordBatch> {
+    let mut mask = vec![false; batch.num_rows()];
+    for &position in &set.positions {
+        let position = position as usize;
+        if position >= batch.num_rows() {
+            return Err(TaibaiError::Storage(
+                "durable tail update sidecar references a row outside the tail".into(),
+            ));
+        }
+        mask[position] = true;
+    }
+    let all_rows: Vec<u32> = (0..batch.num_rows() as u32).collect();
+    let mut columns = batch.columns.clone();
+    for (col_idx, value) in &set.assigned {
+        if *col_idx >= columns.len() {
+            return Err(TaibaiError::Storage(format!(
+                "durable tail update sidecar references column {col_idx} outside the tail"
+            )));
+        }
+        if columns[*col_idx].data_type() != value.data_type() {
+            return Err(TaibaiError::Storage(
+                "durable tail update sidecar value type does not match the tail column".into(),
+            ));
+        }
+        columns[*col_idx] =
+            rebuild_update_column(&columns[*col_idx], Some(value), &all_rows, &mask)?;
+    }
+    RecordBatch::try_new(batch.schema.clone(), columns)
+}
+
+/// Resolve the live tail for one id, collecting the sidecars above it and
+/// decoding them oldest-first. A corrupt sidecar is an error (fail closed:
+/// applying a partial chain would resurrect rows or drop updates).
+fn live_tail_with_sidecars(
     tail_dir: &Path,
     table_dir: &Path,
     id: Uuid,
     generations: &mut Vec<Generation>,
-) -> Result<Option<(PathBuf, Vec<Vec<u32>>)>> {
+) -> Result<Option<(PathBuf, Vec<DecodedSidecar>)>> {
     generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
-    let mut deletions_rev = Vec::new();
-    match resolve_live_tail(table_dir, generations, true, true, Some(&mut deletions_rev)) {
+    let mut sidecars_rev = Vec::new();
+    match resolve_live_tail(table_dir, generations, true, true, Some(&mut sidecars_rev)) {
         LiveTail::Found(path) => {
-            let mut applied = Vec::with_capacity(deletions_rev.len());
-            for sidecar in deletions_rev.iter().rev() {
-                applied.push(decode_delete_positions(&fs::read(sidecar)?)?);
+            let mut applied = Vec::with_capacity(sidecars_rev.len());
+            for file in sidecars_rev.iter().rev() {
+                applied.push(decode_sidecar(file)?);
             }
             Ok(Some((path, applied)))
         }
         // The tail's rows are durable in the target segment: retire the
-        // id's remaining generations (delete sidecars preserved — see
+        // id's remaining generations (sidecars preserved — see
         // `remove_other_generations_ex`) and the satisfied intent itself.
         LiveTail::Suppressed(Suppression::Flush(intent)) => {
             remove_other_generations_ex(tail_dir, id, &intent, true)?;
@@ -1467,7 +1843,7 @@ fn live_tail_with_deletions(
     }
 }
 
-fn resolve_live_tail_paths(table_dir: &Path) -> Result<Vec<(Uuid, PathBuf, Vec<Vec<u32>>)>> {
+fn resolve_live_tail_paths(table_dir: &Path) -> Result<Vec<(Uuid, PathBuf, Vec<DecodedSidecar>)>> {
     let tail_dir = table_dir.join(TAIL_DIR);
     if !tail_dir.exists() {
         return Ok(Vec::new());
@@ -1491,16 +1867,16 @@ fn resolve_live_tail_paths(table_dir: &Path) -> Result<Vec<(Uuid, PathBuf, Vec<V
 
     let mut resolved = Vec::new();
     for (id, mut generations) in by_id {
-        let Some((path, deletions)) =
-            live_tail_with_deletions(&tail_dir, table_dir, id, &mut generations)?
+        let Some((path, sidecars)) =
+            live_tail_with_sidecars(&tail_dir, table_dir, id, &mut generations)?
         else {
             continue;
         };
-        // Delete sidecars must survive this cleanup: they are only applied
-        // (and then superseded) by the caller, and a crash in between must
-        // find them again on the next recovery.
+        // Sidecars must survive this cleanup: they are only applied (and
+        // then superseded) by the caller, and a crash in between must find
+        // them again on the next recovery.
         remove_other_generations_ex(&tail_dir, id, &path, true)?;
-        resolved.push((id, path, deletions));
+        resolved.push((id, path, sidecars));
     }
     remove_empty_dir(&tail_dir);
     Ok(resolved)
@@ -1508,13 +1884,11 @@ fn resolve_live_tail_paths(table_dir: &Path) -> Result<Vec<(Uuid, PathBuf, Vec<V
 
 pub fn recover(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTail>> {
     let mut recovered = Vec::new();
-    for (id, path, deletions) in resolve_live_tail_paths(table_dir)? {
-        let (partition_key, mut batch) = decode_tail_file(&path, schema)?;
-        // Apply delete sidecars oldest-first: each sidecar's positions refer
-        // to the batch state its DELETE statement observed.
-        for positions in &deletions {
-            batch = filter_out_positions(&batch, positions)?;
-        }
+    for (id, path, sidecars) in resolve_live_tail_paths(table_dir)? {
+        let (partition_key, batch) = decode_tail_file(&path, schema)?;
+        // Replay the pending sidecars oldest-first: each one's positions
+        // refer to the batch state its statement observed.
+        let batch = apply_sidecars(batch, &sidecars)?;
         recovered.push(RecoveredTail {
             id,
             partition_key,
@@ -1528,19 +1902,17 @@ pub fn recover(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTail>> 
 /// headers without decoding their payloads.
 pub fn recover_index(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTailIndex>> {
     let mut recovered = Vec::new();
-    for (id, mut path, deletions) in resolve_live_tail_paths(table_dir)? {
+    for (id, mut path, sidecars) in resolve_live_tail_paths(table_dir)? {
         // The lazy materialization path reads only the tail file, so pending
-        // delete sidecars must be folded into a fresh full tail HERE. The
-        // decode cost is confined to memtables that restarted with unflushed
-        // DELETEs; plain tails stay lazy.
-        if !deletions.is_empty() {
-            let (partition_key, mut batch) = decode_tail_file(&path, schema)?;
-            for positions in &deletions {
-                batch = filter_out_positions(&batch, positions)?;
-            }
+        // sidecars must be folded into a fresh full tail HERE. The decode
+        // cost is confined to memtables that restarted with unflushed
+        // DELETE/UPDATE statements; plain tails stay lazy.
+        if !sidecars.is_empty() {
+            let (partition_key, batch) = decode_tail_file(&path, schema)?;
+            let batch = apply_sidecars(batch, &sidecars)?;
             persist(table_dir, id, &partition_key, &batch)?;
             path = newest_live_tail_path(&table_dir.join(TAIL_DIR), id)?.ok_or_else(|| {
-                TaibaiError::Storage("durable tail vanished after delete consolidation".into())
+                TaibaiError::Storage("durable tail vanished after sidecar consolidation".into())
             })?;
         }
         let bytes = fs::read(&path)?;
@@ -2292,6 +2664,7 @@ fn parse_generation(path: &Path) -> Option<(Uuid, Generation)> {
         "clear" => GenerationKind::Clear,
         "flush" => GenerationKind::Flush,
         "del" => GenerationKind::Delete,
+        "upd" => GenerationKind::Update,
         _ => return None,
     };
     if parts.next().is_some() {
@@ -2359,20 +2732,26 @@ fn remove_other_generations(tail_dir: &Path, id: Uuid, keep_path: &Path) -> Resu
     remove_other_generations_ex(tail_dir, id, keep_path, false)
 }
 
-/// `preserve_deletes` keeps delete sidecars: callers that already collected
-/// their contents but have not applied them yet (or crashed before doing so)
-/// must find them again on the next recovery.
+/// `preserve_sidecars` keeps delete AND update sidecars: callers that
+/// already collected their contents but have not applied them yet (or
+/// crashed before doing so) must find them again on the next recovery. A
+/// fresh full tail written by `persist` supersedes them instead
+/// (`preserve_sidecars = false`): the snapshot already contains their effect.
 fn remove_other_generations_ex(
     tail_dir: &Path,
     id: Uuid,
     keep_path: &Path,
-    preserve_deletes: bool,
+    preserve_sidecars: bool,
 ) -> Result<()> {
     for generation in generations_for_id(tail_dir, id)? {
         if generation.path != keep_path {
             if matches!(generation.kind, GenerationKind::Tail) {
                 archive_or_remove(tail_dir, &generation.path);
-            } else if matches!(generation.kind, GenerationKind::Delete) && preserve_deletes {
+            } else if matches!(
+                generation.kind,
+                GenerationKind::Delete | GenerationKind::Update
+            ) && preserve_sidecars
+            {
                 continue;
             } else {
                 remove_file_if_exists(&generation.path)?;

@@ -1023,6 +1023,44 @@ impl BatchWriter {
         )
     }
 
+    /// Durable side of the auto-commit UPDATE's memtable pass: record the
+    /// statement's matched rows and assigned constants as an incremental
+    /// `.upd` sidecar (O(affected rows)) instead of rewriting the memtable's
+    /// whole tail, which made repeated small UPDATEs quadratic in the
+    /// memtable size. Falls back to a full `persist` of the updated batch
+    /// when no live tail exists to hang the sidecar on. The in-memory batch
+    /// swap remains the caller's, after this returns.
+    pub(crate) fn update_memtable_tail_rows(
+        &self,
+        memtable: &MemTable,
+        positions: &[u32],
+        assigned: &[(usize, crate::types::scalar::ScalarValue)],
+        updated_batch: &RecordBatch,
+    ) -> Result<()> {
+        if memtable.state() != MemTableState::Pending {
+            return Ok(());
+        }
+        if memtable.is_transactional()
+            || memtable.visibility() != crate::storage::core::memtable::TxnVisibility::Committed
+        {
+            return Ok(());
+        }
+        let table_dir = self.segment_mgr.table_dir(memtable.db(), memtable.table());
+        match crate::storage::core::durable_tail::update_rows(
+            &table_dir,
+            memtable.id(),
+            positions,
+            assigned,
+        ) {
+            Ok(true) => Ok(()),
+            // No live tail to hang the sidecar on: the snapshot write also
+            // drains the commit thread first, so in-flight INSERT frames
+            // cannot land after it.
+            Ok(false) => self.persist_memtable_tail_batch(memtable, updated_batch),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
         let _ = self.sender.send(WriteCommand::Shutdown);

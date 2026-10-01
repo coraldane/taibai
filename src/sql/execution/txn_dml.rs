@@ -455,7 +455,8 @@ pub(crate) fn exec_update_in_txn(
             reader_txn_id,
             narrowed_partition,
             |memtable, _original, batch, live_positions| {
-                let (new_batch, affected, matched_rows) = super::dml_update::update_memtable_batch(
+                let (new_batch, affected, matched_rows, _assigned_pairs) =
+                    super::dml_update::update_memtable_batch(
                     assignments,
                     &resolved_where_clause,
                     &table_schema,
