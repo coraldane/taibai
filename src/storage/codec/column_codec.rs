@@ -1435,6 +1435,16 @@ fn expand_varchar_dictionary(
 ) -> Result<ColumnArray> {
     let mut cursor = Cursor::new(payload);
     let dict_count = read_u32_le(&mut cursor)? as usize;
+    // Bound the pre-allocation against the payload: every dictionary entry
+    // costs at least a 4-byte length prefix, so a count beyond payload/4 is
+    // corruption — pre-allocating it would try to reserve up to 64GB from a
+    // single flipped u32 (parse_i64_runs_plain_rle already applies the same
+    // guard to its run count).
+    if dict_count.saturating_mul(4) > payload.len() + 4 {
+        return Err(TaibaiError::Storage(
+            "dictionary varchar decode: dictionary count exceeds payload".into(),
+        ));
+    }
     let mut dict: Vec<&str> = Vec::with_capacity(dict_count);
     for _ in 0..dict_count {
         let len = read_u32_le(&mut cursor)? as usize;

@@ -61,7 +61,7 @@ fn extract_bloom_columns(expr: &LogicalExpr, schema: &Schema) -> Vec<String> {
 }
 
 fn extract_bloom_recursive(expr: &LogicalExpr, schema: &Schema, cols: &mut Vec<String>) {
-    if let LogicalExpr::BinaryOp { left, op, .. } = expr {
+    if let LogicalExpr::BinaryOp { left, op, right } = expr {
         if *op == BinOp::Eq {
             if let LogicalExpr::Column(idx) = **left {
                 if let Some(col_def) = schema.columns.get(idx) {
@@ -70,7 +70,11 @@ fn extract_bloom_recursive(expr: &LogicalExpr, schema: &Schema, cols: &mut Vec<S
             }
         }
         if *op == BinOp::And {
+            // Both arms: visiting only the left branch silently dropped
+            // equality keys from the right conjunct (`a = 1 AND b = 2`
+            // registered only a).
             extract_bloom_recursive(left, schema, cols);
+            extract_bloom_recursive(right, schema, cols);
         }
     }
 }

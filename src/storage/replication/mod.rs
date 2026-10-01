@@ -597,6 +597,31 @@ impl RepLog {
         if seq > self.persisted_seq.load(Ordering::Acquire) {
             self.persist_seq(seq);
         }
+        // A restart resumes next_seq from the durable file, which can lag a
+        // standby's applied watermark by up to `persist_every` events. Any
+        // events published in that gap carry seqs the standby already
+        // consumed, and every resume filter (events_after, the bridge, the
+        // standby's own dedup) silently drops them — the new data they carry
+        // is lost with no error. Re-stamp the surviving ring entries above
+        // the watermark: they were published after the restart, so they are
+        // causally new even though numerically stale. A standby that was
+        // behind the watermark now fails events_after explicitly and
+        // re-bootstraps instead of silently diverging.
+        let mut state = self.state.lock().unwrap();
+        if seq + 1 > state.next_seq {
+            let mut next = seq + 1;
+            for slot in state.ring.iter_mut() {
+                slot.0 = next;
+                next += 1;
+            }
+            tracing::warn!(
+                standby_applied = seq,
+                renumbered = state.ring.len(),
+                new_next_seq = next,
+                "replication seq fell behind a standby watermark (primary restarted on a stale seq file); ring re-stamped"
+            );
+            state.next_seq = next;
+        }
     }
 
     pub fn current_seq(&self) -> u64 {
@@ -837,4 +862,33 @@ mod tests {
         assert_eq!(reopened.persisted_seq(), 2);
         assert_eq!(reopened.publish(tail_event("t")), 3);
     }
+    /// P0: a primary that restarts on a stale seq file (the file lags by up
+    /// to `persist_every` events) stamps fresh events with seqs a standby
+    /// already applied. A reconnecting standby's watermark must re-stamp the
+    /// ring above itself, or every resume filter silently drops the new
+    /// events and the pair diverges without any error.
+    #[test]
+    fn standby_watermark_re_stamps_a_lagging_ring() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = RepLog::new(64, temp.path());
+        // Simulate a crash + restart on a stale file: the file says 0 (only
+        // persisted every 256), a standby out there applied seq 3.
+        let reused = log.publish(tail_event("t")); // stamped with a reused seq
+        assert_eq!(reused, 1, "control: seq resumed from the stale file");
+        log.note_standby_applied(3);
+        let history = log.events_after(3).unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "the causally-new event must survive the resume filter"
+        );
+        assert_eq!(history[0].0, 4, "re-stamped above the standby watermark");
+        assert_eq!(log.current_seq(), 4);
+        // Subsequent publishes continue above the watermark.
+        assert_eq!(log.publish(tail_event("t")), 5);
+        // A normal resume (watermark at or below current) re-stamps nothing.
+        log.note_standby_applied(2);
+        assert_eq!(log.current_seq(), 5);
+    }
+
 }

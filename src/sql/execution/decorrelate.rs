@@ -223,7 +223,14 @@ fn try_decorrelate(
     let outer_len = left_schema.columns.len();
     let (is_anti, needs_value_column) = match node.kind {
         CorrelatedKind::Exists { negated } => (negated, false),
-        CorrelatedKind::In { negated } => (negated, true),
+        CorrelatedKind::In { negated: false } => (false, true),
+        // NOT IN is NOT expressible as an anti join: SQL says x NOT IN S is
+        // UNKNOWN (row excluded) when x is NULL or when S contains any NULL,
+        // while an anti join's equality condition merely finds "no match"
+        // for those rows and wrongly outputs them. The per-row subquery
+        // runtime implements the three-valued semantics correctly, so keep
+        // this shape on that path instead of rewriting it.
+        CorrelatedKind::In { negated: true } => return None,
         CorrelatedKind::Scalar => return None,
     };
 

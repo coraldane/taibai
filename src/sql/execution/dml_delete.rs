@@ -266,6 +266,7 @@ pub(crate) fn for_each_visible_memtable(
     engine: &Engine,
     db: &str,
     table: &str,
+    table_schema: &Schema,
     reader_txn_id: u64,
     narrowed_partition: Option<&str>,
     mut consume: impl FnMut(
@@ -299,6 +300,23 @@ pub(crate) fn for_each_visible_memtable(
             &memtable,
             &original,
         )?;
+        // A memtable recovered from a pre-ALTER durable tail keeps its
+        // insert-time layout while the plan speaks catalog positions and
+        // names. Align the view to the catalog before any consumer touches
+        // it — the DELETE planner resolves predicate columns against
+        // table_schema and would otherwise read the wrong physical column
+        // after a DROP COLUMN shifted positions. Alignment is
+        // row-preserving, so `live_positions` and the consumers'
+        // absolute-position lifts stay valid. `original` stays untouched:
+        // the memtable's own batch (and its tail) keep their layout until
+        // an UPDATE swaps in an aligned replacement.
+        let view = if crate::storage::core::memtable::batch_matches_schema(&view, table_schema) {
+            view
+        } else {
+            Arc::new(crate::storage::core::memtable::align_batch_to_schema(
+                &view, table_schema,
+            )?)
+        };
         consume(memtable, original, view, live_positions)?;
     }
     Ok(())
@@ -319,6 +337,7 @@ pub(crate) fn plan_delete_memtable_rows(
         engine,
         db,
         table,
+        table_schema,
         reader_txn_id,
         target_partition_key,
         |memtable, original, view, live_positions| {
@@ -1558,7 +1577,8 @@ pub(crate) fn prune_segments_by_cluster_key(
     let Some(bounds) = cluster_key_bounds(schema, table_meta, predicate) else {
         return Ok(segment_files);
     };
-    let Some((start, end)) = cluster_prune::cluster_segment_range(&segment_files, mgr, &bounds)
+    let Some((start, end)) =
+        cluster_prune::cluster_segment_range(&segment_files, mgr, schema, &bounds)
     else {
         return Ok(segment_files);
     };

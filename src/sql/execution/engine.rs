@@ -259,6 +259,12 @@ fn rebuild_compacted_location_indexes(
 ) {
     let schema = Schema::new(table_meta.columns.clone());
     let memtables = memtable_manager.get_by_table(db, table);
+    // Compaction frees segment path numbers the next writer may reuse; the
+    // (path, column, rows, deleted) sum-cache key cannot tell incarnations
+    // apart, so clear the table's entries up front.
+    crate::sql::execution::scan::aggregate_meta::invalidate_segment_sum_cache_under(
+        &data_dir.join(db).join(table),
+    );
     let result = segment_mgr.with_table_mutation_lock(db, table, || {
         super::dml_insert::rebuild_table_location_indexes_from(
             index_manager,

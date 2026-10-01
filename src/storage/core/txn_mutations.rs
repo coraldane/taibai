@@ -54,6 +54,11 @@ pub struct TableTxnMutations {
     /// Rows this transaction deleted or replaced; the catalog `row_count`
     /// decrement is deferred to COMMIT with this value.
     pub deleted_rows: u64,
+    /// Rows this transaction's INSERT statements already added to the
+    /// catalog `row_count` at statement time; ROLLBACK retracts exactly this
+    /// much (COMMIT does nothing here — the statement-time increment is
+    /// already final).
+    pub inserted_rows: u64,
     /// Change-feed Delete events (pre-delete row images), published at COMMIT.
     pub deferred_delete_batches: Vec<RecordBatch>,
     /// Change-feed Update events (post-update row images), published at COMMIT.
@@ -69,6 +74,7 @@ impl TableTxnMutations {
             segments: Vec::new(),
             memtables: Vec::new(),
             deleted_rows: 0,
+            inserted_rows: 0,
             deferred_delete_batches: Vec::new(),
             deferred_update_batches: Vec::new(),
         }
@@ -291,6 +297,36 @@ impl TxnMutationRegistry {
         let _table = Self::table_entry(&mut inner, txn_id, db, table, None);
         let txn = inner.get_mut(&txn_id).expect("table_entry just ensured it");
         txn.charge_insert(bytes)
+    }
+
+    /// Account one INSERT statement's catalog `row_count` increment so
+    /// ROLLBACK can retract it. The entry already exists: every
+    /// transactional INSERT goes through [`Self::charge_txn_insert_bytes`].
+    pub fn note_inserted_rows(&self, txn_id: u64, db: &str, table: &str, rows: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        let entry = Self::table_entry(&mut inner, txn_id, db, table, None);
+        entry.inserted_rows = entry.inserted_rows.saturating_add(rows);
+    }
+
+    /// Drain the transaction's per-table inserted-row deltas for ROLLBACK
+    /// retraction (zeroes the counters, so a double rollback is a no-op).
+    pub fn take_inserted_rows_by_table(
+        &self,
+        txn_id: u64,
+    ) -> Vec<(String, String, u64)> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(txn) = inner.get_mut(&txn_id) else {
+            return Vec::new();
+        };
+        txn.tables
+            .iter_mut()
+            .filter(|entry| entry.inserted_rows > 0)
+            .map(|entry| {
+                let rows = entry.inserted_rows;
+                entry.inserted_rows = 0;
+                (entry.db.clone(), entry.table.clone(), rows)
+            })
+            .collect()
     }
 
     pub fn add_deleted_rows(&self, txn_id: u64, db: &str, table: &str, count: u64) {

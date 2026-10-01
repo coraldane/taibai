@@ -476,13 +476,25 @@ pub(super) fn decode_unique_index_delta_records(
     let mut delta = UniqueIndexDelta::default();
     let mut cursor = Cursor::new(tail);
     while (cursor.position() as usize) < tail.len() {
-        let len = read_u32(&mut cursor)? as usize;
+        // A crash between an append's write() and its sync_all() can tear
+        // only the FINAL record (batches are framed and fsynced as a unit).
+        // Such entries were never durably published — ignoring the suffix
+        // preserves the last durable state instead of failing every
+        // load_unique_index_state forever, which bricked the table's writes
+        // until the delta file was deleted by hand.
+        let len = match read_u32(&mut cursor) {
+            Ok(len) => len as usize,
+            Err(_) => {
+                tracing::warn!("unique index delta ends in a torn record; ignoring the trailing bytes");
+                break;
+            }
+        };
         let start = cursor.position() as usize;
         let end = start + len;
         if end > tail.len() {
-            return Err(TaibaiError::Storage(
-                "truncated unique index delta record".to_string(),
-            ));
+            tracing::warn!(remaining = tail.len() - start,
+                "unique index delta ends in a torn record; ignoring the trailing bytes");
+            break;
         }
         let record = &tail[start..end];
         let mut record_cursor = Cursor::new(record);

@@ -859,6 +859,7 @@ impl<'a> ScanExecutor<'a> {
             || cluster_prune::cluster_segment_zone_maps_are_monotonic(
                 segments,
                 self.runtime.segment_mgr(),
+                &self.spec.table_schema,
                 col_idx,
             )
     }
@@ -875,8 +876,12 @@ impl<'a> ScanExecutor<'a> {
             return segments;
         };
 
-        let Some((start, end)) =
-            cluster_prune::cluster_segment_range(&segments, self.runtime.segment_mgr(), bounds)
+        let Some((start, end)) = cluster_prune::cluster_segment_range(
+            &segments,
+            self.runtime.segment_mgr(),
+            &self.spec.table_schema,
+            bounds,
+        )
         else {
             return segments;
         };

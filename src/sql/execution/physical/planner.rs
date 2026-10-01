@@ -1936,7 +1936,7 @@ fn ordered_cluster_scan_is_safe(
         for segment in &segments {
             // Same accessor the streaming executor's monotonicity guard
             // uses (cluster_meta_cache-backed).
-            let Some(zm) = mgr.cluster_zone_map_cached(segment, col_idx) else {
+            let Some(zm) = mgr.cluster_zone_map_cached(segment, schema, col_idx) else {
                 return false;
             };
             let compare = crate::storage::index::sort_key::compare_scalars_for_sort;

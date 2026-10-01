@@ -78,11 +78,19 @@ fn extract_zone_maps_recursive(
                 if let LogicalExpr::Column(idx) = **left {
                     if let LogicalExpr::Literal(ref val) = **right {
                         if let Some(col_def) = schema.columns.get(idx) {
-                            filters.push(ZoneMapFilter {
-                                column: col_def.name.clone(),
-                                min_value: val.clone(),
-                                max_value: val.clone(),
-                            });
+                            // Point filters for equality only: ZoneMapFilter
+                            // has no way to express an unbounded side, and
+                            // folding `a > 5` to [5, 5] turns a range into a
+                            // point probe that would falsely exclude rows
+                            // once anything consumes these filters (today it
+                            // merely disqualifies the DISTINCT fast path).
+                            if *op == BinOp::Eq {
+                                filters.push(ZoneMapFilter {
+                                    column: col_def.name.clone(),
+                                    min_value: val.clone(),
+                                    max_value: val.clone(),
+                                });
+                            }
                         }
                     }
                 }
@@ -95,3 +103,4 @@ fn extract_zone_maps_recursive(
         }
     }
 }
+

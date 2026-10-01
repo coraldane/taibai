@@ -673,7 +673,12 @@ fn correlated_in_with_aggregate_decorrelates() {
         "SELECT p.name FROM products p \
          WHERE p.id * 10 NOT IN (SELECT MAX(o.qty) FROM orders o WHERE o.product_id = p.id) \
          ORDER BY p.name",
-        &["s:carrot", "s:date", "s:eggplant"],
+        // date (no orders) is UNKNOWN under standard SQL: MAX over its empty
+        // group is NULL and `x NOT IN (NULL)` is UNKNOWN, so the row is
+        // excluded (MySQL/PostgreSQL agree). The old anti-join rewrite
+        // output it; NOT IN no longer decorrelates precisely because that
+        // rewrite changed NULL semantics.
+        &["s:carrot", "s:eggplant"],
     );
 }
 

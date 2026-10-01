@@ -45,16 +45,32 @@ pub enum ScalarValueHashable {
     Int8(Option<i8>),
     Int16(Option<i16>),
     Int32(Option<i32>),
+    /// Canonical variant for every signed integer width: narrower columns
+    /// widen here (see `from_column`/`from_scalar`), so an INT32 column
+    /// joined against an INT64 column hashes and compares equal — the enum
+    /// derive would otherwise treat `Int32(1)` and `Int64(1)` as different
+    /// keys and silently drop every row of the join.
     Int64(Option<i64>),
     UInt8(Option<u8>),
     UInt16(Option<u16>),
     UInt32(Option<u32>),
+    /// u64 stays its own variant: values above i64::MAX have no lossless
+    /// signed representation, and a signed/unsigned pair that both fit i64
+    /// still meets in Int64 via widening.
     UInt64(Option<u64>),
     FloatToI64(Option<i64>), // Floats hashed via ordered-float, stored as bits
     VarChar(Option<String>),
     Date(Option<i32>),
     Time(Option<i64>),
     Timestamp(Option<i64>),
+    /// Content-hashed binary keys. Mapping these to `Null` (the old
+    /// behavior) collapsed every non-null Blob/Vector row onto one key, so
+    /// UNION/INTERSECT/EXCEPT dedup silently dropped distinct rows and
+    /// blob-column joins matched everything to everything.
+    Blob(Option<Vec<u8>>),
+    /// f32 elements stored as ordered bit patterns (f32 itself is neither
+    /// Eq nor Hash — same trick as FloatToI64).
+    Vector(Option<Vec<i64>>),
     Null,
 }
 
@@ -66,15 +82,17 @@ impl ScalarValueHashable {
             }
             ColumnArray::Dictionary { .. } => Self::from_column(&column.materialize_varchar(), row),
             ColumnArray::Bool { data, .. } => Self::Bool(Some(data[row] != 0)),
-            ColumnArray::Int8 { data, .. } => Self::Int8(Some(data[row])),
-            ColumnArray::Int16 { data, .. } => Self::Int16(Some(data[row])),
-            ColumnArray::Int32 { data, .. } => Self::Int32(Some(data[row])),
+            // Widen every signed width narrower than i64 (and unsigned
+            // widths that fit) into Int64 — see the variant docs.
+            ColumnArray::Int8 { data, .. } => Self::Int64(Some(data[row] as i64)),
+            ColumnArray::Int16 { data, .. } => Self::Int64(Some(data[row] as i64)),
+            ColumnArray::Int32 { data, .. } => Self::Int64(Some(data[row] as i64)),
             ColumnArray::Int64 { data, .. } | ColumnArray::Decimal { data, .. } => {
                 Self::Int64(Some(data[row]))
             }
-            ColumnArray::UInt8 { data, .. } => Self::UInt8(Some(data[row])),
-            ColumnArray::UInt16 { data, .. } => Self::UInt16(Some(data[row])),
-            ColumnArray::UInt32 { data, .. } => Self::UInt32(Some(data[row])),
+            ColumnArray::UInt8 { data, .. } => Self::Int64(Some(data[row] as i64)),
+            ColumnArray::UInt16 { data, .. } => Self::Int64(Some(data[row] as i64)),
+            ColumnArray::UInt32 { data, .. } => Self::Int64(Some(data[row] as i64)),
             ColumnArray::UInt64 { data, .. } => Self::UInt64(Some(data[row])),
             ColumnArray::Float32 { data, .. } => {
                 Self::FloatToI64(Some(crate::types::scalar::float_key_bits(data[row] as f64) as i64))
@@ -87,20 +105,30 @@ impl ScalarValueHashable {
             ColumnArray::Time { data, .. } => Self::Time(Some(data[row])),
             ColumnArray::Timestamp { data, .. } => Self::Timestamp(Some(data[row])),
             ColumnArray::Interval { data, .. } => Self::Int64(Some(data[row])),
-            ColumnArray::Blob { .. } | ColumnArray::Vector { .. } => Self::Null,
+            ColumnArray::Blob { data, .. } => {
+                Self::Blob(Some(data.value(row).to_vec()))
+            }
+            ColumnArray::Vector { data, .. } => Self::Vector(Some(
+                data[row]
+                    .iter()
+                    .map(|v| crate::types::scalar::float_key_bits(*v as f64) as i64)
+                    .collect(),
+            )),
         }
     }
 
     pub fn from_scalar(v: &ScalarValue) -> Self {
         match v {
             ScalarValue::Bool(b) => ScalarValueHashable::Bool(*b),
-            ScalarValue::Int8(i) => ScalarValueHashable::Int8(*i),
-            ScalarValue::Int16(i) => ScalarValueHashable::Int16(*i),
-            ScalarValue::Int32(i) => ScalarValueHashable::Int32(*i),
+            // Same widening as from_column so literal keys (IN lists, join
+            // literals) and column keys land in one canonical variant.
+            ScalarValue::Int8(i) => ScalarValueHashable::Int64(i.map(|v| v as i64)),
+            ScalarValue::Int16(i) => ScalarValueHashable::Int64(i.map(|v| v as i64)),
+            ScalarValue::Int32(i) => ScalarValueHashable::Int64(i.map(|v| v as i64)),
             ScalarValue::Int64(i) => ScalarValueHashable::Int64(*i),
-            ScalarValue::UInt8(i) => ScalarValueHashable::UInt8(*i),
-            ScalarValue::UInt16(i) => ScalarValueHashable::UInt16(*i),
-            ScalarValue::UInt32(i) => ScalarValueHashable::UInt32(*i),
+            ScalarValue::UInt8(i) => ScalarValueHashable::Int64(i.map(|v| v as i64)),
+            ScalarValue::UInt16(i) => ScalarValueHashable::Int64(i.map(|v| v as i64)),
+            ScalarValue::UInt32(i) => ScalarValueHashable::Int64(i.map(|v| v as i64)),
             ScalarValue::UInt64(i) => ScalarValueHashable::UInt64(*i),
             ScalarValue::Float32(f) => {
                 ScalarValueHashable::FloatToI64(f.map(|v| crate::types::scalar::float_key_bits(v as f64) as i64))
@@ -113,6 +141,15 @@ impl ScalarValueHashable {
             ScalarValue::Time(t) => ScalarValueHashable::Time(*t),
             ScalarValue::Timestamp(t) => ScalarValueHashable::Timestamp(*t),
             ScalarValue::Decimal(d) => ScalarValueHashable::Int64(*d),
+            ScalarValue::Blob(b) => ScalarValueHashable::Blob(b.clone()),
+            ScalarValue::Vector(v) => ScalarValueHashable::Vector(v.as_ref().map(
+                |elements| {
+                    elements
+                        .iter()
+                        .map(|v| crate::types::scalar::float_key_bits(*v as f64) as i64)
+                        .collect()
+                },
+            )),
             _ => ScalarValueHashable::Null,
         }
     }
@@ -135,6 +172,15 @@ impl ScalarValueHashable {
             ScalarValueHashable::Date(v) => ScalarValue::Date(*v),
             ScalarValueHashable::Time(v) => ScalarValue::Time(*v),
             ScalarValueHashable::Timestamp(v) => ScalarValue::Timestamp(*v),
+            ScalarValueHashable::Blob(v) => ScalarValue::Blob(v.clone()),
+            ScalarValueHashable::Vector(v) => ScalarValue::Vector(v.as_ref().map(|bits| {
+                // Stored as ordered f64 bits of each f32 element (see
+                // from_column); f64::from_bits().as f32() inverts exactly
+                // for values that originated from f32.
+                bits.iter()
+                    .map(|b| f64::from_bits(*b as u64) as f32)
+                    .collect()
+            })),
             ScalarValueHashable::Null => ScalarValue::Int64(None),
         }
     }

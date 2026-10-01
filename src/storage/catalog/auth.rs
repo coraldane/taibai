@@ -272,9 +272,17 @@ impl AuthStore {
         }
         let data = serde_json::to_string_pretty(self)
             .map_err(|e| TaibaiError::Storage(format!("failed to serialize auth: {}", e)))?;
+        // Single-handle write + fsync before rename — same torn-rename
+        // protection as the catalog (and the read-only-sync Windows trap).
         let tmp_path = path.with_extension("json.tmp");
-        fs::write(&tmp_path, &data)
+        use std::io::Write as _;
+        let mut tmp = fs::File::create(&tmp_path)
+            .map_err(|e| TaibaiError::Storage(format!("failed to create auth.json.tmp: {}", e)))?;
+        tmp.write_all(data.as_bytes())
             .map_err(|e| TaibaiError::Storage(format!("failed to write auth.json.tmp: {}", e)))?;
+        tmp.sync_all()
+            .map_err(|e| TaibaiError::Storage(format!("failed to fsync auth.json.tmp: {}", e)))?;
+        drop(tmp);
         fs::rename(&tmp_path, path)
             .map_err(|e| TaibaiError::Storage(format!("failed to rename auth.json: {}", e)))?;
         Ok(())

@@ -82,19 +82,15 @@ pub fn simplify_expr(expr: LogicalExpr) -> (LogicalExpr, bool) {
                 }
             }
 
-            // Arithmetic simplifications
+            // Arithmetic simplifications. NULL-safety contract: a rewrite is
+            // only valid when the replacement evaluates to the same
+            // three-valued result for NULL inputs. `x * 0 → 0` and
+            // `0 * x → 0` are deliberately absent — SQL `NULL * 0` is NULL,
+            // so folding them to 0 silently changes NULL rows.
             match (&op, &new_left, &new_right) {
-                // x * 0 → 0
-                (BinOp::Mul, _, LogicalExpr::Literal(ScalarValue::Int64(Some(0)))) => {
-                    return (LogicalExpr::Literal(ScalarValue::Int64(Some(0))), true);
-                }
-                // x * 1 → x
+                // x * 1 → x (NULL * 1 = NULL = x, safe)
                 (BinOp::Mul, _, LogicalExpr::Literal(ScalarValue::Int64(Some(1)))) => {
-                    return (new_right, true); // return 1, caller should swap
-                }
-                // 0 * x → 0
-                (BinOp::Mul, LogicalExpr::Literal(ScalarValue::Int64(Some(0))), _) => {
-                    return (LogicalExpr::Literal(ScalarValue::Int64(Some(0))), true);
+                    return (new_left, true);
                 }
                 // x + 0 → x
                 (BinOp::Add, _, LogicalExpr::Literal(ScalarValue::Int64(Some(0)))) => {
@@ -155,13 +151,16 @@ pub fn simplify_expr(expr: LogicalExpr) -> (LogicalExpr, bool) {
 /// Fold a binary operation on two literal values.
 fn fold_binary(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> Option<ScalarValue> {
     match (left, right) {
-        // Int64 arithmetic
+        // Int64 arithmetic. Overflow mirrors the row-level checked semantics
+        // (filter.rs eval_binary_scalar): an overflowing fold yields NULL,
+        // never a wrapped value or a debug panic. checked_rem also covers
+        // i64::MIN % -1, which traps on native `%`.
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => match op {
-            BinOp::Add => Some(ScalarValue::Int64(Some(l + r))),
-            BinOp::Sub => Some(ScalarValue::Int64(Some(l - r))),
-            BinOp::Mul => Some(ScalarValue::Int64(Some(l * r))),
+            BinOp::Add => Some(ScalarValue::Int64(l.checked_add(*r))),
+            BinOp::Sub => Some(ScalarValue::Int64(l.checked_sub(*r))),
+            BinOp::Mul => Some(ScalarValue::Int64(l.checked_mul(*r))),
             BinOp::Div if *r != 0 => Some(ScalarValue::Float64(Some(*l as f64 / *r as f64))),
-            BinOp::Mod if *r != 0 => Some(ScalarValue::Int64(Some(l % r))),
+            BinOp::Mod if *r != 0 => Some(ScalarValue::Int64(l.checked_rem(*r))),
             BinOp::Eq => Some(ScalarValue::Bool(Some(l == r))),
             BinOp::Neq => Some(ScalarValue::Bool(Some(l != r))),
             BinOp::Lt => Some(ScalarValue::Bool(Some(l < r))),

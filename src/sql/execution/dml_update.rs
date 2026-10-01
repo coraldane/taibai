@@ -112,6 +112,7 @@ pub fn exec_update(
             engine,
             db,
             table,
+            &table_schema,
             reader_txn_id,
             narrowed_partition,
             |memtable, _original, batch, _live_positions| {
@@ -176,16 +177,28 @@ pub fn exec_update(
                 continue;
             }
 
-            // Pass A: masks (projected reads only).
-            let mut rg_masks: Vec<Option<Vec<bool>>> = Vec::with_capacity(reader.num_row_groups());
-            let mut any_match = false;
-            for rg_idx in 0..reader.num_row_groups() {
-                if let Some(ref pred) = predicate {
-                    if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
-                        rg_masks.push(None);
-                        continue;
-                    }
+        // Pass A: masks (projected reads only).
+        //
+        // Footer zone maps follow the segment's own column order, so the
+        // catalog-space predicate must be re-anchored per segment before it
+        // may touch them — a positional probe after a DROP COLUMN reads the
+        // wrong column's zone map and silently skips row groups that hold
+        // matching rows. When alignment fails (a predicate column predates
+        // the footer), pruning is disabled for the whole segment: the
+        // default-filled mask read below decides row by row, matching the
+        // DELETE/SELECT/COUNT absent-column semantics.
+        let aligned_predicate = predicate
+            .as_ref()
+            .and_then(|pred| reader.align_row_group_predicate(&table_schema, pred).ok());
+        let mut rg_masks: Vec<Option<Vec<bool>>> = Vec::with_capacity(reader.num_row_groups());
+        let mut any_match = false;
+        for rg_idx in 0..reader.num_row_groups() {
+            if let Some(ref pred) = aligned_predicate {
+                if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
+                    rg_masks.push(None);
+                    continue;
                 }
+            }
                 let mask = build_update_mask(
                     &reader,
                     rg_idx,
@@ -859,8 +872,18 @@ pub(crate) fn build_update_mask(
         // requested columns in request order, so evaluation by catalog
         // position stays correct even when this segment's footer predates a
         // DROP/RENAME COLUMN (positional projection reads silently hit the
-        // wrong physical column after the DDL).
-        let predicate_batch = if predicate_projection.is_empty() {
+        // wrong physical column after the DDL). A footer that predates a
+        // PREDICATE column cannot serve the narrow read at all — degrade to
+        // the full aligned read (missing columns filled with their DEFAULT,
+        // the same absent-column semantics as DELETE/SELECT/COUNT) instead
+        // of failing the statement.
+        let segment_drifts = !predicate_projection.is_empty()
+            && crate::storage::segment::reader::any_column_absent_in_schema(
+                table_schema,
+                reader.schema(),
+                predicate_projection,
+            );
+        let predicate_batch = if predicate_projection.is_empty() || segment_drifts {
             reader.read_row_group_columns_aligned(row_group_idx, table_schema)?
         } else {
             reader.read_row_group_columns(row_group_idx, table_schema, predicate_projection)?

@@ -292,6 +292,26 @@ impl PubSubHub {
             .unwrap_or(false)
     }
 
+    /// Per-table capture gate for the insert path. Legacy (v1) subscribers
+    /// match by topic pattern (`db.table` / `db.*`), but the capture cost is
+    /// paid before patterns are evaluated, so any v1 subscriber keeps the
+    /// gate global (delivery still filters per pattern). The
+    /// reliable-mirror side narrows precisely to THIS table's channel: when
+    /// only mirror channels are active, inserts into unrelated tables skip
+    /// the whole-batch capture clone entirely.
+    pub fn has_table_subscribers(&self, db: &str, table: &str) -> bool {
+        if !self.settings.enabled {
+            return false;
+        }
+        if self.subs.subscriber_count.load(Ordering::Relaxed) > 0 {
+            return true;
+        }
+        self.mirror
+            .get()
+            .map(|m| m.has_active_channel_for(db, table))
+            .unwrap_or(false)
+    }
+
     pub fn subscriber_count(&self) -> u64 {
         self.subs.subscriber_count.load(Ordering::Relaxed)
     }

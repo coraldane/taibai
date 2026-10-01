@@ -57,6 +57,17 @@ pub struct HashJoinExec {
 struct ProbeState {
     right_batches: Vec<RecordBatch>,
     left_batches: Vec<RecordBatch>,
+    /// Unmatched build rows pending emission, materialized into
+    /// `output_buffer` in chunks by `drain_buffer` — boxing millions of
+    /// `(Vec, Vec)` rows up front peaked far beyond the query budget.
+    pending_unmatched: Vec<RowPointer>,
+    /// Which side/shape the pending pointers emit as.
+    pending_unmatched_mode: Option<UnmatchedMode>,
+    /// Bytes accumulated by probe-side materialization paths (fast-path
+    /// right collection, CROSS join right collection). Charged against the
+    /// same query budget as the build side so a probe-heavy join fails with
+    /// a clean budget error instead of an OOM.
+    probe_materialized_bytes: u64,
     right_batch_idx: usize,
     right_row_idx: usize,
     right_collected: bool,
@@ -98,6 +109,16 @@ enum FastJoinPlan {
 
 /// Represents one output row as (left_row_values, right_row_values or None)
 type OutputRow = (Vec<ScalarValue>, Option<Vec<ScalarValue>>);
+
+#[derive(Clone, Copy, PartialEq)]
+enum UnmatchedMode {
+    /// LEFT JOIN: unmatched build-left rows emit with a NULL right side.
+    LeftNullRight,
+    /// RIGHT JOIN: unmatched build-right rows emit with a NULL left side.
+    RightNullLeft,
+    /// Anti join: unmatched build rows emit alone.
+    AntiLeft,
+}
 
 impl HashJoinExec {
     pub fn new(
@@ -676,7 +697,25 @@ impl HashJoinExec {
                 if !self.probe_state.right_collected {
                     while let Some(batch) = self.right.next_batch()? {
                         if batch.num_rows() > 0 {
-                            self.probe_state.right_batches.push(batch);
+                            {
+                                self.probe_state.probe_materialized_bytes = self
+                                    .probe_state
+                                    .probe_materialized_bytes
+                                    .saturating_add(batch.estimated_size_bytes() as u64);
+                                if self.probe_state.probe_materialized_bytes as usize
+                                    > self.memory_limit_bytes
+                                {
+                                    return Err(crate::common::error::TaibaiError::ResourceBusy(
+                                        format!(
+                                            "cross join right side exceeded the query memory \
+                                             budget ({} > {} bytes); raise query_memory_limit_mb",
+                                            self.probe_state.probe_materialized_bytes,
+                                            self.memory_limit_bytes
+                                        ),
+                                    ));
+                                }
+                                self.probe_state.right_batches.push(batch);
+                            }
                         }
                     }
                     self.probe_state.right_collected = true;
@@ -816,10 +855,9 @@ impl HashJoinExec {
                 let ht = self.hash_table.as_ref().unwrap();
                 ht.unmatched_rows()
             };
-            for ptr in &unmatched {
-                let left_row = self.collect_left_row(ptr);
-                self.probe_state.output_buffer.push((left_row, None));
-            }
+            self.probe_state.pending_unmatched = unmatched;
+            self.probe_state.pending_unmatched_mode = Some(UnmatchedMode::AntiLeft);
+            self.materialize_unmatched_chunk();
         }
         self.drain_buffer()
     }
@@ -1072,6 +1110,18 @@ impl HashJoinExec {
         if !self.probe_state.right_collected {
             while let Some(batch) = self.right.next_batch()? {
                 if batch.num_rows() > 0 {
+                    self.probe_state.probe_materialized_bytes = self
+                        .probe_state
+                        .probe_materialized_bytes
+                        .saturating_add(batch.estimated_size_bytes() as u64);
+                    if self.probe_state.probe_materialized_bytes as usize
+                        > self.memory_limit_bytes
+                    {
+                        return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
+                            "join probe side materialization exceeded the query memory budget                              ({} > {} bytes); raise query_memory_limit_mb or reduce the probe side",
+                            self.probe_state.probe_materialized_bytes, self.memory_limit_bytes
+                        )));
+                    }
                     self.probe_state.right_batches.push(batch);
                 }
             }
@@ -1361,8 +1411,13 @@ impl HashJoinExec {
                     if batch.num_rows() == 0 {
                         continue;
                     }
+                    // Single-slot streaming (mirrors next_left_probe_batch):
+                    // rows are consumed strictly in order, so retaining
+                    // predecessor batches materialized the entire left side
+                    // of RIGHT/FULL joins outside the memory budget.
+                    self.probe_state.left_batches.clear();
                     self.probe_state.left_batches.push(batch);
-                    self.probe_state.left_batch_idx = self.probe_state.left_batches.len() - 1;
+                    self.probe_state.left_batch_idx = 0;
                     self.probe_state.left_row_idx = 0;
                 }
                 Ok(None) => return Ok(None),
@@ -1407,13 +1462,9 @@ impl HashJoinExec {
             let ht = self.hash_table.as_ref().unwrap();
             ht.unmatched_rows()
         };
-        let null_right = self.make_null_right_row();
-        for ptr in &unmatched {
-            let left_row = self.collect_left_row(ptr);
-            self.probe_state
-                .output_buffer
-                .push((left_row, Some(null_right.clone())));
-        }
+        self.probe_state.pending_unmatched = unmatched;
+        self.probe_state.pending_unmatched_mode = Some(UnmatchedMode::LeftNullRight);
+        self.materialize_unmatched_chunk();
         Ok(())
     }
 
@@ -1422,17 +1473,56 @@ impl HashJoinExec {
             let ht = self.hash_table.as_ref().unwrap();
             ht.unmatched_rows()
         };
-        let null_left = self.make_null_left_row();
-        for ptr in &unmatched {
-            let right_row = {
-                let ht = self.hash_table.as_ref().unwrap();
-                self.collect_build_row(ht, ptr)
-            };
-            self.probe_state
-                .output_buffer
-                .push((null_left.clone(), Some(right_row)));
-        }
+        self.probe_state.pending_unmatched = unmatched;
+        self.probe_state.pending_unmatched_mode = Some(UnmatchedMode::RightNullLeft);
+        self.materialize_unmatched_chunk();
         Ok(())
+    }
+
+    /// Move one bounded chunk of the pending unmatched pointers into the
+    /// row-boxed output buffer. The pointer stash stays compact (16
+    /// bytes/row); the expensive (Vec, Vec) boxing happens per chunk as
+    /// `drain_buffer` consumes, so peak memory tracks the batch size
+    /// instead of the unmatched-row count.
+    fn materialize_unmatched_chunk(&mut self) {
+        if self.probe_state.pending_unmatched.is_empty() {
+            return;
+        }
+        let take = Self::BATCH_SIZE.min(self.probe_state.pending_unmatched.len());
+        let chunk: Vec<RowPointer> = self.probe_state.pending_unmatched.drain(..take).collect();
+        let mode = self
+            .probe_state
+            .pending_unmatched_mode
+            .expect("pointers stashed without a mode");
+        match mode {
+            UnmatchedMode::LeftNullRight => {
+                let null_right = self.make_null_right_row();
+                for ptr in &chunk {
+                    let left_row = self.collect_left_row(ptr);
+                    self.probe_state
+                        .output_buffer
+                        .push((left_row, Some(null_right.clone())));
+                }
+            }
+            UnmatchedMode::RightNullLeft => {
+                let null_left = self.make_null_left_row();
+                for ptr in &chunk {
+                    let right_row = {
+                        let ht = self.hash_table.as_ref().unwrap();
+                        self.collect_build_row(ht, ptr)
+                    };
+                    self.probe_state
+                        .output_buffer
+                        .push((null_left.clone(), Some(right_row)));
+                }
+            }
+            UnmatchedMode::AntiLeft => {
+                for ptr in &chunk {
+                    let left_row = self.collect_left_row(ptr);
+                    self.probe_state.output_buffer.push((left_row, None));
+                }
+            }
+        }
     }
 
     fn join_rows_match(&self, left_row: &[ScalarValue], right_row: &[ScalarValue]) -> Result<bool> {
@@ -1445,6 +1535,16 @@ impl HashJoinExec {
     }
 
     fn drain_buffer(&mut self) -> Result<Option<RecordBatch>> {
+        // When the boxed buffer is exhausted but unmatched pointers remain
+        // stashed, materialize the next chunk and keep draining — callers
+        // treat a None here as end-of-output.
+        if self.probe_state.buffer_pos >= self.probe_state.output_buffer.len()
+            && !self.probe_state.pending_unmatched.is_empty()
+        {
+            self.probe_state.output_buffer.clear();
+            self.probe_state.buffer_pos = 0;
+            self.materialize_unmatched_chunk();
+        }
         let start = self.probe_state.buffer_pos;
         let end = (start + Self::BATCH_SIZE).min(self.probe_state.output_buffer.len());
         if start >= end {

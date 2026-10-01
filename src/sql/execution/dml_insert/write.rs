@@ -626,7 +626,7 @@ fn exec_materialized_insert_batch(
     // deferred bulk/relaxed writes become visible at flush time. The clone is
     // skipped entirely while no client is subscribed.
     let pubsub_batch = if hot_mirror_eligible(txn_id, bulk_import_mode, relaxed_direct_insert)
-        && engine.pubsub().has_any_subscribers()
+        && engine.pubsub().has_table_subscribers(db, table)
     {
         Some(batch.clone())
     } else {
@@ -702,6 +702,15 @@ fn exec_materialized_insert_batch(
     }
 
     if publish_catalog {
+        // Account BEFORE record_inserted_rows: the catalog row_count
+        // increment happens before its save step, so a save failure must
+        // not strand an unaccounted increment that ROLLBACK would leave
+        // behind (note first, retract even when record errors out).
+        if txn_id > 0 {
+            engine
+                .txn_mutations()
+                .note_inserted_rows(txn_id, db, table, row_count as u64);
+        }
         engine.record_inserted_rows(
             db,
             table,

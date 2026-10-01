@@ -452,6 +452,7 @@ pub(crate) fn exec_update_in_txn(
             engine,
             db,
             table,
+            &table_schema,
             reader_txn_id,
             narrowed_partition,
             |memtable, _original, batch, live_positions| {
@@ -537,18 +538,24 @@ pub(crate) fn exec_update_in_txn(
             let mut newly_deleted: Vec<u64> = Vec::new();
             let mut updated_images: Vec<RecordBatch> = Vec::new();
 
-            for rg_idx in 0..reader.num_row_groups() {
-                if let Some(ref pred) = predicate {
-                    // Footer zone maps follow the segment's own column order;
-                    // re-anchor the catalog-space predicate per segment.
-                    let Ok(aligned) = reader.align_row_group_predicate(&table_schema, pred)
-                    else {
-                        break; // referenced column absent from this segment
-                    };
-                    if !aligned.matches_row_group(reader.zone_maps(rg_idx)) {
-                        continue;
-                    }
+        // Footer zone maps follow the segment's own column order: re-anchor
+        // the catalog-space predicate per segment. When a predicate column
+        // is absent from this footer, alignment fails and row-group pruning
+        // is disabled for the whole segment — the default-filled aligned
+        // read below then decides row by row (the absent-column semantics
+        // DELETE/SELECT/COUNT already use). The old code `break`ed out of
+        // the loop here, silently skipping every remaining row group of the
+        // segment and losing updates.
+        let aligned_predicate = predicate
+            .as_ref()
+            .and_then(|pred| reader.align_row_group_predicate(&table_schema, pred).ok());
+
+        for rg_idx in 0..reader.num_row_groups() {
+            if let Some(ref pred) = aligned_predicate {
+                if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
+                    continue;
                 }
+            }
                 let mask = super::dml_update::build_update_mask(
                     &reader,
                     rg_idx,

@@ -563,16 +563,20 @@ fn peer_end(
 }
 
 /// True for frames equivalent to "unbounded start through the current row"
-/// (the SQL default when no frame clause is given): a running prefix
-/// aggregate per partition answers them exactly.
+/// under RANGE semantics (the SQL default when no frame clause is given): a
+/// running prefix aggregate that flushes at peer boundaries answers them
+/// exactly. An explicit ROWS frame must NOT take this shortcut — ROWS
+/// accumulates row by row, so peer-group flushing would hand every row in a
+/// peer group the group total instead of its running value.
 fn is_running_prefix_frame(plan: &WindowFuncPlan) -> bool {
     match &plan.frame {
         None => true,
         Some(frame) => {
-            matches!(
-                frame.start,
-                crate::sql::parser::ast::FrameBound::UnboundedPreceding
-            ) && matches!(frame.end, crate::sql::parser::ast::FrameBound::CurrentRow)
+            frame.frame_type == crate::sql::parser::ast::FrameType::Range
+                && matches!(
+                    frame.start,
+                    crate::sql::parser::ast::FrameBound::UnboundedPreceding
+                ) && matches!(frame.end, crate::sql::parser::ast::FrameBound::CurrentRow)
         }
     }
 }

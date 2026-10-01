@@ -277,6 +277,17 @@ impl UniqueIndexBase {
                 "corrupt unique index block size".to_string(),
             ));
         }
+        // Each directory entry is at least 4+8+4+8+4 bytes plus a length-
+        // prefixed first key (>= 4 bytes), so a count beyond the footer
+        // region's capacity is corruption — without this bound a flipped
+        // byte pre-allocates billions of entries (and later up to 4GB per
+        // block) before any validation fails.
+        let footer_span = (file_len - 8).saturating_sub(footer_offset);
+        if block_count.saturating_mul(32) > footer_span as usize {
+            return Err(TaibaiError::Storage(
+                "corrupt unique index block count".to_string(),
+            ));
+        }
         let mut blocks = Vec::with_capacity(block_count);
         let mut expected_start = 0usize;
         for _ in 0..block_count {
@@ -291,6 +302,13 @@ impl UniqueIndexBase {
                 ));
             }
             expected_start = start + len;
+            if data_offset >= file_len
+                || data_len as u64 > file_len - data_offset
+            {
+                return Err(TaibaiError::Storage(
+                    "corrupt unique index block data window".to_string(),
+                ));
+            }
             blocks.push(UniqueIndexBlockRef {
                 first_key,
                 start,

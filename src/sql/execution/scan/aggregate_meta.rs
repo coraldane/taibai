@@ -1189,6 +1189,18 @@ impl AggAccum {
 /// Per-segment partial sums for the metadata aggregate fast path. Keyed by
 /// (segment path, column, row count, deleted row count, float?) so appends,
 /// compaction, and deletes naturally invalidate entries. In-process only.
+/// Drop every cached per-segment SUM entry whose segment lives under
+/// `table_dir`. Segment numbering restarts at 1 once a table directory is
+/// recreated (DROP/CREATE same name, TRUNCATE) or compaction frees path
+/// numbers, so a surviving entry can be hit by a NEW segment with the same
+/// (path, column, row_count, deleted) tuple and answer with the previous
+/// incarnation's SUM. Key embeds no table generation, so lifecycle events
+/// must invalidate explicitly.
+pub(crate) fn invalidate_segment_sum_cache_under(table_dir: &Path) {
+    let mut cache = segment_sum_cache().lock().unwrap();
+    cache.retain(|(path, _, _, _, _), _| !Path::new(path).starts_with(table_dir));
+}
+
 fn segment_sum_cache() -> &'static std::sync::Mutex<
     std::collections::HashMap<(String, String, u64, u64, bool), SumCacheValue>,
 > {

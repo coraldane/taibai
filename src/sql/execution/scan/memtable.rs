@@ -29,7 +29,10 @@ pub fn scan_resident_hot_store(
     table_meta: &TableMeta,
     spec: &ScanSpec,
 ) -> Option<RecordBatch> {
-    if spec.reader_txn_id != 0 {
+    // TTL gate mirrors count_resident_hot_store: the hot gather truncates at
+    // the pushed LIMIT before TTL filtering runs, so with expired rows
+    // present it would return fewer live rows than exist.
+    if spec.reader_txn_id != 0 || spec.ttl_active || table_meta.ttl.is_some() {
         return None;
     }
     let store = hot_mgr.get(db, &spec.table_name)?;
@@ -254,6 +257,9 @@ pub fn scan_memtables(
     // to the plain memtable scan so those rows stay visible.
     if has_live_memtable_data
         && spec.reader_txn_id == 0
+        // TTL filtering runs after this gather truncates at the pushed
+        // LIMIT — the shortcut is only safe while no rows can expire.
+        && !spec.ttl_active
         && memtable_mgr.hot_table_fully_mirrored(db, table_name)
     {
         if let Some(store) = hot_mgr.get(db, table_name) {
@@ -288,27 +294,16 @@ pub fn scan_memtables(
                     return None;
                 }
 
-                // Exactly one materialization per path: the txn-filtered
-                // batch is owned when present; the no-predicate path moves it
-                // (or clones the source once). The old code deep-cloned the
-                // source up front and cloned it again below.
-                let txn_filtered = match &txn_positions {
-                    Some(positions) => {
-                        match crate::storage::core::txn_mutations::filter_batch_excluding_positions(
-                            source, positions,
-                        ) {
-                            Ok(filtered) => Some(filtered),
-                            Err(e) => return Some(Err(e)),
-                        }
-                    }
-                    None => None,
-                };
                 // A memtable predating an ALTER keeps its insert-time column
-                // layout while catalog indices move immediately: align to the
-                // catalog before predicate evaluation and projection, so
-                // catalog indices resolve to the right columns and added
-                // columns fill with their DEFAULT (the segment-side aligned
-                // read's semantics).
+                // layout while catalog indices move immediately: align to
+                // the catalog BEFORE any consumer below, so catalog indices
+                // resolve to the right columns and added columns fill with
+                // their DEFAULT (the segment-side aligned read's semantics).
+                // Alignment is row-preserving, so the deferred-DML tombstone
+                // positions — row indices, layout-independent — filter
+                // equivalently against the aligned batch; filtering before
+                // alignment (the old order) evaluated predicates against the
+                // stale layout after a DROP/ADD COLUMN.
                 let aligned;
                 let source: &RecordBatch =
                     if memtable_batch_needs_alignment(source, &spec.table_schema) {
@@ -320,6 +315,20 @@ pub fn scan_memtables(
                     } else {
                         source
                     };
+                // Exactly one materialization per path: the txn-filtered
+                // batch is owned when present; the no-predicate path moves it
+                // (or clones the source once).
+                let txn_filtered = match &txn_positions {
+                    Some(positions) => {
+                        match crate::storage::core::txn_mutations::filter_batch_excluding_positions(
+                            source, positions,
+                        ) {
+                            Ok(filtered) => Some(filtered),
+                            Err(e) => return Some(Err(e)),
+                        }
+                    }
+                    None => None,
+                };
                 let filtered = if let Some(txn_filtered) = txn_filtered {
                     if spec.has_predicates() {
                         match super::row_filter::apply_predicates(
@@ -735,4 +744,152 @@ fn reverse_batch(batch: &RecordBatch) -> Option<RecordBatch> {
         .map(|column| column.take(&rows))
         .collect();
     RecordBatch::try_new(batch.schema.clone(), columns).ok()
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use std::sync::Arc;
+    use crate::protocol::types::DataType;
+    use crate::storage::catalog::schema::TtlInfo;
+    use crate::types::batch::{ColumnDef, Schema};
+
+    fn col(name: &str) -> ColumnDef {
+        ColumnDef::new(name, DataType::Int64)
+    }
+
+    /// P0: a transactional reader's tombstone filter used to run BEFORE the
+    /// catalog alignment, so predicates evaluated against the memtable's
+    /// insert-time layout while using catalog-space column indices. Layout:
+    /// memtable keeps (a, id, v); the catalog dropped `a` and is (id, v).
+    /// The `id >= 2` clause (catalog index 0) used to hit the `a` column
+    /// and matched nothing.
+    #[test]
+    fn txn_memtable_scan_aligns_before_tombstone_predicate_eval() {
+        let old_schema = Schema::new(vec![col("a"), col("id"), col("v")]);
+        let catalog_schema = Schema::new(vec![col("id"), col("v")]);
+
+        let manager = MemTableManager::new(10_000, 60, 2, 3600);
+        let registry = Arc::new(
+            crate::storage::core::txn_mutations::TxnMutationRegistry::new(),
+        );
+        manager.set_txn_mutations(Arc::clone(&registry));
+
+        let memtable = manager.get_or_create("main", "t", "", &old_schema);
+        let mut batch = RecordBatch::new(old_schema.clone());
+        for (a, id, v) in [(0, 1, 10), (0, 2, 20), (0, 3, 30)] {
+            batch.column_mut(0).unwrap().push(&ScalarValue::Int64(Some(a))).unwrap();
+            batch.column_mut(1).unwrap().push(&ScalarValue::Int64(Some(id))).unwrap();
+            batch.column_mut(2).unwrap().push(&ScalarValue::Int64(Some(v))).unwrap();
+        }
+        memtable.append(&batch).unwrap();
+        // Deferred delete inside txn 9 (position 0 = the id = 1 row): forces
+        // the tombstone-filtered branch under test.
+        registry
+            .register_memtable_tombstones(9, "main", "t", None, Arc::clone(&memtable), [0u32])
+            .unwrap();
+
+        let mut spec = ScanSpec::new("t");
+        spec.table_schema = catalog_schema.clone();
+        spec.reader_txn_id = 9;
+        spec.range_predicates.push(crate::storage::partition::pruning::RangeClause {
+            column_index: 0, // catalog `id`
+            op: crate::storage::partition::pruning::RangeOp::Ge,
+            value: ScalarValue::Int64(Some(2)),
+        });
+
+        let hot_mgr = crate::storage::core::hot_store::HotStoreManager::new();
+        let batches = scan_memtables(&manager, &hot_mgr, "main", "t", &spec).unwrap();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2, "ids 2 and 3 match id >= 2");
+        assert_eq!(batch.schema.columns.len(), 2);
+        assert_eq!(batch.schema.columns[0].name, "id");
+        match batch.column(0).unwrap() {
+            crate::types::array::ColumnArray::Int64 { data, .. } => {
+                assert_eq!(data, &vec![2i64, 3]);
+            }
+            other => panic!("expected int64 id column, got {other:?}"),
+        }
+    }
+
+    /// P0: the resident hot-store shortcut truncated its gather at the
+    /// pushed LIMIT before TTL filtering runs. With expired rows present the
+    /// query returned fewer live rows than exist, so the shortcut must be
+    /// disabled for TTL tables — the same gate count_resident_hot_store has
+    /// always had.
+    #[test]
+    fn resident_hot_scan_declines_ttl_tables() {
+        use crate::storage::catalog::schema::TableMeta;
+
+        let schema = Schema::new(vec![
+            ColumnDef::new("category", DataType::VarChar),
+            ColumnDef::new("ts", DataType::Timestamp),
+            ColumnDef::new("price", DataType::Float64),
+            ColumnDef::new("volume", DataType::Int64),
+        ]);
+        let mut meta = TableMeta::new("main", "events", schema.columns.clone());
+        meta.cluster_key = vec!["category".to_string(), "ts".to_string()];
+        meta.hot_time_column = Some("ts".to_string());
+
+        let hot_mgr = crate::storage::core::hot_store::HotStoreManager::new();
+        let memtable_mgr = MemTableManager::new(10_000, 60, 2, 3600);
+        let mut batch = RecordBatch::new(schema.clone());
+        for i in 0..3i64 {
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::VarChar(Some("alpha".into())))
+                .unwrap();
+            batch
+                .column_mut(1)
+                .unwrap()
+                .push(&ScalarValue::Timestamp(Some(1_000 + i)))
+                .unwrap();
+            batch
+                .column_mut(2)
+                .unwrap()
+                .push(&ScalarValue::Float64(Some(10.0)))
+                .unwrap();
+            batch
+                .column_mut(3)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(i)))
+                .unwrap();
+        }
+        hot_mgr.try_append("main", "events", &meta, &batch).unwrap();
+        // The resident shortcut only answers while the store claims full
+        // residency (close-of-day / restart warmup marks this in production).
+        hot_mgr
+            .get("main", "events")
+            .unwrap()
+            .mark_full_resident();
+
+        let mut spec = ScanSpec::new("events");
+        spec.table_schema = schema.clone();
+        spec.eq_predicates.push((
+            0,
+            ScalarValue::VarChar(Some("alpha".into())),
+        ));
+        spec.limit = Some(2);
+
+        // Control: without a TTL the shortcut serves the lookup.
+        assert!(
+            scan_resident_hot_store(&hot_mgr, &memtable_mgr, "main", &meta, &spec).is_some(),
+            "control: no TTL, resident shortcut must serve the lookup"
+        );
+
+        // With a TTL the shortcut must decline regardless of the spec flag.
+        meta.ttl = Some(TtlInfo {
+            column: "ts".to_string(),
+            duration_secs: 60,
+            column_idx: 1,
+        });
+        spec.ttl_active = true;
+        assert!(scan_resident_hot_store(&hot_mgr, &memtable_mgr, "main", &meta, &spec).is_none());
+        // Hand-built specs that forgot to raise the flag are still stopped
+        // by the authoritative table-meta check.
+        spec.ttl_active = false;
+        assert!(scan_resident_hot_store(&hot_mgr, &memtable_mgr, "main", &meta, &spec).is_none());
+    }
 }

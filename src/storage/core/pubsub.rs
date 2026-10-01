@@ -189,21 +189,43 @@ impl SubscriptionHandle {
         let mut seq_start = 0;
         let mut seq_end = 0;
         let mut batches = Vec::new();
+        let mut lost_prefix = false;
         {
             let log = self.channel.log.lock().unwrap();
-            for entry in log.entries.iter() {
-                if entry.seq < next {
-                    continue;
+            // Re-check under the log lock: an append-side eviction between
+            // the unlocked needs_resync check above and this lock could have
+            // evicted [next, E] and flagged resync — collecting from E+1
+            // would silently skip those frames with no way to detect the
+            // hole afterwards.
+            if self.sub.needs_resync.load(Ordering::SeqCst) {
+                lost_prefix = true;
+            } else {
+                for entry in log.entries.iter() {
+                    if entry.seq < next {
+                        continue;
+                    }
+                    if !batches.is_empty() && batches.len() >= max_entries {
+                        break;
+                    }
+                    if batches.is_empty() {
+                        if entry.seq != next {
+                            // The frame at `next` is gone but later frames
+                            // survive: the prefix was evicted mid-drain.
+                            lost_prefix = true;
+                            break;
+                        }
+                        seq_start = entry.seq;
+                    }
+                    seq_end = entry.seq;
+                    batches.push(Arc::clone(&entry.batch));
                 }
-                if !batches.is_empty() && batches.len() >= max_entries {
-                    break;
-                }
-                if batches.is_empty() {
-                    seq_start = entry.seq;
-                }
-                seq_end = entry.seq;
-                batches.push(Arc::clone(&entry.batch));
             }
+        }
+        if lost_prefix {
+            self.sub.closed.store(true, Ordering::SeqCst);
+            let floor = self.channel.floor();
+            self.channel.remove_sub(self.sub.id);
+            return DrainResult::Resync { floor };
         }
         if batches.is_empty() {
             return DrainResult::Empty;
@@ -556,6 +578,17 @@ impl PubSubManager {
             .unwrap()
             .values()
             .any(|channel| !channel.is_retired())
+    }
+
+    /// Per-table form of [`Self::has_active_channels`] for the insert
+    /// capture gate: true when this specific table still has a live (not
+    /// retired) reliable-subscription channel.
+    pub fn has_active_channel_for(&self, db: &str, table: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        self.existing_channel(db, table)
+            .is_some_and(|channel| !channel.is_retired())
     }
 
     pub fn epoch(&self) -> u64 {

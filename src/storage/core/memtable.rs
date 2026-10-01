@@ -1250,13 +1250,52 @@ impl MemTableManager {
 
     pub fn get_all_pending(&self) -> Vec<Arc<MemTable>> {
         let memtables = self.memtables.read().unwrap();
+        let pinned = self.txn_mutations.read().unwrap();
         memtables
             .iter()
             .filter(|mt| {
                 // FLUSH ALL (and shutdown) must never materialize another
-                // session's uncommitted rows into segments: transactional
-                // memtables only reach segments through COMMIT.
-                mt.state() == MemTableState::Pending && !mt.is_transactional()
+                // session's uncommitted rows into segments, nor flush a
+                // memtable a live deferred-DML transaction still pins:
+                // transactional memtables only reach segments through COMMIT,
+                // and pinned ones must keep their batch positions stable.
+                mt.state() == MemTableState::Pending
+                    && !mt.is_transactional()
+                    && !pinned
+                        .as_ref()
+                        .is_some_and(|registry| registry.is_memtable_pinned(mt.id()))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The single choke point every flush entry point (background flusher,
+    /// FLUSH TABLE, pressure passes, full-memtable checkpoints, DDL
+    /// convergence) must collect through. Centralizes the two exclusions
+    /// that keep flushes from breaking other sessions:
+    ///
+    /// * transactional memtables reach segments only at COMMIT — flushing
+    ///   one publishes another session's uncommitted rows as plain segment
+    ///   rows that a later ROLLBACK cannot retract;
+    /// * a deferred-DML pin means a live transaction still needs this
+    ///   memtable's batch positions stable until COMMIT — flushing it makes
+    ///   that transaction's COMMIT unrecoverably fail.
+    ///
+    /// Callers that need further narrowing (partition key, row-count
+    /// thresholds) filter on top of this snapshot; they must not widen it.
+    pub fn get_flushable_by_table(&self, db: &str, table: &str) -> Vec<Arc<MemTable>> {
+        let memtables = self.memtables.read().unwrap();
+        let pinned = self.txn_mutations.read().unwrap();
+        memtables
+            .iter()
+            .filter(|mt| {
+                mt.db() == db
+                    && mt.table() == table
+                    && mt.state() == MemTableState::Pending
+                    && !mt.is_transactional()
+                    && !pinned
+                        .as_ref()
+                        .is_some_and(|registry| registry.is_memtable_pinned(mt.id()))
             })
             .cloned()
             .collect()

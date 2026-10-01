@@ -569,9 +569,21 @@ impl DatabaseCatalog {
         }
         let data = serde_json::to_string_pretty(self)
             .map_err(|e| TaibaiError::Storage(format!("failed to serialize catalog: {}", e)))?;
+        // Write + fsync on one handle: the fsync must happen before the
+        // rename or a power loss can persist the rename ahead of the data
+        // blocks, leaving a torn/empty catalog that fails to deserialize at
+        // startup — every table definition in the database becomes
+        // unloadable. (Reopening the file read-only for sync_all fails on
+        // Windows: FlushFileBuffers needs a write handle.)
         let tmp_path = schema_path.with_extension("json.tmp");
-        fs::write(&tmp_path, &data)
+        use std::io::Write as _;
+        let mut tmp = fs::File::create(&tmp_path)
+            .map_err(|e| TaibaiError::Storage(format!("failed to create catalog tmp: {}", e)))?;
+        tmp.write_all(data.as_bytes())
             .map_err(|e| TaibaiError::Storage(format!("failed to write catalog tmp: {}", e)))?;
+        tmp.sync_all()
+            .map_err(|e| TaibaiError::Storage(format!("failed to fsync catalog tmp: {}", e)))?;
+        drop(tmp);
         fs::rename(&tmp_path, &schema_path)
             .map_err(|e| TaibaiError::Storage(format!("failed to rename catalog: {}", e)))?;
         Ok(())

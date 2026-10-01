@@ -313,9 +313,13 @@ pub fn eval_filter_with(
             }
         },
         LogicalExpr::Not(inner) => {
-            let inner_mask = eval_filter_with(inner, batch, subqueries)?;
+            // Three-valued NOT: a row survives only when the inner predicate
+            // is definitely FALSE. The old `!mask[i]` bit-flip turned UNKNOWN
+            // rows (inner mask false) into survivors, so `WHERE NOT (a = 5)`
+            // wrongly included rows with a NULL.
+            let vals = eval_expr_column_with(inner, batch, subqueries)?;
             for i in 0..num_rows {
-                mask[i] = !inner_mask[i];
+                mask[i] = matches!(vals[i], ScalarValue::Bool(Some(false)));
             }
         }
         LogicalExpr::IsNull(inner) => {

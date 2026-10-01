@@ -606,6 +606,12 @@ pub fn exec_drop_table(
     engine
         .index_manager()
         .remove_table_unique_index_snapshots(db, name, &unique_index_names);
+    // A same-name CREATE TABLE restarts segment numbering at 1: without this
+    // the sum cache would answer a fresh segment_000001 with the dropped
+    // table's SUM whenever (column, row_count, deleted) collide.
+    crate::sql::execution::scan::aggregate_meta::invalidate_segment_sum_cache_under(
+        &engine.segment_mgr().table_dir(db, name),
+    );
 
     let mut cleanup_error = None;
     if let Some(tombstone) = tombstone {
@@ -706,6 +712,12 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
             engine
                 .segment_mgr()
                 .invalidate_readers_under(&old_table_dir);
+            // Sum-cache entries keyed under the old path survive the rename;
+            // a future CREATE TABLE reusing this name restarts segment
+            // numbering at 1 and could hit them (see drop table).
+            crate::sql::execution::scan::aggregate_meta::invalidate_segment_sum_cache_under(
+                &old_table_dir,
+            );
 
             std::fs::create_dir_all(&operation_dir)?;
             std::fs::write(operation_dir.join(RENAME_TARGET_FILE), new_name.as_bytes())?;
@@ -1634,6 +1646,11 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
             engine.batch_writer().clear_memtables(db, table);
             engine.segment_mgr().remove_table_state(db, table);
             engine.hot_store_manager().remove(db, table);
+            // Reloaded data reuses segment paths from position 1; drop the
+            // previous incarnation's cached SUMs (see drop table).
+            crate::sql::execution::scan::aggregate_meta::invalidate_segment_sum_cache_under(
+                &table_dir,
+            );
             let unique_index_names = before_meta
                 .unique_indexes
                 .iter()

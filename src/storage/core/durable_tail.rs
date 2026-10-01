@@ -403,18 +403,33 @@ impl TailCommitter {
                 "durable tail committer backlog is large; fsync throughput cannot keep up with writes"
             );
         }
-        if self
-            .sender
-            .send(CommitCommand::Barrier {
+        // Bounded send, matching submit(): callers of barrier (DDL, DELETE
+        // conflict resolution, UPDATE sidecar) may hold the table mutation
+        // lock, and an unbounded blocking send on a full queue would stall
+        // the whole table while the commit thread grinds through a slow
+        // device. Failing the barrier is always safe — the caller either
+        // retries or falls back to the segment flush protocol.
+        let send_deadline = std::time::Duration::from_secs(30);
+        match self.sender.send_timeout(
+            CommitCommand::Barrier {
                 table_dir: table_dir.to_path_buf(),
                 completion: Arc::clone(&completion),
-            })
-            .is_err()
-        {
-            self.queued.fetch_sub(1, Ordering::Relaxed);
-            return Err(TaibaiError::Storage(
-                "durable tail commit thread stopped".into(),
-            ));
+            },
+            send_deadline,
+        ) {
+            Ok(()) => {}
+            Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+                return Err(TaibaiError::Storage(format!(
+                    "durable tail commit queue stalled for {send_deadline:?}; barrier abandoned"
+                )));
+            }
+            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+                return Err(TaibaiError::Storage(
+                    "durable tail commit thread stopped".into(),
+                ));
+            }
         }
         let (timeout, warn_after) = tail_commit_timeouts();
         completion.wait_bounded(timeout, warn_after)

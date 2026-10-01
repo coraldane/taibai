@@ -916,46 +916,87 @@ impl SegmentManager {
 
     /// Read-side metadata cache for a sealed segment's cluster-key column zone map.
     ///
-    /// Returns the cached zone map for `col_idx` in `path`, deriving and caching it
-    /// on first access. Returns `None` when the segment has no usable bounds for the
-    /// column (empty/null). Mutable (unsealed) segments are never cached because their
-    /// footer can still change. The cache shares the reader-cache invalidation
-    /// lifecycle, so compaction/seal/delete automatically clears stale entries.
+    /// Returns the cached zone map for the catalog column `col_idx` (resolved
+    /// against `table_schema`) in `path`, deriving and caching it on first
+    /// access. Returns `None` when the segment has no usable bounds for the
+    /// column (empty/null) or the footer predates the column. Mutable
+    /// (unsealed) segments are never cached because their footer can still
+    /// change. The cache shares the reader-cache invalidation lifecycle, so
+    /// compaction/seal/delete automatically clears stale entries.
     pub fn cluster_zone_map_cached(
         &self,
         path: &Path,
+        table_schema: &crate::types::batch::Schema,
         col_idx: usize,
     ) -> Option<crate::storage::partition::pruning::ZoneMap> {
+        // Resolve the catalog column to the footer index BY NAME. Positional
+        // use of the catalog index reads the wrong physical column once a
+        // DROP/RENAME COLUMN shifts catalog indices while sealed footers
+        // keep their layout — pruning then skips segments that hold matching
+        // rows. The footer index also keys the cache: for a fixed segment
+        // file it identifies the physical column, so post-DDL lookups land
+        // on a fresh key instead of a stale entry.
+        let footer_idx = self.resolve_footer_column_index(path, table_schema, col_idx)?;
         if self.is_mutable_segment_path(path) {
-            return self.derive_cluster_zone_map(path, col_idx);
+            return self.derive_cluster_zone_map(path, footer_idx);
         }
 
-        if let Some(cached) = self.cluster_meta_cache.lock().unwrap().get(path, col_idx) {
+        if let Some(cached) = self.cluster_meta_cache.lock().unwrap().get(path, footer_idx) {
             return cached;
         }
 
-        let derived = self.derive_cluster_zone_map(path, col_idx);
+        let derived = self.derive_cluster_zone_map(path, footer_idx);
         self.cluster_meta_cache
             .lock()
             .unwrap()
-            .put(path.to_path_buf(), col_idx, derived.clone());
+            .put(path.to_path_buf(), footer_idx, derived.clone());
         derived
     }
 
+    /// Translate a catalog column index into the segment's footer index by
+    /// name (current name first, then the column's historical names), so
+    /// positional metadata access below lands on the right physical column.
+    fn resolve_footer_column_index(
+        &self,
+        path: &Path,
+        table_schema: &crate::types::batch::Schema,
+        catalog_idx: usize,
+    ) -> Option<usize> {
+        let column = table_schema.columns.get(catalog_idx)?;
+        if let Some(meta) = self.segment_meta(path).ok().flatten() {
+            let mut names = Vec::with_capacity(column.previous_names.len() + 1);
+            names.push(column.name.as_str());
+            names.extend(column.previous_names.iter().map(String::as_str));
+            return names
+                .iter()
+                .find_map(|name| meta.schema.index_of(name));
+        }
+        let reader = self.open_reader_cached(path).ok()?;
+        let mut names = Vec::with_capacity(column.previous_names.len() + 1);
+        names.push(column.name.as_str());
+        names.extend(column.previous_names.iter().map(String::as_str));
+        names
+            .iter()
+            .find_map(|name| reader.schema().index_of(name))
+    }
+
+    /// Positional zone-map access in FOOTER space: `footer_idx` must already
+    /// have been translated from the catalog index by name (see
+    /// [`Self::resolve_footer_column_index`]).
     fn derive_cluster_zone_map(
         &self,
         path: &Path,
-        col_idx: usize,
+        footer_idx: usize,
     ) -> Option<crate::storage::partition::pruning::ZoneMap> {
         if let Some(meta) = self.segment_meta(path).ok().flatten() {
-            let zm = meta.segment_zone_maps.get(col_idx)?;
+            let zm = meta.segment_zone_maps.get(footer_idx)?;
             if zm.row_count == 0 || zm.min_value.is_null() || zm.max_value.is_null() {
                 return None;
             }
             return Some(zm.clone());
         }
         let reader = self.open_reader_cached(path).ok()?;
-        let zm = reader.segment_zone_maps().get(col_idx)?;
+        let zm = reader.segment_zone_maps().get(footer_idx)?;
         if zm.row_count == 0 || zm.min_value.is_null() || zm.max_value.is_null() {
             return None;
         }

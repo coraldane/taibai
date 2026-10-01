@@ -684,6 +684,12 @@ pub fn exec_optimize_table(
         compactor.optimize_table(db, table, &table_meta)?
     };
 
+    // Compaction frees segment path numbers the next writer may reuse; the
+    // sum-cache key cannot tell incarnations apart (see drop table).
+    crate::sql::execution::scan::aggregate_meta::invalidate_segment_sum_cache_under(
+        &engine.data_dir().join(db).join(table),
+    );
+
     // TTL-expired rows physically removed by the rewrite were never
     // subtracted from the catalog by a DELETE; correct row_count first.
     if stats.rows_dropped_ttl > 0 {

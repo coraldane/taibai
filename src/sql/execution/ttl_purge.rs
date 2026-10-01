@@ -246,6 +246,8 @@ fn remove_partition_files(
             continue;
         }
         mgr.invalidate_readers_under(&path);
+        // Purged segment paths are recyclable; drop their cached SUMs.
+        crate::sql::execution::scan::aggregate_meta::invalidate_segment_sum_cache_under(&path);
         // Count live rows from the segment itself: the catalog's partition
         // list is not always maintained by the write path, so the file is
         // the source of truth here.

@@ -764,15 +764,11 @@ impl BatchWriter {
 
     pub fn flush_table(&self, db: &str, table: &str) -> Result<()> {
         self.wait_out_table_flush_io(db, table);
-        // Transactional memtables reach segments only through COMMIT
-        // (see get_all_pending); flushing them here would publish
-        // another session's uncommitted rows.
-        let mts = self
-            .memtable_mgr
-            .get_by_table(db, table)
-            .into_iter()
-            .filter(|mt| !mt.is_transactional())
-            .collect::<Vec<_>>();
+        // Transactional memtables reach segments only through COMMIT and
+        // deferred-DML pins must keep their positions stable (see
+        // get_flushable_by_table); flushing either would break another
+        // session's transaction.
+        let mts = self.memtable_mgr.get_flushable_by_table(db, table);
         for group in Self::group_memtables_for_flush(mts) {
             Self::flush_memtable_group(
                 &self.segment_mgr,
@@ -789,10 +785,9 @@ impl BatchWriter {
         self.wait_out_table_flush_io(db, table);
         let mts = self
             .memtable_mgr
-            .get_by_table(db, table)
+            .get_flushable_by_table(db, table)
             .into_iter()
             .filter(|memtable| memtable.partition_key() == partition_key)
-            .filter(|memtable| !memtable.is_transactional())
             .collect::<Vec<_>>();
         for group in Self::group_memtables_for_flush(mts) {
             Self::flush_memtable_group(
@@ -822,14 +817,12 @@ impl BatchWriter {
         partition_key: &str,
     ) -> Result<()> {
         self.wait_out_table_flush_io(db, table);
-        let mts = Self::flushable_under_lock(
-            &self.memtable_mgr,
-            self.memtable_mgr
-                .get_by_table(db, table)
-                .into_iter()
-                .filter(|memtable| memtable.partition_key() == partition_key)
-                .collect::<Vec<_>>(),
-        );
+        let mts = self
+            .memtable_mgr
+            .get_flushable_by_table(db, table)
+            .into_iter()
+            .filter(|memtable| memtable.partition_key() == partition_key)
+            .collect::<Vec<_>>();
         for group in Self::group_memtables_for_flush(mts) {
             Self::flush_memtable_group(
                 &self.segment_mgr,
@@ -843,35 +836,9 @@ impl BatchWriter {
         Ok(())
     }
 
-    /// Memtables eligible for a caller-lock-held flush: the same exclusions
-    /// as the background selection (`flush_table`/`get_all_pending`). A
-    /// transaction's memtable reaches segments only at COMMIT — flushing it
-    /// here would publish another session's uncommitted rows, which a
-    /// subsequent ROLLBACK cannot retract. A deferred-DML pin means a live
-    /// transaction still needs the batch positions stable for its deferred
-    /// removal (the registry documents that flush must skip pinned
-    /// memtables).
-    fn flushable_under_lock(
-        memtable_mgr: &MemTableManager,
-        mts: Vec<Arc<crate::storage::core::memtable::MemTable>>,
-    ) -> Vec<Arc<crate::storage::core::memtable::MemTable>> {
-        let txn_mutations = memtable_mgr.txn_mutations();
-        mts.into_iter()
-            .filter(|mt| {
-                !mt.is_transactional()
-                    && !txn_mutations
-                        .as_ref()
-                        .is_some_and(|registry| registry.is_memtable_pinned(mt.id()))
-            })
-            .collect()
-    }
-
     pub(crate) fn flush_table_under_table_lock(&self, db: &str, table: &str) -> Result<()> {
         self.wait_out_table_flush_io(db, table);
-        let mts = Self::flushable_under_lock(
-            &self.memtable_mgr,
-            self.memtable_mgr.get_by_table(db, table),
-        );
+        let mts = self.memtable_mgr.get_flushable_by_table(db, table);
         for group in Self::group_memtables_for_flush(mts) {
             Self::flush_memtable_group(
                 &self.segment_mgr,
@@ -1093,6 +1060,28 @@ impl BatchWriter {
             return Ok(());
         }
         let table_dir = self.segment_mgr.table_dir(memtable.db(), memtable.table());
+        // A memtable recovered from a pre-ALTER tail keeps its insert-time
+        // layout; the UPDATE plan produced a CATALOG-aligned replacement.
+        // The `.upd` sidecar's `assigned` column indices are catalog-space,
+        // but recovery replays them against the OLD-layout tail file — a
+        // positional mismatch that would corrupt a neighboring column. Skip
+        // the incremental sidecar for drifted layouts and persist the full
+        // aligned batch as a fresh tail generation instead (positions are
+        // row indices and stay valid either way).
+        let layouts_match = memtable
+            .read_snapshot_arc()
+            .is_some_and(|current| current.schema == updated_batch.schema);
+        if !layouts_match {
+            return self.persist_memtable_tail_batch(memtable, updated_batch);
+        }
+        // Drain the commit thread first: the sidecar's positions may cover
+        // rows whose INSERT frames are still queued for fsync. Persisting
+        // the sidecar before those frames, then crashing in the window,
+        // leaves recovery with a tail shorter than the sidecar references —
+        // a hard "row outside the tail" error that aborts engine startup.
+        // The barrier acquires no table lock (see persist_memtable_tail_batch),
+        // so holding the caller's mutation lock here cannot deadlock.
+        self.tail_committer.barrier(&table_dir)?;
         match crate::storage::core::durable_tail::update_rows(
             &table_dir,
             memtable.id(),
@@ -1212,8 +1201,13 @@ impl BatchWriter {
         db: &str,
         table: &str,
     ) -> bool {
+        // Collect through the shared flush choke point: a transactional
+        // memtable here would publish uncommitted rows as plain segment rows
+        // (ROLLBACK cannot retract them), and a deferred-DML pin must keep
+        // its positions stable until that transaction COMMITs. A full
+        // transactional memtable simply stays Pending until its COMMIT.
         let full = memtable_mgr
-            .get_by_table(db, table)
+            .get_flushable_by_table(db, table)
             .into_iter()
             .filter(|mt| mt.row_count() >= max_rows_per_memtable)
             .collect::<Vec<_>>();
@@ -1256,11 +1250,11 @@ impl BatchWriter {
         flush_gate: &PartitionFlushGate,
         max_files_per_table: usize,
     ) -> Result<usize> {
+        // get_all_pending already applies the shared flush eligibility
+        // contract (non-transactional, unpinned).
         let mut tables = std::collections::HashSet::new();
         for memtable in memtable_mgr.get_all_pending() {
-            if !memtable.is_transactional() {
-                tables.insert((memtable.db().to_string(), memtable.table().to_string()));
-            }
+            tables.insert((memtable.db().to_string(), memtable.table().to_string()));
         }
         let mut flushed_tables = 0usize;
         for (db, table) in tables {
@@ -1269,11 +1263,7 @@ impl BatchWriter {
             if file_count < max_files_per_table {
                 continue;
             }
-            let memtables = memtable_mgr
-                .get_by_table(&db, &table)
-                .into_iter()
-                .filter(|memtable| !memtable.is_transactional())
-                .collect::<Vec<_>>();
+            let memtables = memtable_mgr.get_flushable_by_table(&db, &table);
             if memtables.is_empty() {
                 continue;
             }
@@ -1421,11 +1411,9 @@ impl BatchWriter {
         tail_committer: &Arc<TailCommitter>,
         flush_gate: &PartitionFlushGate,
     ) -> Result<()> {
-        let mts = memtable_mgr
-            .get_all_pending()
-            .into_iter()
-            .filter(|mt| !mt.is_transactional())
-            .collect();
+        // get_all_pending already excludes transactional and pinned
+        // memtables — the shared flush eligibility contract.
+        let mts = memtable_mgr.get_all_pending();
         for group in Self::group_memtables_for_flush(mts) {
             Self::flush_memtable_group(segment_mgr, &group, false, tail_committer, flush_gate)?;
         }
@@ -1569,6 +1557,14 @@ impl BatchWriter {
             Arc<RecordBatch>,
         )>,
     > {
+        // Pin re-check INSIDE the partition lock: the caller's eligibility
+        // snapshot (get_flushable_by_table / get_all_pending) races a
+        // concurrent deferred-DML statement registering its pin under the
+        // same partition (or table) mutation lock, so the lock is the
+        // mutual-exclusion point. A memtable pinned between snapshot and
+        // freeze must stay Pending — flushing it would make that
+        // transaction's COMMIT unrecoverably fail.
+        let txn_mutations = segment_mgr.txn_mutations();
         segment_mgr.with_partition_mutation_lock(
             group[0].db(),
             group[0].table(),
@@ -1576,6 +1572,9 @@ impl BatchWriter {
             || {
                 Ok(group
                     .iter()
+                    .filter(|mt| {
+                        !txn_mutations.is_some_and(|registry| registry.is_memtable_pinned(mt.id()))
+                    })
                     .filter_map(|mt| Self::freeze_memtable_locked(mt).map(|b| (mt.clone(), b)))
                     .collect::<Vec<_>>())
             },

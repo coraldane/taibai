@@ -1048,6 +1048,13 @@ impl SealedSummary {
                 }
             }
         }
+        // Reclaim zeroed entries: a high-cardinality key stream (one new key
+        // per row) otherwise grows the summary by "distinct keys ever seen"
+        // forever — multi-GB over months, and invisible to the memory
+        // accounting that gates appends. Lookups treat a missing key as 0,
+        // so dropping the zero entries is observationally identical.
+        self.key_rows.retain(|_, rows| *rows > 0);
+        self.key_partition_rows.retain(|_, rows| *rows > 0);
     }
 }
 
@@ -1217,7 +1224,11 @@ impl HotStore {
         // Backpressure valve (design 搂3.1): reject the append before mutating if
         // it would push resident memory past the hard limit. The caller (insert
         // path) reacts by checkpoint-flushing + compacting the persisted prefix,
-        // then retrying once.
+        // then retrying once. Checked UNDER the writer lock and against the
+        // up-to-date counter: with the check outside, N concurrent appends all
+        // passed the same stale projection and over-committed the limit by N-1
+        // batches.
+        let _writer = self.writer.lock().unwrap();
         let projected = self
             .memory_bytes
             .load(Ordering::Relaxed)
@@ -1233,8 +1244,6 @@ impl HotStore {
                 projected, self.memory_hard_limit
             )));
         }
-
-        let _writer = self.writer.lock().unwrap();
 
         // Grouping sources: keys are derived straight from each column range
         // in one fused pass per slice — no intermediate Vec<ValueKey> and no
@@ -1503,7 +1512,11 @@ impl HotStore {
                 }
             }
             if !seen && skipped_by_watermark {
-                if !self.key_exists_anywhere(&st, &key, partition_key.as_ref()) {
+                // open_guard is held for the whole walk — consult the halves
+                // directly instead of re-acquiring the read lock.
+                if !(Self::key_in_sealed(&st, &key, partition_key.as_ref())
+                    || Self::key_in_open(&open_guard, &key, partition_key.as_ref()))
+                {
                     return None;
                 }
             } else if !seen {
@@ -1728,14 +1741,29 @@ impl HotStore {
         key: &ValueKey,
         partition_key: Option<&ValueKey>,
     ) -> bool {
-        let sealed_hit = st.sealed.iter().any(|c| match partition_key {
-            Some(pk) => c.key_partition_postings(key, pk).is_some(),
-            None => c.key_postings(key).is_some(),
-        });
-        if sealed_hit {
+        if Self::key_in_sealed(st, key, partition_key) {
             return true;
         }
         let open = st.open.read().unwrap();
+        Self::key_in_open(&open, key, partition_key)
+    }
+
+    fn key_in_sealed(
+        st: &StoreState,
+        key: &ValueKey,
+        partition_key: Option<&ValueKey>,
+    ) -> bool {
+        st.sealed.iter().any(|c| match partition_key {
+            Some(pk) => c.key_partition_postings(key, pk).is_some(),
+            None => c.key_postings(key).is_some(),
+        })
+    }
+
+    fn key_in_open(
+        open: &std::sync::RwLockReadGuard<'_, OpenChunk>,
+        key: &ValueKey,
+        partition_key: Option<&ValueKey>,
+    ) -> bool {
         match partition_key {
             Some(pk) => open.key_partition_postings(key, pk).is_some(),
             None => open.key_postings(key).is_some(),
@@ -1788,8 +1816,13 @@ impl HotStore {
             min_offset,
             |slice, _| total += slice.len() as u64,
         );
-        if !probed && skipped && !self.key_exists_anywhere(&st, &key, partition_key.as_ref()) {
-            return None;
+        if !probed && skipped {
+            // The `open` read guard is held — avoid re-acquiring it.
+            if !(Self::key_in_sealed(&st, &key, partition_key.as_ref())
+                || Self::key_in_open(&open, &key, partition_key.as_ref()))
+            {
+                return None;
+            }
         }
         (probed || skipped).then_some(total)
     }
@@ -1828,8 +1861,13 @@ impl HotStore {
                     .count() as u64;
             },
         );
-        if !probed && skipped && !self.key_exists_anywhere(&st, &key, partition_key.as_ref()) {
-            return None;
+        if !probed && skipped {
+            // The `open` read guard is held — avoid re-acquiring it.
+            if !(Self::key_in_sealed(&st, &key, partition_key.as_ref())
+                || Self::key_in_open(&open, &key, partition_key.as_ref()))
+            {
+                return None;
+            }
         }
         (probed || skipped).then_some(total)
     }

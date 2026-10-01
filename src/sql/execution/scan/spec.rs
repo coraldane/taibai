@@ -34,6 +34,14 @@ pub struct ScanSpec {
     pub minmax_index_columns: Vec<usize>,
     pub set_index_columns: Vec<usize>,
     pub reader_txn_id: u64,
+    /// TTL read-filtering is active for this table (`table_meta.ttl` set at
+    /// spec-compile time). Hot-store/memtable fast paths that truncate
+    /// gather early (LIMIT pushdown, key lookups) must be disabled when this
+    /// is set: TTL filters rows AFTER collection, so a pre-filter truncation
+    /// would return fewer rows than exist. This flag is the single decision
+    /// point — fast paths check it instead of re-deriving TTL state, so a
+    /// new fast path cannot forget the gate.
+    pub ttl_active: bool,
     /// Partial-residency bound when the hybrid hot-mirror leg is active:
     /// `(partition_column_index, covers_from_value)`. The mirror answers rows
     /// with `column > value` (its leg adds a `Gt` clause); every non-mirror
@@ -106,6 +114,7 @@ impl ScanSpec {
             minmax_index_columns: Vec::new(),
             set_index_columns: Vec::new(),
             reader_txn_id: 0,
+            ttl_active: false,
             hot_mirror_bound: None,
             simple_metadata_aggregates: None,
             distinct_column: None,
@@ -172,6 +181,7 @@ pub fn compile_scan_spec(
 ) -> ScanSpec {
     let mut spec = ScanSpec::new(table_name);
     spec.table_schema = table_schema.clone();
+    spec.ttl_active = table_meta.ttl.is_some();
 
     if let LogicalPlan::Scan(scan) = plan {
         spec.distinct_column = scan.distinct_column.clone();

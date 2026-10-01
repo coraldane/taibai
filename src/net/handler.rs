@@ -1789,17 +1789,19 @@ impl Handler {
             ))]);
         }
 
+        // A (re)connecting standby proved it durably applied `last_seq`.
+        // Fast-forward BEFORE reading history: a primary that restarted on a
+        // stale seq file may have stamped fresh events with seqs this
+        // standby already consumed. note_standby_applied re-stamps the ring
+        // above the watermark so the history below (and the live fan-out)
+        // delivers them; calling it after events_after would hand the bridge
+        // a snapshot that still skips them.
+        rep_log.note_standby_applied(last_seq);
+
         let history = match rep_log.events_after(last_seq) {
             Ok(history) => history,
             Err(error) => return Ok(vec![build_error(&error.to_string())]),
         };
-
-        // A (re)connecting standby proved it durably applied `last_seq`.
-        // Fast-forward the seq file before handing out any new events: the
-        // primary may have crashed and restarted with the file lagging behind
-        // this seq, and re-stamping consumed seqs would make the standby skip
-        // everything up to its old position.
-        rep_log.note_standby_applied(last_seq);
 
         let Some(push_tx) = self.push_channel.clone() else {
             return Ok(vec![build_error(

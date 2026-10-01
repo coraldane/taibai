@@ -453,6 +453,23 @@ impl Engine {
             return Err(TaibaiError::Sql("no active transaction".into()));
         }
         let txn_id = session.active_txn_id();
+        // Retract the catalog row_count of rows INSERT statements already
+        // counted at statement time. Without this, a rolled-back
+        // transaction's rows stayed in the stats forever (only DELETE's
+        // COMMIT path ever decremented).
+        for (db, table, rows) in self.txn_mutations().take_inserted_rows_by_table(txn_id) {
+            if let Err(error) =
+                self.record_inserted_rows(&db, &table, -(rows as i64), true, false)
+            {
+                tracing::warn!(
+                    db,
+                    table,
+                    rows,
+                    error = %error,
+                    "failed to retract rolled-back rows from catalog row_count"
+                );
+            }
+        }
         // Deferred DML plans are dropped first: no durable state was
         // written at statement time, so discarding them restores the
         // pre-statement state.
@@ -703,6 +720,13 @@ impl Engine {
             }
         } else if !dirty_partitions.is_empty() {
             stats = compactor.optimize_table(db, table, &table_meta)?;
+        }
+        if stats.segments_written > 0 {
+            // Compaction freed segment path numbers that later writers can
+            // reuse; drop this table's cached SUM metadata (see drop table).
+            crate::sql::execution::scan::aggregate_meta::invalidate_segment_sum_cache_under(
+                &self.data_dir.join(db).join(table),
+            );
         }
         if stats.segments_written > 0 || stats.rows_dropped > 0 {
             let schema = Schema::new(table_meta.columns.clone());
