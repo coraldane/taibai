@@ -426,6 +426,13 @@ impl MemTable {
             MemTableBacking::Spilled { rows, .. } => *rows,
         };
         let (_, batch) = decoded.map_err(|error| {
+            // A tail whose layout predates an ALTER COLUMN (legacy data from
+            // an older version) can never materialize against the current
+            // catalog: count it and say so loudly — the rows stay on disk
+            // but this memtable reads as empty until the table is reloaded.
+            if crate::storage::core::durable_tail::is_schema_drift_error(&error) {
+                crate::storage::core::durable_tail::note_tail_schema_drift(&tail_path, &error);
+            }
             tracing::error!(
                 error = %error,
                 path = %tail_path.display(),
@@ -559,8 +566,8 @@ impl MemTable {
         self.content_version.load(Ordering::Acquire)
     }
 
-    pub fn schema(&self) -> Option<Schema> {
-        Some(self.schema.clone())
+    pub fn schema(&self) -> Schema {
+        self.schema.clone()
     }
 
     pub fn age_secs(&self) -> u64 {
@@ -613,6 +620,54 @@ fn replace_key_positions_for_rows(
 
 type WritableTableKey = (String, String, String, u64);
 
+/// Whether a batch diverges from the target schema and needs
+/// [`align_batch_to_schema`]: widths differ, or same-width names sit at
+/// different positions (DROP + ADD keeps the width). An empty target schema
+/// (hand-built specs in tests) never aligns.
+pub(crate) fn batch_matches_schema(batch: &RecordBatch, schema: &Schema) -> bool {
+    if schema.num_columns() == 0 {
+        return true;
+    }
+    batch.num_columns() == schema.num_columns()
+        && batch
+            .schema
+            .columns
+            .iter()
+            .zip(schema.columns.iter())
+            .all(|(batch_col, target_col)| {
+                batch_col.name.eq_ignore_ascii_case(&target_col.name)
+            })
+}
+
+/// Align a batch to the target schema: map every target column into the
+/// batch by name (current name, then previous names — the batch keeps its
+/// insert-time layout across RENAME/DROP), and fill columns the batch
+/// predates (ALTER ADD COLUMN is catalog-only metadata) with the column's
+/// DEFAULT, through the same `default_value_column` the segment-side aligned
+/// read uses. Row count and row order are unchanged, so transactional
+/// position maps stay valid. This is the ONE reconciliation for in-memory
+/// batches; segment batches are reconciled at read time by
+/// `SegmentReader::read_row_group_columns_aligned`.
+pub(crate) fn align_batch_to_schema(
+    batch: &RecordBatch,
+    schema: &Schema,
+) -> Result<RecordBatch> {
+    let mut columns = Vec::with_capacity(schema.num_columns());
+    for col_def in &schema.columns {
+        let mapped = std::iter::once(&col_def.name)
+            .chain(col_def.previous_names.iter())
+            .find_map(|name| batch.schema.index_of(name));
+        match mapped {
+            Some(batch_idx) => columns.push(batch.columns[batch_idx].clone()),
+            None => columns.push(crate::storage::segment::reader::default_value_column(
+                col_def,
+                batch.num_rows(),
+            )?),
+        }
+    }
+    RecordBatch::try_new(schema.clone(), columns)
+}
+
 pub struct MemTableManager {
     memtables: RwLock<Vec<Arc<MemTable>>>,
     writable: RwLock<HashMap<WritableTableKey, Weak<MemTable>>>,
@@ -632,6 +687,11 @@ pub struct MemTableManager {
     /// after construction; flush selection consults it to skip memtables
     /// pinned by live transactions.
     txn_mutations: RwLock<Option<Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>>>,
+    /// Per-table authoritative write layout, set by width-changing DDL after
+    /// the catalog flip (see `exec_alter_table`). New memtables are created
+    /// with it, so hot state always matches the catalog even when an
+    /// in-flight statement planned against the pre-ALTER schema.
+    table_schemas: Mutex<HashMap<(String, String), Schema>>,
 }
 
 /// What one hot-unfed accounting entry scopes to. `Table` marks bypasses
@@ -663,7 +723,29 @@ impl MemTableManager {
             replace_key_indexes: RwLock::new(HashMap::new()),
             hot_unfed_rows: Mutex::new(HashMap::new()),
             txn_mutations: RwLock::new(None),
+            table_schemas: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Publish the layout new memtables of this table must use. Called by
+    /// width-changing DDL under the table mutation lock, after the catalog
+    /// flip: statements queued on the lock read it before their first
+    /// append, so no memtable can outlive the ALTER with a stale layout.
+    pub fn set_table_schema(&self, db: &str, table: &str, schema: Schema) {
+        self.table_schemas
+            .lock()
+            .unwrap()
+            .insert((db.to_string(), table.to_string()), schema);
+    }
+
+    /// The layout new memtables of this table must use, if a width-changing
+    /// DDL published one. Absent = the incoming statement schema governs.
+    pub fn table_schema(&self, db: &str, table: &str) -> Option<Schema> {
+        self.table_schemas
+            .lock()
+            .unwrap()
+            .get(&(db.to_string(), table.to_string()))
+            .cloned()
     }
 
     pub fn set_txn_mutations(
@@ -887,6 +969,11 @@ impl MemTableManager {
         schema: &Schema,
         txn_id: u64,
     ) -> Arc<MemTable> {
+        // A width-changing DDL publishes the authoritative layout for new
+        // memtables; an in-flight statement that planned against the
+        // pre-ALTER schema must not create a stale-width memtable with it
+        // (its batch is aligned to this schema by the append site).
+        let schema = self.table_schema(db, table).unwrap_or_else(|| schema.clone());
         let key = (
             db.to_string(),
             table.to_string(),

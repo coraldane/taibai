@@ -918,6 +918,10 @@ impl Engine {
                 let mut loaded_segments: HashSet<std::path::PathBuf> = HashSet::new();
                 let mut failed_segments: HashSet<std::path::PathBuf> = HashSet::new();
                 let mut budget_exhausted = false;
+                // Old-layout segments feed through the catalog alignment:
+                // the store is always catalog-width, so a table whose
+                // segments predate an ALTER still warms up after restart.
+                let warmup_schema = Schema::new(table_meta.columns.clone());
                 let eligible: HashSet<std::path::PathBuf> =
                     mtimed.iter().map(|(_, path)| path.clone()).collect();
                 for (_, seg_path) in &mtimed {
@@ -961,6 +965,28 @@ impl Engine {
                                     // skip this row group instead of feeding
                                     // possibly-deleted rows into the hot store.
                                     tracing::warn!(error = %e, "warmup: delete-bitmap filter failed");
+                                    segment_loaded = false;
+                                    continue;
+                                }
+                            }
+                        } else {
+                            batch
+                        };
+                        // Segments predating an ALTER carry the old layout:
+                        // align to the catalog — added columns fill with
+                        // their DEFAULT — so the store is always
+                        // catalog-width and old segments still warm it.
+                        let batch = if !crate::storage::core::memtable::batch_matches_schema(
+                            &batch,
+                            &warmup_schema,
+                        ) {
+                            match crate::storage::core::memtable::align_batch_to_schema(
+                                &batch,
+                                &warmup_schema,
+                            ) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "warmup: schema alignment failed");
                                     segment_loaded = false;
                                     continue;
                                 }

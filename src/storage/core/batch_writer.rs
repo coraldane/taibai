@@ -5,7 +5,9 @@ use std::time::Instant;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::core::durable_tail::{PreparedTailAppend, TailCommitTicket, TailCommitter};
-use crate::storage::core::memtable::{MemTable, MemTableManager, MemTableState};
+use crate::storage::core::memtable::{
+    align_batch_to_schema, batch_matches_schema, MemTable, MemTableManager, MemTableState,
+};
 use crate::storage::segment::meta::remove_sidecar_meta;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::{RecordBatch, Schema};
@@ -446,6 +448,23 @@ impl BatchWriter {
         let mt =
             self.memtable_mgr
                 .get_or_create_with_txn(db, table, partition_key, &schema, txn_id);
+        // An in-flight statement can plan against the pre-ALTER schema and
+        // reach this lock after a width-changing ALTER published the new
+        // layout: align the batch — added columns take their DEFAULT — so
+        // the memtable, its durable tail and crash recovery all see one
+        // width. The eager tail frame is rebuilt in this rare path; the
+        // encoding cost moves under the lock only for the raced statement.
+        let (batch, prepared) = if !batch_matches_schema(&batch, &mt.schema()) {
+            let aligned = align_batch_to_schema(&batch, &mt.schema())?;
+            let prepared = if txn_id == 0 {
+                Some(PreparedTailAppend::new(&aligned)?)
+            } else {
+                prepared
+            };
+            (aligned, prepared)
+        } else {
+            (batch, prepared)
+        };
         log_insert_profile("memtable_get", row_count as usize, get_start.elapsed());
         let append_start = Instant::now();
         let insert_bytes = (txn_id > 0).then(|| batch.estimated_size_bytes() as u64);

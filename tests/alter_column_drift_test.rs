@@ -168,11 +168,118 @@ fn resident_memtable_predating_add_column_reads_default_fill() {
         vec![vec!["2"]]
     );
 
-    // NOTE: INSERTs written after the ALTER are a separate, write-side
-    // limitation: both the hot-mirror feed and the memtable append reject a
-    // new-width batch while the stale-width memtable/store is still active
-    // ("column count mismatch"), so new rows only land once the stale
-    // memtable rotates out. This test pins the read side.
+    // Width-changing DDL converges hot state first: the ALTER flushed the
+    // resident rows into a segment, so post-ALTER inserts land in a fresh
+    // catalog-width memtable instead of failing the append width check.
+    exec(&engine, &mut session, "INSERT INTO t VALUES (3, 30, 8)");
+    assert_eq!(
+        query_all(&engine, &mut session, "SELECT id FROM t WHERE score = 8"),
+        vec![vec!["3"]]
+    );
+    assert_eq!(
+        query_all(&engine, &mut session, "SELECT COUNT(*) FROM t"),
+        vec![vec!["3"]]
+    );
+}
+
+/// The invariant behind the read-side fixes: a width-changing ALTER converges
+/// hot state (memtables, durable tails) into segments inside the table
+/// mutation lock BEFORE the catalog flips, so no stale-layout hot state can
+/// outlive the ALTER and post-ALTER writes just work.
+#[test]
+fn add_column_converges_hot_state_before_catalog_flip() {
+    use taibai::storage::core::durable_tail;
+
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    exec(&engine, &mut session, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    exec(&engine, &mut session, "INSERT INTO t VALUES (1, 10), (2, 20)");
+    let table_dir = temp_dir.path().join("main").join("t");
+
+    exec(&engine, &mut session, "ALTER TABLE t ADD COLUMN score INT DEFAULT 7");
+
+    // Hot state converged: the memtable's rows are durable in a segment and
+    // no stale tail generation remains.
+    let segments = taibai::storage::segment_manager::SegmentManager::discover_segments(&table_dir)
+        .expect("discover segments");
+    assert_eq!(segments.len(), 1, "resident rows flushed into a segment");
+    assert_eq!(
+        durable_tail::generation_file_count(&table_dir).expect("tail dir"),
+        0,
+        "no stale tail generations may outlive the ALTER"
+    );
+
+    // Reads span the flushed rows and the new default.
+    assert_eq!(
+        query_all(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE score = 7"),
+        vec![vec!["2"]]
+    );
+    // Post-ALTER inserts land in a fresh catalog-width memtable.
+    exec(&engine, &mut session, "INSERT INTO t VALUES (3, 30, 8)");
+    assert_eq!(
+        query_all(&engine, &mut session, "SELECT COUNT(*) FROM t"),
+        vec![vec!["3"]]
+    );
+    engine.segment_mgr().shutdown();
+}
+
+/// Width-changing DDL must not run while a transaction has written to the
+/// table: the flush skips transactional memtables, so the flip would leave a
+/// stale-layout transactional memtable behind.
+#[test]
+fn add_column_refuses_open_transaction_with_writes() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    exec(&engine, &mut session, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+
+    // Another session's open transaction with writes: the flush skips its
+    // transactional memtable, so the layout flip would strand it stale-width.
+    let mut txn_session = Session::new("root".to_string(), "main".to_string());
+    exec(&engine, &mut txn_session, "BEGIN");
+    exec(&engine, &mut txn_session, "INSERT INTO t VALUES (1, 10)");
+
+    let error = engine
+        .execute(&mut session, "ALTER TABLE t ADD COLUMN score INT DEFAULT 7")
+        .expect_err("ALTER must refuse while another transaction wrote the table");
+    assert!(
+        error.to_string().contains("commit or rollback"),
+        "unexpected error: {error}"
+    );
+
+    exec(&engine, &mut txn_session, "ROLLBACK");
+    exec(&engine, &mut session, "ALTER TABLE t ADD COLUMN score INT DEFAULT 7");
+    exec(&engine, &mut session, "INSERT INTO t VALUES (2, 20, 7)");
+    assert_eq!(
+        query_all(&engine, &mut session, "SELECT COUNT(*) FROM t"),
+        vec![vec!["1"]]
+    );
+    engine.segment_mgr().shutdown();
+}
+
+/// DROP COLUMN converges the same way: the resident batch (old width) is
+/// flushed before the catalog drops the column, and post-ALTER inserts use
+/// the narrowed layout.
+#[test]
+fn drop_column_converges_hot_state() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    exec(
+        &engine,
+        &mut session,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)",
+    );
+    exec(&engine, &mut session, "INSERT INTO t VALUES (1, 10, 20)");
+    // Resident (no flush): the stale-width memtable must not survive the DDL.
+    exec(&engine, &mut session, "ALTER TABLE t DROP COLUMN a");
+
+    let mut rows = query_all(&engine, &mut session, "SELECT id, b FROM t");
+    rows.sort();
+    assert_eq!(rows, vec![vec!["1", "20"]]);
+    exec(&engine, &mut session, "INSERT INTO t VALUES (2, 21)");
+    assert_eq!(
+        query_all(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE b = 21"),
+        vec![vec!["1"]]
+    );
+    engine.segment_mgr().shutdown();
 }
 
 /// Same drift for DROP COLUMN: the resident batch keeps the dropped column

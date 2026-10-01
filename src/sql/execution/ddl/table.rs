@@ -1097,6 +1097,56 @@ pub fn exec_alter_table(
         }
     }
 
+    // Width-changing column operations move data layout: hot state (resident
+    // memtables, durable tails, hot mirror) must converge to the new catalog
+    // layout inside the table mutation lock that excludes appenders, BEFORE
+    // the catalog file flips. The save is the atomic commit point; a crash
+    // anywhere in the section leaves the consistent pre-DDL state on disk —
+    // the flush protocol retires tails and folds pending sidecars with its
+    // own crash safety, so no stale-layout hot state can outlive the ALTER.
+    let width_changing = operations.iter().any(|operation| {
+        matches!(
+            operation,
+            AlterOperation::AddColumn { .. } | AlterOperation::DropColumn { .. }
+        )
+    });
+    if !width_changing {
+        return alter_column_catalog_only(engine, db, name, operations, false);
+    }
+    engine.segment_mgr().with_table_mutation_lock(db, name, || {
+        // Flushing skips transactional memtables (their rows reach segments
+        // only at COMMIT), and deferred-DML pins make memtable positions
+        // load-bearing: the layout flip must not run under either.
+        let has_open_txn_writes = engine
+            .memtable_manager()
+            .get_by_table(db, name)
+            .iter()
+            .any(|mt| mt.is_transactional())
+            || engine.txn_mutations().table_has_pins(db, name);
+        if has_open_txn_writes {
+            return Err(TaibaiError::Sql(format!(
+                "cannot ALTER the column layout of '{}.{}' while a transaction has written to it; commit or rollback first",
+                db, name
+            )));
+        }
+        engine.batch_writer().flush_table_under_table_lock(db, name)?;
+        engine.invalidate_hot_store(db, name);
+        alter_column_catalog_only(engine, db, name, operations, true)
+    })
+}
+
+/// The catalog-side ALTER (column add/drop/rename, TTL, compression, unique
+/// keys) under the catalog write lock. `width_changing` callers have already
+/// converged hot state under the table mutation lock; the flag publishes the
+/// post-ALTER layout for new memtables before the lock releases.
+fn alter_column_catalog_only(
+    engine: &Engine,
+    db: &str,
+    name: &str,
+    operations: &[AlterOperation],
+    width_changing: bool,
+) -> Result<ExecResult> {
+
     let mut catalogs = engine.catalogs().write().unwrap();
     let catalog = catalogs
         .get_mut(db)
@@ -1316,6 +1366,18 @@ pub fn exec_alter_table(
                 })?;
                 meta.compression_level = *level;
             }
+        }
+    }
+
+    // Publish the authoritative layout for new memtables while still under
+    // the table mutation lock: statements queued on it create memtables with
+    // this schema, and the append site aligns in-flight batches that planned
+    // against the pre-ALTER schema (added columns take their DEFAULT).
+    if width_changing {
+        if let Some(meta) = catalog.get_table(name) {
+            engine
+                .memtable_manager()
+                .set_table_schema(db, name, Schema::new(meta.columns.clone()));
         }
     }
 

@@ -5,7 +5,6 @@ use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::spec::ScanSpec;
-use crate::common::error::Result;
 
 fn live_memtables_and_watermark(
     memtable_mgr: &MemTableManager,
@@ -220,46 +219,10 @@ fn resident_hot_covers(
 }
 
 /// Whether a resident memtable batch diverges from the catalog schema and
-/// needs [`align_batch_to_catalog`]: widths differ, or same-width names sit
-/// at different positions (DROP + ADD keeps the width). Hand-built specs
-/// (tests) carry an empty catalog schema and never align.
+/// needs alignment. Hand-built specs (tests) carry an empty catalog schema
+/// and never align.
 fn memtable_batch_needs_alignment(batch: &RecordBatch, table_schema: &Schema) -> bool {
-    if table_schema.num_columns() == 0 {
-        return false;
-    }
-    if batch.num_columns() != table_schema.num_columns() {
-        return true;
-    }
-    !batch
-        .schema
-        .columns
-        .iter()
-        .zip(table_schema.columns.iter())
-        .all(|(batch_col, catalog_col)| batch_col.name.eq_ignore_ascii_case(&catalog_col.name))
-}
-
-/// Align a resident memtable batch to the catalog schema: map every catalog
-/// column into the batch by name (current name, then previous names — the
-/// batch keeps its insert-time layout across RENAME/DROP), and fill columns
-/// the batch predates (ALTER ADD COLUMN is catalog-only metadata) with the
-/// column's DEFAULT, through the same [`crate::storage::segment::reader::
-/// default_value_column`] the segment-side aligned read uses. Row count and
-/// row order are unchanged, so transactional position maps stay valid.
-fn align_batch_to_catalog(batch: &RecordBatch, table_schema: &Schema) -> Result<RecordBatch> {
-    let mut columns = Vec::with_capacity(table_schema.num_columns());
-    for col_def in &table_schema.columns {
-        let mapped = std::iter::once(&col_def.name)
-            .chain(col_def.previous_names.iter())
-            .find_map(|name| batch.schema.index_of(name));
-        match mapped {
-            Some(batch_idx) => columns.push(batch.columns[batch_idx].clone()),
-            None => columns.push(crate::storage::segment::reader::default_value_column(
-                col_def,
-                batch.num_rows(),
-            )?),
-        }
-    }
-    RecordBatch::try_new(table_schema.clone(), columns)
+    !crate::storage::core::memtable::batch_matches_schema(batch, table_schema)
 }
 
 pub fn scan_memtables(
@@ -349,7 +312,7 @@ pub fn scan_memtables(
                 let aligned;
                 let source: &RecordBatch =
                     if memtable_batch_needs_alignment(source, &spec.table_schema) {
-                        aligned = match align_batch_to_catalog(source, &spec.table_schema) {
+                        aligned = match crate::storage::core::memtable::align_batch_to_schema(source, &spec.table_schema) {
                             Ok(batch) => batch,
                             Err(e) => return Some(Err(e)),
                         };
@@ -621,7 +584,7 @@ pub fn count_memtable_rows(
             let aligned_holder;
             let mt_batch: &RecordBatch =
                 if memtable_batch_needs_alignment(mt_batch, &spec.table_schema) {
-                    aligned_holder = match align_batch_to_catalog(mt_batch, &spec.table_schema) {
+                    aligned_holder = match crate::storage::core::memtable::align_batch_to_schema(mt_batch, &spec.table_schema) {
                         Ok(batch) => batch,
                         Err(e) => {
                             tracing::warn!(error = %e, "memtable catalog alignment failed");

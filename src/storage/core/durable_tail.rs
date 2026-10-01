@@ -1908,7 +1908,18 @@ pub fn recover_index(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredT
         // cost is confined to memtables that restarted with unflushed
         // DELETE/UPDATE statements; plain tails stay lazy.
         if !sidecars.is_empty() {
-            let (partition_key, batch) = decode_tail_file(&path, schema)?;
+            let (partition_key, batch) = match decode_tail_file(&path, schema) {
+                Ok(decoded) => decoded,
+                // A layout that predates an ALTER COLUMN (legacy data from an
+                // older version) cannot fold: quarantine it — the tail and
+                // sidecars stay on disk, the memtable is skipped — instead of
+                // failing the whole startup or silently folding garbage.
+                Err(error) if is_schema_drift_error(&error) => {
+                    report_tail_schema_drift(&path, &error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let batch = apply_sidecars(batch, &sidecars)?;
             persist(table_dir, id, &partition_key, &batch)?;
             path = newest_live_tail_path(&table_dir.join(TAIL_DIR), id)?.ok_or_else(|| {
@@ -2563,6 +2574,7 @@ static TAIL_BYTES_DISCARDED: AtomicU64 = AtomicU64::new(0);
 static INTENTS_UNREADABLE: AtomicU64 = AtomicU64::new(0);
 static SEGMENTS_UNREADABLE: AtomicU64 = AtomicU64::new(0);
 static ROWCOUNT_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+static TAILS_SCHEMA_DRIFT: AtomicU64 = AtomicU64::new(0);
 
 /// Point-in-time aggregate of durability damage seen since process start.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2580,6 +2592,11 @@ pub struct TailDamageSnapshot {
     /// Spilled memtables whose decoded row count disagreed with the recorded
     /// one (the decoded content is authoritative and kept).
     pub rowcount_mismatches: u64,
+    /// Durable tails whose frame layout predates an ALTER TABLE column
+    /// change (data written by an older version, before width-changing DDL
+    /// converged hot state). Quarantined: the file stays on disk, the
+    /// memtable's rows are unavailable until the table is reloaded.
+    pub tails_schema_drift: u64,
 }
 
 /// Aggregate of every durability damage event since process start.
@@ -2590,7 +2607,31 @@ pub fn tail_damage_snapshot() -> TailDamageSnapshot {
         intents_unreadable: INTENTS_UNREADABLE.load(Ordering::Relaxed),
         segments_unreadable: SEGMENTS_UNREADABLE.load(Ordering::Relaxed),
         rowcount_mismatches: ROWCOUNT_MISMATCHES.load(Ordering::Relaxed),
+        tails_schema_drift: TAILS_SCHEMA_DRIFT.load(Ordering::Relaxed),
     }
+}
+
+/// Whether a tail decode error is the schema-drift signature (frames written
+/// before an ALTER TABLE column change) rather than plain corruption. Only
+/// drift gets the quarantine-and-continue recovery treatment; corruption
+/// keeps failing closed.
+pub(crate) fn is_schema_drift_error(error: &TaibaiError) -> bool {
+    error.to_string().contains("column count mismatch")
+}
+
+fn report_tail_schema_drift(path: &Path, error: &TaibaiError) {
+    TAILS_SCHEMA_DRIFT.fetch_add(1, Ordering::Relaxed);
+    tracing::error!(
+        tail = %path.display(),
+        error = %error,
+        "recovery quarantined a durable tail whose layout predates an ALTER TABLE column change (data written by an older version); its rows stay on disk but are unavailable — reload the table from a backup taken before the ALTER"
+    );
+}
+
+/// Counted for a spilled memtable whose tail cannot materialize against the
+/// current catalog because its layout predates an ALTER COLUMN.
+pub(crate) fn note_tail_schema_drift(path: &Path, error: &TaibaiError) {
+    report_tail_schema_drift(path, error);
 }
 
 fn report_tail_discarded(path: &Path, reason: &str, bytes: u64) {
