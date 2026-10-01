@@ -117,7 +117,28 @@ fn count_with_single_eq(
     let pred = spec.to_row_group_predicate();
 
     for seg_path in segment_files {
-        if let Some(meta) = segment_mgr.segment_meta(seg_path)? {
+        let meta_snapshot = segment_mgr.segment_meta(seg_path)?;
+        if let Some(meta) = meta_snapshot.as_ref() {
+            // A segment whose footer predates the predicate column
+            // logically carries the column's DEFAULT (or NULL) on every
+            // row — the same default-fill the SELECT scan and value
+            // aggregates already apply. The footer has no entry to align
+            // or prune against, so `=` folds to one constant comparison
+            // over the live rows.
+            if row_filter::any_predicate_column_absent(&spec.table_schema, &meta.schema, &[col_idx])
+            {
+                let reader = segment_mgr.open_scan_reader(seg_path, spec.reader_txn_id)?;
+                *total_rows += count_eq_on_default_filled_segment(
+                    &spec.table_schema,
+                    &reader,
+                    col_idx,
+                    value,
+                );
+                if let Some(ref mut s) = stats {
+                    s.entry("count".to_string()).or_default().segments_opened += 1;
+                }
+                continue;
+            }
             // Sidecar zone maps follow the segment's footer column order;
             // re-index the predicate onto it before comparing.
             let aligned_pred =
@@ -127,6 +148,17 @@ fn count_with_single_eq(
             }
         }
         let reader = segment_mgr.open_scan_reader(seg_path, spec.reader_txn_id)?;
+        if row_filter::any_predicate_column_absent(&spec.table_schema, reader.schema(), &[col_idx])
+        {
+            // No sidecar meta to consult — the footer itself predates the
+            // column.
+            *total_rows +=
+                count_eq_on_default_filled_segment(&spec.table_schema, &reader, col_idx, value);
+            if let Some(ref mut s) = stats {
+                s.entry("count".to_string()).or_default().segments_opened += 1;
+            }
+            continue;
+        }
 
         // count_matching_rows_fast probes bloom filters / zone maps / raw
         // blocks by footer column number: col_idx is a catalog index and
@@ -146,6 +178,26 @@ fn count_with_single_eq(
     Ok(())
 }
 
+/// COUNT one segment that predates the predicate column: every row
+/// logically carries the column's DEFAULT (`column_default_value`), so the
+/// eq predicate folds to a single constant comparison over all live rows.
+/// NULL never satisfies `=`, and the compared value is coerced to the
+/// column type at spec build time, so plain scalar equality is exact.
+fn count_eq_on_default_filled_segment(
+    table_schema: &Schema,
+    reader: &crate::storage::segment::SegmentReader,
+    col_idx: usize,
+    value: &ScalarValue,
+) -> u64 {
+    let default = crate::storage::segment::reader::column_default_value(
+        &table_schema.columns[col_idx],
+    );
+    if default.is_null() || default != *value {
+        return 0;
+    }
+    reader.row_count().saturating_sub(reader.deleted_row_count())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn count_with_predicates(
     spec: &ScanSpec,
@@ -162,6 +214,29 @@ fn count_with_predicates(
     let filter_columns = spec.all_predicate_columns();
 
     for seg_path in segment_files {
+        let meta_snapshot = segment_mgr.segment_meta(seg_path).ok().flatten();
+        if let Some(meta) = meta_snapshot.as_ref() {
+            // A segment whose footer predates a predicate column carries the
+            // column's DEFAULT on every row (SELECT/aggregate default-fill
+            // semantics): zone maps and bloom probes have no entry to prune
+            // with and projection alignment would fail, so evaluate the
+            // predicates over default-filled whole row groups instead.
+            if row_filter::any_predicate_column_absent(
+                &spec.table_schema,
+                &meta.schema,
+                &filter_columns,
+            ) {
+                let reader = segment_mgr.open_scan_reader(seg_path, spec.reader_txn_id)?;
+                count_predicates_on_default_filled_segment(
+                    spec,
+                    &reader,
+                    total_rows,
+                    stats.as_deref_mut(),
+                )?;
+                continue;
+            }
+        }
+
         // Meta-based row-group pruning is authoritative when the sidecar meta
         // exists; re-running the same pruning through the reader footer (the
         // old behavior) doubled the metadata walk for every segment. Keep the
@@ -171,7 +246,7 @@ fn count_with_predicates(
         // bloom filters / value sets by the segment's own footer column
         // order, while the predicate and check lists carry catalog indices:
         // translate them onto each segment before pruning.
-        let meta_snapshot = segment_mgr.segment_meta(seg_path).ok().flatten();
+        let had_meta_snapshot = meta_snapshot.is_some();
         let meta_candidates = match meta_snapshot {
             Some(meta) => {
                 let aligned = row_filter::align_prune_checks_to_footer(
@@ -214,6 +289,24 @@ fn count_with_predicates(
         }
 
         let reader = segment_mgr.open_scan_reader(seg_path, spec.reader_txn_id)?;
+
+        // No sidecar meta to consult — decide default-fill applicability on
+        // the footer itself before the alignment-based pruning below.
+        if !had_meta_snapshot
+            && row_filter::any_predicate_column_absent(
+                &spec.table_schema,
+                reader.schema(),
+                &filter_columns,
+            )
+        {
+            count_predicates_on_default_filled_segment(
+                spec,
+                &reader,
+                total_rows,
+                stats.as_deref_mut(),
+            )?;
+            continue;
+        }
 
         let prune_result = match meta_candidates {
             Some(candidates) => super::row_group::RowGroupPruneResult {
@@ -296,6 +389,38 @@ fn count_with_predicates(
         if let Some(ref mut s) = stats {
             s.entry("count".to_string()).or_default().segments_opened += 1;
         }
+    }
+    Ok(())
+}
+
+/// COUNT row groups of a segment that predates a predicate column: read
+/// whole row groups in catalog order (defaults filled) and evaluate the
+/// predicates the way the SELECT scan applies them. No zone-map/bloom
+/// pruning — the footer has no entries for the missing column, and the
+/// defaults make the missing-column clauses decidable per row anyway.
+fn count_predicates_on_default_filled_segment(
+    spec: &ScanSpec,
+    reader: &crate::storage::segment::SegmentReader,
+    total_rows: &mut u64,
+    mut stats: Option<&mut HashMap<String, ScanStats>>,
+) -> Result<()> {
+    for rg_idx in 0..reader.num_row_groups() {
+        let mut batch = reader.read_row_group_columns_aligned(rg_idx, &spec.table_schema)?;
+        if !reader.delete_bitmap().is_empty() {
+            let rg_start_row = reader.row_group_start_row(rg_idx);
+            batch = delete_bitmap::filter_batch(batch, rg_start_row, reader.delete_bitmap())?;
+        }
+        let filtered = row_filter::apply_predicates(
+            &batch,
+            &spec.eq_predicates,
+            &spec.range_predicates,
+            &spec.in_predicates,
+            spec.remaining_predicate.as_ref(),
+        )?;
+        *total_rows += filtered.num_rows() as u64;
+    }
+    if let Some(ref mut s) = stats {
+        s.entry("count".to_string()).or_default().segments_opened += 1;
     }
     Ok(())
 }

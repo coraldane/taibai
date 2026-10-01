@@ -1345,6 +1345,25 @@ pub(super) fn align_indices_to_footer(
     )
 }
 
+/// Whether any of the catalog-space `indices` names a column the footer
+/// schema predates. COUNT fast paths use this to route such segments to the
+/// default-fill evaluation (the SELECT/aggregate semantics) instead of
+/// failing the alignment on the missing column.
+pub(super) fn any_predicate_column_absent(
+    table_schema: &Schema,
+    footer_schema: &Schema,
+    indices: &[usize],
+) -> bool {
+    if table_schema.num_columns() == 0 {
+        return false;
+    }
+    crate::storage::segment::reader::any_column_absent_in_schema(
+        table_schema,
+        footer_schema,
+        indices,
+    )
+}
+
 /// Re-index a row-group predicate from catalog space onto one segment's
 /// footer column order, so zone-map pruning indexes the columns the clauses
 /// actually reference instead of whatever sits at the same position.

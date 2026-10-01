@@ -128,11 +128,27 @@ pub fn compute_simple_aggregate(
         let meta_rows = meta.as_ref().map(|m| m.row_count).unwrap_or(0);
         let pruned = match meta.as_ref() {
             Some(m) => {
-                // Sidecar zone maps follow the segment's footer column
-                // order; re-index the predicate onto it before comparing.
-                let aligned_predicate =
-                    row_filter::align_predicate_to_footer(table_schema, &m.schema, &predicate)?;
-                !row_group::prune_segment_by_zone_map(&aligned_predicate, &m.segment_zone_maps)
+                // A predicate on a column this segment predates cannot prune:
+                // the footer has no zone map to consult (every row logically
+                // carries the column's DEFAULT). Keep the segment as a
+                // candidate — the reader gate below routes drifted segments
+                // through the regular pipeline, which evaluates the predicate
+                // on the default-filled batch.
+                let clause_columns: Vec<usize> = predicate
+                    .clauses
+                    .iter()
+                    .map(|clause| clause.column_index)
+                    .collect();
+                if row_filter::any_predicate_column_absent(table_schema, &m.schema, &clause_columns)
+                {
+                    false
+                } else {
+                    // Sidecar zone maps follow the segment's footer column
+                    // order; re-index the predicate onto it before comparing.
+                    let aligned_predicate =
+                        row_filter::align_predicate_to_footer(table_schema, &m.schema, &predicate)?;
+                    !row_group::prune_segment_by_zone_map(&aligned_predicate, &m.segment_zone_maps)
+                }
             }
             None => false,
         };

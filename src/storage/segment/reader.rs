@@ -1208,17 +1208,7 @@ pub(crate) fn default_value_column(
     col_def: &crate::types::batch::ColumnDef,
     row_count: usize,
 ) -> Result<crate::types::array::ColumnArray> {
-    let value = match &col_def.default_value {
-        Some(crate::types::batch::ColumnDefaultValue::Literal(value)) => value.clone(),
-        Some(crate::types::batch::ColumnDefaultValue::CurrentTimestamp) => {
-            ScalarValue::Timestamp(Some(
-                col_def
-                    .added_at_micros
-                    .unwrap_or_else(now_micros_for_default),
-            ))
-        }
-        None => ScalarValue::null_for_type(col_def.data_type),
-    };
+    let value = column_default_value(col_def);
     let mut column = crate::types::array::ColumnArray::empty(col_def.data_type);
     if value.is_null() {
         for _ in 0..row_count {
@@ -1230,6 +1220,53 @@ pub(crate) fn default_value_column(
         }
     }
     Ok(column)
+}
+
+/// The scalar every row of a segment predating `col_def` logically carries:
+/// the column's DEFAULT literal (CurrentTimestamp pinned to the ALTER
+/// instant), or NULL when no default is declared. Shared by the aligned
+/// default-fill read and the COUNT fast paths, so predicate evaluation can
+/// never disagree with the materialized fill.
+pub(crate) fn column_default_value(
+    col_def: &crate::types::batch::ColumnDef,
+) -> crate::types::scalar::ScalarValue {
+    match &col_def.default_value {
+        Some(crate::types::batch::ColumnDefaultValue::Literal(value)) => value.clone(),
+        Some(crate::types::batch::ColumnDefaultValue::CurrentTimestamp) => {
+            ScalarValue::Timestamp(Some(
+                col_def
+                    .added_at_micros
+                    .unwrap_or_else(now_micros_for_default),
+            ))
+        }
+        None => ScalarValue::null_for_type(col_def.data_type),
+    }
+}
+
+/// Whether ANY of the catalog-space `indices` names a column this footer
+/// schema predates (neither its current nor any previous name exists in the
+/// footer). Such segments carry the column's DEFAULT on every row — the
+/// caller decides the default-fill semantics; an out-of-range catalog index
+/// reports `false` so the regular alignment surfaces its own error.
+pub fn any_column_absent_in_schema(
+    table_schema: &crate::types::batch::Schema,
+    footer_schema: &crate::types::batch::Schema,
+    indices: &[usize],
+) -> bool {
+    if table_schema.num_columns() == 0 {
+        return false;
+    }
+    indices.iter().any(|&catalog_idx| {
+        let Some(column) = table_schema.columns.get(catalog_idx) else {
+            return false;
+        };
+        let mut names = Vec::with_capacity(column.previous_names.len() + 1);
+        names.push(column.name.clone());
+        names.extend(column.previous_names.iter().cloned());
+        !names
+            .iter()
+            .any(|name| footer_schema.index_of(name).is_some())
+    })
 }
 
 fn now_micros_for_default() -> i64 {
