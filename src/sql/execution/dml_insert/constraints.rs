@@ -303,6 +303,155 @@ fn unique_key_for_row(
     Some(key)
 }
 
+/// Bounded-memory uniqueness validation for row-rewriting statements
+/// (UPDATE): the keys the statement INTRODUCES are materialized once (they
+/// are already bounded by the statement's mutation budget); every other
+/// live row is streamed past that set. Collisions purely among streamed
+/// survivors are pre-existing state the statement did not create — the
+/// same philosophy the batch validator documents — so the introduced sets
+/// are only ever probed from the survivor side, never grown by it.
+///
+/// All batches are addressed through `projected_indices[p] = batch column
+/// index of validation position p`; batches that already carry the
+/// validation projection pass the identity.
+pub struct IntroducedKeyValidator<'a> {
+    table: &'a str,
+    /// Per index to validate: the positions of its key columns inside the
+    /// VALIDATION projection plus its materialized introduced-key set.
+    indexes: Vec<(
+        &'a crate::storage::catalog::schema::UniqueIndexMeta,
+        Vec<usize>,
+        std::collections::HashSet<Vec<ScalarValue>>,
+    )>,
+}
+
+impl<'a> IntroducedKeyValidator<'a> {
+    /// `validation_schema` describes the projection every batch is
+    /// addressed in; indexes whose columns are missing from it (dropped
+    /// between planning and validation) are skipped rather than panicking.
+    pub fn new(
+        table: &'a str,
+        validation_schema: &Schema,
+        indexes_to_validate: &'a [crate::storage::catalog::schema::UniqueIndexMeta],
+    ) -> Self {
+        let mut validators = Vec::with_capacity(indexes_to_validate.len());
+        for index in indexes_to_validate {
+            let positions: Option<Vec<usize>> = index
+                .columns
+                .iter()
+                .map(|column| validation_schema.index_of(column))
+                .collect();
+            if let Some(positions) = positions {
+                validators.push((index, positions, std::collections::HashSet::new()));
+            }
+        }
+        Self {
+            table,
+            indexes: validators,
+        }
+    }
+
+    /// Register the keys of every row of a batch. Two introduced rows
+    /// sharing a key is an immediate violation — both will be live after
+    /// the statement.
+    pub fn introduce_full_batch(
+        &mut self,
+        batch: &RecordBatch,
+        projected_indices: &[usize],
+    ) -> Result<()> {
+        self.introduce_selected(batch, projected_indices, 0, batch.num_rows() as u32, &[])
+    }
+
+    /// Register the keys of the MATCHED positions of a batch (rows this
+    /// statement rewrote in memory; their new keys go live).
+    pub fn introduce_matched(
+        &mut self,
+        batch: &RecordBatch,
+        projected_indices: &[usize],
+        matched: &[u32],
+    ) -> Result<()> {
+        for &row_idx in matched {
+            self.introduce_selected(batch, projected_indices, row_idx, row_idx + 1, &[])?;
+        }
+        Ok(())
+    }
+
+    fn introduce_selected(
+        &mut self,
+        batch: &RecordBatch,
+        projected_indices: &[usize],
+        from: u32,
+        to: u32,
+        _excluded: &[u32],
+    ) -> Result<()> {
+        for row_idx in from..to {
+            for (index, positions, keys) in &mut self.indexes {
+                let Some(key) = key_at(batch, projected_indices, positions, row_idx as usize)
+                else {
+                    continue;
+                };
+                if !keys.insert(key.clone()) {
+                    return Err(duplicate_unique_key_error(self.table, &index.name, &key));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stream a survivor batch past the introduced sets: any shared key is
+    /// a violation. `excluded` row positions are skipped (rows this
+    /// statement rewrote — their old keys retire with them).
+    pub fn check_rows_excluding(
+        &mut self,
+        batch: &RecordBatch,
+        projected_indices: &[usize],
+        excluded: &[u32],
+    ) -> Result<()> {
+        let excluded: std::collections::HashSet<u32> = excluded.iter().copied().collect();
+        for row_idx in 0..batch.num_rows() as u32 {
+            if excluded.contains(&row_idx) {
+                continue;
+            }
+            for (index, positions, keys) in &self.indexes {
+                let Some(key) = key_at(batch, projected_indices, positions, row_idx as usize)
+                else {
+                    continue;
+                };
+                if keys.contains(&key) {
+                    return Err(duplicate_unique_key_error(self.table, &index.name, &key));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Currently always Ok; the hook where any deferred finalization
+    /// (counting, overflow accounting) would live.
+    pub fn finish(self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Assemble one index key for `row_idx`: `positions` names validation-space
+/// columns, `projected_indices` maps validation space onto the batch.
+fn key_at(
+    batch: &RecordBatch,
+    projected_indices: &[usize],
+    positions: &[usize],
+    row_idx: usize,
+) -> Option<Vec<ScalarValue>> {
+    let mut key = Vec::with_capacity(positions.len());
+    for &position in positions {
+        let batch_idx = projected_indices.get(position).copied()?;
+        let column = batch.column(batch_idx)?;
+        if column.bitmap().is_null(row_idx) {
+            return None;
+        }
+        key.push(column.scalar(row_idx));
+    }
+    Some(key)
+}
+
 pub fn validate_unique_indexes_in_batches(
     table: &str,
     schema: &Schema,

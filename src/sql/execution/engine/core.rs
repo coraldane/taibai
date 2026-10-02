@@ -180,6 +180,15 @@ impl Engine {
         } else {
             None
         };
+        // Footer rewrites rolled back by startup recovery above may already
+        // have been shipped to standbys; re-emit the recovered footer states
+        // as compensation events (no-op without the rollback log).
+        crate::storage::segment::reader::drain_footer_rollback_compensations(
+            data_dir,
+            |path, bitmap, deleted_count| {
+                segment_mgr.emit_delete_footer_rewrite(path, bitmap, deleted_count)
+            },
+        );
 
         let auth_manager = Arc::new(AuthManager::new(data_dir)?);
         let auto_increment_mgr = Arc::new(AutoIncrementManager::new());
@@ -209,7 +218,7 @@ impl Engine {
         let performance_baselines =
             Arc::new(crate::common::performance_baseline::PerformanceBaselineStore::load(data_dir));
         let catalogs = Arc::new(RwLock::new(catalogs));
-        start_auto_compaction_thread(
+        let auto_compact_supervisor = start_auto_compaction_thread(
             Arc::clone(&segment_mgr),
             data_dir.to_path_buf(),
             Arc::clone(&catalogs),
@@ -242,6 +251,10 @@ impl Engine {
             txn_mutations,
             rep_log,
             read_only: AtomicBool::new(false),
+            auto_compact_supervisor: Mutex::new(auto_compact_supervisor),
+            // Registered post-construction by `start_close_of_day_scheduler`
+            // (the engine is Arc-wrapped by then).
+            close_of_day_supervisor: Mutex::new(None),
         };
         if hot_warmup_enabled {
             engine.warmup_hot_stores();

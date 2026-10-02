@@ -817,3 +817,210 @@ fn external_merge_sort_drops_deleted_rows() -> Result<()> {
     assert_eq!(read_ids(&segments[0])?, vec![4, 6]);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// TTL expiry vs. clean-segment retention (non-clustered tables)
+// ---------------------------------------------------------------------------
+
+fn ttl_schema() -> Schema {
+    Schema::new(vec![
+        ColumnDef::new("id", DataType::Int64),
+        ColumnDef::new("ts", DataType::Timestamp),
+    ])
+}
+
+fn ttl_meta(schema: &Schema, duration_secs: i64) -> TableMeta {
+    let mut meta = test_meta_without_cluster(schema);
+    meta.set_ttl("ts", duration_secs);
+    meta
+}
+
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64
+}
+
+fn write_ttl_segment(path: &Path, schema: &Schema, stamps: &[i64]) -> Result<()> {
+    let mut batch = RecordBatch::new(schema.clone());
+    for (row, ts) in stamps.iter().enumerate() {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(row as i64)))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::Timestamp(Some(*ts)))?;
+    }
+    let mut writer = SegmentWriter::create(path, schema.clone(), TEST_ROW_GROUP_SIZE, 3)?;
+    writer.write_batch(&batch)?;
+    writer.seal()
+}
+
+#[test]
+fn noncluster_compaction_purges_ttl_expired_clean_segment() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let table_dir = tmp.path().join("default").join("t");
+    std::fs::create_dir_all(&table_dir)?;
+
+    let schema = ttl_schema();
+    let now = now_micros();
+    // Both segments are clean (no tombstones), full, and unfragmented under
+    // the 2-row target — pure Keep candidates without the TTL exemption.
+    // One holds only rows expired an hour ago; the other only fresh rows.
+    let hour_ago = now - 3_600 * 1_000_000;
+    let expired = table_dir.join("seg_00001.dat");
+    let fresh = table_dir.join("seg_00002.dat");
+    write_ttl_segment(&expired, &schema, &[hour_ago, hour_ago + 1])?;
+    write_ttl_segment(&fresh, &schema, &[now, now + 1])?;
+    let fresh_mtime = file_mtime(&fresh);
+
+    let segment_mgr = noncluster_dirty_only_manager(&tmp)?;
+    let compactor = Compactor::new(Arc::clone(&segment_mgr), tmp.path().to_path_buf());
+    let stats = compactor.optimize_table("default", "t", &ttl_meta(&schema, 60))?;
+
+    // The zone map proves the first segment fully expired, so the Keep
+    // classification was overridden and it entered the rewrite; every row
+    // was physically dropped, removing the input entirely.
+    assert_eq!(stats.segments_read, 1);
+    assert_eq!(stats.segments_written, 0);
+    assert_eq!(stats.rows_written, 0);
+    // rows_dropped_ttl is exactly the value the engine's
+    // adjust_row_count_for_ttl_drops subtracts from the catalog row_count —
+    // one subtraction for the two rows physically removed here.
+    assert_eq!(stats.rows_dropped, 2);
+    assert_eq!(stats.rows_dropped_ttl, 2);
+    assert!(!expired.exists());
+
+    // The provably-unexpired clean segment stays untouched: the exemption
+    // only pulls in segments whose zone map proves full expiry.
+    assert_eq!(file_mtime(&fresh), fresh_mtime);
+    assert_eq!(
+        SegmentManager::discover_segments(&table_dir)?,
+        vec![fresh.clone()]
+    );
+    Ok(())
+}
+
+#[test]
+fn noncluster_compaction_keeps_ttl_segment_with_visible_rows() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let table_dir = tmp.path().join("default").join("t");
+    std::fs::create_dir_all(&table_dir)?;
+
+    let schema = ttl_schema();
+    let now = now_micros();
+    // Mixed expired/fresh rows: the fresh timestamp lifts the zone-map max
+    // past the TTL horizon, so full expiry cannot be proven and the clean
+    // segment must stay Keep — rewriting it would drop the expired row but
+    // is not the rewrite path's call to make without a proof.
+    let seg = table_dir.join("seg_00001.dat");
+    write_ttl_segment(&seg, &schema, &[now - 3_600 * 1_000_000, now])?;
+    let seg_mtime = file_mtime(&seg);
+
+    let segment_mgr = noncluster_dirty_only_manager(&tmp)?;
+    let compactor = Compactor::new(Arc::clone(&segment_mgr), tmp.path().to_path_buf());
+    let stats = compactor.optimize_table("default", "t", &ttl_meta(&schema, 60))?;
+
+    assert_eq!(stats.segments_read, 0);
+    assert_eq!(stats.segments_written, 0);
+    assert_eq!(stats.rows_written, 0);
+    assert_eq!(stats.rows_dropped, 0);
+    assert_eq!(file_mtime(&seg), seg_mtime);
+    assert_eq!(SegmentManager::discover_segments(&table_dir)?, vec![seg.clone()]);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Budgeted unsorted rewrite (bounded row-ref buffer)
+// ---------------------------------------------------------------------------
+
+fn read_ids_and_row_group_sizes(path: &Path) -> Result<(Vec<i64>, Vec<u64>)> {
+    let reader = SegmentReader::open(path)?;
+    let mut ids = Vec::new();
+    let mut sizes = Vec::new();
+    for rg_idx in 0..reader.num_row_groups() {
+        sizes.push(reader.row_group_rows(rg_idx));
+        let batch = reader.read_row_group(rg_idx)?;
+        for row_idx in 0..batch.num_rows() {
+            if let ScalarValue::Int64(Some(id)) = batch.scalar(row_idx, 0).unwrap() {
+                ids.push(id);
+            }
+        }
+    }
+    Ok((ids, sizes))
+}
+
+#[test]
+fn unsorted_budgeted_rewrite_matches_full_buffer_result() -> Result<()> {
+    // Builds the same fragmented three-segment table (each row group one
+    // row, so all inputs are dirty and selected) in its own directory and
+    // returns the compacted output's row order and row-group layout. The
+    // unsorted rewrite preserves source order, so the expected ids read
+    // back are exactly the insert order.
+    let build = |tmp: tempfile::TempDir| -> Result<(Vec<i64>, Vec<u64>)> {
+        let table_dir = tmp.path().join("default").join("t");
+        std::fs::create_dir_all(&table_dir)?;
+        let schema = test_schema();
+        let rows_of = |ids: &[i64]| -> Vec<(i64, String)> {
+            ids.iter()
+                .map(|&id| (id, format!("value-{id}")))
+                .collect::<Vec<_>>()
+        };
+        for (seq, ids) in [&[5i64, 1, 8][..], &[3, 9, 2], &[7, 4, 6]].iter().enumerate() {
+            let owned = rows_of(ids);
+            let rows = owned
+                .iter()
+                .map(|(id, name)| (*id, name.as_str()))
+                .collect::<Vec<_>>();
+            write_segment_with_row_group_size(
+                &table_dir.join(format!("seg_{:05}.dat", seq + 1)),
+                &schema,
+                &rows,
+                1,
+            )?;
+        }
+
+        // Target row group of 2 rows: the rewrite gathers and writes in
+        // 2-row chunks, so the output layout is 2/2/2/2/1.
+        let segment_mgr = Arc::new(SegmentManager::with_config(
+            tmp.path(),
+            SegmentConfig {
+                row_group_target_rows: 2,
+                ..SegmentConfig::default()
+            },
+        )?);
+        let compactor = Compactor::new(segment_mgr, tmp.path().to_path_buf());
+        let stats = compactor.optimize_table("default", "t", &test_meta_without_cluster(&schema))?;
+        assert_eq!(stats.rows_written, 9);
+        let segments = SegmentManager::discover_segments(&table_dir)?;
+        assert_eq!(segments.len(), 1);
+        read_ids_and_row_group_sizes(&segments[0])
+    };
+
+    // Default budget: the whole 9-row ref buffer fits, single pass.
+    let single_pass = build(tempfile::tempdir()?)?;
+
+    // Tiny budget (3 refs < 9 live rows): the buffer must drain mid-scan in
+    // whole-chunk flushes instead of collecting every ref up front.
+    CLUSTERED_MERGE_BUDGET_OVERRIDE.store(
+        ROW_REF_BYTES * 3,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let budgeted = build(tempfile::tempdir()?)?;
+    CLUSTERED_MERGE_BUDGET_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    // Same rows, same source order, same row-group layout as the
+    // single-pass rewrite.
+    assert_eq!(
+        single_pass,
+        (
+            vec![5, 1, 8, 3, 9, 2, 7, 4, 6],
+            vec![2, 2, 2, 2, 1]
+        )
+    );
+    assert_eq!(budgeted, single_pass);
+    Ok(())
+}

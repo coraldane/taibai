@@ -383,24 +383,35 @@ impl SegmentManager {
         let mgr_clone = Arc::clone(mgr);
         let stop = mgr.flush_stop.clone();
         let paused = mgr.flush_paused.clone();
-        std::thread::Builder::new()
-            .name("taibai-flush".into())
-            .spawn(move || {
-                while !stop.load(Ordering::Acquire) {
-                    std::thread::sleep(std::time::Duration::from_secs(FLUSH_CHECK_INTERVAL_SECS));
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if paused.load(Ordering::Acquire) {
-                        tracing::debug!("flush thread paused, skipping periodic check");
-                        continue;
-                    }
-                    if let Err(e) = mgr_clone.periodic_flush_check() {
-                        tracing::warn!(error = %e, "periodic flush check failed");
-                    }
-                }
-            })
-            .expect("failed to spawn flush thread");
+        let body_stop = Arc::clone(&stop);
+        let body = move || {
+            // One supervised round = one iteration of the original polling
+            // loop. The supervisor (audit P1-5) catches a panicking
+            // `periodic_flush_check` — e.g. a poisoned-lock `unwrap` — logs
+            // it and retries with backoff instead of leaving periodic
+            // sealing silently dead until process restart.
+            crate::common::thread_supervisor::sleep_interruptibly(
+                &body_stop,
+                Duration::from_secs(FLUSH_CHECK_INTERVAL_SECS),
+            );
+            if body_stop.load(Ordering::Acquire) {
+                return;
+            }
+            if paused.load(Ordering::Acquire) {
+                tracing::debug!("flush thread paused, skipping periodic check");
+                return;
+            }
+            if let Err(e) = mgr_clone.periodic_flush_check() {
+                tracing::warn!(error = %e, "periodic flush check failed");
+            }
+        };
+        // The supervisor shares `flush_stop`, so `SegmentManager::shutdown`
+        // stops the loop exactly as before supervision; the returned handle
+        // detaches (dropped here), matching the previous discarded
+        // JoinHandle. Pause/resume semantics are unchanged: the flag is
+        // re-read at the top of every round.
+        let _ =
+            crate::common::thread_supervisor::spawn_supervised_with_stop("taibai-flush", stop, body);
     }
 
     pub fn shutdown(&self) {
@@ -715,6 +726,21 @@ impl SegmentManager {
         table_dir: &Path,
     ) -> Result<u64> {
         self.with_table_mutation_lock(db, table, || {
+            // Same pin gate as compaction/TTL/DDL: an open transaction's
+            // deferred tombstones reference segment paths, and deleting a
+            // fully-deleted segment under them left that COMMIT retrying a
+            // vanished path forever.
+            if self
+                .txn_mutations()
+                .is_some_and(|registry| registry.table_has_pins(db, table))
+            {
+                tracing::debug!(
+                    db,
+                    table,
+                    "table pinned by an open transaction, skipping fully-deleted cleanup"
+                );
+                return Ok(0);
+            }
             let mut removed = 0u64;
             for path in self.discover_inactive_segments(db, table, table_dir)? {
                 let reader = self.open_reader_cached(&path)?;
@@ -908,20 +934,41 @@ impl SegmentManager {
             return Ok(reader);
         }
 
-        let reader = match if self.requires_owned_reader(path) {
-            SegmentReader::open_owned(path)
+        // The reader cache is bounded by BYTES, not entry count: owned
+        // readers hold a full heap copy of the file, so before a5b116b's
+        // smaller replacement segments the count-bounded cache could retain
+        // `capacity` copies of up to ~255 MB each. Charge each entry by its
+        // real footprint — file length for owned readers, a small fixed
+        // constant for mmap readers (whose mapping lives in the page cache).
+        let (reader, owned) = if self.requires_owned_reader(path) {
+            match SegmentReader::open_owned(path) {
+                Ok(reader) => (reader, true),
+                Err(err) if is_transient_footer_error(&err) => {
+                    (self.open_mutable_reader_owned(path)?, true)
+                }
+                Err(err) => return Err(err),
+            }
         } else {
-            SegmentReader::open(path)
-        } {
-            Ok(reader) => reader,
-            Err(err) if is_transient_footer_error(&err) => self.open_mutable_reader_owned(path)?,
-            Err(err) => return Err(err),
+            match SegmentReader::open(path) {
+                Ok(reader) => (reader, false),
+                Err(err) if is_transient_footer_error(&err) => {
+                    (self.open_mutable_reader_owned(path)?, true)
+                }
+                Err(err) => return Err(err),
+            }
+        };
+        let cost_bytes = if owned {
+            std::fs::metadata(path)
+                .map(|meta| meta.len())
+                .unwrap_or(reader_cache::AVG_READER_COST_BYTES)
+        } else {
+            reader_cache::AVG_READER_COST_BYTES
         };
         Ok(self
             .reader_cache
             .lock()
             .unwrap()
-            .put(path.to_path_buf(), reader))
+            .put(path.to_path_buf(), reader, cost_bytes))
     }
 
     /// True when the active segment for `path` has appended rows that are not

@@ -41,11 +41,10 @@ struct ClusterReadSource {
     row_count: usize,
 }
 
-/// Surviving rows of an unsorted partition as (row group, row) references,
-/// with deleted and TTL-expired rows already purged.
-struct UnsortedRowRefs {
-    row_refs: Vec<RowRef>,
-    source_row_groups: Vec<SourceRowGroup>,
+/// Outcome of the streaming unsorted rewrite: the counters the
+/// prepared-compaction builder needs from the heavy phase.
+struct UnsortedRewriteStats {
+    rows_written: usize,
     deleted_rows: u64,
     ttl_dropped: u64,
 }
@@ -110,6 +109,12 @@ fn clustered_merge_budget_bytes() -> usize {
 /// Maximum number of sorted runs merged at once; larger run counts are
 /// merged in waves.
 const CLUSTERED_MERGE_MAX_RUNS: usize = 64;
+
+/// Memory one `RowRef` occupies in the unsorted rewrite's collection buffer
+/// (two `usize`s = 16 bytes). It converts the shared compaction byte budget
+/// into that buffer's row cap, so the unsorted path stays under the same
+/// budget the clustered path already enforces.
+const ROW_REF_BYTES: usize = std::mem::size_of::<RowRef>();
 
 /// Outcome of the unlocked heavy phase (decode/sort/tmp write) of one
 /// partition compaction. The commit phase validates and installs it under
@@ -180,6 +185,37 @@ fn ttl_row_visible(
         crate::types::scalar::ScalarValue::Timestamp(Some(ts))
             if ts.saturating_add(duration_us) > now_us
     )
+}
+
+/// Cheap footer-only proof that EVERY row of a segment is TTL-expired: the
+/// TTL column's zone-map max plus the duration is already past `now_us`.
+/// Used to pull otherwise clean segments into a rewrite — the row-level TTL
+/// purge only runs inside compaction rewrites, so without this proof-based
+/// exception a clean segment's expired rows could never be physically
+/// removed. Anything the zone maps cannot prove returns false so the
+/// segment conservatively stays untouched: an uncomputed or empty map, a
+/// NULL max, NULL TTL values (`null_count` — those rows stay visible to
+/// the read filter), or a non-timestamp TTL column (never hidden either).
+fn segment_ttl_fully_expired(
+    reader: &crate::storage::segment::SegmentReader,
+    ttl_col_idx: usize,
+    duration_us: i64,
+    now_us: i64,
+) -> bool {
+    (0..reader.num_row_groups()).all(|rg_idx| {
+        reader
+            .zone_maps(rg_idx)
+            .get(ttl_col_idx)
+            .is_some_and(|zone| {
+                zone.row_count > 0
+                    && zone.null_count == 0
+                    && matches!(
+                        &zone.max_value,
+                        crate::types::scalar::ScalarValue::Timestamp(Some(ts))
+                            if ts.saturating_add(duration_us) <= now_us
+                    )
+            })
+    })
 }
 
 pub struct Compactor {
@@ -527,19 +563,89 @@ impl Compactor {
         Ok(stats)
     }
 
-    /// Collect the surviving rows of an unsorted partition as (row group,
-    /// row) references, purging deleted and TTL-expired rows.
-    fn collect_unsorted_row_refs(
+    /// Streaming rewrite of an unsorted partition: walk the input segments
+    /// in source order, purge deleted and TTL-expired rows, and write the
+    /// survivors to the replacement segment.
+    ///
+    /// The surviving-row reference buffer is bounded by the shared
+    /// compaction memory budget: once the 16-byte refs cross it, whole
+    /// output row groups are flushed to the writer and the buffer is reused
+    /// for the rest of the scan. Before this bound the refs of every live
+    /// row were collected up front (~8GB for 500M rows) while the clustered
+    /// path already had a budget via its external merge. Flushing only
+    /// whole row groups, one chunk-sized gather at a time, and appending
+    /// refs in source order keeps the rewritten row set, its order, and the
+    /// output row-group layout identical to the old collect-then-chunk
+    /// loop.
+    #[allow(clippy::too_many_arguments)]
+    fn rewrite_unsorted_partition(
         &self,
+        db: &str,
+        table: &str,
+        partition_label: &str,
+        tmp_path: &Path,
+        schema: &Schema,
+        bloom_column_indices: &[usize],
         segment_files: &[PathBuf],
         ttl: Option<(usize, i64)>,
-        now_us: i64,
-    ) -> Result<UnsortedRowRefs> {
-        let mut row_refs = Vec::new();
-        let mut source_row_groups = Vec::new();
+        output_row_group_rows: usize,
+        compression_level: i32,
+    ) -> Result<UnsortedRewriteStats> {
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
+        let duration = ttl.map(|(_, secs)| secs.saturating_mul(1_000_000));
+        let chunk_rows = output_row_group_rows.max(1);
+        let write_progress_rows = chunk_rows.saturating_mul(16).max(1);
+        // Soft row cap of the ref buffer, translated from the byte budget
+        // via the per-row ref cost. One output chunk is the minimum flush
+        // granularity (a partial flush would strand a short row group
+        // mid-segment and change the output layout), so budgets smaller
+        // than a chunk still buffer a whole chunk.
+        let ref_budget_rows = (clustered_merge_budget_bytes() / ROW_REF_BYTES).max(chunk_rows);
+
+        let mut writer = SegmentWriter::create_with_bloom_columns(
+            tmp_path,
+            schema.clone(),
+            output_row_group_rows,
+            bloom_column_indices,
+            compression_level,
+        )?;
+        let projection = (0..schema.num_columns()).collect::<Vec<_>>();
+        // The cache lives across budget flushes: after a flush the next rows
+        // usually come from the same source row groups the scan is walking.
+        let mut row_group_cache = RowGroupCache::new(32, projection);
+        let mut source_row_groups: Vec<SourceRowGroup> = Vec::new();
+        let mut row_refs: Vec<RowRef> = Vec::new();
         let mut deleted_rows = 0u64;
         let mut ttl_dropped = 0u64;
-        let duration = ttl.map(|(_, secs)| secs.saturating_mul(1_000_000));
+        let mut rows_written = 0usize;
+
+        // Gathers and writes one chunk of buffered refs. Sources and refs
+        // are passed per call: the scan keeps appending to
+        // `source_row_groups`, which a capturing closure would pin for the
+        // whole loop.
+        let mut write_refs = |sources: &[SourceRowGroup], refs: &[RowRef]| -> Result<()> {
+            if refs.is_empty() {
+                return Ok(());
+            }
+            let batch = self.gather_cached_chunk(schema, sources, refs, &mut row_group_cache)?;
+            rows_written += batch.num_rows();
+            writer.write_batch_parallel(&batch)?;
+            if rows_written.is_multiple_of(write_progress_rows) {
+                tracing::info!(
+                    db,
+                    table,
+                    table_full_name = %format!("{}.{}", db, table),
+                    partition_key = partition_label,
+                    rows_written,
+                    "compact write progress"
+                );
+            }
+            Ok(())
+        };
+
         for seg_path in segment_files {
             let reader = self.segment_mgr.open_reader(seg_path)?;
             let mut segment_row_base = 0u64;
@@ -569,11 +675,54 @@ impl Compactor {
                     segment_path: seg_path.clone(),
                     row_group_idx: rg_idx,
                 });
+                if row_refs.len() >= ref_budget_rows {
+                    // Budget drain: flush every whole chunk currently
+                    // buffered, keeping only the sub-chunk tail for the next
+                    // round. Each flushed batch is one chunk large — the
+                    // same gather memory the single-pass loop used — so only
+                    // the ref buffer, never the write path, changes shape.
+                    let whole_chunks = row_refs.len() - row_refs.len() % chunk_rows;
+                    let tail = row_refs.split_off(whole_chunks);
+                    for chunk in row_refs.chunks(chunk_rows) {
+                        write_refs(&source_row_groups, chunk)?;
+                    }
+                    row_refs.clear();
+                    row_refs.extend(tail);
+                }
             }
         }
-        Ok(UnsortedRowRefs {
-            row_refs,
-            source_row_groups,
+        // Tail flush: the final chunk may be short, exactly like the last
+        // chunk of the old collect-then-chunk loop.
+        for chunk in row_refs.chunks(chunk_rows) {
+            write_refs(&source_row_groups, chunk)?;
+        }
+
+        if rows_written == 0 {
+            // Nothing survived: skip sealing an empty replacement — the
+            // caller's AllDropped path removes the header-only tmp file.
+            return Ok(UnsortedRewriteStats {
+                rows_written,
+                deleted_rows,
+                ttl_dropped,
+            });
+        }
+        writer.seal()?;
+        tracing::info!(
+            db,
+            table,
+            table_full_name = %format!("{}.{}", db, table),
+            partition_key = partition_label,
+            source_row_groups = source_row_groups.len(),
+            rows_written,
+            rows_dropped = deleted_rows,
+            rows_dropped_ttl = ttl_dropped,
+            ref_budget_rows,
+            fallback_cache_hits = row_group_cache.hits(),
+            fallback_cache_misses = row_group_cache.misses(),
+            "unsorted partition rewrite completed"
+        );
+        Ok(UnsortedRewriteStats {
+            rows_written,
             deleted_rows,
             ttl_dropped,
         })
@@ -745,12 +894,21 @@ impl Compactor {
             // Non-clustered table: only dirty (or under-full, merge-worthy)
             // segments enter the rewrite; clean full-size segments are never
             // rewritten — rewriting them would be pure write amplification.
+            // The one exception is clean segments the zone maps prove fully
+            // TTL-expired (see `select_noncluster_compaction_inputs`): those
+            // must join the rewrite or their expired rows linger forever.
+            let now_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as i64;
             match self.select_noncluster_compaction_inputs(
                 db,
                 table,
                 partition_key,
                 &segment_files,
                 output_row_group_rows,
+                ttl,
+                now_us,
             )? {
                 Some(inputs) => inputs,
                 None => return Ok(PreparedCompaction::Skipped),
@@ -816,117 +974,139 @@ impl Compactor {
         // from those global arrays. This avoids carrying a 16-byte
         // (row-group,row) reference and rebuilding a source map for every
         // output chunk.
-        let mut preloaded_batch = None;
-        let mut source_row_groups = Vec::new();
-        let mut row_refs = Vec::new();
-        let mut sorted_indices = Vec::new();
-        let source_row_group_count;
-        // Both collection strategies assign these before any use below.
-        let deleted_rows: u64;
-        let ttl_dropped: u64;
-
         if sort_key_indices.is_empty() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_micros() as i64;
-            let unsorted = self.collect_unsorted_row_refs(&segment_files, ttl, now)?;
-            row_refs = unsorted.row_refs;
-            source_row_groups = unsorted.source_row_groups;
-            deleted_rows = unsorted.deleted_rows;
-            ttl_dropped = unsorted.ttl_dropped;
-            source_row_group_count = source_row_groups.len();
-        } else {
-            let decode_started = Instant::now();
-            let (sources, global_row_base) = self.collect_clustered_sources(&segment_files)?;
-            source_row_group_count = sources.len();
-
-            let estimated_width = estimated_row_width_bytes(schema);
-            let in_memory_budget_rows =
-                (clustered_merge_budget_bytes() / estimated_width).max(output_row_group_rows * 4);
-            if global_row_base > in_memory_budget_rows {
-                // Partition exceeds the in-memory budget: spill sorted runs
-                // to temp files and k-way merge them into the output, keeping
-                // peak memory proportional to the budget instead of the
-                // partition.
-                let final_path = self
-                    .segment_mgr
-                    .next_replacement_segment_path(table_dir, partition_key)?;
-                let tmp_path = store::replacement_tmp_path(&final_path, "compact_tmp");
-                let (rows_written, dropped, dropped_ttl) = self.prepare_clustered_external(
-                    db,
-                    table,
-                    partition_label,
-                    &tmp_path,
-                    &final_path,
-                    schema,
-                    sort_key_indices,
-                    bloom_column_indices,
-                    &segment_files,
-                    ttl,
-                    output_row_group_rows,
-                    compression_level,
-                )?;
-                if rows_written == 0 {
-                    let _ = std::fs::remove_file(&tmp_path);
-                    return Ok(PreparedCompaction::AllDropped {
-                        segment_files,
-                        identities,
-                        segments_read,
-                        rows_dropped: dropped,
-                        rows_dropped_ttl: dropped_ttl,
-                    });
-                }
-                tracing::info!(
-                    db,
-                    table,
-                    table_full_name = %format!("{}.{}", db, table),
-                    partition_key = partition_label,
-                    rows = rows_written,
-                    rows_dropped = dropped,
-                    elapsed_ms = decode_started.elapsed().as_millis(),
-                    "clustered optimization finished via external merge sort"
-                );
-                return Ok(PreparedCompaction::Replacement {
+            // Unsorted rewrite: refs are streamed to the replacement writer
+            // under the compaction memory budget (see
+            // `rewrite_unsorted_partition`), so this path owns its tmp path
+            // and returns the finished outcome directly — the same early
+            // return shape as the clustered external merge below.
+            let final_path = self
+                .segment_mgr
+                .next_replacement_segment_path(table_dir, partition_key)?;
+            let tmp_path = store::replacement_tmp_path(&final_path, "compact_tmp");
+            let rewrite = self.rewrite_unsorted_partition(
+                db,
+                table,
+                partition_label,
+                &tmp_path,
+                schema,
+                bloom_column_indices,
+                &segment_files,
+                ttl,
+                output_row_group_rows,
+                compression_level,
+            )?;
+            if rewrite.rows_written == 0 {
+                // Every input row was deleted or expired; the writer holds
+                // only the header, so discard it instead of sealing an empty
+                // replacement.
+                let _ = std::fs::remove_file(&tmp_path);
+                let _ = crate::storage::segment::meta::remove_sidecar_meta(&tmp_path);
+                return Ok(PreparedCompaction::AllDropped {
                     segment_files,
                     identities,
-                    tmp_path,
-                    final_path,
                     segments_read,
-                    rows_to_write: rows_written,
+                    rows_dropped: rewrite.deleted_rows,
+                    rows_dropped_ttl: rewrite.ttl_dropped,
+                });
+            }
+            return Ok(PreparedCompaction::Replacement {
+                segment_files,
+                identities,
+                tmp_path,
+                final_path,
+                segments_read,
+                rows_to_write: rewrite.rows_written,
+                rows_dropped: rewrite.deleted_rows,
+                rows_dropped_ttl: rewrite.ttl_dropped,
+            });
+        }
+
+        let decode_started = Instant::now();
+        let (sources, global_row_base) = self.collect_clustered_sources(&segment_files)?;
+        let source_row_group_count = sources.len();
+
+        let estimated_width = estimated_row_width_bytes(schema);
+        let in_memory_budget_rows =
+            (clustered_merge_budget_bytes() / estimated_width).max(output_row_group_rows * 4);
+        if global_row_base > in_memory_budget_rows {
+            // Partition exceeds the in-memory budget: spill sorted runs
+            // to temp files and k-way merge them into the output, keeping
+            // peak memory proportional to the budget instead of the
+            // partition.
+            let final_path = self
+                .segment_mgr
+                .next_replacement_segment_path(table_dir, partition_key)?;
+            let tmp_path = store::replacement_tmp_path(&final_path, "compact_tmp");
+            let (rows_written, dropped, dropped_ttl) = self.prepare_clustered_external(
+                db,
+                table,
+                partition_label,
+                &tmp_path,
+                &final_path,
+                schema,
+                sort_key_indices,
+                bloom_column_indices,
+                &segment_files,
+                ttl,
+                output_row_group_rows,
+                compression_level,
+            )?;
+            if rows_written == 0 {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Ok(PreparedCompaction::AllDropped {
+                    segment_files,
+                    identities,
+                    segments_read,
                     rows_dropped: dropped,
                     rows_dropped_ttl: dropped_ttl,
                 });
             }
-            if global_row_base > u32::MAX as usize {
-                return Err(TaibaiError::Storage(format!(
-                    "clustered optimization supports at most {} rows per partition",
-                    u32::MAX
-                )));
-            }
-
-            let clustered = self.decode_clustered_partition(
+            tracing::info!(
                 db,
                 table,
-                partition_label,
-                schema,
-                &sources,
-                global_row_base,
-                sort_key_indices,
-                ttl,
-                decode_started,
-            )?;
-            preloaded_batch = Some(clustered.batch);
-            sorted_indices = clustered.sorted_indices;
-            deleted_rows = clustered.deleted_rows;
-            ttl_dropped = clustered.ttl_dropped;
+                table_full_name = %format!("{}.{}", db, table),
+                partition_key = partition_label,
+                rows = rows_written,
+                rows_dropped = dropped,
+                elapsed_ms = decode_started.elapsed().as_millis(),
+                "clustered optimization finished via external merge sort"
+            );
+            return Ok(PreparedCompaction::Replacement {
+                segment_files,
+                identities,
+                tmp_path,
+                final_path,
+                segments_read,
+                rows_to_write: rows_written,
+                rows_dropped: dropped,
+                rows_dropped_ttl: dropped_ttl,
+            });
+        }
+        if global_row_base > u32::MAX as usize {
+            return Err(TaibaiError::Storage(format!(
+                "clustered optimization supports at most {} rows per partition",
+                u32::MAX
+            )));
         }
 
-        let rows_to_write = if sort_key_indices.is_empty() {
-            row_refs.len()
-        } else {
-            sorted_indices.len()
-        };
+        let clustered = self.decode_clustered_partition(
+            db,
+            table,
+            partition_label,
+            schema,
+            &sources,
+            global_row_base,
+            sort_key_indices,
+            ttl,
+            decode_started,
+        )?;
+        let preloaded_batch = clustered.batch;
+        let sorted_indices = clustered.sorted_indices;
+        let deleted_rows = clustered.deleted_rows;
+        let ttl_dropped = clustered.ttl_dropped;
+
+        let rows_to_write = sorted_indices.len();
         if rows_to_write == 0 {
             return Ok(PreparedCompaction::AllDropped {
                 segment_files,
@@ -954,17 +1134,14 @@ impl Compactor {
             "compact partition writing replacement segment"
         );
 
-        let write_result = self.write_compacted_segment(
+        let write_result = self.write_clustered_segment(
             db,
             table,
             partition_label,
             &tmp_path,
             schema,
-            sort_key_indices,
             bloom_column_indices,
-            preloaded_batch.as_ref(),
-            &source_row_groups,
-            &row_refs,
+            &preloaded_batch,
             &sorted_indices,
             output_row_group_rows,
             compression_level,
@@ -1007,8 +1184,15 @@ impl Compactor {
     /// segments merge only in company with other inputs: a lone one would be
     /// rewritten into the same lone small file. Clean segments that already
     /// hold a full row group of compact live data are never rewritten — that
-    /// would be pure write amplification. Returns `None` when nothing
-    /// qualifies (the whole partition is skipped).
+    /// would be pure write amplification — except when the table has a TTL
+    /// and the segment's zone maps prove every row already expired: the
+    /// row-level TTL purge only runs inside a rewrite, so keeping such a
+    /// segment would strand its expired rows on disk (and in the catalog
+    /// row_count) forever; whole-partition TTL drops cannot cover it because
+    /// they only fire when the TTL column is the time partition column.
+    /// Returns `None` when nothing qualifies (the whole partition is
+    /// skipped).
+    #[allow(clippy::too_many_arguments)]
     fn select_noncluster_compaction_inputs(
         &self,
         db: &str,
@@ -1016,6 +1200,8 @@ impl Compactor {
         partition_key: Option<&str>,
         segment_files: &[PathBuf],
         output_row_group_rows: usize,
+        ttl: Option<(usize, i64)>,
+        now_us: i64,
     ) -> Result<Option<Vec<PathBuf>>> {
         #[derive(Clone, Copy, PartialEq)]
         enum InputClass {
@@ -1044,6 +1230,18 @@ impl Compactor {
             } else if under_full {
                 small_count += 1;
                 InputClass::MergeSmall
+            } else if ttl.is_some_and(|(ttl_col, secs)| {
+                segment_ttl_fully_expired(
+                    &reader,
+                    ttl_col,
+                    secs.saturating_mul(1_000_000),
+                    now_us,
+                )
+            }) {
+                // Clean and full, but provably past the TTL horizon: the
+                // only way these rows ever leave the disk is a rewrite.
+                rewrite_count += 1;
+                InputClass::Rewrite
             } else {
                 InputClass::Keep
             };
@@ -1264,19 +1462,21 @@ impl Compactor {
         }
     }
 
+    /// Write the clustered in-memory rewrite: gather the pre-sorted global
+    /// row indices out of the contiguous decoded batch in output-row-group
+    /// chunks. The unsorted rewrite streams its own chunks inside
+    /// `rewrite_unsorted_partition`; this writer performs no source I/O —
+    /// the decode pass already holds every column in memory.
     #[allow(clippy::too_many_arguments)]
-    fn write_compacted_segment(
+    fn write_clustered_segment(
         &self,
         db: &str,
         table: &str,
         partition_key: &str,
         path: &Path,
         schema: &Schema,
-        sort_key_indices: &[usize],
         bloom_column_indices: &[usize],
-        preloaded_batch: Option<&RecordBatch>,
-        source_row_groups: &[SourceRowGroup],
-        row_refs: &[RowRef],
+        source: &RecordBatch,
         sorted_indices: &[u32],
         output_row_group_rows: usize,
         compression_level: i32,
@@ -1291,90 +1491,25 @@ impl Compactor {
         let write_gather_chunk_rows = output_row_group_rows.max(1);
         let write_progress_rows = write_gather_chunk_rows.saturating_mul(16).max(1);
         let mut rows_written = 0usize;
-        let projection = (0..schema.num_columns()).collect::<Vec<_>>();
-        // Non-sorting cleanup preserves source order, so a small cache remains
-        // effective there. Clustered OPTIMIZE uses the source batches decoded
-        // during its sort pass and performs no I/O in the write/gather phase.
-        let mut row_group_cache = RowGroupCache::new(32, projection);
 
-        tracing::info!(
-            db,
-            table,
-            table_full_name = %format!("{}.{}", db, table),
-            partition_key,
-            source_row_groups = source_row_groups.len(),
-            preloaded_contiguous_columns = preloaded_batch.is_some(),
-            fallback_cache_capacity = row_group_cache.capacity(),
-            chunk_rows = write_gather_chunk_rows,
-            output_row_group_rows,
-            compression_level,
-            "compact write using index-only gather"
-        );
-
-        let total_rows = if sort_key_indices.is_empty() {
-            for chunk in row_refs.chunks(write_gather_chunk_rows) {
-                let batch = self.gather_cached_chunk(
-                    schema,
-                    source_row_groups,
-                    chunk,
-                    &mut row_group_cache,
-                )?;
-                rows_written += batch.num_rows();
-                writer.write_batch_parallel(&batch)?;
+        for chunk in sorted_indices.chunks(write_gather_chunk_rows) {
+            let batch = gather_global_chunk(schema, source, chunk)?;
+            rows_written += batch.num_rows();
+            writer.write_batch_parallel(&batch)?;
+            if rows_written.is_multiple_of(write_progress_rows) {
+                let progress_pct = rows_written as f64 * 100.0 / sorted_indices.len() as f64;
+                tracing::info!(
+                    db,
+                    table,
+                    table_full_name = %format!("{}.{}", db, table),
+                    partition_key,
+                    rows_written,
+                    total_rows = sorted_indices.len(),
+                    progress_pct = format_args!("{:.2}", progress_pct),
+                    "compact write progress"
+                );
             }
-            row_refs.len()
-        } else {
-            let source = preloaded_batch.ok_or_else(|| {
-                TaibaiError::Storage(
-                    "missing contiguous source columns for clustered optimization".to_string(),
-                )
-            })?;
-            for chunk in sorted_indices.chunks(write_gather_chunk_rows) {
-                let batch = gather_global_chunk(schema, source, chunk)?;
-                rows_written += batch.num_rows();
-                writer.write_batch_parallel(&batch)?;
-                if rows_written.is_multiple_of(write_progress_rows) {
-                    let progress_pct = rows_written as f64 * 100.0 / sorted_indices.len() as f64;
-                    tracing::info!(
-                        db,
-                        table,
-                        table_full_name = %format!("{}.{}", db, table),
-                        partition_key,
-                        rows_written,
-                        total_rows = sorted_indices.len(),
-                        progress_pct = format_args!("{:.2}", progress_pct),
-                        "compact write progress"
-                    );
-                }
-            }
-            sorted_indices.len()
-        };
-
-        if sort_key_indices.is_empty() && total_rows > 0 && rows_written != total_rows {
-            let progress_pct = rows_written as f64 * 100.0 / total_rows as f64;
-            tracing::info!(
-                db,
-                table,
-                table_full_name = %format!("{}.{}", db, table),
-                partition_key,
-                rows_written,
-                total_rows,
-                progress_pct = format_args!("{:.2}", progress_pct),
-                "compact write progress"
-            );
         }
-
-        tracing::info!(
-            db,
-            table,
-            table_full_name = %format!("{}.{}", db, table),
-            partition_key,
-            rows_written,
-            fallback_cache_hits = row_group_cache.hits(),
-            fallback_cache_misses = row_group_cache.misses(),
-            fallback_cached_row_groups = row_group_cache.len(),
-            "compact write gathered rows"
-        );
 
         writer.seal()
     }
@@ -1841,14 +1976,6 @@ impl RowGroupCache {
             hits: 0,
             misses: 0,
         }
-    }
-
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn len(&self) -> usize {
-        self.batches.len()
     }
 
     fn hits(&self) -> usize {

@@ -5,6 +5,17 @@
 
 use super::*;
 
+
+fn decimal_at(result: &ExecResult, row: usize, col: usize) -> i64 {
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result");
+    };
+    match batches[0].scalar(row, col).unwrap() {
+        ScalarValue::Decimal(Some(v)) => v,
+        other => panic!("unexpected value {:?}", other),
+    }
+}
+
 /// P0 (INSERT): a transactional INSERT that exceeds the mutation budget must
 /// leave NO rows behind — a later COMMIT must not publish ghost rows whose
 /// unique-index keys were never recorded.
@@ -712,5 +723,139 @@ fn update_journal_rolls_forward_when_images_durable() -> Result<()> {
         0,
     );
     assert_eq!(value, 99, "updated values stay after roll-forward");
+    Ok(())
+}
+
+/// Self-assignment regression (found while streaming the validation):
+/// `SET uk = <the row's current value>` must not collide with the row's own
+/// retiring old key. The all-segment sweep reads pre-tombstone footers, so
+/// matched rows must be excluded via the planned new bitmaps.
+#[test]
+fn update_self_assignment_does_not_collide_with_own_key() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64, uk VARCHAR, UNIQUE KEY uk_key (uk))",
+    )?;
+    let table_meta = engine.get_table_meta("main", "t").unwrap();
+    let schema = crate::types::batch::Schema::new(table_meta.columns.clone());
+    let mut batch = crate::types::batch::RecordBatch::with_capacity(schema.clone(), 3);
+    for (id, uk) in [(1i64, "a"), (2, "b"), (3, "c")] {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(id)))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(uk.to_string())))?;
+    }
+    engine.segment_mgr().write_new_segment(
+        &engine.data_dir().join("main").join("t").join("seg_00001.dat"),
+        schema,
+        1,
+        &batch,
+        3,
+    )?;
+
+    // Re-assigning a row its own key (and one row a neighbor's retired key
+    // is NOT tested here — only pure self-assignment) must succeed.
+    engine.execute(&mut session, "UPDATE t SET uk = 'a' WHERE id = 1")?;
+    let count_a = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE uk = 'a'")?,
+        0,
+        0,
+    );
+    assert_eq!(count_a, 1);
+
+    // A cross-row swap via three statements (park one key on a fresh value
+    // first) must also validate cleanly.
+    engine.execute(&mut session, "UPDATE t SET uk = 'temp' WHERE id = 2")?;
+    engine.execute(&mut session, "UPDATE t SET uk = 'b' WHERE id = 1")?;
+    engine.execute(&mut session, "UPDATE t SET uk = 'a' WHERE id = 2")?;
+    let count_b = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE uk = 'b'")?,
+        0,
+        0,
+    );
+    assert_eq!(count_b, 1);
+    let count_a = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE uk = 'a'")?,
+        0,
+        0,
+    );
+    assert_eq!(count_a, 1);
+    Ok(())
+}
+
+/// P1 (DECIMAL divergence): the standard INSERT path converted float
+/// literals through f64 multiplication (`2.675 * 100` = 267.499...,
+/// stored 267) while the fast path's exact decimal parse stored 268 — the
+/// same SQL could store different values depending on unrelated syntax.
+/// Both paths now share the exact decimal conversion; this exercises the
+/// standard path via a DEFAULT-containing statement (fast path declines).
+#[test]
+fn decimal_literal_rounding_matches_between_paths() -> Result<()> {
+    let cases: &[(&str, &str, i64)] = &[
+        ("2.675", "half-up on the first dropped digit", 268),
+        ("2.674", "below half stays down", 267),
+        ("-2.675", "negative rounds away from zero", -268),
+        ("8.115", "second divergence case", 812),
+        ("1.999", "carry into the integer part", 200),
+        // Classic f64 divergence: 1.005 * 100 lands just below 100.5, the
+        // old f64 path stored 100 while exact decimal parsing stores 101.
+        ("1.005", "f64 product below the half boundary", 101),
+    ];
+
+    // Standard path: an arithmetic expression in the VALUES makes the fast
+    // path decline;  preserves the literal's value exactly.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "main")?;
+        let mut session = session();
+        engine.execute(
+            &mut session,
+            "CREATE TABLE d (id INT64, amt DECIMAL(9,2))",
+        )?;
+        for (index, (literal, _, _)) in cases.iter().enumerate() {
+            engine.execute(
+                &mut session,
+                &format!("INSERT INTO d (id, amt) VALUES ({}, {} + 0)", index + 1, literal),
+            )?;
+        }
+        for (index, (literal, label, expected)) in cases.iter().enumerate() {
+            let result = engine.execute(
+                &mut session,
+                &format!("SELECT amt FROM d WHERE id = {}", index + 1),
+            )?;
+            let stored = decimal_at(&result, 0, 0);
+            assert_eq!(stored, *expected, "{literal} ({label}) via standard path");
+        }
+    }
+
+    // Fast path: identical literals without the DEFAULT-triggering shape.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "main")?;
+        let mut session = session();
+        engine.execute(&mut session, "CREATE TABLE d (id INT64, amt DECIMAL(9,2))")?;
+        for (index, (literal, _, _)) in cases.iter().enumerate() {
+            engine.execute(
+                &mut session,
+                &format!("INSERT INTO d (id, amt) VALUES ({}, {})", index + 1, literal),
+            )?;
+        }
+        for (index, (literal, label, expected)) in cases.iter().enumerate() {
+            let result = engine.execute(
+                &mut session,
+                &format!("SELECT amt FROM d WHERE id = {}", index + 1),
+            )?;
+            let stored = decimal_at(&result, 0, 0);
+            assert_eq!(stored, *expected, "{literal} ({label}) via fast path");
+        }
+    }
     Ok(())
 }

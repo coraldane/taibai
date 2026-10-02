@@ -37,7 +37,9 @@ pub(crate) fn resolve_compression_level(override_level: Option<i32>) -> i32 {
 }
 
 /// Reader/meta cache capacity, installed from `storage.reader_cache_capacity`
-/// in the config file during server startup.
+/// in the config file during server startup. The reader cache converts this
+/// entry count into a byte budget of `capacity * 256 KiB` (256 MiB by
+/// default) and evicts by LRU bytes; see `reader_cache::ReaderCache`.
 pub(super) fn reader_cache_capacity() -> usize {
     crate::common::config::reader_cache_capacity()
 }

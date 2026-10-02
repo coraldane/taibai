@@ -85,6 +85,11 @@ pub fn exec_replace(
         engine
             .segment_mgr()
             .with_table_mutation_lock(db, table, || {
+                // In-lock re-check (the check at the fn top races a
+                // transaction registering its pin under this same lock):
+                // REPLACE shifts memtable positions, which would make that
+                // transaction's COMMIT delete the wrong rows.
+                super::txn_dml::refuse_auto_commit_dml_while_pinned(engine, db, table)?;
                 ensure_replace_location_indexes(
                     engine,
                     db,
@@ -96,13 +101,101 @@ pub fn exec_replace(
                 let memtable_plans = super::dml_delete::plan_replace_memtable_conflicts(
                     engine, db, table, &key_sets,
                 )?;
-                let mut undo = super::dml_delete::delete_replace_conflicts_under_table_lock(
+
+                // Stage the replacement rows FIRST, into the private
+                // transaction (invisible until commit; nothing durable is
+                // rewritten yet). The delete legs below then rewrite segment
+                // footers under the DEFERRED journal lifecycle, journaling
+                // this staging's durability watermark, so a crash between a
+                // footer's tombstone fsync and the commit rolls the old rows
+                // back at startup instead of deleting them with no
+                // replacement — the same window UPDATE's stage-first order
+                // closes. (The reverse order — tombstones first, durable
+                // insert second — leaves a crash window of "new row visible
+                // while the old row still exists", which recovery cannot
+                // arbitrate; the staged-then-commit protocol keeps every
+                // crash outcome atomic.)
+                if let Err(error) = exec_materialized_insert_batch(
+                    engine,
+                    db,
+                    table,
+                    &materialized.table_meta,
+                    materialized.schema,
+                    survivors,
+                    internal_txn_id,
+                    false,
+                    false,
+                    false,
+                    true,
+                    materialized.missing_auto_inc,
+                    false,
+                    false,
+                ) {
+                    // Nothing else was mutated yet: discard the invisible
+                    // staged rows and fail. Best-effort cleanup — the
+                    // original error wins.
+                    if let Err(rollback_error) = engine.batch_writer().rollback_txn(internal_txn_id)
+                    {
+                        tracing::warn!(
+                            db,
+                            table,
+                            txn_id = internal_txn_id,
+                            error = %rollback_error,
+                            "REPLACE staged-insert rollback failed; staged rows may linger invisibly"
+                        );
+                    }
+                    let _ = engine.txn_mutations().remove(internal_txn_id);
+                    return Err(error);
+                }
+                // Durability watermark for the deferred footer journals: the
+                // staged rows live in the private transaction's memtables;
+                // once their tails are durable, recovery keeps the
+                // tombstones (roll forward), otherwise it restores the
+                // pre-statement footers (roll back).
+                let image_checks: Vec<crate::storage::segment::reader::ImageDurabilityCheck> =
+                    engine
+                        .memtable_manager()
+                        .get_by_table(db, table)
+                        .into_iter()
+                        .filter(|memtable| memtable.txn_id() == internal_txn_id)
+                        .map(|memtable| {
+                            crate::storage::segment::reader::ImageDurabilityCheck {
+                                memtable_id: memtable.id(),
+                                partition: memtable.partition_key().to_string(),
+                                expected_rows: memtable.row_count(),
+                            }
+                        })
+                        .collect();
+
+                let mut undo = match super::dml_delete::delete_replace_conflicts_under_table_lock(
                     engine,
                     db,
                     table,
                     &materialized.table_meta,
                     &key_sets,
-                )?;
+                    &image_checks,
+                ) {
+                    Ok(undo) => undo,
+                    Err(error) => {
+                        // The delete leg restored its own partial work
+                        // (immediate footer rewrites, which also clear any
+                        // deferred journal at the same path); discard the
+                        // staged rows. Best-effort — the original error wins.
+                        if let Err(rollback_error) =
+                            engine.batch_writer().rollback_txn(internal_txn_id)
+                        {
+                            tracing::warn!(
+                                db,
+                                table,
+                                txn_id = internal_txn_id,
+                                error = %rollback_error,
+                                "REPLACE staged-insert rollback after failed conflict delete failed"
+                            );
+                        }
+                        let _ = engine.txn_mutations().remove(internal_txn_id);
+                        return Err(error);
+                    }
+                };
                 // The resident hot store is append-only and cannot remove the rows
                 // replaced below. Drop it before filtering so subsequent reads
                 // rebuild from the authoritative segments plus memtables.
@@ -115,9 +208,21 @@ pub fn exec_replace(
                 ) {
                     Ok(memtable_undo) => undo.merge(memtable_undo),
                     Err(error) => {
-                        let _ = super::dml_delete::restore_replace_delete_under_table_lock(
-                            engine, &undo,
-                        );
+                        if let Err(rollback_error) = rollback_replace_under_table_lock(
+                            engine,
+                            db,
+                            table,
+                            &materialized.table_meta,
+                            internal_txn_id,
+                            &undo,
+                        ) {
+                            tracing::warn!(
+                                db,
+                                table,
+                                error = %rollback_error,
+                                "REPLACE rollback after failed memtable conflict delete failed"
+                            );
+                        }
                         return Err(error);
                     }
                 }
@@ -136,34 +241,6 @@ pub fn exec_replace(
                     return Err(TaibaiError::Internal(
                         "forced REPLACE insert failure".to_string(),
                     ));
-                }
-
-                let insert_result = exec_materialized_insert_batch(
-                    engine,
-                    db,
-                    table,
-                    &materialized.table_meta,
-                    materialized.schema,
-                    survivors,
-                    internal_txn_id,
-                    false,
-                    false,
-                    false,
-                    true,
-                    materialized.missing_auto_inc,
-                    false,
-                    false,
-                );
-                if let Err(error) = insert_result {
-                    rollback_replace_under_table_lock(
-                        engine,
-                        db,
-                        table,
-                        &materialized.table_meta,
-                        internal_txn_id,
-                        &undo,
-                    )?;
-                    return Err(error);
                 }
 
                 let finalize_result = engine
@@ -255,6 +332,38 @@ pub fn exec_replace(
         }
         return Err(error);
     }
+
+    // The staged replacement rows are durable: the tombstone legs are now
+    // unconditionally correct. Clear the deferred journals under a brief
+    // second table-lock acquisition — journals are only ever written under
+    // this lock, so the ownership-matched clear cannot race a concurrent
+    // statement replacing the same journal path. Best effort: a leftover is
+    // re-judged by startup recovery, which finds the watermark met and rolls
+    // forward.
+    if !undo.segment_footers.is_empty() {
+        let table_dir = engine.data_dir().join(db).join(table);
+        let journal_segments: Vec<(std::path::PathBuf, Vec<u8>, u64)> = undo
+            .segment_footers
+            .iter()
+            .map(|(path, _, _, bitmap, deleted)| {
+                (path.clone(), bitmap.clone(), *deleted)
+            })
+            .collect();
+        let _ = engine.segment_mgr().with_table_mutation_lock(db, table, || {
+            for (path, bitmap, deleted) in &journal_segments {
+                crate::storage::segment::reader::clear_deferred_delete_journal_for_statement(
+                    &table_dir,
+                    path,
+                    bitmap,
+                    *deleted,
+                );
+            }
+            Ok(())
+        });
+    }
+    // The internal transaction is terminal — drop its registry entry (same
+    // cleanup as UPDATE's image transaction).
+    let _ = engine.txn_mutations().remove(internal_txn_id);
 
     super::dml_delete::finalize_replace_delete(engine, db, table, &materialized.table_meta, &undo)?;
     engine.record_inserted_rows(db, table, physical_insert_rows as i64, false, true)?;
@@ -1083,6 +1192,9 @@ fn rollback_replace_under_table_lock(
         table,
         crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
     );
+    // The internal transaction is discarded — drop its registry entry (the
+    // txn_id is never reused by the allocator).
+    let _ = engine.txn_mutations().remove(txn_id);
 
     if errors.is_empty() {
         Ok(())
@@ -1549,8 +1661,15 @@ fn push_literal_fast(
             Ok(())
         }
         (ColumnArray::Decimal { data, bitmap }, ScalarValue::Float64(Some(v))) => {
-            let multiplier = decimal_multiplier(scale)?;
-            data.push((*v * multiplier as f64).round() as i64);
+            // Exact-decimal conversion via the shortest round-trip text —
+            // see float_literal_to_decimal_i64; the f64 multiply below is
+            // only the scientific-notation fallback.
+            let scaled = crate::sql::execution::helpers::float_literal_to_decimal_i64(*v, scale)
+                .unwrap_or_else(|| {
+                    let multiplier = decimal_multiplier(scale).unwrap_or(1);
+                    (*v * multiplier as f64).round() as i64
+                });
+            data.push(scaled);
             bitmap.push_valid();
             Ok(())
         }

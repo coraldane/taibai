@@ -1180,6 +1180,24 @@ impl Engine {
     /// in memtable form so routine restarts do not create tiny segments.
     pub fn shutdown(&mut self) -> Result<()> {
         tracing::info!("engine shutdown: checkpointing resident data");
+        // Supervised background schedulers (auto-compact, close-of-day) stop
+        // first so no compaction or archival flush races the final
+        // checkpoint. Idempotent: a taken handle is gone on the next call.
+        for handle in [
+            self.auto_compact_supervisor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+            self.close_of_day_supervisor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            handle.shutdown();
+        }
         if let Err(e) = self.flush_shutdown_buffers() {
             tracing::warn!(error = %e, "engine shutdown checkpoint failed");
         }

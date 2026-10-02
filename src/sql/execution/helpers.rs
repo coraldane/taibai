@@ -1096,6 +1096,9 @@ pub fn eval_expr_to_scalar_with_scale_timezone(
             // evaluators share (`WHERE flag = 'yes'` and
             // `SET flag = 'yes'` must accept the same literals).
             (DataType::Decimal, ScalarValue::Float64(Some(v))) => {
+                if let Some(scaled) = float_literal_to_decimal_i64(*v, scale) {
+                    return Ok(ScalarValue::Decimal(Some(scaled)));
+                }
                 let multiplier = decimal_multiplier(scale)?;
                 Ok(ScalarValue::Decimal(Some(
                     (*v * multiplier as f64).round() as i64
@@ -1171,6 +1174,85 @@ pub fn eval_expr_to_scalar_with_scale_timezone(
                 .to_string(),
         )),
     }
+}
+
+/// Exact-decimal conversion of a float LITERAL to its scaled integer.
+/// Literal floats arrive from the lexer as f64, but Rust's shortest
+/// round-trip Display reconstructs the original decimal text, so the value
+/// can be re-parsed with exact integer arithmetic (half-up on the first
+/// dropped digit, sign applied last — half away from zero, matching the
+/// fast INSERT path's parser) instead of f64 multiplication: `2.675 * 100`
+/// is 267.499... in binary floating point and used to store 267 while the
+/// fast path's exact parse stored 268, silently diverging on syntax alone.
+/// Text in scientific notation (beyond realistic literals) keeps the f64
+/// fallback. `None` means the text was not a plain decimal.
+pub(crate) fn float_literal_to_decimal_i64(value: f64, scale: i32) -> Option<i64> {
+    let text = value.to_string();
+    if text.contains(['e', 'E']) {
+        let multiplier = decimal_multiplier(scale).ok()?;
+        return Some((value * multiplier as f64).round() as i64);
+    }
+    parse_exact_decimal_text(&text, scale)
+}
+
+fn parse_exact_decimal_text(text: &str, scale: i32) -> Option<i64> {
+    let scale = usize::try_from(scale).ok()?;
+    let bytes = text.as_bytes();
+    let mut idx = 0usize;
+    let negative = match bytes.first() {
+        Some(b'-') => {
+            idx = 1;
+            true
+        }
+        Some(b'+') => {
+            idx = 1;
+            false
+        }
+        _ => false,
+    };
+    let mut value: i64 = 0;
+    let mut seen_digit = false;
+    while idx < bytes.len() && bytes[idx] != b'.' {
+        let b = bytes[idx];
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        seen_digit = true;
+        value = value.checked_mul(10)?.checked_add((b - b'0') as i64)?;
+        idx += 1;
+    }
+    if idx < bytes.len() {
+        idx += 1; // consume '.'
+    }
+    let mut frac_digits = 0usize;
+    while frac_digits < scale && idx < bytes.len() {
+        let b = bytes[idx];
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        seen_digit = true;
+        value = value.checked_mul(10)?.checked_add((b - b'0') as i64)?;
+        frac_digits += 1;
+        idx += 1;
+    }
+    while frac_digits < scale {
+        value = value.checked_mul(10)?;
+        frac_digits += 1;
+    }
+    // Half-up on the first dropped digit; the rest of the tail only needs
+    // to stay digits.
+    if let Some(&b) = bytes.get(idx) {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        if b >= b'5' {
+            value = value.checked_add(1)?;
+        }
+    }
+    if !seen_digit {
+        return None;
+    }
+    Some(if negative { -value } else { value })
 }
 
 fn decimal_multiplier(scale: i32) -> Result<i64> {

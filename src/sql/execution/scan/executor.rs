@@ -734,6 +734,14 @@ impl<'a> ScanExecutor<'a> {
         // Rayon lanes do not inherit the ambient cancellation context, so
         // capture the flag and let lane closures stop starting new reads.
         let cancel_flag = crate::common::query_cancel::current_flag();
+        // Budget is enforced DURING collection, not after: the sink at the
+        // call site only noticed the overrun once every segment had already
+        // been decoded into memory.
+        let byte_cap = {
+            let mb = crate::common::config::query_limits().query_memory_limit_mb;
+            (mb as u64).saturating_mul(1024 * 1024)
+        };
+        let mut output_bytes = 0u64;
         let mut output = Vec::new();
         for (chunk_index, chunk) in paths.chunks(max_parallel).enumerate() {
             crate::common::query_cancel::check()?;
@@ -844,7 +852,17 @@ impl<'a> ScanExecutor<'a> {
             });
             for outcome in scanned {
                 let (_, mut batches) = outcome?;
-                output.append(&mut batches);
+                for batch in batches.drain(..) {
+                    output_bytes =
+                        output_bytes.saturating_add(batch.estimated_size_bytes() as u64);
+                    if output_bytes > byte_cap {
+                        return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
+                            "parallel scan materialization exceeded the query memory budget ({} > {} bytes); raise query_memory_limit_mb",
+                            output_bytes, byte_cap
+                        )));
+                    }
+                    output.push(batch);
+                }
             }
         }
         Ok(output)

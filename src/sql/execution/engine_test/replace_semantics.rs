@@ -477,6 +477,23 @@ fn replace_insert_failure_restores_deleted_rows_and_unique_state() -> Result<()>
             "INSERT INTO t (id, code, name) VALUES (2, 10, 'duplicate')",
         )
         .is_err());
+    // The failed statement must also leave no delete-footer journal behind.
+    let journals: Vec<String> = std::fs::read_dir(engine.segment_mgr().table_dir("main", "t"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".del"))
+        })
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        journals.is_empty(),
+        "failed REPLACE must not leave statement journals: {journals:?}"
+    );
 
     engine.execute(
         &mut session,
@@ -674,3 +691,199 @@ fn bulk_import_refreshes_primary_key_snapshot_for_replace() -> Result<()> {
     assert_eq!(val, 99);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// P3 (REPLACE crash window): the segment conflict leg rewrites footers under
+// the DEFERRED journal lifecycle, watermarked by the staged replacement rows.
+// ---------------------------------------------------------------------------
+
+/// `.del` journals left in the table directory (any lifecycle).
+fn leftover_del_journals(engine: &Engine, db: &str, table: &str) -> Vec<String> {
+    std::fs::read_dir(engine.segment_mgr().table_dir(db, table))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".del"))
+        })
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect()
+}
+
+/// Seed segment-resident rows via the direct bulk path (the same seam the
+/// duplicate-key tests use): REPLACE's conflict-delete leg only fires for
+/// rows that live in segments, and the bulk write lands them there
+/// immediately. Returns the segment holding the rows.
+fn seed_segment_rows(engine: &Engine, ids: &[i64]) -> Result<std::path::PathBuf> {
+    let values: Vec<i64> = ids.iter().map(|id| id * 10).collect();
+    let payload = bulk_payload(
+        "t",
+        ids.len() as u32,
+        vec![
+            ("id", DataType::Int64, int64_col(ids)),
+            ("v", DataType::Int64, int64_col(&values)),
+        ],
+    );
+    engine.exec_bulk_insert_payload_with_options("main", &payload, false)?;
+    let table_dir = engine.data_dir().join("main").join("t");
+    let segments = SegmentManager::discover_segments(&table_dir)?;
+    segments.into_iter().next().ok_or_else(|| {
+        crate::common::error::TaibaiError::Internal("no segment after bulk seed".into())
+    })
+}
+
+/// A REPLACE statement whose insert leg fails AFTER the segment footer legs
+/// tombstoned the conflicting rows must restore the rows AND leave no
+/// statement journal behind.
+#[test]
+fn replace_insert_failure_after_segment_rewrite_restores_rows_and_clears_journals() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64 PRIMARY KEY, v INT64)",
+    )?;
+    seed_segment_rows(&engine, &[1, 2, 3, 4])?;
+
+    crate::sql::execution::dml_insert::force_next_replace_insert_failure();
+    let failed = engine.execute(&mut session, "REPLACE INTO t (id, v) VALUES (1, 99)");
+    assert!(failed.is_err());
+
+    let value = first_i64(
+        engine.execute(&mut session, "SELECT v FROM t WHERE id = 1")?,
+        0,
+        0,
+    );
+    assert_eq!(value, 10, "conflicting row restored after failed REPLACE");
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 4);
+    let journals = leftover_del_journals(&engine, "main", "t");
+    assert!(
+        journals.is_empty(),
+        "rollback must consume every statement journal: {journals:?}"
+    );
+
+    // The table stays usable: a retry succeeds.
+    engine.execute(&mut session, "REPLACE INTO t (id, v) VALUES (1, 99)")?;
+    let value = first_i64(
+        engine.execute(&mut session, "SELECT v FROM t WHERE id = 1")?,
+        0,
+        0,
+    );
+    assert_eq!(value, 99);
+    Ok(())
+}
+
+/// P3 (REPLACE crash window), roll-BACK: a crash after the conflict-tombstone
+/// fsync but before the staged replacement rows became durable used to delete
+/// the old rows and lose the new ones. Simulated by applying the tombstone
+/// leg with a deferred journal whose watermark points at a never-durable
+/// memtable, then restarting the engine.
+#[test]
+fn replace_crash_between_footer_rewrite_and_commit_rolls_back_on_restart() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session1 = session();
+
+    engine.execute(
+        &mut session1,
+        "CREATE TABLE t (id INT64 PRIMARY KEY, v INT64)",
+    )?;
+    let segment_path = seed_segment_rows(&engine, &[1, 2, 3, 4])?;
+
+    // The crash window: the statement tombstoned all four conflicting rows
+    // with a deferred journal, but its replacement rows never became durable.
+    let reader = engine.segment_mgr().open_reader(&segment_path)?;
+    let mut full_bitmap = vec![0u8; (reader.row_count().div_ceil(8)) as usize];
+    for row in 0..reader.row_count() {
+        full_bitmap[(row / 8) as usize] |= 1u8 << (row % 8);
+    }
+    drop(reader);
+    crate::storage::segment::reader::SegmentReader::rewrite_footer_with_deletes(
+        &segment_path,
+        &full_bitmap,
+        4,
+        crate::storage::segment::reader::FooterRewriteMode::Deferred(vec![
+            crate::storage::segment::reader::ImageDurabilityCheck {
+                memtable_id: uuid::Uuid::new_v4(),
+                partition: String::new(),
+                expected_rows: 1,
+            },
+        ]),
+    )?;
+    drop(engine);
+
+    // Restart: startup recovery must restore the pre-statement footer.
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session2 = session();
+    let count = first_i64(engine.execute(&mut session2, "SELECT COUNT(*) FROM t")?, 0, 0);
+    assert_eq!(count, 4, "conflict rows restored by journal rollback");
+    for id in 1..=4i64 {
+        let value = first_i64(
+            engine.execute(&mut session2, &format!("SELECT v FROM t WHERE id = {id}"))?,
+            0,
+            0,
+        );
+        assert_eq!(value, id * 10, "row {id} keeps its pre-statement value");
+    }
+    // The rollback was compensated (standby log drained) and no journal or
+    // rollback record survives the restart.
+    assert!(
+        leftover_del_journals(&engine, "main", "t").is_empty(),
+        "restart consumes the rolled-back journal"
+    );
+    let rollback_log =
+        crate::storage::segment::reader::footer_rollback_log_path(dir.path());
+    let drained = match std::fs::read_to_string(&rollback_log) {
+        Ok(content) => content.trim().is_empty(),
+        Err(_) => true,
+    };
+    assert!(drained, "rollback compensation log must be drained on startup");
+    Ok(())
+}
+
+/// P3 (REPLACE crash window): a successful REPLACE over segment-resident
+/// conflicts leaves no pending statement journal — the deferred `.del` files
+/// are cleared once the staged rows' tail commit is durable.
+#[test]
+fn replace_clears_statement_journals_after_durable_commit() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64 PRIMARY KEY, v INT64)",
+    )?;
+    seed_segment_rows(&engine, &[1, 2, 3, 4])?;
+
+    engine.execute(&mut session, "REPLACE INTO t (id, v) VALUES (1, 99)")?;
+    let value = first_i64(
+        engine.execute(&mut session, "SELECT v FROM t WHERE id = 1")?,
+        0,
+        0,
+    );
+    assert_eq!(value, 99);
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 4);
+    let journals = leftover_del_journals(&engine, "main", "t");
+    assert!(
+        journals.is_empty(),
+        "no statement journal may outlive the REPLACE: {journals:?}"
+    );
+    Ok(())
+}
+

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::common::error::{Result, TaibaiError};
+use crate::common::thread_supervisor::run_panic_gated;
 use crate::storage::core::durable_tail::{PreparedTailAppend, TailCommitTicket, TailCommitter};
 use crate::storage::core::memtable::{
     align_batch_to_schema, batch_matches_schema, MemTable, MemTableManager, MemTableState,
@@ -241,6 +242,11 @@ impl BatchWriter {
         let flush_handle = std::thread::Builder::new()
             .name("taibai-bw-flush".into())
             .spawn(move || {
+                // The thread keeps its plain stop/join protocol; each
+                // maintenance pass runs panic-gated (audit P1-5) so a
+                // poisoned-lock unwrap inside one pass cannot kill the
+                // flusher permanently — the pass is logged and skipped, the
+                // next interval continues.
                 while !flush_stop.load(Ordering::Acquire) {
                     for _ in 0..flush_interval {
                         if flush_stop.load(Ordering::Acquire) {
@@ -251,13 +257,19 @@ impl BatchWriter {
                             // durable tails is the first relief valve: it
                             // frees memory without cutting small row groups.
                             if flush_spill_enabled {
-                                let spilled = Self::spill_pressure_pass(
-                                    &flush_mgr,
-                                    &flush_mt_mgr,
-                                    &flush_tail_committer,
-                                    flush_memory_high_water,
-                                    flush_spill_min_age_secs,
-                                );
+                                let spilled = run_panic_gated(
+                                    "taibai-bw-flush",
+                                    || {
+                                        Self::spill_pressure_pass(
+                                            &flush_mgr,
+                                            &flush_mt_mgr,
+                                            &flush_tail_committer,
+                                            flush_memory_high_water,
+                                            flush_spill_min_age_secs,
+                                        )
+                                    },
+                                )
+                                .unwrap_or(0);
                                 if spilled > 0 {
                                     tracing::info!(
                                         spilled,
@@ -268,22 +280,32 @@ impl BatchWriter {
                             if flush_mt_mgr.total_estimated_memory_bytes()
                                 >= flush_memory_high_water
                             {
-                                if let Err(e) = Self::flush_all_pending(
-                                    &flush_mgr,
-                                    &flush_mt_mgr,
-                                    &flush_tail_committer,
-                                    &flush_gate_for_thread,
+                                if let Some(Err(e)) = run_panic_gated(
+                                    "taibai-bw-flush",
+                                    || {
+                                        Self::flush_all_pending(
+                                            &flush_mgr,
+                                            &flush_mt_mgr,
+                                            &flush_tail_committer,
+                                            &flush_gate_for_thread,
+                                        )
+                                    },
                                 ) {
                                     tracing::warn!(error = %e, "pressure memtable flush failed");
                                 }
                             }
                         }
-                        if let Err(error) = Self::flush_tail_file_pressure(
-                            &flush_mgr,
-                            &flush_mt_mgr,
-                            &flush_tail_committer,
-                            &flush_gate_for_thread,
-                            MAX_TAIL_FILES_PER_TABLE,
+                        if let Some(Err(error)) = run_panic_gated(
+                            "taibai-bw-flush",
+                            || {
+                                Self::flush_tail_file_pressure(
+                                    &flush_mgr,
+                                    &flush_mt_mgr,
+                                    &flush_tail_committer,
+                                    &flush_gate_for_thread,
+                                    MAX_TAIL_FILES_PER_TABLE,
+                                )
+                            },
                         ) {
                             tracing::warn!(
                                 error = %error,
@@ -300,11 +322,16 @@ impl BatchWriter {
                     // flush" starved tail->segment conversion during
                     // sustained imports and let tail files pile up in the
                     // memtable_tail directory.
-                    if let Err(e) = Self::flush_pending_memtables(
-                        &flush_mgr,
-                        &flush_mt_mgr,
-                        &flush_tail_committer,
-                        &flush_gate_for_thread,
+                    if let Some(Err(e)) = run_panic_gated(
+                        "taibai-bw-flush",
+                        || {
+                            Self::flush_pending_memtables(
+                                &flush_mgr,
+                                &flush_mt_mgr,
+                                &flush_tail_committer,
+                                &flush_gate_for_thread,
+                            )
+                        },
                     ) {
                         tracing::warn!(error = %e, "periodic memtable flush failed");
                     }
@@ -1164,15 +1191,24 @@ impl BatchWriter {
                 Ok(WriteCommand::Flush { db, table }) => {
                     last_write_epoch = write_epoch.load(Ordering::Acquire);
                     pending_tables.remove(&(db.clone(), table.clone()));
-                    if Self::checkpoint_full_memtables(
-                        &segment_mgr,
-                        &memtable_mgr,
-                        &tail_committer,
-                        &flush_gate,
-                        max_rows_per_memtable,
-                        &db,
-                        &table,
-                    ) {
+                    // Panic-gated (audit P1-5): a panicking checkpoint (e.g.
+                    // a poisoned-lock unwrap deep in the flush path) is
+                    // logged and treated as a failure — the table is
+                    // requeued — instead of permanently killing the worker
+                    // thread and its channel consumer.
+                    let checkpoint =
+                        run_panic_gated("taibai-bw-worker", || {
+                            Self::checkpoint_full_memtables(
+                                &segment_mgr,
+                                &memtable_mgr,
+                                &tail_committer,
+                                &flush_gate,
+                                max_rows_per_memtable,
+                                &db,
+                                &table,
+                            )
+                        });
+                    if checkpoint.unwrap_or(true) {
                         pending_tables.insert((db, table));
                     }
                     checkpoint_idle = false;
@@ -1192,15 +1228,19 @@ impl BatchWriter {
                         continue;
                     };
                     pending_tables.remove(&(db.clone(), table.clone()));
-                    if Self::checkpoint_full_memtables(
-                        &segment_mgr,
-                        &memtable_mgr,
-                        &tail_committer,
-                        &flush_gate,
-                        max_rows_per_memtable,
-                        &db,
-                        &table,
-                    ) {
+                    let checkpoint =
+                        run_panic_gated("taibai-bw-worker", || {
+                            Self::checkpoint_full_memtables(
+                                &segment_mgr,
+                                &memtable_mgr,
+                                &tail_committer,
+                                &flush_gate,
+                                max_rows_per_memtable,
+                                &db,
+                                &table,
+                            )
+                        });
+                    if checkpoint.unwrap_or(true) {
                         pending_tables.insert((db, table));
                     }
                     let after_checkpoint_epoch = write_epoch.load(Ordering::Acquire);

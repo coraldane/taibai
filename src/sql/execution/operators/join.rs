@@ -63,6 +63,13 @@ struct ProbeState {
     pending_unmatched: Vec<RowPointer>,
     /// Which side/shape the pending pointers emit as.
     pending_unmatched_mode: Option<UnmatchedMode>,
+    /// The probe row whose matches are still being boxed (scalar path).
+    /// Boxing drains every BATCH_SIZE rows, so a skewed key whose match
+    /// list spans several output batches pauses here and resumes on the
+    /// next call instead of boxing every match up front — the old peak
+    /// tracked the whole match list of the worst key (every build row on
+    /// many-to-many joins), which no memory limit covered.
+    pending_probe: Option<PendingProbe>,
     /// Bytes accumulated by probe-side materialization paths (fast-path
     /// right collection, CROSS join right collection). Charged against the
     /// same query budget as the build side so a probe-heavy join fails with
@@ -118,6 +125,50 @@ enum UnmatchedMode {
     RightNullLeft,
     /// Anti join: unmatched build rows emit alone.
     AntiLeft,
+}
+
+/// One probe row mid-boxing on the scalar probe path: the build-side
+/// matches not yet boxed (compact `RowPointer`s), the resume cursor, and
+/// the FULL-join flag deciding null-extension once the list runs out.
+/// Mirrors the spill path's per-row pending state
+/// (`PartitionProbeState::pending_probe_row`).
+struct PendingProbe {
+    probe_row: Vec<ScalarValue>,
+    matches: Vec<RowPointer>,
+    pos: usize,
+    /// FULL join: whether any residual-verified match was seen so far.
+    /// Kept here so a mid-list drain cannot lose it across calls.
+    matched_any: bool,
+}
+
+impl PendingProbe {
+    fn new(probe_row: Vec<ScalarValue>, matches: Vec<RowPointer>) -> Self {
+        Self {
+            probe_row,
+            matches,
+            pos: 0,
+            matched_any: false,
+        }
+    }
+}
+
+/// Which scalar probe variant is boxing the pending probe row's matches
+/// (decides pairing direction, build-row marking and null extension).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScalarProbeKind {
+    /// Build = left, probe = right; plain inner pairing.
+    InnerBuildLeft,
+    /// Build = right, probe = left; plain inner pairing.
+    InnerBuildRight,
+    /// LEFT: build = left; mark matched build rows.
+    LeftOuter,
+    /// RIGHT: build = right; mark matched build rows.
+    RightOuter,
+    /// FULL: build = right; mark matched and null-extend the probe row
+    /// when no residual match survives.
+    FullOuter,
+    /// SEMI: build = left; emit each build row at most once.
+    Semi,
 }
 
 impl HashJoinExec {
@@ -454,6 +505,14 @@ impl HashJoinExec {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
             }
+            // A probe row paused mid-match-list (skewed key) resumes here
+            // before the next probe row is pulled.
+            if self.probe_state.pending_probe.is_some() {
+                if self.box_pending_probe_matches(ScalarProbeKind::InnerBuildLeft)? {
+                    return self.drain_buffer();
+                }
+                continue;
+            }
             let right_row = match self.get_next_right_row()? {
                 Some(row) => row,
                 None => return Ok(None),
@@ -467,18 +526,7 @@ impl HashJoinExec {
                 let ht = self.hash_table.as_ref().unwrap();
                 ht.probe(&key)
             };
-            for ptr in &matches {
-                let left_row = self.collect_left_row(ptr);
-                if self.join_rows_match(&left_row, &right_row)? {
-                    self.probe_state
-                        .output_buffer
-                        .push((left_row, Some(right_row.clone())));
-                }
-            }
-            if self.probe_state.output_buffer.is_empty() {
-                continue;
-            }
-            return self.drain_buffer();
+            self.probe_state.pending_probe = Some(PendingProbe::new(right_row, matches));
         }
     }
 
@@ -486,6 +534,12 @@ impl HashJoinExec {
         loop {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
+            }
+            if self.probe_state.pending_probe.is_some() {
+                if self.box_pending_probe_matches(ScalarProbeKind::InnerBuildRight)? {
+                    return self.drain_buffer();
+                }
+                continue;
             }
             let left_row = match self.get_next_left_row()? {
                 Some(row) => row,
@@ -497,20 +551,7 @@ impl HashJoinExec {
                 .map(|&index| left_row[index].clone())
                 .collect();
             let matches = self.hash_table.as_ref().unwrap().probe(&key);
-            for pointer in &matches {
-                let right_row = {
-                    let table = self.hash_table.as_ref().unwrap();
-                    self.collect_build_row(table, pointer)
-                };
-                if self.join_rows_match(&left_row, &right_row)? {
-                    self.probe_state
-                        .output_buffer
-                        .push((left_row.clone(), Some(right_row)));
-                }
-            }
-            if !self.probe_state.output_buffer.is_empty() {
-                return self.drain_buffer();
-            }
+            self.probe_state.pending_probe = Some(PendingProbe::new(left_row, matches));
         }
     }
 
@@ -519,6 +560,12 @@ impl HashJoinExec {
         loop {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
+            }
+            if self.probe_state.pending_probe.is_some() {
+                if self.box_pending_probe_matches(ScalarProbeKind::LeftOuter)? {
+                    return self.drain_buffer();
+                }
+                continue;
             }
             let right_row = match self.get_next_right_row()? {
                 Some(row) => row,
@@ -549,27 +596,9 @@ impl HashJoinExec {
                 let ht = self.hash_table.as_ref().unwrap();
                 ht.probe(&key)
             };
-            if matches.is_empty() {
-                // No left match for this right row - for LEFT JOIN, we don't emit this case
-                // We only emit unmatched left rows at the end
-            } else {
-                for ptr in &matches {
-                    let left_row = self.collect_left_row(ptr);
-                    if self.join_rows_match(&left_row, &right_row)? {
-                        {
-                            let ht = self.hash_table.as_mut().unwrap();
-                            ht.mark_matched(ptr);
-                        }
-                        self.probe_state
-                            .output_buffer
-                            .push((left_row, Some(right_row.clone())));
-                    }
-                }
-            }
-            if self.probe_state.output_buffer.is_empty() {
-                continue;
-            }
-            return self.drain_buffer();
+            // A probe (right) row without a key match simply produces no
+            // output here; unmatched LEFT rows are emitted at the end.
+            self.probe_state.pending_probe = Some(PendingProbe::new(right_row, matches));
         }
     }
 
@@ -579,6 +608,12 @@ impl HashJoinExec {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
             }
+            if self.probe_state.pending_probe.is_some() {
+                if self.box_pending_probe_matches(ScalarProbeKind::RightOuter)? {
+                    return self.drain_buffer();
+                }
+                continue;
+            }
             let left_row = match self.get_next_left_row()? {
                 Some(row) => row,
                 None => {
@@ -608,27 +643,7 @@ impl HashJoinExec {
                 let ht = self.hash_table.as_ref().unwrap();
                 ht.probe(&key)
             };
-            if !matches.is_empty() {
-                for ptr in &matches {
-                    let right_row = {
-                        let ht = self.hash_table.as_ref().unwrap();
-                        self.collect_build_row(ht, ptr)
-                    };
-                    if self.join_rows_match(&left_row, &right_row)? {
-                        {
-                            let ht = self.hash_table.as_mut().unwrap();
-                            ht.mark_matched(ptr);
-                        }
-                        self.probe_state
-                            .output_buffer
-                            .push((left_row.clone(), Some(right_row)));
-                    }
-                }
-            }
-            if self.probe_state.output_buffer.is_empty() {
-                continue;
-            }
-            return self.drain_buffer();
+            self.probe_state.pending_probe = Some(PendingProbe::new(left_row, matches));
         }
     }
 
@@ -638,6 +653,12 @@ impl HashJoinExec {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
             }
+            if self.probe_state.pending_probe.is_some() {
+                if self.box_pending_probe_matches(ScalarProbeKind::FullOuter)? {
+                    return self.drain_buffer();
+                }
+                continue;
+            }
             let left_row = match self.get_next_left_row()? {
                 Some(row) => row,
                 None => {
@@ -667,40 +688,10 @@ impl HashJoinExec {
                 let ht = self.hash_table.as_ref().unwrap();
                 ht.probe(&key)
             };
-            if matches.is_empty() {
-                let null_right = self.make_null_right_row();
-                self.probe_state
-                    .output_buffer
-                    .push((left_row, Some(null_right)));
-            } else {
-                let mut matched_any = false;
-                for ptr in &matches {
-                    let right_row = {
-                        let ht = self.hash_table.as_ref().unwrap();
-                        self.collect_build_row(ht, ptr)
-                    };
-                    if self.join_rows_match(&left_row, &right_row)? {
-                        matched_any = true;
-                        {
-                            let ht = self.hash_table.as_mut().unwrap();
-                            ht.mark_matched(ptr);
-                        }
-                        self.probe_state
-                            .output_buffer
-                            .push((left_row.clone(), Some(right_row)));
-                    }
-                }
-                if !matched_any {
-                    let null_right = self.make_null_right_row();
-                    self.probe_state
-                        .output_buffer
-                        .push((left_row, Some(null_right)));
-                }
-            }
-            if self.probe_state.output_buffer.is_empty() {
-                continue;
-            }
-            return self.drain_buffer();
+            // Null-extension for zero surviving matches happens inside
+            // box_pending_probe_matches, after the whole (possibly
+            // chunked) match list has been walked.
+            self.probe_state.pending_probe = Some(PendingProbe::new(left_row, matches));
         }
     }
 
@@ -819,6 +810,12 @@ impl HashJoinExec {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
             }
+            if self.probe_state.pending_probe.is_some() {
+                if self.box_pending_probe_matches(ScalarProbeKind::Semi)? {
+                    return self.drain_buffer();
+                }
+                continue;
+            }
             let right_row = match self.get_next_right_row()? {
                 Some(row) => row,
                 None => return Ok(None),
@@ -832,23 +829,101 @@ impl HashJoinExec {
                 let ht = self.hash_table.as_ref().unwrap();
                 ht.probe(&key)
             };
-            for ptr in &matches {
-                // Semi join emits each left row at most once, even when it
-                // matches several right rows.
-                if self.hash_table.as_ref().unwrap().is_marked(ptr) {
-                    continue;
-                }
-                let left_row = self.collect_left_row(ptr);
-                if self.join_rows_match(&left_row, &right_row)? {
-                    self.hash_table.as_mut().unwrap().mark_matched(ptr);
-                    self.probe_state.output_buffer.push((left_row, None));
-                }
-            }
-            if self.probe_state.output_buffer.is_empty() {
-                continue;
-            }
-            return self.drain_buffer();
+            self.probe_state.pending_probe = Some(PendingProbe::new(right_row, matches));
         }
+    }
+
+    /// Box the pending probe row's matches into `output_buffer`, pausing
+    /// as soon as the buffer reaches BATCH_SIZE: peak memory tracks the
+    /// batch size instead of the match count of a single skewed key. The
+    /// old loop boxed EVERY match of a probe row before the first drain,
+    /// so one probe key hitting the whole build side boxed all of it —
+    /// growth no memory limit covered.
+    ///
+    /// Returns `true` when the caller must emit a batch now (the buffer
+    /// is full); unfinished matches stay stashed in `pending_probe` and
+    /// resume on the next call, so the pull-based contract survives
+    /// mid-row. Returns `false` when the probe row is fully processed
+    /// (its remaining work was below one batch, or all matches were
+    /// filtered out by the residual condition).
+    fn box_pending_probe_matches(&mut self, kind: ScalarProbeKind) -> Result<bool> {
+        let Some(mut pending) = self.probe_state.pending_probe.take() else {
+            return Ok(false);
+        };
+        while pending.pos < pending.matches.len() {
+            if self.probe_state.output_buffer.len() >= Self::BATCH_SIZE {
+                // Pause: the remaining matches stay in `pending`, which is
+                // put back for the next call.
+                self.probe_state.pending_probe = Some(pending);
+                return Ok(true);
+            }
+            let ptr = pending.matches[pending.pos];
+            pending.pos += 1;
+            match kind {
+                ScalarProbeKind::InnerBuildLeft | ScalarProbeKind::LeftOuter => {
+                    // Build = left, probe row = right row.
+                    let left_row = self.collect_left_row(&ptr);
+                    if self.join_rows_match(&left_row, &pending.probe_row)? {
+                        if matches!(kind, ScalarProbeKind::LeftOuter) {
+                            self.hash_table.as_mut().unwrap().mark_matched(&ptr);
+                        }
+                        let right_row = pending.probe_row.clone();
+                        self.probe_state
+                            .output_buffer
+                            .push((left_row, Some(right_row)));
+                    }
+                }
+                ScalarProbeKind::Semi => {
+                    // Semi join emits each build row at most once, even
+                    // when it matches several probe rows; the mark lives
+                    // in the hash table, so it survives mid-row pauses.
+                    if self.hash_table.as_ref().unwrap().is_marked(&ptr) {
+                        continue;
+                    }
+                    let left_row = self.collect_left_row(&ptr);
+                    if self.join_rows_match(&left_row, &pending.probe_row)? {
+                        self.hash_table.as_mut().unwrap().mark_matched(&ptr);
+                        self.probe_state.output_buffer.push((left_row, None));
+                    }
+                }
+                ScalarProbeKind::InnerBuildRight
+                | ScalarProbeKind::RightOuter
+                | ScalarProbeKind::FullOuter => {
+                    // Build = right, probe row = left row.
+                    let right_row = {
+                        let ht = self.hash_table.as_ref().unwrap();
+                        self.collect_build_row(ht, &ptr)
+                    };
+                    if self.join_rows_match(&pending.probe_row, &right_row)? {
+                        if matches!(
+                            kind,
+                            ScalarProbeKind::RightOuter | ScalarProbeKind::FullOuter
+                        ) {
+                            self.hash_table.as_mut().unwrap().mark_matched(&ptr);
+                        }
+                        if matches!(kind, ScalarProbeKind::FullOuter) {
+                            pending.matched_any = true;
+                        }
+                        let left_row = pending.probe_row.clone();
+                        self.probe_state
+                            .output_buffer
+                            .push((left_row, Some(right_row)));
+                    }
+                }
+            }
+        }
+        if matches!(kind, ScalarProbeKind::FullOuter) && !pending.matched_any {
+            // No residual match survived: null-extend the probe row. This
+            // runs only after the whole (possibly chunked) match list was
+            // walked, so matched_any accounts for earlier batches too.
+            let null_right = self.make_null_right_row();
+            self.probe_state
+                .output_buffer
+                .push((pending.probe_row, Some(null_right)));
+        }
+        // Probe row complete: `pending` is dropped on purpose — the next
+        // call advances to the next probe row.
+        Ok(self.probe_state.output_buffer.len() >= Self::BATCH_SIZE)
     }
 
     /// Anti join: emit left rows that have NO match in right.

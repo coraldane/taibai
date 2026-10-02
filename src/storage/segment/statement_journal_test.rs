@@ -5,7 +5,9 @@
 //! matched rows deleted with no replacement and no trace).
 
 use super::reader::{
-    clear_deferred_delete_journal, recover_statement_footer_journals, FooterRewriteMode,
+    clear_deferred_delete_journal, clear_deferred_delete_journal_for_statement,
+    clear_deferred_delete_journal_when_satisfied, drain_footer_rollback_compensations,
+    footer_rollback_log_path, recover_statement_footer_journals, FooterRewriteMode,
     ImageDurabilityCheck, SegmentReader,
 };
 use super::store::discover_segments;
@@ -198,4 +200,145 @@ fn caller_clear_removes_deferred_journal() {
     clear_deferred_delete_journal(&segment);
     recover_statement_footer_journals(&table_dir);
     assert_eq!(rows_visible(&segment), 3);
+}
+
+/// The conditional in-process clear must NOT remove a journal whose
+/// watermark is unmet — that decision belongs to startup recovery (or to
+/// the owning statement after its own images are durable).
+#[test]
+fn conditional_clear_keeps_unmet_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = seeded_table_dir(dir.path());
+    let segment = table_dir.join("seg_00001.dat");
+    seed_sealed_segment(&segment);
+
+    SegmentReader::rewrite_footer_with_deletes(
+        &segment,
+        &[0b0000_0001],
+        1,
+        deferred(vec![random_check(1)]),
+    )
+    .unwrap();
+
+    // Watermark points at a memtable with no durable tail: never satisfied.
+    clear_deferred_delete_journal_when_satisfied(&table_dir, &segment);
+    assert!(
+        journal_path(&segment).exists(),
+        "unmet watermark keeps the journal"
+    );
+    assert_eq!(rows_visible(&segment), 3);
+
+    // Startup recovery still owns the final judgement.
+    recover_statement_footer_journals(&table_dir);
+    assert_eq!(rows_visible(&segment), 4);
+}
+
+/// The statement-owned clear removes the journal when its redo matches the
+/// caller's rewrite (even with an unmet tail watermark — the images may be
+/// durable in a rescued segment flush), but leaves a LATER statement's
+/// journal to its own watermark judgement.
+#[test]
+fn statement_clear_matches_ownership_not_watermark() {
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = seeded_table_dir(dir.path());
+    let segment = table_dir.join("seg_00001.dat");
+    seed_sealed_segment(&segment);
+
+    // Our rewrite: rows 0-1 tombstoned, watermark bogus (unmet).
+    SegmentReader::rewrite_footer_with_deletes(
+        &segment,
+        &[0b0000_0011],
+        2,
+        deferred(vec![random_check(2)]),
+    )
+    .unwrap();
+
+    // A foreign state (a later statement wrote more tombstones): kept.
+    clear_deferred_delete_journal_for_statement(&table_dir, &segment, &[0b0000_0111], 3);
+    assert!(
+        journal_path(&segment).exists(),
+        "a later statement's journal is judged on its own watermark"
+    );
+
+    // Our exact state: removed despite the unmet watermark.
+    clear_deferred_delete_journal_for_statement(&table_dir, &segment, &[0b0000_0011], 2);
+    assert!(
+        !journal_path(&segment).exists(),
+        "the owning statement clears its journal unconditionally"
+    );
+    assert_eq!(rows_visible(&segment), 2);
+}
+
+/// Standby compensation (P3): a rollback performed by startup recovery is
+/// recorded durably as `db\ttable\tsegment`; draining the log re-emits the
+/// segment's CURRENT (restored) footer state and truncates the log.
+#[test]
+fn rollback_recorded_then_drained_with_restored_footer_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = seeded_table_dir(dir.path());
+    let segment = table_dir.join("seg_00001.dat");
+    seed_sealed_segment(&segment);
+
+    SegmentReader::rewrite_footer_with_deletes(
+        &segment,
+        &[0b0000_1111],
+        4,
+        deferred(vec![random_check(4)]),
+    )
+    .unwrap();
+    let rollback_log = footer_rollback_log_path(dir.path());
+    assert!(!rollback_log.exists(), "no rollback recorded yet");
+
+    recover_statement_footer_journals(&table_dir);
+
+    let recorded = std::fs::read_to_string(&rollback_log).unwrap();
+    assert_eq!(
+        recorded,
+        format!("main\tt\t{}\n", segment.display()),
+        "rollback record format is db<TAB>table<TAB>segment"
+    );
+
+    // Drain: the emitted state is the RESTORED footer (no tombstones), and
+    // the log is truncated afterwards.
+    let mut emitted: Vec<(PathBuf, Vec<u8>, u64)> = Vec::new();
+    drain_footer_rollback_compensations(dir.path(), |path, bitmap, deleted_count| {
+        emitted.push((path.to_path_buf(), bitmap.to_vec(), deleted_count));
+    });
+    assert_eq!(emitted.len(), 1, "one compensation per rollback record");
+    assert_eq!(emitted[0].0, segment);
+    assert_eq!(emitted[0].1, Vec::<u8>::new(), "restored bitmap is empty");
+    assert_eq!(emitted[0].2, 0, "restored deleted count is zero");
+    assert!(
+        std::fs::read_to_string(&rollback_log)
+            .unwrap()
+            .trim()
+            .is_empty(),
+        "drain truncates the rollback log"
+    );
+
+    // Draining again finds nothing.
+    drain_footer_rollback_compensations(dir.path(), |_, _, _| panic!("log is empty"));
+}
+
+/// A missing rollback log is a no-op (standby/none deployments never write
+/// one), and records whose segment vanished (dropped table) are skipped
+/// without failing the drain.
+#[test]
+fn drain_handles_missing_log_and_missing_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    // Missing log: no panic, no file created.
+    drain_footer_rollback_compensations(dir.path(), |_, _, _| panic!("no records"));
+    assert!(!footer_rollback_log_path(dir.path()).exists());
+
+    // A record whose segment no longer exists is skipped; the log is still
+    // truncated so it cannot grow forever.
+    let rollback_log = footer_rollback_log_path(dir.path());
+    std::fs::write(
+        &rollback_log,
+        format!("main\tt\t{}\n", dir.path().join("main").join("t").join("gone.dat").display()),
+    )
+    .unwrap();
+    drain_footer_rollback_compensations(dir.path(), |_, _, _| panic!("segment is gone"));
+    assert!(rollback_log.exists());
+    assert!(std::fs::read_to_string(&rollback_log).unwrap().is_empty());
 }

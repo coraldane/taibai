@@ -1530,6 +1530,79 @@ pub fn clear_deferred_delete_journal(segment_path: &Path) {
     let _ = fs::remove_file(&journal);
 }
 
+/// In-process twin of [`recover_statement_footer_journals`]'s roll-forward
+/// judgement: remove the deferred journal at `segment_path` only when the
+/// statement it records is provably complete — the embedded footer parses
+/// and every image watermark is durable.
+///
+/// Callers that just made their own images durable (REPLACE after its tail
+/// commit wait) pass through in the common uncontended case. When a LATER
+/// statement on the same segment has already replaced the journal, the
+/// judgement runs on THAT statement's watermark, so a racing statement's
+/// undo is never discarded before its own images are durable — the same
+/// criterion startup recovery would apply to the leftover.
+///
+/// Must be serialized against journal writers (the table mutation lock):
+/// without it a check-then-remove could delete a journal that a concurrent
+/// rewrite just swapped in. Startup recovery is naturally exclusive.
+///
+/// A journal with an EMPTY check list is never removed here: an empty
+/// watermark cannot prove durability, so the decision is left to startup
+/// recovery (whose conservative roll-back only trades a lost statement for
+/// a consistent table).
+pub fn clear_deferred_delete_journal_when_satisfied(table_dir: &Path, segment_path: &Path) {
+    let journal_path = pending_delete_journal_path(segment_path);
+    let Ok(Some(journal)) = read_delete_journal_v2(&journal_path) else {
+        return;
+    };
+    let satisfied = !journal.image_checks.is_empty()
+        && SegmentReader::read_dat_footer_source(segment_path, None).is_ok()
+        && journal.image_checks.iter().all(|check| {
+            crate::storage::core::durable_tail::durable_tail_rows_for_memtable(
+                table_dir,
+                check.memtable_id,
+            ) >= check.expected_rows
+        });
+    if satisfied {
+        let _ = fs::remove_file(&journal_path);
+    }
+}
+
+/// Clear the deferred journal of a statement that just COMPLETED (its rows
+/// are durable in a tail, or a failed tail commit was already rescued by a
+/// segment flush, which the tail-only watermark cannot see). The journal is
+/// removed when its redo is provably THIS statement's rewrite — the delete
+/// section of the recorded new footer equals the `(bitmap, count)` the
+/// caller wrote — and ownership is unforgeable: a later statement rewriting
+/// the same segment always adds tombstones, so its absolute state differs.
+/// A journal left by a LATER statement is judged on that statement's own
+/// watermark (the roll-forward criterion).
+///
+/// Same serialization requirement as
+/// [`clear_deferred_delete_journal_when_satisfied`]: callers hold the table
+/// mutation lock.
+pub fn clear_deferred_delete_journal_for_statement(
+    table_dir: &Path,
+    segment_path: &Path,
+    new_bitmap: &[u8],
+    new_deleted_count: u64,
+) {
+    let journal_path = pending_delete_journal_path(segment_path);
+    let Ok(Some(journal)) = read_delete_journal_v2(&journal_path) else {
+        return;
+    };
+    let ours = parse_segment_footer(&journal.new_footer)
+        .map(|footer| {
+            footer.deleted_row_count == new_deleted_count && footer.delete_bitmap == new_bitmap
+        })
+        .unwrap_or(false);
+    if ours {
+        let _ = fs::remove_file(&journal_path);
+        return;
+    }
+    clear_deferred_delete_journal_when_satisfied(table_dir, segment_path);
+}
+
 fn write_delete_journal(journal: &Path, data_end: u64, footer: &[u8]) -> Result<()> {
     let mut body = Vec::with_capacity(footer.len() + 12);
     body.extend_from_slice(&data_end.to_le_bytes());
@@ -1757,6 +1830,11 @@ fn journal_is_deferred(journal: &Path) -> bool {
 ///   the tombstones and the image commit → roll BACK, restoring the
 ///   matched rows (the statement is lost, the table is consistent).
 ///
+/// Every performed rollback is recorded in `<data_dir>/.taibai-footer-
+/// rollbacks` (durable before the journal is removed) so engine startup can
+/// compensate standbys that already applied the pre-rollback
+/// DeleteFooterRewrite event — see `drain_footer_rollback_compensations`.
+///
 /// Effect verification instead of step tracking mirrors the flush-intent
 /// arbitration in the durable tail.
 pub fn recover_statement_footer_journals(table_dir: &Path) {
@@ -1815,8 +1893,131 @@ pub fn recover_statement_footer_journals(table_dir: &Path) {
                 );
                 continue;
             }
+            // Record the rollback BEFORE removing the journal, and durably:
+            // a crash in between leaves both, and the next startup judges the
+            // (idempotent) rollback again and re-records it.
+            record_footer_rollback(table_dir, segment);
         }
         let _ = fs::remove_file(&path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Standby compensation for rolled-back footer rewrites
+//
+// A primary may have shipped a DeleteFooterRewrite event for a rewrite that
+// startup recovery subsequently rolled back; without compensation the
+// standby keeps the tombstones forever. Recovery records each rollback in
+// `<data_dir>/.taibai-footer-rollbacks` and the engine, once RepLog is
+// wired, drains the log and re-emits the segment's current (restored)
+// footer state as an idempotent absolute-bitmap event.
+// ---------------------------------------------------------------------------
+
+/// Path of the rollback compensation log under a data directory.
+pub fn footer_rollback_log_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(".taibai-footer-rollbacks")
+}
+
+/// Append one durable `db\ttable\tsegment_path` record for a rollback the
+/// recovery just performed. Best-effort beyond the rollback itself: a lost
+/// record only delays standby convergence (the standby diverges until
+/// re-bootstrapped), it cannot corrupt the primary.
+fn record_footer_rollback(table_dir: &Path, segment_path: &Path) {
+    let Some(table) = table_dir.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let Some(db_dir) = table_dir.parent() else {
+        return;
+    };
+    let Some(db) = db_dir.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let Some(data_dir) = db_dir.parent() else {
+        return;
+    };
+    let log = footer_rollback_log_path(data_dir);
+    let line = format!("{db}\t{table}\t{}\n", segment_path.display());
+    let write = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .and_then(|mut file| {
+            use std::io::Write as _;
+            file.write_all(line.as_bytes())?;
+            file.flush()?;
+            file.sync_data()
+        });
+    if let Err(error) = write {
+        tracing::warn!(
+            rollback_log = %log.display(),
+            error = %error,
+            "failed to record footer rollback for standby compensation"
+        );
+    }
+}
+
+/// Drain the rollback compensation log: for every recorded rollback, read
+/// the segment's CURRENT (post-recovery) embedded footer state and hand it
+/// to `emit` — the caller turns each `(segment, bitmap, deleted_count)`
+/// triple into a DeleteFooterRewrite replication event, which is idempotent
+/// on standbys because the bitmap is absolute. The log is truncated
+/// afterwards. A missing log is a no-op; unreadable records (segment since
+/// dropped, footer corrupt) are skipped with a warning.
+pub fn drain_footer_rollback_compensations(
+    data_dir: &Path,
+    mut emit: impl FnMut(&Path, &[u8], u64),
+) {
+    let log = footer_rollback_log_path(data_dir);
+    let Ok(content) = fs::read_to_string(&log) else {
+        return;
+    };
+    for line in content.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let (Some(db), Some(table), Some(segment)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            tracing::warn!(rollback_log = %log.display(), "skipping malformed rollback record");
+            continue;
+        };
+        let segment_path = PathBuf::from(segment);
+        match read_embedded_footer(&segment_path) {
+            Ok(source) => match parse_segment_footer(&source.footer) {
+                Ok(parsed) => {
+                    tracing::info!(
+                        db,
+                        table,
+                        segment = %segment_path.display(),
+                        "emitting footer-rollback compensation event"
+                    );
+                    emit(
+                        &segment_path,
+                        &parsed.delete_bitmap,
+                        parsed.deleted_row_count,
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    db,
+                    table,
+                    segment = %segment_path.display(),
+                    error = %error,
+                    "rollback compensation: footer unparseable; skipping"
+                ),
+            },
+            Err(error) => tracing::warn!(
+                db,
+                table,
+                segment = %segment_path.display(),
+                error = %error,
+                "rollback compensation: segment unreadable; skipping"
+            ),
+        }
+    }
+    if let Err(error) = fs::write(&log, b"") {
+        tracing::warn!(
+            rollback_log = %log.display(),
+            error = %error,
+            "failed to truncate footer rollback log"
+        );
     }
 }
 

@@ -96,6 +96,10 @@ pub fn exec_update(
     crate::common::query_cancel::enter_committing_phase();
 
     let update_body = || -> Result<u64> {
+        // In-lock re-check: the fn-top gate races a transaction registering
+        // its memtable-position pin under this lock, and this statement
+        // shifts those positions.
+        super::txn_dml::refuse_auto_commit_dml_while_pinned(engine, db, table)?;
         // Updated rows are published as change events (post-update values
         // for memtable rows, which are entirely in memory).
         let publish_updates = engine.pubsub().has_subscribers();
@@ -231,56 +235,82 @@ pub fn exec_update(
         // rows assigned the same constant key must collide here, and a new
         // key must not equal any surviving key.
         if !indexes_to_validate.is_empty() {
-            let mut validation_batches = collect_surviving_unique_keys_from_all_segments(
-                mgr,
-                &table_dir,
-                &table_schema,
+            // Bounded-memory validation (P4): the keys this statement
+            // INTRODUCES — reinserted images and updated memtable rows, both
+            // already bounded by the statement's mutation budget — are
+            // materialized once; every other live row is STREAMED past that
+            // set without accumulation. Collisions purely among survivors
+            // are pre-existing state this statement did not create (the
+            // INSERT-side validator documents the same philosophy). The
+            // previous shape collected every survivor's key columns into a
+            // Vec before comparing, so a wide table's validation cost scaled
+            // with the whole table, not the statement.
+            let mut validator = super::dml_insert::IntroducedKeyValidator::new(
+                table,
                 &validation_schema,
-                &validation_indices,
-            )?;
+                &indexes_to_validate,
+            );
+            let projected_indices: Vec<usize> = validation_indices.to_vec();
+            let identity_indices: Vec<usize> = (0..validation_indices.len()).collect();
+            // Introduced: segment images (full catalog layout).
+            for image in &segment_plan.image_batches {
+                validator.introduce_full_batch(image, &projected_indices)?;
+            }
+            // Introduced: updated memtable rows — only the MATCHED rows
+            // carry new keys; the rest keep theirs and stream below.
+            for (_, batch, matched_rows, _) in &memtable_updates {
+                validator.introduce_matched(batch, &projected_indices, matched_rows)?;
+            }
+            // Survivors: every visible memtable row this statement did not
+            // rewrite.
             for memtable in engine
                 .memtable_manager()
                 .get_visible_to(db, table, reader_txn_id)
             {
-                let batch = memtable_updates
+                if let Some(updated) = memtable_updates
                     .iter()
                     .find(|(updated, _, _, _)| Arc::ptr_eq(updated, &memtable))
-                    .map(|(_, batch, _, _)| Arc::clone(batch))
-                    .or_else(|| memtable.read_snapshot_arc());
-                if let Some(batch) = batch {
-                    if batch.num_rows() > 0 {
-                        let projected = RecordBatch::try_new(
-                            validation_schema.clone(),
-                            validation_indices
-                                .iter()
-                                .map(|&idx| batch.columns[idx].clone())
-                                .collect(),
-                        )
-                        .expect("validation projection preserves column types");
-                        validation_batches.push(Arc::new(projected));
-                    }
+                {
+                    let (_, batch, matched_rows, _) = updated;
+                    validator.check_rows_excluding(batch, &projected_indices, matched_rows)?;
+                } else if let Some(batch) = memtable.read_snapshot_arc() {
+                    validator.check_rows_excluding(&batch, &projected_indices, &[])?;
                 }
             }
-            for image in &segment_plan.image_batches {
-                let projected = RecordBatch::try_new(
-                    validation_schema.clone(),
-                    validation_indices
-                        .iter()
-                        .map(|&idx| image.columns[idx].clone())
-                        .collect(),
-                )
-                .expect("validation projection preserves column types");
-                validation_batches.push(Arc::new(projected));
+            // Survivors: ALL segment rows, streamed row group by row group
+            // (never the WHERE-pruned dry-run scan — uniqueness is global
+            // across row groups, segments and partitions). Rows this
+            // statement tombstones are excluded via the planned new
+            // bitmaps: their old keys retire, so a self-assignment
+            // (SET uk = <the row's current value>) must not collide with
+            // its own image.
+            let mut planned_tombstones: std::collections::HashMap<
+                std::path::PathBuf,
+                Vec<u8>,
+            > = std::collections::HashMap::new();
+            for (seg_path, new_bitmap, _, _) in &segment_plan.footers {
+                planned_tombstones.insert(seg_path.clone(), new_bitmap.clone());
             }
-            if let Err(error) = super::dml_insert::validate_unique_indexes_in_batches(
-                table,
-                &validation_schema,
-                &indexes_to_validate,
-                &validation_batches,
-            ) {
+            let mut check_error: Option<crate::common::error::TaibaiError> = None;
+            for_each_surviving_key_row_group(
+                mgr,
+                &table_dir,
+                &table_schema,
+                &validation_indices,
+                &planned_tombstones,
+                &mut |projected| {
+                    if check_error.is_none() {
+                        check_error = validator
+                            .check_rows_excluding(projected, &identity_indices, &[])
+                            .err();
+                    }
+                },
+            )?;
+            if let Some(error) = check_error {
                 // Nothing durable has happened yet — clean abort.
                 return Err(error);
             }
+            validator.finish()?;
         }
 
         // New-key index entries are built BEFORE the batches move into the
@@ -890,26 +920,35 @@ struct SegmentReinsertPlan {
     updated_count: u64,
 }
 
-/// Validation key sweep over EVERY segment of the table — deliberately NOT
-/// pruned by the statement's WHERE or partition scope: uniqueness is global,
-/// and collecting validation keys inside the pruned dry-run scan (5a30a42)
-/// let `UPDATE ... SET uk = <existing key in a pruned row group/segment/
-/// partition>` commit a physical duplicate. Narrow projection on the key
-/// columns keeps the sweep cheap; footer-dead rows drop via the delete
-/// bitmap; name-aligned reads keep drift layouts on the right columns.
-fn collect_surviving_unique_keys_from_all_segments(
+/// Stream every live segment row's key columns past `visit` — deliberately
+/// NOT pruned by the statement's WHERE or partition scope: uniqueness is
+/// global, and collecting validation keys inside the pruned dry-run scan
+/// (5a30a42) let `UPDATE ... SET uk = <existing key in a pruned row
+/// group/segment/partition>` commit a physical duplicate. The sweep reads
+/// one row group at a time (narrow key projection, name-aligned for drift
+/// layouts) and hands the gathered survivors to the callback, so memory is
+/// bounded by one row group instead of the whole table. Rows marked in
+/// `planned_tombstones` (this statement's not-yet-applied new footers) are
+/// excluded alongside footer-dead rows: their old keys retire.
+fn for_each_surviving_key_row_group(
     mgr: &crate::storage::segment_manager::SegmentManager,
     table_dir: &std::path::Path,
     table_schema: &Schema,
-    validation_schema: &Schema,
     validation_indices: &[usize],
-) -> Result<Vec<Arc<RecordBatch>>> {
-    let mut batches = Vec::new();
+    planned_tombstones: &std::collections::HashMap<std::path::PathBuf, Vec<u8>>,
+    visit: &mut dyn FnMut(&RecordBatch),
+) -> Result<()> {
     if !table_dir.exists() {
-        return Ok(batches);
+        return Ok(());
     }
+    let mut validation_schema_columns = Vec::with_capacity(validation_indices.len());
+    for &idx in validation_indices {
+        validation_schema_columns.push(table_schema.columns[idx].clone());
+    }
+    let validation_schema = Schema::new(validation_schema_columns);
     for seg_path in crate::storage::segment_manager::SegmentManager::discover_segments(table_dir)? {
         let reader = mgr.open_reader_cached(&seg_path)?;
+        let planned = planned_tombstones.get(&seg_path);
         for rg_idx in 0..reader.num_row_groups() {
             // Name-based narrow read: catalog indices hit the wrong physical
             // column on segments whose footer predates a DROP/RENAME COLUMN.
@@ -918,10 +957,11 @@ fn collect_surviving_unique_keys_from_all_segments(
             let delete_bitmap = reader.delete_bitmap();
             let survivors: Vec<u32> = (0..batch.num_rows() as u32)
                 .filter(|&row_idx| {
-                    !crate::storage::segment::delete_bitmap::is_deleted(
-                        delete_bitmap,
-                        rg_start + row_idx as u64,
-                    )
+                    let absolute = rg_start + row_idx as u64;
+                    !crate::storage::segment::delete_bitmap::is_deleted(delete_bitmap, absolute)
+                        && !planned.is_some_and(|bitmap| {
+                            crate::storage::segment::delete_bitmap::is_deleted(bitmap, absolute)
+                        })
                 })
                 .collect();
             if survivors.is_empty() {
@@ -934,10 +974,10 @@ fn collect_surviving_unique_keys_from_all_segments(
                     .collect(),
             )
             .expect("validation projection preserves column types");
-            batches.push(Arc::new(gathered));
+            visit(&gathered);
         }
     }
-    Ok(batches)
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

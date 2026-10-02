@@ -23,9 +23,16 @@ use super::scan::cluster_prune;
 use super::scan::row_filter::ClusterKeyBounds;
 use crate::sql::parser::ast::{BinOp, Expr};
 
+/// One segment footer rewrite performed by a REPLACE statement:
+/// `(path, pre-rewrite bitmap, pre-rewrite deleted count, post-rewrite
+/// bitmap, post-rewrite deleted count)`. The pre-state restores the footer
+/// on rollback; the post-state identifies OUR deferred journal once the
+/// statement is durable and clears it.
+pub(crate) type ReplaceSegmentFooterWrite = (PathBuf, Vec<u8>, u64, Vec<u8>, u64);
+
 #[derive(Default)]
 pub(crate) struct ReplaceDeleteUndo {
-    segment_footers: Vec<(PathBuf, Vec<u8>, u64)>,
+    pub(crate) segment_footers: Vec<ReplaceSegmentFooterWrite>,
     deleted_rows: u64,
     deleted_locations: Vec<UniqueRowLocation>,
     /// Original batches of memtables whose conflicting rows were filtered out,
@@ -525,12 +532,22 @@ fn restore_replace_memtable_undo(engine: &Engine, undo: &ReplaceDeleteUndo) -> R
     }
 }
 
+/// Delete rows conflicting with the REPLACE key sets. Segment legs rewrite
+/// footers under the DEFERRED journal lifecycle: the caller passes the
+/// durability watermark of the REPLACE's staged replacement rows, so a crash
+/// between a footer's fsync and the staged insert's commit restores the old
+/// rows at startup instead of losing them (the same protocol as UPDATE's
+/// tombstone leg). The caller must have staged those rows into the private
+/// transaction BEFORE calling, so the watermark references real memtables.
+///
+/// The caller holds the table mutation lock.
 pub(crate) fn delete_replace_conflicts_under_table_lock(
     engine: &Engine,
     db: &str,
     table: &str,
     table_meta: &TableMeta,
     key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+    image_checks: &[crate::storage::segment::reader::ImageDurabilityCheck],
 ) -> Result<ReplaceDeleteUndo> {
     let table_dir = engine.data_dir().join(db).join(table);
     let mut undo = ReplaceDeleteUndo::default();
@@ -769,11 +786,24 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
         if newly_deleted == 0 {
             continue;
         }
-        undo.segment_footers
-            .push((seg_path.clone(), old_bitmap, old_deleted));
-        if let Err(error) =
-            mgr.rewrite_delete_footer(&seg_path, &new_bitmap, old_deleted + newly_deleted)
-        {
+        undo.segment_footers.push((
+            seg_path.clone(),
+            old_bitmap,
+            old_deleted,
+            new_bitmap.clone(),
+            old_deleted + newly_deleted,
+        ));
+        // Deferred lifecycle: the journal also records the pre-rewrite footer
+        // (undo) and the REPLACE staging's durability watermark. The restore
+        // paths below rewrite with the IMMEDIATE lifecycle, which overwrites
+        // this segment's journal and removes it on landing, so an in-process
+        // rollback leaves no journal behind either.
+        if let Err(error) = mgr.rewrite_delete_footer_with_mode(
+            &seg_path,
+            &new_bitmap,
+            old_deleted + newly_deleted,
+            crate::storage::segment::reader::FooterRewriteMode::Deferred(image_checks.to_vec()),
+        ) {
             let _ = restore_replace_delete_under_table_lock(engine, &undo);
             return Err(error);
         }
@@ -876,7 +906,11 @@ pub(crate) fn restore_replace_delete_under_table_lock(
     undo: &ReplaceDeleteUndo,
 ) -> Result<()> {
     let mut first_error = restore_replace_memtable_undo(engine, undo).err();
-    for (path, bitmap, deleted_count) in undo.segment_footers.iter().rev() {
+    for (path, bitmap, deleted_count, ..) in undo.segment_footers.iter().rev() {
+        // The restore rewrites with the IMMEDIATE lifecycle, which overwrites
+        // any deferred journal at the same path and removes it on landing;
+        // the explicit clear below makes that guarantee independent of the
+        // rewrite's own journal handling.
         if let Err(error) = engine
             .segment_mgr()
             .rewrite_delete_footer(path, bitmap, *deleted_count)
@@ -884,7 +918,9 @@ pub(crate) fn restore_replace_delete_under_table_lock(
             if first_error.is_none() {
                 first_error = Some(error);
             }
+            continue;
         }
+        crate::storage::segment::reader::clear_deferred_delete_journal(path);
     }
     match first_error {
         Some(error) => Err(error),
@@ -1268,6 +1304,10 @@ pub fn exec_delete(
     let mut index_maintenance = DeleteIndexMaintenance::plan(&table_meta, &table_schema);
 
     let mut delete_body = || -> Result<bool> {
+        // In-lock re-check: the fn-top gate races a transaction registering
+        // its pin under this lock; deleting rows under a fresh pin would
+        // corrupt that transaction's COMMIT.
+        super::txn_dml::refuse_auto_commit_dml_while_pinned(engine, db, table)?;
         // Deleted-row batches for the change feed (segments + memtables).
         let mut deleted_events = super::helpers::ChangeEventBuffer::new("delete", db, table);
         // Memtable-resident rows are removed in place (no forced flush),
