@@ -1395,6 +1395,22 @@ pub fn exec_delete(
                 pred,
             )?;
         }
+        // Point-DELETE fast path: a WHERE that is exactly a full PK/unique
+        // equality resolves the affected segments through the location
+        // index instead of zone-map pruning across every candidate segment.
+        // The located rows are still re-verified by the predicate
+        // evaluation below; memtable-resident matches are left to the
+        // memtable leg above, which always runs.
+        if let Some(located) = point_delete_segments(
+            engine,
+            db,
+            table,
+            &resolved_where_clause,
+            &table_schema,
+            table_meta,
+        )? {
+            segment_files = located;
+        }
         // When change subscribers exist the deleted rows themselves must
         // be published, so row groups are read with every column instead of
         // the key-only projection; index key positions then map to the full
@@ -1791,6 +1807,160 @@ pub(crate) fn delete_partition_eq_key(
         )),
         PartitionType::Value => scalar.to_text(),
         PartitionType::None => None,
+    }
+}
+
+/// A pure point predicate: the WHERE clause is EXACTLY a conjunction of
+/// `column = literal` equalities covering one full primary key or unique
+/// index — nothing else. Returns the probe-able key with the owning index's
+/// name, so a DELETE can resolve the affected segments through the
+/// maintained location index instead of scanning every candidate segment.
+/// Anything richer (ranges, OR, extra conditions) returns `None` and the
+/// caller keeps its pruned scan.
+pub(crate) fn point_delete_key(
+    where_clause: &Option<Expr>,
+    schema: &Schema,
+    table_meta: &TableMeta,
+) -> Option<(String, Vec<ScalarValue>)> {
+    let expr = where_clause.as_ref()?;
+
+    // Split the conjunction; every leaf must be a `column = literal`.
+    let mut leaves = Vec::new();
+    collect_conjunction_leaves(expr, &mut leaves);
+    let mut equalities: Vec<(&str, &Expr)> = Vec::with_capacity(leaves.len());
+    for leaf in leaves {
+        let Expr::BinaryOp { left, op, right } = leaf else {
+            return None;
+        };
+        if *op != BinOp::Eq {
+            return None;
+        }
+        let (name, literal) = if matches!(right.as_ref(), Expr::Literal(_))
+            && column_ref_name(left).is_some()
+        {
+            (column_ref_name(left)?, right.as_ref())
+        } else if matches!(left.as_ref(), Expr::Literal(_))
+            && column_ref_name(right).is_some()
+        {
+            (column_ref_name(right)?, left.as_ref())
+        } else {
+            return None;
+        };
+        equalities.push((name, literal));
+    }
+    if equalities.is_empty() {
+        return None;
+    }
+
+    // Candidate key layouts: the primary key, then every unique index.
+    let mut candidates: Vec<(String, Vec<usize>)> = Vec::new();
+    let primary: Vec<usize> = table_meta
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| column.primary_key.then_some(index))
+        .collect();
+    if !primary.is_empty() {
+        candidates.push((
+            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME.to_string(),
+            primary,
+        ));
+    }
+    for index in &table_meta.unique_indexes {
+        let indices = index
+            .columns
+            .iter()
+            .map(|column| schema.index_of(column))
+            .collect::<Option<Vec<_>>>()?;
+        candidates.push((index.name.clone(), indices));
+    }
+
+    for (index_name, indices) in candidates {
+        if indices.len() != equalities.len() {
+            continue;
+        }
+        let mut key = Vec::with_capacity(indices.len());
+        let mut matched_all = true;
+        for &idx in &indices {
+            let column = &schema.columns[idx];
+            let Some((_, literal)) = equalities
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&column.name))
+            else {
+                matched_all = false;
+                break;
+            };
+            match eval_expr_to_scalar(literal, &column.data_type) {
+                Ok(value) => key.push(value),
+                Err(_) => {
+                    matched_all = false;
+                    break;
+                }
+            }
+        }
+        if matched_all {
+            return Some((index_name, key));
+        }
+    }
+    None
+}
+
+fn collect_conjunction_leaves<'a>(expr: &'a Expr, leaves: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::BinaryOp { left, op, right } if *op == BinOp::And => {
+            collect_conjunction_leaves(left, leaves);
+            collect_conjunction_leaves(right, leaves);
+        }
+        _ => leaves.push(expr),
+    }
+}
+
+fn column_ref_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Column(name) => Some(name.as_str()),
+        Expr::QualifiedColumn { column, .. } => Some(column.as_str()),
+        _ => None,
+    }
+}
+
+/// Point-DELETE segment narrowing: probe the location index named by
+/// [`point_delete_key`] and return exactly the segments holding the key.
+/// `Ok(None)` (not a point predicate, or no index snapshot) keeps the
+/// caller's pruned scan; `Ok(Some(vec![]))` means the key lives nowhere in
+/// the segments — memtable-resident markers carry an empty segment path and
+/// are left to the memtable leg, which always runs.
+///
+/// The located rows are NOT trusted for deletion: the caller's predicate
+/// evaluation re-verifies them, so a stale location can never delete an
+/// unrelated live row.
+pub(crate) fn point_delete_segments(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    where_clause: &Option<Expr>,
+    schema: &Schema,
+    table_meta: &TableMeta,
+) -> Result<Option<Vec<std::path::PathBuf>>> {
+    let Some((index_name, key)) = point_delete_key(where_clause, schema, table_meta) else {
+        return Ok(None);
+    };
+    match engine
+        .index_manager()
+        .unique_key_locations(db, table, &index_name, std::iter::once(&key))?
+    {
+        Some(locations) => {
+            let mut segments = locations
+                .into_iter()
+                .filter(|location| !location.segment_path.is_empty())
+                .map(|location| std::path::PathBuf::from(location.segment_path))
+                .filter(|path| path.is_file())
+                .collect::<Vec<_>>();
+            segments.sort();
+            segments.dedup();
+            Ok(Some(segments))
+        }
+        // No maintained snapshot for the index: keep the pruned scan.
+        None => Ok(None),
     }
 }
 

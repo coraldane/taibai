@@ -425,6 +425,27 @@ impl<'a> IntroducedKeyValidator<'a> {
         Ok(())
     }
 
+    /// Introduced keys of one index, for the location-index fast path: the
+    /// segment-survivor check can probe the maintained snapshot with them
+    /// instead of streaming every row group of the table's key columns.
+    pub fn introduced_keys(&self, index_name: &str) -> Option<Vec<Vec<ScalarValue>>> {
+        self.indexes
+            .iter()
+            .find(|(index, _, _)| index.name == index_name)
+            .map(|(_, _, keys)| keys.iter().cloned().collect())
+    }
+
+    /// Collision error for the location-index fast path: an introduced key
+    /// already exists at a segment location the statement does not
+    /// tombstone — the same error the streaming check would report.
+    pub fn probe_collision_error(
+        &self,
+        index_name: &str,
+        key: &[ScalarValue],
+    ) -> crate::common::error::TaibaiError {
+        duplicate_unique_key_error(self.table, index_name, key)
+    }
+
     /// Currently always Ok; the hook where any deferred finalization
     /// (counting, overflow accounting) would live.
     pub fn finish(self) -> Result<()> {

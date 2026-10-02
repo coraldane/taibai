@@ -5,6 +5,7 @@ use crate::storage::segment_manager::SegmentManager;
 use crate::types::scalar::ScalarValue;
 
 mod aggregate_cache;
+mod amplification_regressions;
 mod audit_regression;
 mod bulk_payload;
 mod cancellation;

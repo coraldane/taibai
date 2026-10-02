@@ -1667,6 +1667,7 @@ impl SegmentManager {
         let mut writer = SegmentWriter::create(path, schema, row_group_size, compression_level)?;
         writer.write_batch(batch)?;
         writer.seal()?;
+        self.note_direct_segment_write(path);
         Ok(())
     }
 
@@ -1699,7 +1700,31 @@ impl SegmentManager {
             writer.write_batch(batch)?;
         }
         writer.seal()?;
+        self.note_direct_segment_write(path);
         Ok(())
+    }
+
+    /// A direct segment write bypassed every index-maintenance primitive, so
+    /// unique-index snapshots stamped with the previous epoch are potentially
+    /// INCOMPLETE (they cannot know these rows' keys). Bumping the epoch here
+    /// forces the next probe to refresh from the segments — without it, a
+    /// directly-seeded table's empty-but-"fresh" snapshot wrongly answered
+    /// "key absent" to uniqueness probes.
+    fn note_direct_segment_write(&self, path: &Path) {
+        let Some(table_dir) = path.parent() else {
+            return;
+        };
+        let Ok(relative) = table_dir.strip_prefix(&self.data_dir) else {
+            return;
+        };
+        let mut components = relative.components();
+        let (Some(db), Some(table)) = (components.next(), components.next()) else {
+            return;
+        };
+        self.note_segments_changed(
+            &db.as_os_str().to_string_lossy(),
+            &table.as_os_str().to_string_lossy(),
+        );
     }
 
     fn table_states_snapshot(&self) -> Vec<Arc<TableSegmentState>> {

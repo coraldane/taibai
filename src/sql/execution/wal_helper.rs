@@ -39,7 +39,9 @@ pub(crate) fn prepare_batch_for_wal(batch: &crate::types::batch::RecordBatch) ->
         let has_nulls = !bitmap.is_all_valid();
         if has_nulls {
             let bm_bytes = bitmap.to_bytes();
-            raw.extend_from_slice(&(bm_bytes.len() as u32).to_le_bytes());
+            let bm_len = u32::try_from(bm_bytes.len())
+                .map_err(|_| TaibaiError::Internal("WAL null bitmap length overflow".into()))?;
+            raw.extend_from_slice(&bm_len.to_le_bytes());
             raw.extend_from_slice(&bm_bytes);
         } else {
             raw.extend_from_slice(&0u32.to_le_bytes());
@@ -48,8 +50,9 @@ pub(crate) fn prepare_batch_for_wal(batch: &crate::types::batch::RecordBatch) ->
         let len_offset = raw.len();
         raw.extend_from_slice(&0u32.to_le_bytes());
         let data_offset = raw.len();
-        encode_column_raw_into(col, &mut raw);
-        let data_len = (raw.len() - data_offset) as u32;
+        encode_column_raw_into(col, &mut raw)?;
+        let data_len = u32::try_from(raw.len() - data_offset)
+            .map_err(|_| TaibaiError::Internal("WAL column payload length overflow".into()))?;
         raw[len_offset..len_offset + 4].copy_from_slice(&data_len.to_le_bytes());
     }
 
@@ -88,13 +91,27 @@ pub(crate) fn compress_prepared_batch_for_wal_with(
     }
 }
 
-fn encode_column_raw_into(col: &crate::types::array::ColumnArray, out: &mut Vec<u8>) {
+/// Per-value length prefixes are u32 frame fields: refuse instead of
+/// silently wrapping — a wrapped prefix makes recovery decode a misaligned
+/// frame (data corruption at restart, not a clean error), exactly the class
+/// the header fields above already refuse.
+fn encode_column_raw_into(
+    col: &crate::types::array::ColumnArray,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     use crate::types::array::ColumnArray;
+    fn value_len(len: usize) -> Result<u32> {
+        u32::try_from(len).map_err(|_| {
+            TaibaiError::Internal("WAL value length exceeds the u32 frame field".into())
+        })
+    }
     match col {
         ColumnArray::Selected { .. } | ColumnArray::Rle { .. } => {
-            encode_column_raw_into(col.flattened(), out)
+            encode_column_raw_into(col.flattened(), out)?
         }
-        ColumnArray::Dictionary { .. } => encode_column_raw_into(&col.materialize_varchar(), out),
+        ColumnArray::Dictionary { .. } => {
+            encode_column_raw_into(&col.materialize_varchar(), out)?
+        }
         ColumnArray::Bool { data, .. } => out.extend_from_slice(data),
         ColumnArray::Int8 { data, .. } => {
             let bytes =
@@ -169,25 +186,26 @@ fn encode_column_raw_into(col: &crate::types::array::ColumnArray, out: &mut Vec<
         }
         ColumnArray::VarChar { data, .. } => {
             for s in data {
-                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                out.extend_from_slice(&value_len(s.len())?.to_le_bytes());
                 out.extend_from_slice(s.as_bytes());
             }
         }
         ColumnArray::Blob { data, .. } => {
             for b in data {
-                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(&value_len(b.len())?.to_le_bytes());
                 out.extend_from_slice(b);
             }
         }
         ColumnArray::Vector { data, .. } => {
             for v in data {
-                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                out.extend_from_slice(&value_len(v.len())?.to_le_bytes());
                 for f in v {
                     out.extend_from_slice(&f.to_le_bytes());
                 }
             }
         }
     }
+    Ok(())
 }
 
 pub fn deserialize_batch_from_wal(

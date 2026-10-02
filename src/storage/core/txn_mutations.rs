@@ -146,6 +146,14 @@ pub fn set_txn_mutation_budget_for_tests(bytes: Option<u64>) {
 /// plus tree-node overhead).
 const POSITION_CHARGE_BYTES: u64 = 48;
 
+/// Statement-staging charge estimate: one tombstone position or row id per
+/// entry, mirroring what `register_memtable_tombstones` and
+/// `register_segment_tombstones` will charge when the staged effects are
+/// applied.
+pub fn estimate_position_charge(entries: usize) -> u64 {
+    (entries as u64).saturating_mul(POSITION_CHARGE_BYTES)
+}
+
 /// Shared registry hanging off the engine, segment manager (scan lookup) and
 /// memtable manager (flush pin). All methods take the single lock; entries
 /// are created by rare DML statements and probed per scan only by readers of
@@ -334,6 +342,25 @@ impl TxnMutationRegistry {
             .get(&txn_id)
             .map(|txn| txn.mutation_bytes)
             .unwrap_or(0)
+    }
+
+    /// Pre-check that a statement's staged charges fit the transaction's
+    /// remaining mutation budget BEFORE the first staged effect is applied,
+    /// so the apply phase cannot fail midway on a budget charge (the same
+    /// class of half-statement gap `mutation_bytes_of` exists to close).
+    pub fn precheck_statement_charge(
+        &self,
+        txn_id: u64,
+        staged_bytes: u64,
+    ) -> crate::common::error::Result<()> {
+        let total = self.mutation_bytes_of(txn_id).saturating_add(staged_bytes);
+        let budget = txn_mutation_budget_bytes();
+        if total > budget {
+            return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
+                "transaction deferred mutations would charge {total} bytes against the {budget} byte in-memory mutation budget; commit or roll back and split the work"
+            )));
+        }
+        Ok(())
     }
 
     /// Statement-scope undo of [`Self::register_segment_tombstones`]: a

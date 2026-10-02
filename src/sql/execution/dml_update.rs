@@ -279,13 +279,17 @@ pub fn exec_update(
                     validator.check_rows_excluding(&batch, &projected_indices, &[])?;
                 }
             }
-            // Survivors: ALL segment rows, streamed row group by row group
-            // (never the WHERE-pruned dry-run scan — uniqueness is global
-            // across row groups, segments and partitions). Rows this
-            // statement tombstones are excluded via the planned new
-            // bitmaps: their old keys retire, so a self-assignment
-            // (SET uk = <the row's current value>) must not collide with
-            // its own image.
+            // Survivors in segments: probe the maintained unique-index
+            // snapshots first — O(introduced keys) location lookups instead
+            // of streaming every row group of the table's key columns
+            // (which made even a 1-row point UPDATE pay a full-table scan).
+            // Same trust model as the INSERT validator: a fresh snapshot's
+            // answer decides; an ABSENT snapshot (invalidated index) falls
+            // back to the streaming sweep below. Rows this statement
+            // tombstones are excluded: their old keys retire, so a
+            // self-assignment (SET uk = <current value>) must not collide
+            // with its own image. Memtable-resident markers (empty segment
+            // path) are covered by the memtable checks above.
             let mut planned_tombstones: std::collections::HashMap<
                 std::path::PathBuf,
                 Vec<u8>,
@@ -293,24 +297,66 @@ pub fn exec_update(
             for (seg_path, new_bitmap, _, _) in &segment_plan.footers {
                 planned_tombstones.insert(seg_path.clone(), new_bitmap.clone());
             }
-            let mut check_error: Option<crate::common::error::TaibaiError> = None;
-            for_each_surviving_key_row_group(
-                mgr,
-                &table_dir,
-                &table_schema,
-                &validation_indices,
-                &planned_tombstones,
-                &mut |projected| {
-                    if check_error.is_none() {
-                        check_error = validator
-                            .check_rows_excluding(projected, &identity_indices, &[])
-                            .err();
+            let mut sweep_needed = false;
+            'probe: for index in &indexes_to_validate {
+                let Some(keys) = validator.introduced_keys(&index.name) else {
+                    continue;
+                };
+                for key in &keys {
+                    match engine
+                        .index_manager()
+                        .unique_key_locations(db, table, &index.name, std::iter::once(key))?
+                    {
+                        Some(locations) => {
+                            for location in locations {
+                                if location.segment_path.is_empty() {
+                                    continue;
+                                }
+                                let path = std::path::PathBuf::from(&location.segment_path);
+                                let tombstoned = planned_tombstones.get(&path).is_some_and(
+                                    |bitmap| {
+                                        crate::storage::segment::delete_bitmap::is_deleted(
+                                            bitmap,
+                                            location.row_id,
+                                        )
+                                    },
+                                );
+                                if !tombstoned {
+                                    // Nothing durable has happened yet — clean abort.
+                                    return Err(validator.probe_collision_error(&index.name, key));
+                                }
+                            }
+                        }
+                        None => {
+                            sweep_needed = true;
+                            break 'probe;
+                        }
                     }
-                },
-            )?;
-            if let Some(error) = check_error {
-                // Nothing durable has happened yet — clean abort.
-                return Err(error);
+                }
+            }
+            if sweep_needed {
+                // Fallback: ALL segment rows, streamed row group by row group
+                // (never the WHERE-pruned dry-run scan — uniqueness is global
+                // across row groups, segments and partitions).
+                let mut check_error: Option<crate::common::error::TaibaiError> = None;
+                for_each_surviving_key_row_group(
+                    mgr,
+                    &table_dir,
+                    &table_schema,
+                    &validation_indices,
+                    &planned_tombstones,
+                    &mut |projected| {
+                        if check_error.is_none() {
+                            check_error = validator
+                                .check_rows_excluding(projected, &identity_indices, &[])
+                                .err();
+                        }
+                    },
+                )?;
+                if let Some(error) = check_error {
+                    // Nothing durable has happened yet — clean abort.
+                    return Err(error);
+                }
             }
             validator.finish()?;
         }

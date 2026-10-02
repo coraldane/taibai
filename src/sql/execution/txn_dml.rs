@@ -268,26 +268,24 @@ pub(crate) fn exec_delete_in_txn(
         }
         // Committed memtable rows are deferred: hide the positions from this
         // transaction's readers and remove them physically at COMMIT.
+        //
+        // Statement staging (P0, the same protocol UPDATE uses): registrations
+        // and deferred events are COLLECTED here and only applied after the
+        // whole scan and a budget pre-check succeed. A statement that failed
+        // midway used to leave already-registered tombstones behind; the
+        // transaction's later COMMIT then deleted those rows as a
+        // half-statement the client had seen fail.
+        let mut staged_memtable_tombstones: Vec<(Arc<MemTable>, Vec<u32>)> = Vec::new();
+        let mut staged_delete_events: Vec<RecordBatch> = Vec::new();
         for plan in committed_plans {
             statement_deleted += plan.removed_positions.len() as u64;
-            engine.txn_mutations().register_memtable_tombstones(
-                reader_txn_id,
-                db,
-                table,
-                partitions.as_deref(),
+            staged_memtable_tombstones.push((
                 Arc::clone(&plan.memtable),
-                plan.removed_positions.iter().copied(),
-            )?;
+                plan.removed_positions.iter().copied().collect(),
+            ));
             if engine.pubsub().has_subscribers() {
                 match plan.original.take_rows(&plan.removed_positions) {
-                    Ok(deleted) => {
-                        engine.txn_mutations().defer_delete_event(
-                            reader_txn_id,
-                            db,
-                            table,
-                            deleted,
-                        )?;
-                    }
+                    Ok(deleted) => staged_delete_events.push(deleted),
                     Err(error) => tracing::warn!(
                         db,
                         table,
@@ -319,6 +317,19 @@ pub(crate) fn exec_delete_in_txn(
                 &table_meta,
                 pred,
             )?;
+        }
+        // Point-DELETE fast path (same contract as the auto-commit path):
+        // resolve the affected segments through the location index; the
+        // predicate evaluation below still re-verifies the located rows.
+        if let Some(located) = super::dml_delete::point_delete_segments(
+            engine,
+            db,
+            table,
+            &resolved_where_clause,
+            &table_schema,
+            table_meta,
+        )? {
+            segment_files = located;
         }
 
         let publish_deletes = engine.pubsub().has_subscribers();
@@ -376,15 +387,92 @@ pub(crate) fn exec_delete_in_txn(
                 continue;
             }
             statement_deleted += outcome.matched_ids.len() as u64;
-            engine.txn_mutations().register_segment_tombstones(
+            staged_segment_tombstones.push((
+                seg_path,
+                outcome.footer_bitmap,
+                outcome.matched_ids,
+            ));
+        }
+
+        // Apply the staged registrations. The budget pre-check makes the
+        // charges non-failing; any other failure (corruption class)
+        // unregisters what already applied so COMMIT cannot materialize a
+        // half-statement — mirroring UPDATE's staged-apply block.
+        let staged_charges = staged_memtable_tombstones
+            .iter()
+            .map(|(_, positions)| positions.len())
+            .chain(
+                staged_segment_tombstones
+                    .iter()
+                    .map(|(_, _, ids)| ids.len()),
+            )
+            .map(crate::storage::core::txn_mutations::estimate_position_charge)
+            .sum::<u64>()
+            .saturating_add(
+                staged_delete_events
+                    .iter()
+                    .map(|batch| batch.estimated_size_bytes() as u64)
+                    .sum::<u64>(),
+            );
+        engine
+            .txn_mutations()
+            .precheck_statement_charge(reader_txn_id, staged_charges)?;
+
+        let mut applied_segments: Vec<(std::path::PathBuf, Vec<u64>)> = Vec::new();
+        for (seg_path, footer_bitmap, ids) in &staged_segment_tombstones {
+            if let Err(error) = engine.txn_mutations().register_segment_tombstones(
                 reader_txn_id,
                 db,
                 table,
                 partitions.as_deref(),
-                &seg_path,
-                &outcome.footer_bitmap,
-                outcome.matched_ids,
-            )?;
+                seg_path,
+                footer_bitmap,
+                ids.iter().copied(),
+            ) {
+                for (path, applied_ids) in &applied_segments {
+                    engine
+                        .txn_mutations()
+                        .unregister_segment_tombstones(reader_txn_id, db, table, path, applied_ids);
+                }
+                return Err(error);
+            }
+            applied_segments.push((seg_path.clone(), ids.clone()));
+        }
+        let mut applied_memtables: Vec<(uuid::Uuid, Vec<u32>)> = Vec::new();
+        for (memtable, positions) in &staged_memtable_tombstones {
+            if let Err(error) = engine.txn_mutations().register_memtable_tombstones(
+                reader_txn_id,
+                db,
+                table,
+                partitions.as_deref(),
+                Arc::clone(memtable),
+                positions.iter().copied(),
+            ) {
+                for (path, applied_ids) in &applied_segments {
+                    engine
+                        .txn_mutations()
+                        .unregister_segment_tombstones(reader_txn_id, db, table, path, applied_ids);
+                }
+                for (applied_id, applied_positions) in &applied_memtables {
+                    engine.txn_mutations().unregister_memtable_tombstones(
+                        reader_txn_id,
+                        db,
+                        table,
+                        *applied_id,
+                        applied_positions,
+                    );
+                }
+                return Err(error);
+            }
+            applied_memtables.push((memtable.id(), positions.clone()));
+        }
+        // Events last: the pre-check above makes their charge non-failing,
+        // and they have no unregister (a dropped notification is the only
+        // residual risk on a corruption-class failure here).
+        for event in staged_delete_events {
+            engine
+                .txn_mutations()
+                .defer_delete_event(reader_txn_id, db, table, event)?;
         }
 
         Ok(statement_deleted)
