@@ -388,10 +388,33 @@ fn update_rewrites_segments_and_auto_rebuilds_index() -> Result<()> {
     let invalid_file = index_dir.join("uk_code.invalid");
     assert!(!invalid_file.exists());
 
-    // Updating a non-key column rewrites the segment; the location index must
-    // be rebuilt eagerly rather than invalidated for a lazy rebuild.
+    // UPDATE routes matched rows through tombstone + reinsert: the old key
+    // is retired incrementally and the new key appended (no snapshot
+    // invalidation), while the updated row itself is memtable-resident
+    // until the next flush.
     engine.execute(&mut session, "UPDATE t SET code = 21 WHERE id = 1")?;
-    assert!(!invalid_file.exists());
+    assert!(!invalid_file.exists(), "maintenance stays eager, no invalidation");
+    assert_eq!(
+        engine
+            .index_manager()
+            .unique_key_exists("main", "t", "uk_code", &[ScalarValue::Int64(Some(21))])?,
+        Some(true),
+        "the new key is visible immediately"
+    );
+    assert_eq!(
+        engine
+            .index_manager()
+            .unique_key_exists(
+                "main",
+                "t",
+                "uk_code",
+                &[ScalarValue::Int64(Some(10))],
+            )?,
+        Some(false),
+        "the old key is retired incrementally"
+    );
+
+    engine.execute(&mut session, "REBUILD UNIQUE INDEX uk_code ON t")?;
     let locations = engine
         .index_manager()
         .unique_key_locations(
@@ -403,15 +426,6 @@ fn update_rewrites_segments_and_auto_rebuilds_index() -> Result<()> {
         .unwrap();
     assert_eq!(locations.len(), 1);
     assert!(!locations[0].segment_path.is_empty());
-    assert_eq!(
-        engine.index_manager().unique_key_exists(
-            "main",
-            "t",
-            "uk_code",
-            &[ScalarValue::Int64(Some(10))]
-        )?,
-        Some(false)
-    );
 
     // The freed key is reusable and the new key stays unique.
     engine.execute(&mut session, "INSERT INTO t VALUES (3, 10)")?;

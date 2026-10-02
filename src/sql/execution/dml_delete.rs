@@ -971,7 +971,7 @@ pub(crate) struct DeleteIndexMaintenance {
 }
 
 impl DeleteIndexMaintenance {
-    fn plan(table_meta: &TableMeta, schema: &Schema) -> Self {
+    pub(crate) fn plan(table_meta: &TableMeta, schema: &Schema) -> Self {
         let mut indexes = Vec::new();
         for index in &table_meta.unique_indexes {
             let indices = index
@@ -1011,7 +1011,7 @@ impl DeleteIndexMaintenance {
 
     /// Return the id of `path` in the statement's segment table, interning it
     /// on first sight.
-    fn intern_segment(&mut self, path: &str) -> u32 {
+    pub(crate) fn intern_segment(&mut self, path: &str) -> u32 {
         if let Some(pos) = self.segment_paths.iter().position(|existing| existing == path) {
             return pos as u32;
         }
@@ -1023,8 +1023,15 @@ impl DeleteIndexMaintenance {
         !self.indexes.is_empty()
     }
 
-    fn still_maintaining(&self) -> bool {
+    pub(crate) fn still_maintaining(&self) -> bool {
         self.maintained && self.has_indexes()
+    }
+
+    /// Schema-space key column positions per maintained index, for callers
+    /// (the UPDATE reinsert path) recording rows from catalog-ordered
+    /// batches outside this module.
+    pub(crate) fn schema_key_positions(&self) -> &[Vec<usize>] {
+        &self.schema_key_positions
     }
 
     fn admit_row(&mut self) -> bool {
@@ -1109,7 +1116,7 @@ impl DeleteIndexMaintenance {
         }
     }
 
-    fn record_segment_row(
+    pub(crate) fn record_segment_row(
         &mut self,
         segment_id: u32,
         row_id: u64,
@@ -1142,7 +1149,7 @@ impl DeleteIndexMaintenance {
 
     /// Publishes the recorded maintenance. Any failure means the caller must
     /// fall back to wholesale snapshot invalidation.
-    fn apply(&self, engine: &Engine, db: &str, table: &str) -> bool {
+    pub(crate) fn apply(&self, engine: &Engine, db: &str, table: &str) -> bool {
         if !self.has_indexes() {
             return true;
         }

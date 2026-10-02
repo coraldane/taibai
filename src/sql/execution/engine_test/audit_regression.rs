@@ -438,3 +438,66 @@ fn null_default_added_column_selects_without_panic() -> Result<()> {
     assert_eq!(rows, 2);
     Ok(())
 }
+
+/// Adversarial-review regression suite for the UPDATE tombstone+reinsert
+/// routing: uniqueness must be enforced against EVERY post-statement key
+/// (survivors, memtable rows, and the new images themselves), and a
+/// violation must abort with zero durable side effects — not delete the
+/// matched rows.
+#[test]
+fn update_unique_violations_abort_cleanly() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64 PRIMARY KEY, code INT64, UNIQUE KEY uk_code (code))",
+    )?;
+    engine.execute(&mut session, "INSERT INTO t VALUES (1, 10), (2, 20)")?;
+    engine.flush_table_buffers("main", "t")?;
+
+    // Collision with a surviving SEGMENT row: must error and lose nothing.
+    let result = engine.execute(&mut session, "UPDATE t SET code = 20 WHERE id = 1");
+    assert!(result.is_err(), "new key collides with a surviving row");
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 2, "a rejected UPDATE must not delete matched rows");
+
+    // Intra-statement collision: two rows assigned the same constant key.
+    let result = engine.execute(&mut session, "UPDATE t SET code = 99 WHERE id IN (1, 2)");
+    assert!(result.is_err(), "two rows cannot take one key");
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 2);
+
+    // Collision with a MEMTABLE row this statement does not touch.
+    engine.execute(&mut session, "INSERT INTO t VALUES (3, 30)")?; // stays in memtable
+    let result = engine.execute(&mut session, "UPDATE t SET code = 30 WHERE id = 1");
+    assert!(result.is_err(), "new key collides with a memtable row");
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 3);
+
+    // A key freed by an earlier DELETE (tombstoned row still physically
+    // present) must be REUSABLE — dead-row keys must not falsely collide.
+    engine.execute(&mut session, "DELETE FROM t WHERE id = 2")?;
+    engine.execute(&mut session, "INSERT INTO t VALUES (4, 20)")?; // reuses 20
+    let result = engine.execute(&mut session, "UPDATE t SET code = 10 WHERE id = 4");
+    assert!(result.is_ok(), "updating to a still-live key is the only error case");
+    let code = first_i64(
+        engine.execute(&mut session, "SELECT code FROM t WHERE id = 4")?,
+        0,
+        0,
+    );
+    assert_eq!(code, 10);
+    Ok(())
+}

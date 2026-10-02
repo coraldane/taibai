@@ -1158,7 +1158,7 @@ fn collapse_replace_batch(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_batch_by_partition(
+pub(crate) fn write_batch_by_partition(
     engine: &Engine,
     db: &str,
     table: &str,

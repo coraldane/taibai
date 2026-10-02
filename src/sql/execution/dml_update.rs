@@ -166,295 +166,76 @@ pub fn exec_update(
         let compression_level = mgr.table_compression_level(db, table);
         let row_group_target = mgr.row_group_target_rows();
 
-        // Two passes per segment, so the statement streams instead of
-        // materializing whole rewritten segments in memory:
-        //   Pass A evaluates the WHERE masks from the projected predicate
-        //   columns only and skips segments with no match at all;
-        //   Pass B rewrites the segment row group by row group straight into
-        //   the replacement temp file — peak memory is one row group, not the
-        //   whole segment.
-        for seg_path in segment_files {
-            let reader = mgr.open_reader(&seg_path)?;
-            if !super::helpers::segment_may_match(&reader, &table_schema, predicate) {
-                continue;
-            }
-
-        // Pass A: masks (projected reads only).
-        //
-        // Footer zone maps follow the segment's own column order, so the
-        // catalog-space predicate must be re-anchored per segment before it
-        // may touch them — a positional probe after a DROP COLUMN reads the
-        // wrong column's zone map and silently skips row groups that hold
-        // matching rows. When alignment fails (a predicate column predates
-        // the footer), pruning is disabled for the whole segment: the
-        // default-filled mask read below decides row by row, matching the
-        // DELETE/SELECT/COUNT absent-column semantics.
-        let aligned_predicate = predicate
-            .as_ref()
-            .and_then(|pred| reader.align_row_group_predicate(&table_schema, pred).ok());
-        let mut rg_masks: Vec<Option<Vec<bool>>> = Vec::with_capacity(reader.num_row_groups());
-        let mut any_match = false;
-        for rg_idx in 0..reader.num_row_groups() {
-            if let Some(ref pred) = aligned_predicate {
-                if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
-                    rg_masks.push(None);
-                    continue;
-                }
-            }
-                let mask = build_update_mask(
-                    &reader,
-                    rg_idx,
-                    where_clause,
-                    &predicate_projection,
-                    &table_schema,
-                )?;
-                any_match |= mask.iter().any(|m| *m);
-                rg_masks.push(Some(mask));
-            }
-            if !any_match {
-                continue;
-            }
-
-            // Pass B: stream the replacement segment. Row groups are
-            // aggregated into one pending batch and written with a single
-            // write_batch call — write_batch encodes each call's column slice
-            // as one block, so feeding it row-group-sized batches directly
-            // would splice separately-encoded blocks inside one row group and
-            // corrupt the segment. Aggregating keeps the peak memory at one
-            // row group while staying byte-identical to the old
-            // materialize-everything-then-combine write.
-            let partition_key = seg_path.file_name().and_then(|name| {
-                crate::storage::partition::parse_partition_key(&name.to_string_lossy())
-            });
-            let final_path =
-                mgr.next_replacement_segment_path(&table_dir, partition_key.as_deref())?;
-            let tmp_path =
-                crate::storage::segment::store::replacement_tmp_path(&final_path, "update_tmp");
-            let mut writer: Option<crate::storage::segment::SegmentWriter> = None;
-            let mut pending: Option<RecordBatch> = None;
-            let mut written_rows = 0usize;
-            let rewrite_result = (|| -> Result<()> {
-                for (rg_idx, mask_opt) in rg_masks.into_iter().enumerate() {
-                    // Catalog-ordered whole-row-group read: `assigned` maps
-                    // catalog column indices, and the pending batches must
-                    // extend column-wise across segments of different ages —
-                    // both only hold when every batch is in catalog order
-                    // (positional reads hit the wrong physical column after
-                    // a DROP/RENAME COLUMN).
-                    let mut batch =
-                        reader.read_row_group_columns_aligned(rg_idx, &table_schema)?;
-                    match mask_opt {
-                        Some(mask) if mask.iter().any(|m| *m) => {
-                            // Surviving rows keep their order; matched survivors
-                            // receive the assigned value in their assigned
-                            // columns only.
-                            let start_row = reader.row_group_start_row(rg_idx);
-                            let delete_bitmap = reader.delete_bitmap();
-                            let mut kept: Vec<u32> = Vec::new();
-                            let mut kept_matched: Vec<bool> = Vec::with_capacity(mask.len());
-                            for (row_idx, matches) in mask.iter().enumerate() {
-                                let absolute_row = start_row + row_idx as u64;
-                                if crate::storage::segment::delete_bitmap::is_deleted(
-                                    delete_bitmap,
-                                    absolute_row,
-                                ) {
-                                    continue;
-                                }
-                                kept.push(row_idx as u32);
-                                kept_matched.push(*matches);
-                            }
-                            let new_batch =
-                                rebuild_update_batch(&batch, &assigned, &kept, &kept_matched)?;
-                            updated_count += kept_matched.iter().filter(|m| **m).count() as u64;
-                            if publish_updates {
-                                let matched: Vec<u32> = kept_matched
-                                    .iter()
-                                    .enumerate()
-                                    .filter_map(|(idx, m)| m.then_some(idx as u32))
-                                    .collect();
-                                updated_events.push(&new_batch, &matched);
-                            }
-                            batch = new_batch;
-                        }
-                        _ => {
-                            // Unmatched or zone-pruned row group: passthrough,
-                            // minus rows a previous DELETE already tombstoned.
-                            if !reader.delete_bitmap().is_empty() {
-                                batch = crate::storage::segment::delete_bitmap::filter_batch(
-                                    batch,
-                                    reader.row_group_start_row(rg_idx),
-                                    reader.delete_bitmap(),
-                                )?;
-                            }
-                        }
-                    }
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
-                    pending = match pending.take() {
-                        Some(mut accumulated) => {
-                            for col_idx in 0..batch.num_columns() {
-                                let source = batch.column(col_idx).expect("validated column");
-                                accumulated
-                                    .column_mut(col_idx)
-                                    .expect("validated column")
-                                    .extend(source)?;
-                            }
-                            Some(accumulated)
-                        }
-                        None => Some(batch),
-                    };
-                    let pending_rows = pending.as_ref().expect("just set").num_rows();
-                    if pending_rows >= row_group_target {
-                        if writer.is_none() {
-                            // Disk-full or permission errors must fail the
-                            // statement (the caller cleans the temp file) —
-                            // not panic while holding the table lock.
-                            writer = Some(crate::storage::segment::SegmentWriter::create(
-                                &tmp_path,
-                                pending.as_ref().expect("just set").schema.clone(),
-                                row_group_target,
-                                compression_level,
-                            )?);
-                        }
-                        writer
-                            .as_mut()
-                            .expect("created above")
-                            .write_batch(pending.as_ref().expect("just set"))?;
-                        written_rows += pending_rows;
-                        pending = None;
-                    }
-                }
-                if let Some(pending) = pending.take() {
-                    if writer.is_none() {
-                        writer = Some(crate::storage::segment::SegmentWriter::create(
-                            &tmp_path,
-                            pending.schema.clone(),
-                            row_group_target,
-                            compression_level,
-                        )?);
-                    }
-                    writer
-                        .as_mut()
-                        .expect("created above")
-                        .write_batch(&pending)?;
-                    written_rows += pending.num_rows();
-                }
-                Ok(())
-            })();
-            match rewrite_result {
-                Ok(()) => {}
-                Err(error) => {
-                    // Drop this temp file and every earlier one; the old
-                    // segments are untouched, so the statement aborts cleanly.
-                    let _ = std::fs::remove_file(&tmp_path);
-                    let _ = crate::storage::segment::meta::remove_sidecar_meta(&tmp_path);
-                    for (_, tmp, final_path) in &staged_segments {
-                        let _ = std::fs::remove_file(tmp);
-                        let _ = crate::storage::segment::meta::remove_sidecar_meta(tmp);
-                        let _ = std::fs::remove_file(final_path);
-                    }
-                    return Err(error);
-                }
-            }
-            drop(reader);
-            match writer {
-                Some(writer) => {
-                    writer.seal()?;
-                    staged_segments.push((seg_path, tmp_path, final_path));
-                }
-                None => {
-                    // Nothing survived the delete footer in this segment:
-                    // remove it outright instead of writing an empty file.
-                    mgr.remove_segment_file(&seg_path)?;
-                    segments_removed += 1;
-                }
-            }
-        }
-
-        if staged_segments.is_empty() && segments_removed == 0 && memtable_updates.is_empty() {
-            return Ok(0);
-        }
-
-        // Unique/PK validation. Only indexes whose columns are actually
-        // touched by this UPDATE can gain new collisions (assignments are
-        // constant per statement), and the primary key must be validated
-        // even though it is not listed in `unique_indexes` — UPDATE used to
-        // skip PK checks entirely, letting `SET id = <existing>` through.
+        // Validation set up front: the segment dry-run below gathers the
+        // surviving rows' key columns while it scans, so no second
+        // validation sweep over the table is needed.
         let indexes_to_validate = indexes_touched_by_assignments(
             &table_meta.unique_indexes,
             &table_schema,
             assigned.keys().copied().collect(),
         );
-        if !indexes_to_validate.is_empty() {
-            // Materialize only the key columns (not whole rows) to keep the
-            // validation working set proportional to the index width.
-            let mut needed: Vec<usize> = indexes_to_validate
-                .iter()
-                .flat_map(|index| index.columns.iter())
-                .filter_map(|column| table_schema.index_of(column))
-                .collect();
-            needed.sort_unstable();
-            needed.dedup();
-            let validation_schema = Schema::new(
-                needed
+        let (validation_schema, validation_indices): (Schema, Vec<usize>) =
+            if indexes_to_validate.is_empty() {
+                (Schema::empty(), Vec::new())
+            } else {
+                let mut needed: Vec<usize> = indexes_to_validate
                     .iter()
-                    .map(|&idx| table_schema.columns[idx].clone())
-                    .collect(),
-            );
-            // Full-schema batches (memtables) are projected here; segment and
-            // staged reads below use read_row_group_with_projection directly.
-            let project = |batch: &RecordBatch| -> RecordBatch {
-                RecordBatch::try_new(
-                    validation_schema.clone(),
+                    .flat_map(|index| index.columns.iter())
+                    .filter_map(|column| table_schema.index_of(column))
+                    .collect();
+                needed.sort_unstable();
+                needed.dedup();
+                let schema = Schema::new(
                     needed
                         .iter()
-                        .map(|&idx| batch.columns[idx].clone())
+                        .map(|&idx| table_schema.columns[idx].clone())
                         .collect(),
-                )
-                .expect("validation projection preserves column types")
+                );
+                (schema, needed)
             };
-            let mut validation_batches: Vec<Arc<RecordBatch>> = Vec::new();
-            for seg_path in SegmentManager::discover_segments(&table_dir)? {
-                if staged_segments
-                    .iter()
-                    .any(|(old_seg, _, _)| old_seg == &seg_path)
-                {
-                    continue;
-                }
-                let reader = mgr.open_reader(&seg_path)?;
-                for rg_idx in 0..reader.num_row_groups() {
-                    // Name-based read: `needed` is catalog-space and old
-                    // segments keep pre-DDL footers.
-                    let mut batch =
-                        reader.read_row_group_columns(rg_idx, &table_schema, &needed)?;
-                    if !reader.delete_bitmap().is_empty() {
-                        batch = crate::storage::segment::delete_bitmap::filter_batch(
-                            batch,
-                            reader.row_group_start_row(rg_idx),
-                            reader.delete_bitmap(),
-                        )?;
-                    }
-                    if batch.num_rows() > 0 {
-                        validation_batches.push(Arc::new(batch));
-                    }
-                }
-            }
-            // Staged replacement segments (already sealed, not yet swapped
-            // in): read their key columns straight from the temp files.
-            // Staged batches were written catalog-ordered by Pass B, so the
-            // projection matches directly.
-            for (_, tmp_path, _) in &staged_segments {
-                let tmp_reader = crate::storage::segment::SegmentReader::open(tmp_path)?;
-                for rg_idx in 0..tmp_reader.num_row_groups() {
-                    let batch = tmp_reader.read_row_group_with_projection(rg_idx, &needed)?;
-                    if batch.num_rows() > 0 {
-                        validation_batches.push(Arc::new(batch));
-                    }
-                }
-            }
-            // Visible-to-this-transaction memtables only: another session's
-            // uncommitted keys used to cause spurious duplicate errors here.
+
+        // Segment leg: tombstone + reinsert (REPLACE-equivalent semantics).
+        // The old two-pass whole-segment rewrite amplified a single-row
+        // UPDATE into a full segment rewrite plus a per-index full-table
+        // rebuild; under the no-amplification policy the matched rows are
+        // tombstoned in the segment footer (an O(rows/8) bitmap rewrite,
+        // the same primitive DELETE and REPLACE use) and their updated
+        // images go through the standard insert path with incremental index
+        // maintenance on both halves.
+        //
+        // Ordering is correctness-load-bearing: the dry run below touches
+        // NOTHING durable; uniqueness validation runs on its output before
+        // any footer is rewritten, so a key collision aborts the statement
+        // with zero side effects. Only after validation do the footers
+        // tombstone (with undo on IO failure) and the images insert.
+        let segment_plan = plan_segment_rows_for_reinsert(
+            engine,
+            mgr,
+            db,
+            table,
+            table_meta,
+            &table_schema,
+            segment_files,
+            predicate,
+            where_clause,
+            predicate_projection,
+            &assigned,
+            &validation_schema,
+            &validation_indices,
+            publish_updates,
+            &mut updated_events,
+        )?;
+        updated_count += segment_plan.updated_count;
+
+        // Unique/PK validation. The comparison set is EVERY key that will
+        // exist after the statement: segment survivors (live, unmatched),
+        // every visible memtable row (post-update images for rows this
+        // statement already rewrote in memory), AND the new images
+        // themselves — two matched rows assigned the same constant key must
+        // collide here, and a new key must not equal any surviving key.
+        if !indexes_to_validate.is_empty() {
+            let mut validation_batches: Vec<Arc<RecordBatch>> =
+                segment_plan.surviving_key_batches.clone();
             for memtable in engine
                 .memtable_manager()
                 .get_visible_to(db, table, reader_txn_id)
@@ -466,9 +247,28 @@ pub fn exec_update(
                     .or_else(|| memtable.read_snapshot_arc());
                 if let Some(batch) = batch {
                     if batch.num_rows() > 0 {
-                        validation_batches.push(Arc::new(project(&batch)));
+                        let projected = RecordBatch::try_new(
+                            validation_schema.clone(),
+                            validation_indices
+                                .iter()
+                                .map(|&idx| batch.columns[idx].clone())
+                                .collect(),
+                        )
+                        .expect("validation projection preserves column types");
+                        validation_batches.push(Arc::new(projected));
                     }
                 }
+            }
+            for image in &segment_plan.image_batches {
+                let projected = RecordBatch::try_new(
+                    validation_schema.clone(),
+                    validation_indices
+                        .iter()
+                        .map(|&idx| image.columns[idx].clone())
+                        .collect(),
+                )
+                .expect("validation projection preserves column types");
+                validation_batches.push(Arc::new(projected));
             }
             if let Err(error) = super::dml_insert::validate_unique_indexes_in_batches(
                 table,
@@ -476,28 +276,130 @@ pub fn exec_update(
                 &indexes_to_validate,
                 &validation_batches,
             ) {
-                // Validation failed: the temp files are the statement's only
-                // side effect so far — drop them; the old segments are intact.
-                for (_, tmp, final_path) in &staged_segments {
-                    let _ = std::fs::remove_file(tmp);
-                    let _ = crate::storage::segment::meta::remove_sidecar_meta(tmp);
-                    let _ = std::fs::remove_file(final_path);
-                }
+                // Nothing durable has happened yet — clean abort.
                 return Err(error);
             }
         }
 
-        // Two-phase rewrite, phase two: every replacement temp file was
-        // written (and validated) above; only the metadata-only swaps remain.
-        // A failure in the swaps drops the orphaned temp segment instead of
-        // leaking it (startup cleanup only knows the compaction temp
-        // patterns).
-        let segments_rewritten = !staged_segments.is_empty();
-        for (old_seg, tmp_path, final_path) in staged_segments {
-            if let Err(error) = mgr.replace_segments_with_tmp(&tmp_path, &final_path, &[old_seg]) {
-                let _ = std::fs::remove_file(&tmp_path);
-                let _ = crate::storage::segment::meta::remove_sidecar_meta(&tmp_path);
-                return Err(error);
+        // New-key index entries are built BEFORE the batches move into the
+        // write path (each entry's row_id is its batch row index).
+        let unique_constraints: Vec<(String, Vec<usize>)> = table_meta
+            .unique_indexes
+            .iter()
+            .filter_map(|index| {
+                let indices: Option<Vec<usize>> = index
+                    .columns
+                    .iter()
+                    .map(|column| table_schema.index_of(column))
+                    .collect();
+                indices.map(|indices| (index.name.clone(), indices))
+            })
+            .collect();
+        let primary_key_indices: Vec<usize> = table_schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.primary_key)
+            .map(|(idx, _)| idx)
+            .collect();
+        let mut unique_index_entries: Vec<(String, Vec<crate::storage::index::index_manager::UniqueIndexEntry>)> = Vec::new();
+        let mut primary_keys: Vec<Vec<ScalarValue>> = Vec::new();
+        for batch in &segment_plan.image_batches {
+            if !unique_constraints.is_empty() {
+                unique_index_entries.extend(super::dml_insert::build_unique_index_entries_for_batch(
+                    table_meta,
+                    &table_schema,
+                    batch,
+                    &unique_constraints,
+                )?);
+            }
+            if !primary_key_indices.is_empty() {
+                unique_index_entries.push((
+                    crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME.to_string(),
+                    super::dml_insert::primary_location_entries_for_batch(
+                        &table_schema,
+                        batch,
+                        &primary_key_indices,
+                    ),
+                ));
+                primary_keys.extend(super::dml_insert::primary_keys_for_batch(
+                    batch,
+                    &table_schema,
+                    &primary_key_indices,
+                )?);
+            }
+        }
+
+        // Phase 2a: tombstone the footers (undo on failure), then insert
+        // the images through the standard write path (tail durability,
+        // partition routing, memtable append). Row count is net-zero for
+        // an UPDATE: the tombstones are not counted anywhere and the
+        // insert intentionally skips the catalog.
+        segment_plan.apply_footers(mgr)?;
+        for batch in segment_plan.image_batches {
+            super::dml_insert::write_batch_by_partition(
+                engine,
+                db,
+                table,
+                table_meta,
+                batch,
+                table_schema.clone(),
+                0,
+                true,
+                false,
+            )?;
+        }
+
+        // Incremental index maintenance, both halves, still under the
+        // mutation lock: retire the old (key -> segment position) entries
+        // recorded during the dry run, then append the images' entries
+        // exactly like an INSERT would. `apply` returning false means the
+        // precise-maintenance row cap tripped — fall back to snapshot
+        // invalidation (DELETE's contract), never a rebuild.
+        if !segment_plan.index_maintenance.apply(engine, db, table) {
+            engine.index_manager().invalidate_primary_key_index(db, table);
+            let unique_index_names = table_meta
+                .unique_indexes
+                .iter()
+                .map(|index| index.name.clone())
+                .collect::<Vec<_>>();
+            engine
+                .index_manager()
+                .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
+        }
+        if !unique_index_entries.is_empty() {
+            if let Err(error) = super::dml_insert::append_unique_index_entries_after_insert(
+                engine,
+                db,
+                table,
+                unique_index_entries,
+            ) {
+                tracing::warn!(
+                    db,
+                    table,
+                    error = %error,
+                    "UPDATE new-key index append failed; invalidating snapshots"
+                );
+                for index in &table_meta.unique_indexes {
+                    engine
+                        .index_manager()
+                        .invalidate_unique_index_snapshot(db, table, &index.name);
+                }
+                engine.index_manager().invalidate_primary_key_index(db, table);
+            }
+        }
+        if !primary_keys.is_empty() {
+            if let Err(error) = engine
+                .index_manager()
+                .append_primary_keys(db, table, &primary_keys)
+            {
+                tracing::warn!(
+                    db,
+                    table,
+                    error = %error,
+                    "UPDATE primary-key append failed; invalidating location index"
+                );
+                engine.index_manager().invalidate_primary_key_index(db, table);
             }
         }
 
@@ -568,48 +470,6 @@ pub fn exec_update(
                 engine
                     .pubsub()
                     .publish_change(crate::pubsub::ChangeKind::Update, db, table, batch);
-            }
-        }
-        if updated_count > 0 {
-            // Rebuild location indexes while STILL holding the mutation lock.
-            // Doing this after releasing the lock (as before) left a window
-            // where a concurrent INSERT probed a stale index snapshot and
-            // committed a key this UPDATE had just introduced, permanently
-            // baking a duplicate into the rebuilt index.
-            //
-            // Only two things can stale a snapshot, so the full-table rebuild
-            // runs only when one of them happened: a segment swap moved rows
-            // to new segment paths, or an assignment rewrote a key column
-            // (including memtable rows, whose positions are position-stable
-            // so their row ids in the snapshots stay valid for non-key
-            // updates). A non-key UPDATE over memtable rows only skips it.
-            let keys_touched = !indexes_to_validate.is_empty();
-            if keys_touched || segments_rewritten || segments_removed > 0 {
-                if let Err(error) = super::dml_insert::rebuild_table_location_indexes(
-                    engine,
-                    db,
-                    table,
-                    &table_meta,
-                    &table_schema,
-                ) {
-                    tracing::warn!(
-                        db,
-                        table,
-                        error = %error,
-                        "UPDATE index auto-rebuild failed; falling back to snapshot invalidation"
-                    );
-                    engine
-                        .index_manager()
-                        .invalidate_primary_key_index(db, table);
-                    let unique_index_names = table_meta
-                        .unique_indexes
-                        .iter()
-                        .map(|index| index.name.clone())
-                        .collect::<Vec<_>>();
-                    engine
-                        .index_manager()
-                        .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
-                }
             }
         }
 
@@ -928,4 +788,238 @@ pub(crate) fn build_update_mask(
         }
     }
     Ok(mask)
+}
+
+
+/// Dry-run plan of the segment leg of an auto-commit UPDATE (tombstone +
+/// reinsert). Phase 1 (`collect`) scans and gathers everything the
+/// validation needs WITHOUT touching a single footer; phase 2 (`apply`)
+/// tombstones footers (with undo) and hands the image batches to the
+/// caller for insertion. Keeping validation ahead of every footer write is
+/// what makes a uniqueness failure a clean abort — the previous single-pass
+/// shape tombstoned rows first and lost them on the error path.
+struct SegmentReinsertPlan {
+    /// Per segment: (path, full-length new bitmap, new deleted count,
+    /// undo = previous bitmap bytes + previous deleted count).
+    footers: Vec<(std::path::PathBuf, Vec<u8>, u64, (Vec<u8>, u64))>,
+    image_batches: Vec<RecordBatch>,
+    /// Live, unmatched rows' key columns (gathered, footer-dead rows and
+    /// matched rows excluded) — the ONLY segment keys a new key may collide
+    /// with. Dead-row keys must stay out or reused keys get falsely
+    /// rejected; matched rows' old keys are being retired.
+    surviving_key_batches: Vec<Arc<RecordBatch>>,
+    index_maintenance: crate::sql::execution::dml_delete::DeleteIndexMaintenance,
+    updated_count: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_segment_rows_for_reinsert(
+    engine: &Engine,
+    mgr: &crate::storage::segment_manager::SegmentManager,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    table_schema: &Schema,
+    segment_files: Vec<std::path::PathBuf>,
+    predicate: Option<&crate::storage::segment::RowGroupPredicate>,
+    where_clause: &Option<Expr>,
+    predicate_projection: &[usize],
+    assigned: &std::collections::HashMap<usize, ScalarValue>,
+    validation_schema: &Schema,
+    validation_indices: &[usize],
+    publish_updates: bool,
+    updated_events: &mut super::helpers::ChangeEventBuffer,
+) -> Result<SegmentReinsertPlan> {
+    let mut index_maintenance =
+        crate::sql::execution::dml_delete::DeleteIndexMaintenance::plan(table_meta, table_schema);
+    let maintaining = index_maintenance.still_maintaining();
+    let key_positions: Vec<Vec<usize>> = index_maintenance.schema_key_positions().to_vec();
+
+    let mut footers = Vec::new();
+    let mut image_pending: Option<RecordBatch> = None;
+    let mut image_batches: Vec<RecordBatch> = Vec::new();
+    let mut image_bytes = 0u64;
+    let byte_budget = crate::storage::core::txn_mutations::txn_mutation_budget_bytes();
+    let mut surviving_key_batches: Vec<Arc<RecordBatch>> = Vec::new();
+    let mut updated_count = 0u64;
+    let need_keys = !validation_indices.is_empty();
+    let row_group_target = mgr.row_group_target_rows();
+
+    for seg_path in segment_files {
+        let reader = mgr.open_reader(&seg_path)?;
+        if !super::helpers::segment_may_match(&reader, table_schema, predicate) {
+            continue;
+        }
+        let aligned_predicate = predicate
+            .and_then(|pred| reader.align_row_group_predicate(table_schema, pred).ok());
+        let footer_bitmap = reader.delete_bitmap().to_vec();
+        let base_deleted = reader.deleted_row_count();
+        // Compose a FULL-LENGTH bitmap (footer bitmaps only cover rows that
+        // had deletions when they were written): mark_deleted on a short
+        // slice is a silent no-op.
+        let bitmap_bytes = reader.row_count().div_ceil(8) as usize;
+        let mut new_bitmap = vec![0u8; bitmap_bytes];
+        let copy_len = footer_bitmap.len().min(bitmap_bytes);
+        new_bitmap[..copy_len].copy_from_slice(&footer_bitmap[..copy_len]);
+        let mut newly_deleted = 0u64;
+        let segment_id = maintaining
+            .then(|| index_maintenance.intern_segment(&seg_path.to_string_lossy()));
+        let mut segment_matched = false;
+
+        for rg_idx in 0..reader.num_row_groups() {
+            if let Some(pred) = &aligned_predicate {
+                if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
+                    continue;
+                }
+            }
+            let mask = build_update_mask(
+                &reader,
+                rg_idx,
+                where_clause,
+                predicate_projection,
+                table_schema,
+            )?;
+            let any_matched = mask.iter().any(|m| *m);
+            // Read the row group only when something consumes it: matched
+            // rows feed images + index retirement, `need_keys` feeds the
+            // validation set. Index maintenance alone never needs the batch
+            // (it records matched rows only), so the old `!maintaining`
+            // guard forced a full-table full-column decode on every
+            // PK-bearing table.
+            if !any_matched && !need_keys {
+                continue;
+            }
+            // Catalog-ordered whole-row-group read: assignments map catalog
+            // indices and the images must carry the catalog layout.
+            let batch = reader.read_row_group_columns_aligned(rg_idx, table_schema)?;
+            let start_row = reader.row_group_start_row(rg_idx);
+            let mut kept_survivors: Vec<u32> = Vec::new();
+            let mut matched_rows: Vec<u32> = Vec::new();
+            for (row_idx, matches) in mask.iter().enumerate() {
+                let absolute_row = start_row + row_idx as u64;
+                if crate::storage::segment::delete_bitmap::is_deleted(&footer_bitmap, absolute_row)
+                {
+                    continue;
+                }
+                if *matches {
+                    matched_rows.push(row_idx as u32);
+                    crate::storage::segment::delete_bitmap::mark_deleted(
+                        &mut new_bitmap,
+                        absolute_row,
+                    );
+                    newly_deleted += 1;
+                } else {
+                    kept_survivors.push(row_idx as u32);
+                }
+            }
+            if let Some(segment_id) = segment_id {
+                if !matched_rows.is_empty() {
+                    // The old (key -> position) entries retire at apply
+                    // time; record from the PRE-image batch.
+                    for row_idx in &matched_rows {
+                        index_maintenance.record_segment_row(
+                            segment_id,
+                            start_row + *row_idx as u64,
+                            &batch,
+                            *row_idx as usize,
+                            &key_positions,
+                        );
+                    }
+                }
+            }
+            if !matched_rows.is_empty() {
+                segment_matched = true;
+                let matched_matched = vec![true; matched_rows.len()];
+                let images =
+                    rebuild_update_batch(&batch, assigned, &matched_rows, &matched_matched)?;
+                if publish_updates {
+                    let idxs: Vec<u32> = (0..images.num_rows() as u32).collect();
+                    updated_events.push(&images, &idxs);
+                }
+                updated_count += matched_rows.len() as u64;
+                image_bytes = image_bytes
+                    .saturating_add(images.estimated_size_bytes().saturating_mul(2) as u64);
+                if image_bytes > byte_budget {
+                    return Err(TaibaiError::ResourceBusy(format!(
+                        "UPDATE image materialization exceeded the budget ({} > {} bytes); narrow the statement or raise the transaction budget",
+                        image_bytes, byte_budget
+                    )));
+                }
+                image_pending = match image_pending.take() {
+                    Some(mut accumulated) => {
+                        for col_idx in 0..images.num_columns() {
+                            let source = images.column(col_idx).expect("validated column");
+                            accumulated
+                                .column_mut(col_idx)
+                                .expect("validated column")
+                                .extend(source)?;
+                        }
+                        Some(accumulated)
+                    }
+                    None => Some(images),
+                };
+                if image_pending.as_ref().expect("just set").num_rows() >= row_group_target {
+                    image_batches.push(image_pending.take().expect("just set"));
+                }
+            }
+            if need_keys && !kept_survivors.is_empty() {
+                // Gather exactly the surviving rows (dead and matched rows
+                // excluded): column clones of the full batch would include
+                // dead-row keys and cause false duplicate reports.
+                let gathered = RecordBatch::try_new(
+                    validation_schema.clone(),
+                    validation_indices
+                        .iter()
+                        .map(|&idx| batch.columns[idx].clone().take(&kept_survivors))
+                        .collect(),
+                )
+                .expect("validation projection preserves column types");
+                surviving_key_batches.push(Arc::new(gathered));
+            }
+        }
+        drop(reader);
+        if segment_matched {
+            footers.push((
+                seg_path,
+                new_bitmap,
+                base_deleted + newly_deleted,
+                (footer_bitmap, base_deleted),
+            ));
+        }
+    }
+    if let Some(pending) = image_pending.take() {
+        image_batches.push(pending);
+    }
+    Ok(SegmentReinsertPlan {
+        footers,
+        image_batches,
+        surviving_key_batches,
+        index_maintenance,
+        updated_count,
+    })
+}
+
+impl SegmentReinsertPlan {
+    /// Phase 2a: tombstone every collected footer. On failure the already
+    /// applied footers are restored from their undo snapshots, so an IO
+    /// error is a clean abort rather than a half-deleted table.
+    fn apply_footers(
+        &self,
+        mgr: &crate::storage::segment_manager::SegmentManager,
+    ) -> Result<()> {
+        let mut applied =
+            std::collections::VecDeque::<(std::path::PathBuf, Vec<u8>, u64)>::new();
+        for (seg_path, new_bitmap, new_deleted, (old_bitmap, old_deleted)) in &self.footers {
+            if let Err(error) = mgr.rewrite_delete_footer(seg_path, new_bitmap, *new_deleted) {
+                // Roll the applied footers back: the statement aborts with
+                // the table exactly as it was.
+                while let Some((path, bitmap, deleted)) = applied.pop_front() {
+                    let _ = mgr.rewrite_delete_footer(&path, &bitmap, deleted);
+                }
+                return Err(error);
+            }
+            applied.push_back((seg_path.clone(), old_bitmap.clone(), *old_deleted));
+        }
+        Ok(())
+    }
 }
