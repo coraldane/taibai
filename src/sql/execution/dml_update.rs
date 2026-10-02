@@ -347,7 +347,26 @@ pub fn exec_update(
         // and the staged inserts skip the catalog.
         let image_txn = engine.alloc_txn_id();
         let image_batches = std::mem::take(&mut segment_plan.image_batches);
+        // Durability watermark for the deferred footer journals: the staged
+        // images live in the private transaction's memtables; once their
+        // tails are durable, recovery may keep the tombstones (roll forward),
+        // otherwise it restores the pre-statement footers (roll back).
+        let image_checks: Vec<crate::storage::segment::reader::ImageDurabilityCheck> = engine
+            .memtable_manager()
+            .get_by_table(db, table)
+            .into_iter()
+            .filter(|memtable| memtable.txn_id() == image_txn)
+            .map(|memtable| {
+                crate::storage::segment::reader::ImageDurabilityCheck {
+                    memtable_id: memtable.id(),
+                    partition: memtable.partition_key().to_string(),
+                    expected_rows: memtable.row_count(),
+                }
+            })
+            .collect();
         let staged: Result<()> = (|| {
+            // The index feeds the test-only fault injection below.
+            #[allow(clippy::unused_enumerate_index)]
             for (_batch_idx, batch) in image_batches.into_iter().enumerate() {
                 #[cfg(test)]
                 if _batch_idx == 1
@@ -371,7 +390,7 @@ pub fn exec_update(
                     false,
                 )?;
             }
-            segment_plan.apply_footers(mgr)?;
+            segment_plan.apply_footers_deferred(mgr, &image_checks)?;
             Ok(())
         })();
         if let Err(error) = staged {
@@ -407,6 +426,12 @@ pub fn exec_update(
             return Err(error);
         }
         let _ = engine.txn_mutations().remove(image_txn);
+        // The commit is durable: the tombstone leg is now unconditionally
+        // correct. Clear the deferred journals (best effort — a leftover is
+        // re-judged by startup recovery, which will find the watermark met).
+        for (seg_path, ..) in &segment_plan.footers {
+            crate::storage::segment::reader::clear_deferred_delete_journal(seg_path);
+        }
 
         // Incremental index maintenance, both halves, still under the
         // mutation lock: retire the old (key -> segment position) entries
@@ -1077,17 +1102,35 @@ fn plan_segment_rows_for_reinsert(
 }
 
 impl SegmentReinsertPlan {
-    /// Phase 2a: tombstone every collected footer. On failure the already
-    /// applied footers are restored from their undo snapshots, so an IO
-    /// error is a clean abort rather than a half-deleted table.
-    fn apply_footers(
+    /// Phase 2a: tombstone every collected footer under the DEFERRED journal
+    /// lifecycle — each rewrite's journal also records the pre-statement
+    /// footer (undo) and the statement's image watermark, and survives until
+    /// the caller clears it after the images are durable. A crash anywhere
+    /// in between rolls the footers back at startup
+    /// (`recover_statement_footer_journals`).
+    ///
+    /// On failure the already applied footers are restored from their undo
+    /// snapshots, so an IO error is a clean abort rather than a half-deleted
+    /// table. Each restore rewrite runs under the IMMEDIATE journal
+    /// lifecycle, which overwrites and consumes the deferred journal of the
+    /// same segment — the directory holds no pending statement state after a
+    /// successful undo.
+    fn apply_footers_deferred(
         &self,
         mgr: &crate::storage::segment_manager::SegmentManager,
+        image_checks: &[crate::storage::segment::reader::ImageDurabilityCheck],
     ) -> Result<()> {
         let mut applied =
             std::collections::VecDeque::<(std::path::PathBuf, Vec<u8>, u64)>::new();
         for (seg_path, new_bitmap, new_deleted, (old_bitmap, old_deleted)) in &self.footers {
-            if let Err(error) = mgr.rewrite_delete_footer(seg_path, new_bitmap, *new_deleted) {
+            if let Err(error) = mgr.rewrite_delete_footer_with_mode(
+                seg_path,
+                new_bitmap,
+                *new_deleted,
+                crate::storage::segment::reader::FooterRewriteMode::Deferred(
+                    image_checks.to_vec(),
+                ),
+            ) {
                 // Roll the applied footers back: the statement aborts with
                 // the table exactly as it was.
                 while let Some((path, bitmap, deleted)) = applied.pop_front() {

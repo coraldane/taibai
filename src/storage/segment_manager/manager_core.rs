@@ -86,6 +86,10 @@ impl SegmentManager {
                             let tbl_dir = tbl_entry.path();
                             cleanup_incomplete_compaction_files(&tbl_dir);
                             recover_replace_journals(&tbl_dir);
+                            // Deferred (V02) statement journals are judged
+                            // ONLY here: single writer per data dir means no
+                            // statement is in flight at startup.
+                            crate::storage::segment::reader::recover_statement_footer_journals(&tbl_dir);
                             let max_seq = discover_max_seq(&tbl_dir);
                             let partition_seq = discover_max_partition_seq(&tbl_dir);
                             let key = table_key(&db_name, &table_name);
@@ -1163,7 +1167,22 @@ impl SegmentManager {
         bitmap: &[u8],
         deleted_count: u64,
     ) -> Result<()> {
-        let result = self.rewrite_delete_footer_inner(path, bitmap, deleted_count);
+        self.rewrite_delete_footer_with_mode(path, bitmap, deleted_count, FooterRewriteMode::Immediate)
+    }
+
+    /// Rewrite a segment's delete footer under the chosen journal lifecycle:
+    /// Immediate (single-leg statements, journal cleared on landing) or
+    /// Deferred (multi-leg statements — the journal also carries the undo
+    /// footer and the image watermark and is cleared by the caller once the
+    /// other legs are durable).
+    pub fn rewrite_delete_footer_with_mode(
+        &self,
+        path: &Path,
+        bitmap: &[u8],
+        deleted_count: u64,
+        mode: FooterRewriteMode,
+    ) -> Result<()> {
+        let result = self.rewrite_delete_footer_inner(path, bitmap, deleted_count, mode);
         if result.is_ok() {
             // Deleted rows changed this segment's visible content: bump the
             // epoch here so no caller can forget (a crash between the
@@ -1180,6 +1199,7 @@ impl SegmentManager {
         path: &Path,
         bitmap: &[u8],
         deleted_count: u64,
+        mode: FooterRewriteMode,
     ) -> Result<()> {
         let mutable = self.is_mutable_segment_path(path);
         self.invalidate_reader(path);
@@ -1192,7 +1212,7 @@ impl SegmentManager {
             // first also guarantees the embedded footer we rewrite from is
             // current.
             let Some(state) = self.state_for_segment_path(path) else {
-                SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
+                SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count, mode)?;
                 remove_sidecar_meta(path)?;
                 return Ok(());
             };
@@ -1208,7 +1228,7 @@ impl SegmentManager {
                     break;
                 }
             }
-            SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
+            SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count, mode.clone())?;
             let footer = read_embedded_footer(path)?;
             append_sidecar_footer(path, footer.data_end, &footer.footer)?;
             for segment in active_guard.values_mut() {
@@ -1221,7 +1241,7 @@ impl SegmentManager {
             }
             return Ok(());
         }
-        SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
+        SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count, mode)?;
         remove_sidecar_meta(path)?;
         Ok(())
     }
@@ -2072,4 +2092,5 @@ fn db_table_from_segment_path(path: &Path) -> Option<(String, String)> {
         .to_string_lossy()
         .to_string();
     Some((db, table))
-}
+}use crate::storage::segment::reader::FooterRewriteMode;
+

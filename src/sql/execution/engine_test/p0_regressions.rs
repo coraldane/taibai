@@ -506,3 +506,211 @@ fn fast_insert_falls_back_for_quoted_table_names() -> Result<()> {
     );
     Ok(())
 }
+
+/// P3 (UPDATE crash window): a successful UPDATE leaves no pending statement
+/// journal — the deferred `.del` files are cleared once the image commit is
+/// durable.
+#[test]
+fn update_clears_statement_journals_after_durable_commit() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")?;
+    let table_meta = engine.get_table_meta("main", "t").unwrap();
+    let schema = crate::types::batch::Schema::new(table_meta.columns.clone());
+    let mut batch = crate::types::batch::RecordBatch::with_capacity(schema.clone(), 4);
+    for id in 1..=4i64 {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(id)))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(id * 10)))?;
+    }
+    engine.segment_mgr().write_new_segment(
+        &engine.data_dir().join("main").join("t").join("seg_00001.dat"),
+        schema,
+        2,
+        &batch,
+        3,
+    )?;
+
+    engine.execute(&mut session, "UPDATE t SET v = 99 WHERE id >= 1")?;
+    let value = first_i64(
+        engine.execute(&mut session, "SELECT v FROM t WHERE id = 1")?,
+        0,
+        0,
+    );
+    assert_eq!(value, 99);
+
+    let table_dir = engine.segment_mgr().table_dir("main", "t");
+    let leftover: Vec<_> = std::fs::read_dir(&table_dir)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".del"))
+        })
+        .collect();
+    assert!(leftover.is_empty(), "no statement journal may outlive the UPDATE");
+    Ok(())
+}
+
+/// P3 (UPDATE crash window), roll-BACK: a crash after the tombstone fsync but
+/// before the image commit used to lose the rows silently. Simulated by
+/// applying the tombstone leg (deferred journal, watermark pointing at a
+/// never-durable memtable) and restarting the engine.
+#[test]
+fn update_crash_between_footers_and_commit_rolls_back_on_restart() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session1 = session();
+
+    engine.execute(&mut session1, "CREATE TABLE t (id INT64, v INT64)")?;
+    let table_meta = engine.get_table_meta("main", "t").unwrap();
+    let schema = crate::types::batch::Schema::new(table_meta.columns.clone());
+    let mut batch = crate::types::batch::RecordBatch::with_capacity(schema.clone(), 4);
+    for id in 1..=4i64 {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(id)))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(id * 10)))?;
+    }
+    let segment_path = engine.data_dir().join("main").join("t").join("seg_00001.dat");
+    engine
+        .segment_mgr()
+        .write_new_segment(&segment_path, schema, 2, &batch, 3)?;
+
+    // The crash window: the statement tombstoned rows 0..3 with a deferred
+    // journal, but its image memtable never reached a durable tail.
+    let reader = engine.segment_mgr().open_reader(&segment_path)?;
+    let bitmap = reader.delete_bitmap().to_vec();
+    let deleted = reader.deleted_row_count();
+    let full_bitmap = {
+        let mut bytes = vec![0u8; (reader.row_count().div_ceil(8)) as usize];
+        for row in 0..reader.row_count() {
+            let byte = (row / 8) as usize;
+            bytes[byte] |= 1u8 << (row % 8);
+        }
+        let _ = (bitmap, deleted);
+        bytes
+    };
+    crate::storage::segment::reader::SegmentReader::rewrite_footer_with_deletes(
+        &segment_path,
+        &full_bitmap,
+        4,
+        crate::storage::segment::reader::FooterRewriteMode::Deferred(vec![
+            crate::storage::segment::reader::ImageDurabilityCheck {
+                memtable_id: uuid::Uuid::new_v4(),
+                partition: String::new(),
+                expected_rows: 4,
+            },
+        ]),
+    )?;
+    drop(engine);
+
+    // Restart: startup recovery must restore the pre-statement footer.
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session2 = session();
+    let count = first_i64(engine.execute(&mut session2, "SELECT COUNT(*) FROM t")?, 0, 0);
+    assert_eq!(count, 4, "rows restored by journal rollback");
+    for id in 1..=4i64 {
+        let value = first_i64(
+            engine.execute(&mut session2, &format!("SELECT v FROM t WHERE id = {}", id))?,
+            0,
+            0,
+        );
+        assert_eq!(value, id * 10, "row {} keeps its pre-statement value", id);
+    }
+    Ok(())
+}
+
+/// P3 (UPDATE crash window), roll-FORWARD: when the image watermark IS met
+/// (the commit was durable), recovery keeps the tombstoned footer and the
+/// committed images stay visible.
+#[test]
+fn update_journal_rolls_forward_when_images_durable() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session1 = session();
+
+    engine.execute(&mut session1, "CREATE TABLE t (id INT64, v INT64)")?;
+    let table_meta = engine.get_table_meta("main", "t").unwrap();
+    let schema = crate::types::batch::Schema::new(table_meta.columns.clone());
+    let mut batch = crate::types::batch::RecordBatch::with_capacity(schema.clone(), 4);
+    for id in 1..=4i64 {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(id)))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(id * 10)))?;
+    }
+    let segment_path = engine.data_dir().join("main").join("t").join("seg_00001.dat");
+    engine
+        .segment_mgr()
+        .write_new_segment(&segment_path, schema, 2, &batch, 3)?;
+
+    // A committed UPDATE: images are durable in a real tail.
+    engine.execute(&mut session1, "UPDATE t SET v = 99 WHERE id >= 1")?;
+    let count_updated = first_i64(engine.execute(&mut session1, "SELECT COUNT(*) FROM t")?, 0, 0);
+    assert_eq!(count_updated, 4);
+
+    // Simulate "crash after durable commit, before journal clear": re-apply
+    // the CURRENT footer state (a semantic no-op rewrite) under the deferred
+    // lifecycle, with the watermark pointing at the real image tail.
+    let reader = engine.segment_mgr().open_reader(&segment_path)?;
+    let bitmap = reader.delete_bitmap().to_vec();
+    let deleted = reader.deleted_row_count();
+    drop(reader);
+    let tail_dir = engine.segment_mgr().table_dir("main", "t").join("memtable_tail");
+    let tail_stem = std::fs::read_dir(&tail_dir)
+        .unwrap()
+        .flatten()
+        .find_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let stem = name.strip_suffix(".tail")?.to_string();
+            Some(stem)
+        })
+        .expect("committed image tail exists");
+    let memtable_id = uuid::Uuid::parse_str(tail_stem.split('.').next().unwrap())
+        .expect("tail stem starts with the memtable uuid");
+    crate::storage::segment::reader::SegmentReader::rewrite_footer_with_deletes(
+        &segment_path,
+        &bitmap,
+        deleted,
+        crate::storage::segment::reader::FooterRewriteMode::Deferred(vec![
+            crate::storage::segment::reader::ImageDurabilityCheck {
+                memtable_id,
+                partition: String::new(),
+                expected_rows: 1,
+            },
+        ]),
+    )?;
+    drop(engine);
+
+    // Restart: the watermark is met, so recovery keeps the tombstones and
+    // the recovered image rows stay visible.
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session2 = session();
+    let count = first_i64(engine.execute(&mut session2, "SELECT COUNT(*) FROM t")?, 0, 0);
+    assert_eq!(count, 4, "committed images survive the roll-forward");
+    let value = first_i64(
+        engine.execute(&mut session2, "SELECT v FROM t WHERE id = 1")?,
+        0,
+        0,
+    );
+    assert_eq!(value, 99, "updated values stay after roll-forward");
+    Ok(())
+}

@@ -455,6 +455,7 @@ async fn apply(
                     &path,
                     &bitmap,
                     deleted_count,
+                    crate::storage::segment::reader::FooterRewriteMode::Immediate,
                 )?;
             } else {
                 // Segment not shipped yet: queue; applied when it materializes.

@@ -799,7 +799,7 @@ fn external_merge_sort_drops_deleted_rows() -> Result<()> {
         let mut bitmap = vec![0u8; 3u64.div_ceil(8) as usize];
         crate::storage::segment::delete_bitmap::mark_deleted(&mut bitmap, 1);
         drop(reader);
-        SegmentReader::rewrite_footer_with_deletes(&table_dir.join("seg_00001.dat"), &bitmap, 1)?;
+        SegmentReader::rewrite_footer_with_deletes(&table_dir.join("seg_00001.dat"), &bitmap, 1, crate::storage::segment::reader::FooterRewriteMode::Immediate)?;
     }
 
     CLUSTERED_MERGE_BUDGET_OVERRIDE.store(

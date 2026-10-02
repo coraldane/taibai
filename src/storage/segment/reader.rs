@@ -379,6 +379,7 @@ impl SegmentReader {
         path: &Path,
         delete_bitmap: &[u8],
         deleted_row_count: u64,
+        mode: FooterRewriteMode,
     ) -> Result<()> {
         // Delete rewrites use the embedded footer as the authoritative sealed
         // snapshot. SegmentManager refreshes the sidecar separately when this
@@ -389,12 +390,12 @@ impl SegmentReader {
         // footer used to be copied verbatim and "laundered" by the freshly
         // recomputed checksum.
         let parsed = parse_segment_footer(&source.footer)?;
-        let res_offset = reserved_section_offset(&source.footer)?;
 
         // The rebuilt footer keeps the row-group prefix (including the
         // per-row-group CRC extensions) verbatim — the column blocks are
         // untouched — and replaces the delete section, so the whole-footer
         // checksum must be recomputed, never copied.
+        let res_offset = reserved_section_offset(&source.footer)?;
         let mut new_footer = Vec::with_capacity(res_offset + 20 + delete_bitmap.len());
         new_footer.extend_from_slice(&source.footer[..res_offset]);
         new_footer.extend_from_slice(&deleted_row_count.to_le_bytes());
@@ -411,18 +412,40 @@ impl SegmentReader {
         // between `set_len` and the new footer reaching disk would leave the
         // segment with neither embedded footer nor sidecar, silently dropping
         // its data from every scan. A journal file (`<segment>.del`) makes
-        // the rewrite recoverable — see `repair_pending_footer_rewrite`,
-        // which discovery invokes when a segment fails to open.
+        // the rewrite recoverable — see `repair_pending_footer_rewrite`
+        // (V01) and `recover_statement_footer_journals` (V02).
         let journal = pending_delete_journal_path(path);
-        write_delete_journal(&journal, source.data_end, &new_footer)?;
+        let deferred = match mode {
+            FooterRewriteMode::Immediate => {
+                write_delete_journal(&journal, source.data_end, &new_footer)?;
+                None
+            }
+            FooterRewriteMode::Deferred(image_checks) => {
+                write_delete_journal_v2(
+                    &journal,
+                    source.data_end,
+                    &new_footer,
+                    // Undo: the exact pre-rewrite footer bytes and their
+                    // truncation point, both read from the live segment.
+                    source.data_end,
+                    &source.footer,
+                    &image_checks,
+                )?;
+                Some(())
+            }
+        };
 
-        let write_result = Self::apply_footer_bytes_with_retry(path, source.data_end, &new_footer);
-        if write_result.is_err() {
+        if let Err(error) = Self::apply_footer_bytes_with_retry(path, source.data_end, &new_footer) {
             // The journal stays behind: the next open of this segment
             // repairs from it instead of losing the data block.
-            return write_result;
+            return Err(error);
         }
-        let _ = fs::remove_file(&journal);
+        if deferred.is_none() {
+            let _ = fs::remove_file(&journal);
+        }
+        // A deferred journal survives until the statement's other legs are
+        // durable — the caller clears it (`clear_deferred_delete_journal`)
+        // or startup recovery rolls the footer back.
         Ok(())
     }
 
@@ -472,6 +495,12 @@ impl SegmentReader {
     pub fn repair_pending_footer_rewrite(path: &Path) -> Result<bool> {
         let journal = pending_delete_journal_path(path);
         if !journal.exists() {
+            return Ok(false);
+        }
+        if journal_is_deferred(&journal) {
+            // A deferred (V02) journal belongs to a possibly in-flight
+            // multi-leg statement: only startup recovery may judge it, never
+            // a concurrent discovery pass.
             return Ok(false);
         }
         let Some((data_end, footer)) = read_delete_journal(&journal)? else {
@@ -1440,13 +1469,52 @@ fn split_column(col: &ColumnArray, start: usize, end: usize) -> ColumnArray {
 // ---------------------------------------------------------------------------
 // Delete-footer rewrite journal
 //
-// `<segment-file>.del` records the exact bytes of a pending in-place footer
+// `<segment-file>.del` records the exact bytes of a pending in-place header
 // rewrite before truncation starts, so a crash mid-rewrite can be repaired
 // on the next open instead of silently losing the segment's data.
-// Layout: magic(8) | data_end u64 | footer_len u32 | footer bytes | crc32 u32
+//
+// V01 layout (single-leg statements, e.g. DELETE):
+//   magic(8) | data_end u64 | footer_len u32 | footer bytes | crc32 u32
+// Removed as soon as the new footer lands; discovery repairs forward-only.
+//
+// V02 layout (multi-leg statements, e.g. UPDATE's tombstone leg):
+//   magic(8) | new_data_end u64 | new_footer_len u32 | new_footer
+//          | old_data_end u64 | old_footer_len u32 | old_footer
+//          | checks u32 | per check: uuid(16) | part_len u32 | part
+//                                   | expected_rows u64 | crc32 u32
+// The old footer is the UNDO; the image checks are the statement's
+// durability watermark (effect verification, the flush-intent pattern).
+// The journal survives until the caller clears it after the other legs are
+// durable; `recover_statement_footer_journals` rolls the footer back unless
+// the watermark is met. Online discovery never touches a V02 journal.
 // ---------------------------------------------------------------------------
 
 const DELETE_JOURNAL_MAGIC: &[u8; 8] = b"TBDELJ01";
+const DELETE_JOURNAL_MAGIC_V2: &[u8; 8] = b"TBDELJ02";
+
+/// One leg of a multi-leg statement's durability watermark: the reinserted
+/// image rows of an UPDATE become durable in this memtable's tail at commit;
+/// recovery compares frame-walked tail rows against `expected_rows` to
+/// decide roll-forward vs roll-back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageDurabilityCheck {
+    pub memtable_id: uuid::Uuid,
+    pub partition: String,
+    pub expected_rows: u64,
+}
+
+/// Journal lifecycle of a footer rewrite.
+#[derive(Debug, Clone, Default)]
+pub enum FooterRewriteMode {
+    /// Single-leg statement: the journal is removed as soon as the footer
+    /// lands (V01); discovery's repair completes it forward-only.
+    #[default]
+    Immediate,
+    /// Multi-leg statement: the journal also records the OLD footer (undo)
+    /// and the image watermark (V02) and survives until the caller clears
+    /// it (or startup recovery rolls it back).
+    Deferred(Vec<ImageDurabilityCheck>),
+}
 
 fn pending_delete_journal_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
@@ -1454,15 +1522,53 @@ fn pending_delete_journal_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Remove a deferred journal after the statement's other legs are durable.
+/// Best-effort: a leftover journal is re-judged (and removed) by startup
+/// recovery, so a failed unlink cannot corrupt anything.
+pub fn clear_deferred_delete_journal(segment_path: &Path) {
+    let journal = pending_delete_journal_path(segment_path);
+    let _ = fs::remove_file(&journal);
+}
+
 fn write_delete_journal(journal: &Path, data_end: u64, footer: &[u8]) -> Result<()> {
     let mut body = Vec::with_capacity(footer.len() + 12);
     body.extend_from_slice(&data_end.to_le_bytes());
     body.extend_from_slice(&(footer.len() as u32).to_le_bytes());
     body.extend_from_slice(footer);
-    let mut crc = crc32fast::Hasher::new();
-    crc.update(&body);
-    let crc = crc.finalize();
+    write_journal_file(journal, DELETE_JOURNAL_MAGIC, &body)
+}
 
+fn write_delete_journal_v2(
+    journal: &Path,
+    new_data_end: u64,
+    new_footer: &[u8],
+    old_data_end: u64,
+    old_footer: &[u8],
+    image_checks: &[ImageDurabilityCheck],
+) -> Result<()> {
+    let mut body = Vec::with_capacity(new_footer.len() + old_footer.len() + 28);
+    body.extend_from_slice(&new_data_end.to_le_bytes());
+    body.extend_from_slice(&(new_footer.len() as u32).to_le_bytes());
+    body.extend_from_slice(new_footer);
+    body.extend_from_slice(&old_data_end.to_le_bytes());
+    body.extend_from_slice(&(old_footer.len() as u32).to_le_bytes());
+    body.extend_from_slice(old_footer);
+    body.extend_from_slice(&(image_checks.len() as u32).to_le_bytes());
+    for check in image_checks {
+        body.extend_from_slice(check.memtable_id.as_bytes());
+        body.extend_from_slice(&(check.partition.len() as u32).to_le_bytes());
+        body.extend_from_slice(check.partition.as_bytes());
+        body.extend_from_slice(&check.expected_rows.to_le_bytes());
+    }
+    write_journal_file(journal, DELETE_JOURNAL_MAGIC_V2, &body)
+}
+
+/// Shared tmp+fsync+rename durability: the journal must be fully durable and
+/// atomically visible before the segment's own bytes are touched.
+fn write_journal_file(journal: &Path, magic: &[u8; 8], body: &[u8]) -> Result<()> {
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(body);
+    let crc = crc.finalize();
     let tmp = {
         let mut name = journal.as_os_str().to_os_string();
         name.push(".tmp");
@@ -1473,8 +1579,8 @@ fn write_delete_journal(journal: &Path, data_end: u64, footer: &[u8]) -> Result<
         .create(true)
         .truncate(true)
         .open(&tmp)?;
-    file.write_all(DELETE_JOURNAL_MAGIC)?;
-    file.write_all(&body)?;
+    file.write_all(magic)?;
+    file.write_all(body)?;
     file.write_all(&crc.to_le_bytes())?;
     file.sync_all()?;
     drop(file);
@@ -1488,9 +1594,17 @@ fn read_delete_journal(journal: &Path) -> Result<Option<(u64, Vec<u8>)>> {
     let Ok(bytes) = fs::read(journal) else {
         return Ok(None);
     };
+    if bytes.starts_with(DELETE_JOURNAL_MAGIC_V2) {
+        // Deferred journal: only startup recovery may judge it.
+        return Ok(None);
+    }
     if bytes.len() < 8 + 12 + 4 || !bytes.starts_with(DELETE_JOURNAL_MAGIC) {
         return Ok(None);
     }
+    decode_delete_journal_v1(&bytes)
+}
+
+fn decode_delete_journal_v1(bytes: &[u8]) -> Result<Option<(u64, Vec<u8>)>> {
     let body = &bytes[8..bytes.len() - 4];
     let crc = u32::from_le_bytes(
         bytes[bytes.len() - 4..]
@@ -1508,6 +1622,202 @@ fn read_delete_journal(journal: &Path) -> Result<Option<(u64, Vec<u8>)>> {
         return Ok(None);
     }
     Ok(Some((data_end, body[12..12 + footer_len].to_vec())))
+}
+
+/// The decoded form of a deferred (V02) journal.
+pub struct DeferredDeleteJournal {
+    pub segment_path: PathBuf,
+    pub new_data_end: u64,
+    pub new_footer: Vec<u8>,
+    pub old_data_end: u64,
+    pub old_footer: Vec<u8>,
+    pub image_checks: Vec<ImageDurabilityCheck>,
+}
+
+fn read_delete_journal_v2(journal: &Path) -> Result<Option<DeferredDeleteJournal>> {
+    let Ok(bytes) = fs::read(journal) else {
+        return Ok(None);
+    };
+    if !bytes.starts_with(DELETE_JOURNAL_MAGIC_V2) {
+        return Ok(None);
+    }
+    // A journal always sits next to its segment: "<segment>.del".
+    let segment_path = {
+        let text = journal.to_string_lossy();
+        let stripped = text.strip_suffix(".del").unwrap_or(&text);
+        PathBuf::from(stripped)
+    };
+    if bytes.len() < 8 + 4 {
+        return Ok(None);
+    }
+    let body = &bytes[8..bytes.len() - 4];
+    let crc = u32::from_le_bytes(
+        bytes[bytes.len() - 4..]
+            .try_into()
+            .expect("crc slice has fixed length"),
+    );
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(body);
+    if hasher.finalize() != crc {
+        return Ok(None);
+    }
+    let mut cursor = 0usize;
+    let take_u64 = |cursor: &mut usize| -> Option<u64> {
+        let next = cursor.checked_add(8)?;
+        let slice = body.get(*cursor..next)?;
+        *cursor = next;
+        Some(u64::from_le_bytes(slice.try_into().expect("u64 slice")))
+    };
+    let take_u32 = |cursor: &mut usize| -> Option<u32> {
+        let next = cursor.checked_add(4)?;
+        let slice = body.get(*cursor..next)?;
+        *cursor = next;
+        Some(u32::from_le_bytes(slice.try_into().expect("u32 slice")))
+    };
+    let Some(new_data_end) = take_u64(&mut cursor) else {
+        return Ok(None);
+    };
+    let Some(new_len) = take_u32(&mut cursor).map(|len| len as usize) else {
+        return Ok(None);
+    };
+    let Some(new_footer) = body.get(cursor..cursor + new_len).map(|s| s.to_vec()) else {
+        return Ok(None);
+    };
+    cursor += new_len;
+    let Some(old_data_end) = take_u64(&mut cursor) else {
+        return Ok(None);
+    };
+    let Some(old_len) = take_u32(&mut cursor).map(|len| len as usize) else {
+        return Ok(None);
+    };
+    let Some(old_footer) = body.get(cursor..cursor + old_len).map(|s| s.to_vec()) else {
+        return Ok(None);
+    };
+    cursor += old_len;
+    let Some(check_count) = take_u32(&mut cursor).map(|len| len as usize) else {
+        return Ok(None);
+    };
+    let mut image_checks = Vec::with_capacity(check_count);
+    for _ in 0..check_count {
+        let Some(uuid_bytes) = body.get(cursor..cursor + 16).map(|s| s.to_vec()) else {
+            return Ok(None);
+        };
+        cursor += 16;
+        let memtable_id = uuid::Uuid::from_slice(&uuid_bytes)
+            .map_err(|error| TaibaiError::Storage(format!("bad memtable id in journal: {error}")))?;
+        let Some(part_len) = take_u32(&mut cursor).map(|len| len as usize) else {
+            return Ok(None);
+        };
+        let Some(part_slice) = body.get(cursor..cursor + part_len) else {
+            return Ok(None);
+        };
+        let partition = String::from_utf8_lossy(part_slice).into_owned();
+        cursor += part_len;
+        let Some(expected_rows) = take_u64(&mut cursor) else {
+            return Ok(None);
+        };
+        image_checks.push(ImageDurabilityCheck {
+            memtable_id,
+            partition,
+            expected_rows,
+        });
+    }
+    Ok(Some(DeferredDeleteJournal {
+        segment_path,
+        new_data_end,
+        new_footer,
+        old_data_end,
+        old_footer,
+        image_checks,
+    }))
+}
+
+/// Whether the journal at `journal` carries the deferred (V02) magic.
+fn journal_is_deferred(journal: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(journal) else {
+        return false;
+    };
+    let mut magic = [0u8; 8];
+    use std::io::Read as _;
+    file.read_exact(&mut magic)
+        .is_ok_and(|_| magic == *DELETE_JOURNAL_MAGIC_V2)
+}
+
+/// Startup-time judgement of deferred (V02) delete-footer journals, one
+/// table directory at a time. Single-writer per data dir means nothing is
+/// in flight here, so the decision is safe to make now:
+///
+/// - embedded footer unreadable → the rewrite was interrupted mid-apply →
+///   roll BACK to the journal's old footer (the statement cannot have
+///   completed);
+/// - footer readable and every image check's durable-tail watermark met →
+///   the statement completed after the rewrite → roll FORWARD (journal is
+///   stale, just remove it);
+/// - footer readable but any watermark unmet → the crash landed between
+///   the tombstones and the image commit → roll BACK, restoring the
+///   matched rows (the statement is lost, the table is consistent).
+///
+/// Effect verification instead of step tracking mirrors the flush-intent
+/// arbitration in the durable tail.
+pub fn recover_statement_footer_journals(table_dir: &Path) {
+    let Ok(entries) = fs::read_dir(table_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".del") {
+            continue;
+        }
+        let journal = match read_delete_journal_v2(&path) {
+            Ok(Some(journal)) => journal,
+            Ok(None) => continue, // V01 (or absent): discovery's repair owns it
+            Err(error) => {
+                tracing::warn!(
+                    journal = %path.display(),
+                    error = %error,
+                    "statement journal unreadable; leaving it for discovery repair"
+                );
+                continue;
+            }
+        };
+        let segment = &journal.segment_path;
+        let roll_forward = SegmentReader::read_dat_footer_source(segment, None).is_ok()
+            && !journal.image_checks.is_empty()
+            && journal.image_checks.iter().all(|check| {
+                crate::storage::core::durable_tail::durable_tail_rows_for_memtable(
+                    table_dir,
+                    check.memtable_id,
+                ) >= check.expected_rows
+            });
+        if roll_forward {
+            tracing::info!(
+                segment = %segment.display(),
+                "statement journal: tombstone rewrite confirmed by durable images; rolling forward"
+            );
+        } else {
+            tracing::warn!(
+                segment = %segment.display(),
+                checks = journal.image_checks.len(),
+                "statement journal: images not durable; rolling footer back to pre-statement state"
+            );
+            if let Err(error) = SegmentReader::apply_footer_bytes_with_retry(
+                segment,
+                journal.old_data_end,
+                &journal.old_footer,
+            ) {
+                tracing::error!(
+                    segment = %segment.display(),
+                    error = %error,
+                    "statement journal rollback failed; journal kept for the next startup"
+                );
+                continue;
+            }
+        }
+        let _ = fs::remove_file(&path);
+    }
 }
 
 /// Whether a footer-write failure is worth retrying: transient sharing

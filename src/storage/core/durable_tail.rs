@@ -2451,6 +2451,38 @@ fn scan_tail_log_rows(bytes: &[u8]) -> Option<u64> {
     Some(rows)
 }
 
+/// Durable rows of one memtable's live tail generations — the effect
+/// watermark that statement-journal recovery verifies (header walk only,
+/// frames are never decoded; a crash-truncated final frame ends the valid
+/// prefix, so page-cache-only frames count as absent, exactly the crash
+/// semantics the check wants). A memtable that never spilled or flushed owns
+/// exactly one generation; taking the MAX across generations avoids
+/// double-counting rows a flush intent already retired into a segment.
+pub(crate) fn durable_tail_rows_for_memtable(table_dir: &Path, id: Uuid) -> u64 {
+    let Ok(entries) = fs::read_dir(table_dir.join(TAIL_DIR)) else {
+        return 0;
+    };
+    let prefix = format!("{}.", id.simple());
+    let mut best = 0u64;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        // Only finalized tails (plain .tail); pending-rename tmp files are not
+        // durable yet, and sidecar generations never match the suffix.
+        if !name.starts_with(&prefix) || !name.ends_with(".tail") {
+            continue;
+        }
+        if let Ok(bytes) = fs::read(entry.path()) {
+            if let Some(rows) = scan_tail_log_rows(&bytes) {
+                best = best.max(rows);
+            }
+        }
+    }
+    best
+}
+
 fn read_tail_log_partition_key(path: &Path) -> Result<Option<String>> {
     let mut file = fs::File::open(path)?;
     let mut header = [0u8; 8];
