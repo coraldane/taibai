@@ -2388,14 +2388,74 @@ impl HotStoreManager {
         self.invalidated.write().unwrap().remove(&table_key);
     }
 
-    /// Drop an append-only hot store after an in-place mutation and keep it
-    /// disabled until restart. Recreating it from only subsequent INSERTs
-    /// would hide older live memtable rows behind an incomplete fast path.
+    /// Drop an append-only hot store after an in-place mutation and mark the
+    /// table STALE. A stale table is not served (`get` finds nothing, readers
+    /// fall back to the generic scan) and not fed from a single batch:
+    /// [`Self::rebuild_from_live_state`] — called by the engine at the next
+    /// feed — is the only sound recreation, because the scan-side watermark
+    /// derivation (`row_count - live_memtable_rows`) requires EVERY live
+    /// memtable row to be in the store. Recreating from subsequent INSERTs
+    /// alone would hide older live memtable rows behind an incomplete fast
+    /// path, which is why this used to disable the table until restart.
     pub fn invalidate(&self, db: &str, table: &str) {
         let table_key = (db.to_string(), table.to_string());
         self.bump_feed_epoch(db, table);
         self.stores.write().unwrap().remove(&table_key);
         self.invalidated.write().unwrap().insert(table_key);
+    }
+
+    /// True while the table's store was dropped by [`Self::invalidate`] and
+    /// awaits a full-live-state rebuild.
+    pub fn is_stale(&self, db: &str, table: &str) -> bool {
+        self.invalidated
+            .read()
+            .unwrap()
+            .contains(&(db.to_string(), table.to_string()))
+    }
+
+    /// Rebuild a stale table's store from its FULL live state — every
+    /// reader-visible memtable batch — clearing the stale marker. This is
+    /// the only sound recreation after an in-place mutation (see
+    /// [`Self::invalidate`]); it coalesces any number of invalidating
+    /// mutations into one rebuild. Returns the fresh store, or `None` for
+    /// ineligible tables. No-op (returns the existing store) when not stale.
+    pub fn rebuild_from_live_state(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &TableMeta,
+        live_batches: &[std::sync::Arc<RecordBatch>],
+    ) -> Result<Option<std::sync::Arc<HotStore>>> {
+        let table_key = (db.to_string(), table.to_string());
+        if !self.invalidated.read().unwrap().contains(&table_key) {
+            return Ok(self.get(db, table));
+        }
+        let Some(key_idx) = resolve_key_column(table_meta) else {
+            // Ineligible after all (e.g. the key column was dropped): stop
+            // marking it stale so feeds stop attempting rebuilds.
+            self.invalidated.write().unwrap().remove(&table_key);
+            return Ok(None);
+        };
+        let schema = Schema::new(table_meta.columns.clone());
+        let partition_idx = table_meta.get_partition_column_index_cached();
+        let store = std::sync::Arc::new(HotStore::new(
+            schema,
+            key_idx,
+            partition_idx,
+            self.memory_limit_bytes,
+        ));
+        for batch in live_batches {
+            if batch.num_rows() > 0 {
+                store.append(batch)?;
+            }
+        }
+        self.bump_feed_epoch(db, table);
+        {
+            let mut stores = self.stores.write().unwrap();
+            stores.insert(table_key.clone(), std::sync::Arc::clone(&store));
+        }
+        self.invalidated.write().unwrap().remove(&table_key);
+        Ok(Some(store))
     }
 
     pub fn clear_resident_coverage(&self, db: &str, table: &str) {

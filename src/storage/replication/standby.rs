@@ -442,6 +442,29 @@ async fn apply(
             pending_rewrites.remove(&segment);
             applied.advance(seq, true)?;
         }
+        ReplicationEvent::TailMutation {
+            db,
+            table,
+            memtable_id,
+            is_update,
+            sequence,
+            payload,
+        } => {
+            // The tail file here holds the identical frame history the
+            // primary's sidecar positions were recorded against (events
+            // apply in primary order), so replaying the same encoded bytes
+            // mutates the same rows. Without this arm the standby kept
+            // serving deleted rows from its tail until the next flush.
+            let table_dir = engine.data_dir().join(&db).join(&table);
+            crate::storage::core::durable_tail::apply_replicated_sidecar(
+                &table_dir,
+                memtable_id,
+                is_update,
+                sequence,
+                &payload,
+            )?;
+            applied.advance(seq, true)?;
+        }
         ReplicationEvent::DeleteFooterRewrite {
             db,
             table,

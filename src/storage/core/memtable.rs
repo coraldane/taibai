@@ -308,12 +308,20 @@ impl MemTable {
         self.read_snapshot_arc()
     }
 
-    pub fn read_with<R>(&self, f: impl FnOnce(&RecordBatch) -> R) -> Option<R> {
+    /// Run `f` on a shared snapshot of the batch. The read lock is held
+    /// only for the `Arc` clone; the transform itself runs lock-free, and
+    /// the untouched-source fast paths of the scanner can take the
+    /// snapshot's ownership (zero copy) when this memtable is the sole
+    /// holder.
+    pub fn read_with<R>(&self, f: impl FnOnce(Arc<RecordBatch>) -> R) -> Option<R> {
         if self.ensure_resident().is_err() {
             return None;
         }
-        let guard = self.batch.read().unwrap();
-        guard.as_ref().map(|batch| f(batch.as_ref()))
+        let snapshot = {
+            let guard = self.batch.read().unwrap();
+            guard.as_ref().map(Arc::clone)
+        };
+        snapshot.map(f)
     }
 
     pub fn take_batch(&self) -> Option<RecordBatch> {
@@ -417,8 +425,32 @@ impl MemTable {
                 MemTableBacking::Spilled { tail_path, .. } => tail_path.clone(),
             }
         };
-        let decoded =
-            crate::storage::core::durable_tail::decode_tail_file(&tail_path, &self.schema);
+        // Sidecar-aware materialization: delete/update sidecars above the
+        // tail replay exactly as recovery would. The primary's spill path
+        // is gated to plain tails, so this matters for standby-registered
+        // memtables (sidecars arrived by replication) — without it their
+        // reads resurrected replicated deletes.
+        let table_dir = tail_path
+            .parent()
+            .and_then(|dir| dir.parent())
+            .map(|dir| dir.to_path_buf())
+            .unwrap_or_else(|| tail_path.clone());
+        let decoded = crate::storage::core::durable_tail::decode_tail_with_sidecars(
+            &table_dir,
+            self.id,
+            &self.schema,
+        )
+        .and_then(|decoded| {
+            decoded.map_or_else(
+                || {
+                    Err(crate::common::error::TaibaiError::Storage(format!(
+                        "tail vanished during materialization: {}",
+                        tail_path.display()
+                    )))
+                },
+                |(partition_key, batch)| Ok((partition_key, batch)),
+            )
+        });
         let mut batch_guard = self.batch.write().unwrap();
         let mut backing_guard = self.backing.write().unwrap();
         let expected_rows = match &*backing_guard {

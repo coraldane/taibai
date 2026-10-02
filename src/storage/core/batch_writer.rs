@@ -428,9 +428,58 @@ impl BatchWriter {
         txn_id: u64,
         hot_fed: bool,
     ) -> Result<u64> {
+        let (rows, pending) =
+            self.write_columns_with_txn_tuple(
+                db,
+                table,
+                partition_key,
+                batch,
+                schema,
+                txn_id,
+                hot_fed,
+            )?;
+        self.settle_pending_tail_commit(db, table, pending)?;
+        Ok(rows)
+    }
+
+    /// Variant for callers that hold the constraint stripe across the write:
+    /// returns the pending tail commit so the fsync wait can run AFTER the
+    /// stripe is released — concurrent same-table INSERTs then join one fsync
+    /// group instead of serializing on the stripe across the wait.
+    /// Uniqueness is unaffected: probe, memtable append, tail submit and the
+    /// caller's index publish all stay inside the caller's stripe hold; only
+    /// the durability acknowledgment leaves it.
+    pub(crate) fn write_columns_with_txn_deferred_settle(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: RecordBatch,
+        schema: Schema,
+        txn_id: u64,
+        hot_fed: bool,
+    ) -> Result<(u64, Option<PendingTailCommit>)> {
+        let (rows, pending) =
+            self.write_columns_with_txn_tuple(db, table, partition_key, batch, schema, txn_id, hot_fed)?;
+        Ok((
+            rows,
+            pending.map(|(ticket, memtable)| PendingTailCommit { ticket, memtable }),
+        ))
+    }
+
+    fn write_columns_with_txn_tuple(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: RecordBatch,
+        schema: Schema,
+        txn_id: u64,
+        hot_fed: bool,
+    ) -> Result<(u64, Option<(TailCommitTicket, Arc<MemTable>)>)> {
         let row_count = batch.num_rows() as u64;
         if row_count == 0 {
-            return Ok(0);
+            return Ok((0, None));
         }
         if txn_id == 0 {
             self.write_epoch.fetch_add(1, Ordering::Release);
@@ -464,8 +513,22 @@ impl BatchWriter {
                 "insert lock timing"
             );
         }
-        self.settle_pending_tail_commit(db, table, pending)?;
-        Ok(rows)
+        Ok((rows, pending))
+    }
+
+    /// Settle tail commits collected through the deferred-settle variants.
+    /// Every fsync failure surfaces here exactly as the inline settle would
+    /// have reported it.
+    pub(crate) fn settle_deferred_tail_commits(
+        &self,
+        db: &str,
+        table: &str,
+        pending: Vec<PendingTailCommit>,
+    ) -> Result<()> {
+        for commit in pending {
+            self.settle_pending_tail_commit(db, table, Some((commit.ticket, commit.memtable)))?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

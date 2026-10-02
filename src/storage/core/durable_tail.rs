@@ -1533,11 +1533,13 @@ fn delete_rows_impl(
     }
     let tmp_path = tail_dir.join(format!(".{}.{}.del.tmp", id.simple(), sequence));
     let final_path = tail_dir.join(format!("{}.{}.del", id.simple(), sequence));
-    write_new_synced(&tmp_path, &encode_delete_positions(&positions))?;
+    let payload = encode_delete_positions(&positions);
+    write_new_synced(&tmp_path, &payload)?;
     fs::rename(&tmp_path, &final_path)?;
     // The sidecar must be durable before the statement acks the delete;
     // otherwise a crash restores rows the caller believes are gone.
     sync_dir_best_effort(&tail_dir);
+    emit_sidecar_replication(table_dir, id, false, sequence, &payload);
     Ok(true)
 }
 
@@ -1556,6 +1558,110 @@ fn delete_rows_impl(
 // ---------------------------------------------------------------------------
 
 const GUARD_MAGIC: u32 = 0x5442_4752; // "TBGR"
+
+/// Replication log for memtable-level mutations: every sidecar this module
+/// writes (`.del` / `.upd`) ships verbatim to standbys, whose tail files
+/// hold the identical frame history. Set only on replication primaries —
+/// a standby never writes sidecars of its own (read-only), so the hook
+/// cannot loop.
+static REPLICATION_LOG: OnceLock<Arc<crate::storage::replication::RepLog>> = OnceLock::new();
+
+/// Wire the replication log for sidecar shipping (primary only).
+pub fn set_rep_log(log: Arc<crate::storage::replication::RepLog>) {
+    let _ = REPLICATION_LOG.set(log);
+}
+
+/// Ship one just-written sidecar to standbys. Best-effort enqueue: the
+/// event ring persists events in dequeue order, and callers drain the tail
+/// committer before writing a sidecar, so the standby applies prior append
+/// frames first — exactly the primary's on-disk order.
+fn emit_sidecar_replication(
+    table_dir: &Path,
+    id: Uuid,
+    is_update: bool,
+    sequence: u64,
+    payload: &[u8],
+) {
+    let Some(log) = REPLICATION_LOG.get() else {
+        return;
+    };
+    let db = table_dir
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .map(|name| name.to_string_lossy().into_owned());
+    let table = table_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    let (Some(db), Some(table)) = (db, table) else {
+        return;
+    };
+    log.enqueue(crate::storage::replication::ReplicationEvent::TailMutation {
+        db,
+        table,
+        memtable_id: id,
+        is_update,
+        sequence,
+        payload: payload.to_vec(),
+    });
+}
+
+/// Standby apply of a [`ReplicationEvent::TailMutation`]: validate the
+/// payload decodes (fail loudly on corruption), then write it as this
+/// node's own sidecar generation against the same tail. Replays are
+/// idempotent — a duplicate delete removes already-removed positions, a
+/// duplicate update rewrites the same values.
+pub fn apply_replicated_sidecar(
+    table_dir: &Path,
+    id: Uuid,
+    is_update: bool,
+    sequence: u64,
+    payload: &[u8],
+) -> Result<()> {
+    // Decode purely to validate: applying garbage positions or an invalid
+    // update set at recovery would corrupt the standby's tail state.
+    if is_update {
+        decode_update_set(payload)?;
+    } else {
+        decode_delete_positions(payload)?;
+    }
+    let tail_dir = table_dir.join(TAIL_DIR);
+    fs::create_dir_all(&tail_dir)?;
+    // The PRIMARY's sequence names the file: replaying an event (crash
+    // before the seq watermark persists) replaces the same generation
+    // instead of duplicating it — delete positions are not idempotent on
+    // their own. Events apply in primary order, so the borrowed sequences
+    // order the standby's generations exactly as the primary's.
+    let extension = if is_update { "upd" } else { "del" };
+    let stem = format!("{}.{}", id.simple(), sequence);
+    let tmp_path = tail_dir.join(format!(".{stem}.{extension}.tmp"));
+    let final_path = tail_dir.join(format!("{stem}.{extension}"));
+    write_new_synced(&tmp_path, payload)?;
+    fs::rename(&tmp_path, &final_path)?;
+    sync_dir_best_effort(&tail_dir);
+    Ok(())
+}
+
+/// Materialize a spilled memtable's live content: the tail file plus every
+/// delete/update sidecar generation above it, replayed oldest-first — the
+/// same arbitration recovery applies. Standby-registered memtables are the
+/// raison d'être (their sidecars arrived by replication); the primary's own
+/// spill path stays gated to plain tails (`tail_is_plain`), so this is a
+/// no-op for it.
+pub fn decode_tail_with_sidecars(
+    table_dir: &Path,
+    id: Uuid,
+    schema: &Schema,
+) -> Result<Option<(String, RecordBatch)>> {
+    let tail_dir = table_dir.join(TAIL_DIR);
+    let mut generations = generations_for_id(&tail_dir, id)?;
+    let Some((path, sidecars)) =
+        live_tail_with_sidecars(&tail_dir, table_dir, id, &mut generations)?
+    else {
+        return Ok(None);
+    };
+    let (partition_key, batch) = decode_tail_file(&path, schema)?;
+    Ok(Some((partition_key, apply_sidecars(batch, &sidecars)?)))
+}
 
 /// `<id>.<seq>.guard` — deliberately not a generation kind, so generation
 /// arbitration never sees it; it is found only by name.
@@ -1755,11 +1861,13 @@ pub fn update_rows(
     let sequence = next_sequence();
     let tmp_path = tail_dir.join(format!(".{}.{}.upd.tmp", id.simple(), sequence));
     let final_path = tail_dir.join(format!("{}.{}.upd", id.simple(), sequence));
-    write_new_synced(&tmp_path, &encode_update_set(&set)?)?;
+    let payload = encode_update_set(&set)?;
+    write_new_synced(&tmp_path, &payload)?;
     fs::rename(&tmp_path, &final_path)?;
     // The sidecar must be durable before the statement acks the UPDATE;
     // otherwise a crash restores the pre-update values.
     sync_dir_best_effort(&tail_dir);
+    emit_sidecar_replication(table_dir, id, true, sequence, &payload);
     Ok(true)
 }
 

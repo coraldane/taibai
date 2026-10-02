@@ -16,8 +16,10 @@
 //!   standby on demand (`REPL_SEGMENT_FETCH`), so the in-memory event ring
 //!   holds metadata only.
 //!
-//! R1 scope cuts (documented in docs/operations/replication.md): DELETE,
-//! UPDATE, compaction, TTL and DDL events land in R2; a primary with
+//! R1 scope cuts (documented in docs/operations/replication.md):
+//! memtable DELETE/UPDATE sidecars ship as [`ReplicationEvent::TailMutation`]
+//! (segment-level tombstones as `DeleteFooterRewrite`, replacements as
+//! `SegmentsReplaced`); TTL and DDL events land in R2; a primary with
 //! `replication.enabled` rejects bulk/RELAXED direct writes (the only WAL
 //! bypass) and a standby engine is read-only.
 
@@ -60,6 +62,26 @@ pub enum ReplicationEvent {
         segment: String,
         kind: SegmentUpdateKind,
         memtable_ids: Vec<Uuid>,
+    },
+    /// A memtable-level mutation shipped as the EXACT sidecar bytes the
+    /// primary wrote (`.del` positions or `.upd` update set). The standby's
+    /// tail file holds the identical frame history, so replaying the same
+    /// sidecar generation applies the mutation to the same rows. Without
+    /// this event a standby kept serving deleted rows from its tail until
+    /// the next flush superseded it.
+    TailMutation {
+        db: String,
+        table: String,
+        memtable_id: Uuid,
+        /// `false` = delete positions, `true` = update set.
+        is_update: bool,
+        /// The primary's sidecar GENERATION SEQUENCE: the standby names its
+        /// copy identically, so a replayed event (crash before the seq
+        /// watermark persists) replaces the file instead of duplicating the
+        /// mutation — delete positions are not idempotent on their own.
+        sequence: u64,
+        /// The primary's encoded sidecar payload, verbatim.
+        payload: Vec<u8>,
     },
     /// DELETE tombstones materialized into a segment footer. The bitmap is
     /// the segment's ABSOLUTE delete state (not a delta), so standby apply
@@ -125,6 +147,7 @@ const TAG_SEGMENTS_REPLACED: u16 = 4;
 const TAG_SEGMENTS_REMOVED: u16 = 5;
 const TAG_CATALOG_SNAPSHOT: u16 = 6;
 const TAG_AUTH_SNAPSHOT: u16 = 7;
+const TAG_TAIL_MUTATION: u16 = 8;
 
 impl ReplicationEvent {
     pub fn encode(&self) -> Vec<u8> {
@@ -148,6 +171,23 @@ impl ReplicationEvent {
                 buf.extend_from_slice(&last_lsn.to_le_bytes());
                 buf.extend_from_slice(&(frames.len() as u32).to_le_bytes());
                 buf.extend_from_slice(frames);
+            }
+            Self::TailMutation {
+                db,
+                table,
+                memtable_id,
+                is_update,
+                sequence,
+                payload,
+            } => {
+                buf.extend_from_slice(&TAG_TAIL_MUTATION.to_le_bytes());
+                put_str(&mut buf, db);
+                put_str(&mut buf, table);
+                buf.extend_from_slice(memtable_id.as_bytes());
+                buf.push(u8::from(*is_update));
+                buf.extend_from_slice(&sequence.to_le_bytes());
+                buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                buf.extend_from_slice(payload);
             }
             Self::SegmentUpdate {
                 db,
@@ -272,6 +312,26 @@ impl ReplicationEvent {
                     memtable_ids,
                 })
             }
+            TAG_TAIL_MUTATION => {
+                let db = decoder.read_str("db")?;
+                let table = decoder.read_str("table")?;
+                let memtable_id =
+                    Uuid::from_slice(decoder.take(16, "memtable id")?).map_err(|error| {
+                        TaibaiError::Storage(format!("invalid memtable id: {error}"))
+                    })?;
+                let is_update = decoder.take(1, "is_update")?[0] != 0;
+                let sequence = decoder.read_u64()?;
+                let payload_len = decoder.read_u32()? as usize;
+                let payload = decoder.take(payload_len, "tail mutation payload")?.to_vec();
+                Ok(Self::TailMutation {
+                    db,
+                    table,
+                    memtable_id,
+                    is_update,
+                    sequence,
+                    payload,
+                })
+            }
             TAG_DELETE_FOOTER_REWRITE => {
                 let db = decoder.read_str("db")?;
                 let table = decoder.read_str("table")?;
@@ -330,6 +390,7 @@ impl ReplicationEvent {
     pub fn topic(&self) -> Option<(&str, &str)> {
         match self {
             Self::TailAppend { db, table, .. }
+            | Self::TailMutation { db, table, .. }
             | Self::SegmentUpdate { db, table, .. }
             | Self::DeleteFooterRewrite { db, table, .. }
             | Self::SegmentsReplaced { db, table, .. }
@@ -766,6 +827,22 @@ mod tests {
     fn event_codec_round_trips() {
         for event in [
             tail_event("t"),
+            ReplicationEvent::TailMutation {
+                db: "main".into(),
+                table: "t".into(),
+                memtable_id: Uuid::new_v4(),
+                is_update: false,
+                sequence: 42,
+                payload: vec![0x52, 0x47, 0x42, 0x54, 1, 2, 3],
+            },
+            ReplicationEvent::TailMutation {
+                db: "main".into(),
+                table: "t".into(),
+                memtable_id: Uuid::new_v4(),
+                is_update: true,
+                sequence: 43,
+                payload: Vec::new(),
+            },
             ReplicationEvent::SegmentUpdate {
                 db: "main".into(),
                 table: "t".into(),

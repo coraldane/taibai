@@ -176,6 +176,10 @@ impl Engine {
             ));
             batch_writer.set_rep_log(Arc::clone(&log));
             segment_mgr.set_rep_log(Arc::clone(&log));
+            // Memtable-level sidecars (`.del` / `.upd`) ship verbatim from
+            // the durable-tail module; the standby's identical frame
+            // history makes the same bytes apply to the same rows.
+            crate::storage::core::durable_tail::set_rep_log(Arc::clone(&log));
             Some(log)
         } else {
             None

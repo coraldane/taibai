@@ -173,3 +173,69 @@ fn update_unique_validation_probes_across_segments() -> Result<()> {
     assert_eq!(count, 4, "self-assignment keeps every row");
     Ok(())
 }
+
+/// Hot-mirror invalidation is no longer terminal: an in-place UPDATE drops
+/// the append-only mirror and marks the table stale, and the NEXT INSERT
+/// feed rebuilds it from the FULL live state (every visible memtable batch
+/// — the watermark derivation requires exactly that set). The pre-fix
+/// behavior kept the table's point-lookup fast path disabled until process
+/// restart.
+#[test]
+fn hot_store_rebuilds_from_live_state_after_invalidation() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut writer = session();
+
+    engine.execute(
+        &mut writer,
+        "CREATE TABLE h (id INT64, v INT64, ts TIMESTAMP) CLUSTER BY (id) HOT BY (ts) INDEX (id)",
+    )?;
+    engine.execute(
+        &mut writer,
+        "INSERT INTO h VALUES (1, 10, 1782797460000000), (2, 20, 1782797460000001)",
+    )?;
+    assert!(!engine.hot_store_manager().is_stale("main", "h"));
+
+    // The in-place UPDATE invalidates the append-only mirror...
+    engine.execute(&mut writer, "UPDATE h SET v = 99 WHERE id = 1")?;
+    assert!(
+        engine.hot_store_manager().is_stale("main", "h"),
+        "UPDATE drops the append-only mirror and marks the table stale"
+    );
+
+    // ...and the next feed rebuilds it from the full live state.
+    engine.execute(
+        &mut writer,
+        "INSERT INTO h VALUES (3, 30, 1782797460000002)",
+    )?;
+    assert!(
+        !engine.hot_store_manager().is_stale("main", "h"),
+        "the next INSERT feed rebuilds the mirror (was: disabled until restart)"
+    );
+    let store_rows = engine
+        .hot_store_manager()
+        .get("main", "h")
+        .map(|store| store.row_count())
+        .unwrap_or(0);
+    assert!(
+        store_rows >= 2,
+        "the rebuilt mirror holds the live memtable rows, got {store_rows}"
+    );
+
+    // Point lookups answer for pre- and post-rebuild rows alike.
+    for id in [1i64, 2, 3] {
+        let found = first_i64(
+            engine.execute(&mut writer, &format!("SELECT COUNT(*) FROM h WHERE id = {id}"))?,
+            0,
+            0,
+        );
+        assert_eq!(found, 1, "point lookup for id {id}");
+    }
+    let updated = first_i64(
+        engine.execute(&mut writer, "SELECT v FROM h WHERE id = 1")?,
+        0,
+        0,
+    );
+    assert_eq!(updated, 99);
+    Ok(())
+}

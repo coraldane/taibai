@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use crate::common::error::Result;
 use crate::storage::catalog::schema::TableMeta;
 use crate::storage::core::hot_store::{HotStore, HotStoreManager};
 use crate::storage::core::memtable::MemTableManager;
@@ -289,7 +292,8 @@ pub fn scan_memtables(
             None
         };
         if let Some(mt_batch) = mt
-            .read_with(|source| {
+            .read_with(|snapshot| {
+                let source: &RecordBatch = &snapshot;
                 if source.num_rows() == 0 {
                     return None;
                 }
@@ -304,73 +308,18 @@ pub fn scan_memtables(
                 // equivalently against the aligned batch; filtering before
                 // alignment (the old order) evaluated predicates against the
                 // stale layout after a DROP/ADD COLUMN.
-                let aligned;
-                let source: &RecordBatch =
-                    if memtable_batch_needs_alignment(source, &spec.table_schema) {
-                        aligned = match crate::storage::core::memtable::align_batch_to_schema(source, &spec.table_schema) {
+                if memtable_batch_needs_alignment(source, &spec.table_schema) {
+                    let aligned =
+                        match crate::storage::core::memtable::align_batch_to_schema(
+                            source,
+                            &spec.table_schema,
+                        ) {
                             Ok(batch) => batch,
                             Err(e) => return Some(Err(e)),
                         };
-                        &aligned
-                    } else {
-                        source
-                    };
-                // Exactly one materialization per path: the txn-filtered
-                // batch is owned when present; the no-predicate path moves it
-                // (or clones the source once).
-                let txn_filtered = match &txn_positions {
-                    Some(positions) => {
-                        match crate::storage::core::txn_mutations::filter_batch_excluding_positions(
-                            source, positions,
-                        ) {
-                            Ok(filtered) => Some(filtered),
-                            Err(e) => return Some(Err(e)),
-                        }
-                    }
-                    None => None,
-                };
-                let filtered = if let Some(txn_filtered) = txn_filtered {
-                    if spec.has_predicates() {
-                        match super::row_filter::apply_predicates(
-                            &txn_filtered,
-                            &spec.eq_predicates,
-                            &spec.range_predicates,
-                            &spec.in_predicates,
-                            spec.remaining_predicate.as_ref(),
-                        ) {
-                            Ok(filtered) => filtered,
-                            // Propagate: a failed predicate used to drop the
-                            // whole memtable batch from the result.
-                            Err(e) => return Some(Err(e)),
-                        }
-                    } else {
-                        txn_filtered
-                    }
-                } else if spec.has_predicates() {
-                    match super::row_filter::apply_predicates(
-                        source,
-                        &spec.eq_predicates,
-                        &spec.range_predicates,
-                        &spec.in_predicates,
-                        spec.remaining_predicate.as_ref(),
-                    ) {
-                        Ok(filtered) => filtered,
-                        Err(e) => return Some(Err(e)),
-                    }
-                } else {
-                    source.clone()
-                };
-
-                if filtered.num_rows() == 0 {
-                    return None;
+                    return scan_aligned_memtable_batch(aligned, spec, &txn_positions);
                 }
-
-                let ordered = apply_order_if_cluster_prefix_matches(filtered, spec);
-                Some(Ok(if let Some(proj) = &spec.projection {
-                    apply_projection(&ordered, proj)
-                } else {
-                    ordered
-                }))
+                scan_memtable_snapshot(snapshot, spec, &txn_positions)
             })
             .flatten()
         {
@@ -546,6 +495,126 @@ fn apply_projection(batch: &RecordBatch, projection: &[usize]) -> RecordBatch {
     RecordBatch::try_new(schema, columns).unwrap_or_else(|_| batch.clone())
 }
 
+/// Shared tail of every memtable scan path: empty → `None`, cluster-prefix
+/// order normalization, projection.
+fn finish_memtable_batch(batch: RecordBatch, spec: &ScanSpec) -> Option<Result<RecordBatch>> {
+    if batch.num_rows() == 0 {
+        return None;
+    }
+    let ordered = apply_order_if_cluster_prefix_matches(batch, spec);
+    Some(Ok(if let Some(proj) = &spec.projection {
+        apply_projection(&ordered, proj)
+    } else {
+        ordered
+    }))
+}
+
+/// A drifted (re-aligned) batch: alignment already materialized once, so
+/// the transform pipeline consumes it by value — the untouched case moves
+/// it instead of cloning again.
+fn scan_aligned_memtable_batch(
+    aligned: RecordBatch,
+    spec: &ScanSpec,
+    txn_positions: &Option<std::sync::Arc<std::collections::BTreeSet<u32>>>,
+) -> Option<Result<RecordBatch>> {
+    if let Some(positions) = txn_positions {
+        match crate::storage::core::txn_mutations::filter_batch_excluding_positions(
+            &aligned, positions,
+        ) {
+            Ok(filtered) => return scan_filtered_memtable_batch(filtered, spec),
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    if spec.has_predicates() {
+        match super::row_filter::apply_predicates(
+            &aligned,
+            &spec.eq_predicates,
+            &spec.range_predicates,
+            &spec.in_predicates,
+            spec.remaining_predicate.as_ref(),
+        ) {
+            Ok(filtered) => return finish_memtable_batch(filtered, spec),
+            // Propagate: a failed predicate used to drop the whole memtable
+            // batch from the result.
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    finish_memtable_batch(aligned, spec)
+}
+
+/// A predicate- or txn-filtered batch: the filter already produced an owned
+/// result, finish it.
+fn scan_filtered_memtable_batch(
+    filtered: RecordBatch,
+    spec: &ScanSpec,
+) -> Option<Result<RecordBatch>> {
+    if !spec.has_predicates() {
+        return finish_memtable_batch(filtered, spec);
+    }
+    match super::row_filter::apply_predicates(
+        &filtered,
+        &spec.eq_predicates,
+        &spec.range_predicates,
+        &spec.in_predicates,
+        spec.remaining_predicate.as_ref(),
+    ) {
+        Ok(narrowed) => finish_memtable_batch(narrowed, spec),
+        Err(e) => Some(Err(e)),
+    }
+}
+
+/// The untouched-snapshot fast path. Order normalization here only ever
+/// leaves the batch unchanged or reverses it (`apply_order` never sorts),
+/// and `reverse_batch` builds from a reference — so no full-width copy is
+/// ever needed: a projection copies only the projected columns from the
+/// borrowed snapshot, and without one the snapshot's ownership transfers
+/// zero-copy when the memtable is the sole holder (one clone only against
+/// a concurrent reader).
+fn scan_memtable_snapshot(
+    snapshot: std::sync::Arc<RecordBatch>,
+    spec: &ScanSpec,
+    txn_positions: &Option<std::sync::Arc<std::collections::BTreeSet<u32>>>,
+) -> Option<Result<RecordBatch>> {
+    let source: &RecordBatch = &snapshot;
+    if let Some(positions) = txn_positions {
+        match crate::storage::core::txn_mutations::filter_batch_excluding_positions(
+            source, positions,
+        ) {
+            Ok(filtered) => return scan_filtered_memtable_batch(filtered, spec),
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    if spec.has_predicates() {
+        return match super::row_filter::apply_predicates(
+            source,
+            &spec.eq_predicates,
+            &spec.range_predicates,
+            &spec.in_predicates,
+            spec.remaining_predicate.as_ref(),
+        ) {
+            Ok(filtered) => finish_memtable_batch(filtered, spec),
+            Err(e) => Some(Err(e)),
+        };
+    }
+    let needs_reverse = ordered_cluster_order_for_batch(source, spec).is_some_and(|order| {
+        !is_batch_ordered_by(source, order.column_index, order.desc)
+            && is_batch_ordered_by(source, order.column_index, !order.desc)
+    });
+    if needs_reverse {
+        if let Some(reversed) = reverse_batch(source) {
+            return finish_memtable_batch(reversed, spec);
+        }
+        // A type the reversal does not support keeps insert order — the
+        // same fallback `apply_order_if_cluster_prefix_matches` makes.
+    }
+    if let Some(proj) = &spec.projection {
+        return Some(Ok(apply_projection(source, proj)));
+    }
+    Some(Ok(
+        Arc::try_unwrap(snapshot).unwrap_or_else(|shared| shared.as_ref().clone()),
+    ))
+}
+
 fn apply_order_if_cluster_prefix_matches(batch: RecordBatch, spec: &ScanSpec) -> RecordBatch {
     let Some(order) = ordered_cluster_order_for_batch(&batch, spec) else {
         return batch;
@@ -708,7 +777,10 @@ mod audit_tests {
     /// always had.
     #[test]
     fn resident_hot_scan_declines_ttl_tables() {
-        use crate::storage::catalog::schema::TableMeta;
+        use std::sync::Arc;
+
+use crate::common::error::Result;
+use crate::storage::catalog::schema::TableMeta;
 
         let schema = Schema::new(vec![
             ColumnDef::new("category", DataType::VarChar),
@@ -788,7 +860,10 @@ mod audit_tests {
     /// those shapes.
     #[test]
     fn resident_hot_scan_does_not_truncate_distinct_or_aggregate_shapes() {
-        use crate::storage::catalog::schema::TableMeta;
+        use std::sync::Arc;
+
+use crate::common::error::Result;
+use crate::storage::catalog::schema::TableMeta;
 
         let schema = Schema::new(vec![
             ColumnDef::new("category", DataType::VarChar),

@@ -93,6 +93,15 @@ impl Engine {
         batch: &crate::types::batch::RecordBatch,
         feed: &HotFeedGuard<'_>,
     ) -> crate::common::error::Result<()> {
+        // A dropped-and-stale mirror (an UPDATE/DELETE invalidated it) is
+        // rebuilt from the FULL live state before this feed: recreating it
+        // from this batch alone would hide older live memtable rows behind
+        // the watermark derivation. Rebuilding here coalesces any number of
+        // invalidating mutations into one rebuild; until then readers fall
+        // back to the generic scan, which is correct.
+        if self.hot_store_mgr.is_stale(db, table) {
+            self.rebuild_stale_hot_store(db, table, table_meta);
+        }
         let resident_mark = self.hot_resident_mark_for_append(db, table, table_meta, batch);
         self.hot_store_mgr
             .try_append(db, table, table_meta, batch)?;
@@ -104,6 +113,54 @@ impl Engine {
             self.apply_hot_resident_mark(db, table, resident_mark);
         }
         Ok(())
+    }
+
+    /// Full-live-state rebuild of a stale hot store: every reader-visible
+    /// memtable batch, plus closing the `hot_mirror_covers_from` gate — the
+    /// rebuilt mirror holds no flushed-prefix rows, so any pre-invalidation
+    /// coverage bound must stop answering. Best-effort: a failed rebuild
+    /// leaves the table stale (generic-scan reads stay correct).
+    fn rebuild_stale_hot_store(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+    ) {
+        let live_batches = self
+            .memtable_manager()
+            .get_readable_by_table(db, table)
+            .into_iter()
+            .filter(|mt| mt.is_visible_to(0))
+            .filter_map(|mt| mt.read_snapshot_arc())
+            .collect::<Vec<_>>();
+        match self
+            .hot_store_mgr
+            .rebuild_from_live_state(db, table, table_meta, &live_batches)
+        {
+            Ok(_) => {
+                let mut catalogs = self.catalogs.write().unwrap();
+                if let Some(catalog) = catalogs.get_mut(db) {
+                    if let Some(meta) = catalog.get_table_mut(table) {
+                        meta.hot_mirror_covers_from = None;
+                    }
+                    let meta_dir = self.data_dir.join("meta");
+                    if let Err(error) = catalog.save(&meta_dir) {
+                        tracing::warn!(
+                            db,
+                            table,
+                            error = %error,
+                            "hot store rebuild: persisting cleared mirror coverage failed"
+                        );
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(
+                db,
+                table,
+                error = %error,
+                "hot store rebuild from live state failed; table stays stale (generic-scan reads remain correct)"
+            ),
+        }
     }
 
     /// Account a hot-store feed for the whole write: the guard must be held

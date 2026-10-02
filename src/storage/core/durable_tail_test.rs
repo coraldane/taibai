@@ -1508,3 +1508,83 @@ fn watermark_counts_rows_retired_into_segments_by_flush_intent() -> Result<()> {
     );
     Ok(())
 }
+
+/// Replication round trip: the sidecar the primary writes (`delete_rows`)
+/// ships verbatim (`apply_replicated_sidecar`) onto a standby copy of the
+/// tail directory, and both nodes recover the identical content. This is
+/// the contract `TailMutation` events rely on — without them a standby
+/// served deleted rows from its tail until the next flush.
+#[test]
+fn replicated_delete_sidecar_applies_identically_on_standby() -> Result<()> {
+    let primary = tempfile::tempdir()?;
+    let standby = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    let batch = test_batch(&schema, &[1, 2, 3])?;
+    persist(primary.path(), id, "", &batch)?;
+    // Standby holds the identical tail (TailAppend replay).
+    persist(standby.path(), id, "", &batch)?;
+
+    // Primary deletes rows 0..1; the sidecar bytes are the replication
+    // payload.
+    assert!(delete_rows(primary.path(), id, &[0, 1])?);
+    let tail_dir = primary.path().join(TAIL_DIR);
+    let mut payload = None;
+    let mut sequence = None;
+    for entry in std::fs::read_dir(&tail_dir)?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(stem) = name.strip_suffix(".del") {
+            payload = Some(std::fs::read(entry.path())?);
+            sequence = stem
+                .rsplit('.')
+                .next()
+                .and_then(|seq| seq.parse::<u64>().ok());
+        }
+    }
+    let payload = payload.expect("primary wrote a delete sidecar");
+    let sequence = sequence.expect("primary sidecar carries a sequence");
+    apply_replicated_sidecar(standby.path(), id, false, sequence, &payload)?;
+
+    let primary_rows = recover(primary.path(), &schema)?
+        .iter()
+        .find(|entry| entry.id == id)
+        .expect("primary memtable recovered")
+        .batch
+        .num_rows();
+    let standby_rows = recover(standby.path(), &schema)?
+        .iter()
+        .find(|entry| entry.id == id)
+        .expect("standby memtable recovered")
+        .batch
+        .num_rows();
+    assert_eq!(primary_rows, standby_rows, "standby converges to the primary");
+    assert_eq!(standby_rows, 1, "the replicated delete removed the same rows");
+
+    // Idempotent replay (standby crash before the seq watermark persists):
+    // the same primary sequence replaces the same generation instead of
+    // duplicating the delete.
+    apply_replicated_sidecar(standby.path(), id, false, sequence, &payload)?;
+    let replayed_rows = recover(standby.path(), &schema)?
+        .iter()
+        .find(|entry| entry.id == id)
+        .expect("standby memtable recovered")
+        .batch
+        .num_rows();
+    assert_eq!(replayed_rows, 1, "replayed delete sidecars are idempotent");
+    Ok(())
+}
+
+/// Corrupt payloads fail the apply loudly instead of landing on disk.
+#[test]
+fn replicated_sidecar_rejects_corrupt_payload() -> Result<()> {
+    let standby = tempfile::tempdir()?;
+    assert!(apply_replicated_sidecar(
+        standby.path(),
+        Uuid::new_v4(),
+        false,
+        1,
+        &[0xDE, 0xAD, 0xBE, 0xEF],
+    )
+    .is_err());
+    Ok(())
+}

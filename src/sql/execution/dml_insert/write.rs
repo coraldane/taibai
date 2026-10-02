@@ -649,12 +649,19 @@ fn exec_materialized_insert_batch(
     let unique_constraints = unique_constraints(table_meta, &schema)?;
     let has_unique_checks = !unique_constraints.is_empty();
     let primary_key_indices = primary_key_indices(&schema);
-    let _pk_guard =
+    let pk_guard =
         if !lock_unique_constraints || (primary_key_indices.is_empty() && !has_unique_checks) {
             None
         } else {
             Some(constraint_insert_lock(db, table).lock().unwrap())
         };
+    // The stripe mutual-excludes the probe→publish window against other
+    // unique-key writers. It does NOT need to cover the durable-tail fsync
+    // wait: the writes below collect their pending tail commits, and the
+    // stripe is dropped before they settle — concurrent same-table INSERTs
+    // then join one fsync group instead of serializing on the stripe across
+    // the full fsync round-trip (which defeated the group committer's
+    // design for every constrained table).
 
     // The bulk/relaxed branch re-runs the full existing-data validation
     // inside `exec_bulk_insert_partitioned`; probing the index here too
@@ -765,6 +772,9 @@ fn exec_materialized_insert_batch(
         None
     };
     let write_start = Instant::now();
+    // Pending tail commits of this statement's writes: settled only after
+    // the constraint stripe is dropped (see pk_guard).
+    let mut deferred_commits = Vec::new();
     if bulk_import_mode || relaxed_direct_insert {
         engine.exec_bulk_insert_partitioned(db, table, table_meta, batch, relaxed_direct_insert)?;
     } else {
@@ -772,7 +782,7 @@ fn exec_materialized_insert_batch(
         // reduces to auto-commit: when it holds, every row of the batch is
         // mirrored into the hot store.
         let hot_fed = hot_mirror_eligible(txn_id, bulk_import_mode, relaxed_direct_insert);
-        if let Err(error) = write_batch_by_partition(
+        if let Err(error) = write_batch_by_partition_deferred(
             engine,
             db,
             table,
@@ -782,6 +792,7 @@ fn exec_materialized_insert_batch(
             txn_id,
             table_lock_held,
             hot_fed,
+            &mut deferred_commits,
         ) {
             if hot_fed {
                 // The hot mirror already holds this batch but the
@@ -794,6 +805,13 @@ fn exec_materialized_insert_batch(
                 // rebuild on invalidation.
                 engine.invalidate_hot_store(db, table);
             }
+            // Settle what earlier partitions of this statement submitted:
+            // their fsync failures surface here exactly as the inline
+            // settle would have reported them (the original error wins).
+            let _ =
+                engine
+                    .batch_writer()
+                    .settle_deferred_tail_commits(db, table, deferred_commits);
             return Err(error);
         }
     }
@@ -830,13 +848,32 @@ fn exec_materialized_insert_batch(
         }
     }
     if publish_unique_index_entries {
-        append_unique_index_entries_after_insert(engine, db, table, unique_index_entries)?;
+        if let Err(error) =
+            append_unique_index_entries_after_insert(engine, db, table, unique_index_entries)
+        {
+            // The rows are written and visible; settle their fsync before
+            // propagating so the failure picture matches the inline-settle
+            // contract (the original error still wins).
+            let _ = engine
+                .batch_writer()
+                .settle_deferred_tail_commits(db, table, deferred_commits);
+            return Err(error);
+        }
     }
     if !primary_keys.is_empty() {
         let _ = engine
             .index_manager()
             .append_primary_keys(db, table, &primary_keys)?;
     }
+
+    // The probe→publish window is closed: release the constraint stripe
+    // BEFORE the durable-tail fsync wait, so concurrent same-table INSERTs
+    // join this statement's fsync group instead of serializing on the
+    // stripe across the round-trip.
+    drop(pk_guard);
+    engine
+        .batch_writer()
+        .settle_deferred_tail_commits(db, table, deferred_commits)?;
 
     if publish_catalog {
         // Account BEFORE record_inserted_rows: the catalog row_count
@@ -1299,6 +1336,40 @@ pub(crate) fn write_batch_by_partition(
     table_lock_held: bool,
     hot_fed: bool,
 ) -> Result<()> {
+    // Transactional staging callers never produce pending tail commits (the
+    // durable tail is written at COMMIT), so the scratch collector stays
+    // empty and settling it is a no-op.
+    let mut scratch = Vec::new();
+    write_batch_by_partition_deferred(
+        engine,
+        db,
+        table,
+        table_meta,
+        batch,
+        schema,
+        txn_id,
+        table_lock_held,
+        hot_fed,
+        &mut scratch,
+    )
+}
+
+/// Deferred-settle core: auto-commit callers that hold the constraint stripe
+/// collect their pending tail commits here and settle them after releasing
+/// the stripe, so the fsync wait never serializes same-table INSERTs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_batch_by_partition_deferred(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    batch: RecordBatch,
+    schema: Schema,
+    txn_id: u64,
+    table_lock_held: bool,
+    hot_fed: bool,
+    deferred: &mut Vec<crate::storage::core::batch_writer::PendingTailCommit>,
+) -> Result<()> {
     if table_meta.partition_key.is_empty() || batch.num_rows() == 0 {
         write_partition_batch(
             engine,
@@ -1311,6 +1382,7 @@ pub(crate) fn write_batch_by_partition(
             txn_id,
             table_lock_held,
             hot_fed,
+            Some(&mut *deferred),
         )?;
         return Ok(());
     }
@@ -1334,6 +1406,7 @@ pub(crate) fn write_batch_by_partition(
             txn_id,
             table_lock_held,
             hot_fed,
+            Some(&mut *deferred),
         )?;
         return Ok(());
     }
@@ -1352,6 +1425,7 @@ pub(crate) fn write_batch_by_partition(
                 txn_id,
                 table_lock_held,
                 hot_fed,
+                Some(&mut *deferred),
             )?;
         }
         return Ok(());
@@ -1374,6 +1448,7 @@ pub(crate) fn write_batch_by_partition(
             txn_id,
             table_lock_held,
             hot_fed,
+            Some(&mut *deferred),
         )?;
         return Ok(());
     }
@@ -1391,6 +1466,7 @@ pub(crate) fn write_batch_by_partition(
             txn_id,
             table_lock_held,
             hot_fed,
+            Some(&mut *deferred),
         )?;
     }
     Ok(())
@@ -1408,6 +1484,7 @@ fn write_partition_batch(
     txn_id: u64,
     table_lock_held: bool,
     hot_fed: bool,
+    deferred: Option<&mut Vec<crate::storage::core::batch_writer::PendingTailCommit>>,
 ) -> Result<()> {
     let batch = sort_batch_for_cluster_key(table_meta, batch)?;
     if table_lock_held {
@@ -1422,6 +1499,21 @@ fn write_partition_batch(
                 txn_id,
                 hot_fed,
             )?;
+    } else if let Some(deferred) = deferred {
+        let (_rows, pending) = engine
+            .batch_writer()
+            .write_columns_with_txn_deferred_settle(
+                db,
+                table,
+                partition_key,
+                batch,
+                schema,
+                txn_id,
+                hot_fed,
+            )?;
+        if let Some(pending) = pending {
+            deferred.push(pending);
+        }
     } else {
         engine.batch_writer().write_columns_with_txn(
             db,
