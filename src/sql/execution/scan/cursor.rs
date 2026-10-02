@@ -370,15 +370,12 @@ impl ScanCursor {
         if std::env::var("TAIBAI_INLINE_DECODE").as_deref() == Ok("1") {
             return Ok(false);
         }
-        let pred = self.spec.to_row_group_predicate();
-        let bloom_checks = super::row_group::build_bloom_check_list(&self.spec);
-        let in_checks = super::row_group::build_in_check_list(&self.spec);
-        let set_checks = super::row_group::build_set_check_list(&self.spec);
-        let set_in_checks = super::row_group::build_set_in_check_list(&self.spec);
         // Prune once here and hand the candidate lists to the decode thread,
         // which would otherwise repeat the same metadata pruning per segment.
-        // `None` entries (metadata unavailable at spawn time) fall back to
-        // reader-based pruning inside the thread.
+        // `None` entries (metadata unavailable — or unalignable — at spawn
+        // time) fall back to reader-based pruning inside the thread. The
+        // gateway aligns the catalog-space spec onto each footer's own
+        // column order before consulting its metadata.
         let per_segment_candidates: Vec<Option<Vec<usize>>> = self
             .segments
             .iter()
@@ -389,20 +386,10 @@ impl ScanCursor {
                     .segment_meta(segment)
                     .ok()
                     .flatten()?;
-                if !super::row_group::prune_segment_by_zone_map(&pred, &meta.segment_zone_maps) {
-                    return Some(Vec::new());
+                match super::row_filter::meta_prune_row_groups(&meta, &self.spec) {
+                    Ok(super::row_filter::MetaPrune::Candidates(indices)) => Some(indices),
+                    Ok(super::row_filter::MetaPrune::Unaligned) | Err(_) => None,
                 }
-                Some(
-                    super::row_group::prune_row_group_meta(
-                        &meta.row_groups,
-                        &pred,
-                        &bloom_checks,
-                        &in_checks,
-                        &set_checks,
-                        &set_in_checks,
-                    )
-                    .candidate_indices,
-                )
             })
             .collect();
         let total_candidates: usize = per_segment_candidates
@@ -566,26 +553,21 @@ impl ScanCursor {
 
     fn open_current_segment(&mut self) -> Result<()> {
         let segment = &self.segments[self.segment_pos];
+        // Gateway prune: the catalog-space spec is aligned onto the footer's
+        // own column order before its zone maps / row-group metadata are
+        // consulted. `Unaligned` (or an absent snapshot) falls back to
+        // reader-side pruning below.
         let meta_candidates = self
             .runtime
             .segment_mgr()
             .segment_meta(segment)
             .ok()
             .flatten()
-            .map(|meta| {
-                let pred = self.spec.to_row_group_predicate();
-                if !super::row_group::prune_segment_by_zone_map(&pred, &meta.segment_zone_maps) {
-                    return Vec::new();
+            .and_then(|meta| {
+                match super::row_filter::meta_prune_row_groups(&meta, &self.spec) {
+                    Ok(super::row_filter::MetaPrune::Candidates(indices)) => Some(indices),
+                    Ok(super::row_filter::MetaPrune::Unaligned) | Err(_) => None,
                 }
-                super::row_group::prune_row_group_meta(
-                    &meta.row_groups,
-                    &pred,
-                    &super::row_group::build_bloom_check_list(&self.spec),
-                    &super::row_group::build_in_check_list(&self.spec),
-                    &super::row_group::build_set_check_list(&self.spec),
-                    &super::row_group::build_set_in_check_list(&self.spec),
-                )
-                .candidate_indices
             });
         if meta_candidates
             .as_ref()

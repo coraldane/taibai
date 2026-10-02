@@ -139,15 +139,15 @@ pub fn compute_simple_aggregate(
                     .iter()
                     .map(|clause| clause.column_index)
                     .collect();
-                if row_filter::any_predicate_column_absent(table_schema, &m.schema, &clause_columns)
+                if row_filter::any_predicate_column_absent(table_schema, m.footer_schema(), &clause_columns)
                 {
                     false
                 } else {
                     // Sidecar zone maps follow the segment's footer column
                     // order; re-index the predicate onto it before comparing.
                     let aligned_predicate =
-                        row_filter::align_predicate_to_footer(table_schema, &m.schema, &predicate)?;
-                    !row_group::prune_segment_by_zone_map(&aligned_predicate, &m.segment_zone_maps)
+                        row_filter::align_predicate_to_footer(table_schema, m.footer_schema(), &predicate)?;
+                    !row_group::prune_segment_by_zone_map(&aligned_predicate, m.footer_zone_maps())
                 }
             }
             None => false,
@@ -231,7 +231,7 @@ pub fn compute_simple_aggregate(
             &set_checks,
             &set_in_checks,
         )?;
-        let footer_sums = if let Some(first) = meta.as_ref().and_then(|m| m.row_groups.first()) {
+        let footer_sums = if let Some(first) = meta.as_ref().and_then(|m| m.footer_row_groups().first()) {
             first.col_sums.len() == first.zone_maps.len()
         } else {
             reader
@@ -274,7 +274,7 @@ pub fn compute_simple_aggregate(
                     &aggregate_columns,
                     &column_map,
                     &defaults,
-                    &m.segment_zone_maps,
+                    m.footer_zone_maps(),
                 )
             }) {
             segment_sum_cache_lookup(
@@ -292,7 +292,7 @@ pub fn compute_simple_aggregate(
                     &mut accumulators,
                     &column_map,
                     &defaults,
-                    &m.segment_zone_maps,
+                    m.footer_zone_maps(),
                     m.row_count,
                     &[],
                 )?;
@@ -350,7 +350,7 @@ pub fn compute_simple_aggregate(
 
         let candidate_indices = if let Some(meta) = &meta {
             row_group::prune_row_group_meta(
-                &meta.row_groups,
+                meta.footer_row_groups(),
                 &aligned_checks.predicate,
                 &aligned_checks.bloom_checks,
                 &aligned_checks.in_check_refs(),

@@ -1083,7 +1083,7 @@ impl SegmentManager {
             names.extend(column.previous_names.iter().map(String::as_str));
             return names
                 .iter()
-                .find_map(|name| meta.schema.index_of(name));
+                .find_map(|name| meta.footer_schema().index_of(name));
         }
         let reader = self.open_reader_cached(path).ok()?;
         let mut names = Vec::with_capacity(column.previous_names.len() + 1);
@@ -1103,7 +1103,7 @@ impl SegmentManager {
         footer_idx: usize,
     ) -> Option<crate::storage::partition::pruning::ZoneMap> {
         if let Some(meta) = self.segment_meta(path).ok().flatten() {
-            let zm = meta.segment_zone_maps.get(footer_idx)?;
+            let zm = meta.footer_zone_maps().get(footer_idx)?;
             if zm.row_count == 0 || zm.min_value.is_null() || zm.max_value.is_null() {
                 return None;
             }

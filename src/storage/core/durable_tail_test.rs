@@ -1334,3 +1334,177 @@ fn commit_thread_and_direct_writes_allocate_unique_monotonic_lsns() -> Result<()
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Statement guards: crash arbitration for multi-leg memtable deletes
+// ---------------------------------------------------------------------------
+
+use crate::storage::segment::reader::ImageDurabilityCheck;
+
+fn watermark_of(id: Uuid, rows: u64) -> Vec<ImageDurabilityCheck> {
+    vec![ImageDurabilityCheck {
+        memtable_id: id,
+        partition: String::new(),
+        expected_rows: rows,
+    }]
+}
+
+/// The crash window the guard exists for: the sidecar is durable, the
+/// replacement images are not. Recovery must drop the sidecar (and the
+/// guard) and restore the deleted rows — the multi-leg statement rolled
+/// back, it must not lose them.
+#[test]
+fn guarded_delete_sidecar_rolls_back_when_images_not_durable() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "", &test_batch(&schema, &[1, 2, 3])?)?;
+
+    let never_durable_images = Uuid::new_v4();
+    assert!(delete_rows_guarded(
+        temp.path(),
+        id,
+        &[0, 1],
+        &watermark_of(never_durable_images, 2),
+    )?);
+    assert!(
+        memtable_has_statement_guard(temp.path(), id),
+        "the guard must gate this memtable's flush while the statement is pending"
+    );
+
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].batch.num_rows(), 3, "the guarded delete rolls back");
+    assert!(
+        !memtable_has_statement_guard(temp.path(), id),
+        "the decided guard is removed by recovery"
+    );
+    Ok(())
+}
+
+/// Roll-forward: the watermark's image memtable IS durable, so the guarded
+/// sidecar applies like a plain one.
+#[test]
+fn guarded_delete_sidecar_applies_when_images_durable() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "", &test_batch(&schema, &[1, 2, 3])?)?;
+
+    let images = Uuid::new_v4();
+    persist(temp.path(), images, "", &test_batch(&schema, &[10, 11])?)?;
+    assert!(delete_rows_guarded(
+        temp.path(),
+        id,
+        &[0, 1],
+        &watermark_of(images, 2),
+    )?);
+
+    let recovered = recover(temp.path(), &schema)?;
+    // Recovery resolves every id with a live tail; pick ours by id (the
+    // images memtable is also recovered, in arbitrary HashMap order).
+    let target = recovered
+        .iter()
+        .find(|entry| entry.id == id)
+        .expect("target memtable recovered");
+    assert_eq!(
+        target.batch.num_rows(),
+        1,
+        "the satisfied delete applies"
+    );
+    assert!(!memtable_has_statement_guard(temp.path(), id));
+    Ok(())
+}
+
+/// The acked statement clears its guards: afterwards the sidecar is
+/// unconditionally correct (the caller only clears after the images are
+/// durable) and applies without arbitration.
+#[test]
+fn cleared_guard_makes_sidecar_unconditional() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "", &test_batch(&schema, &[1, 2, 3])?)?;
+    assert!(delete_rows_guarded(
+        temp.path(),
+        id,
+        &[2],
+        &watermark_of(Uuid::new_v4(), 9),
+    )?);
+    clear_statement_guards(temp.path(), id);
+    assert!(!memtable_has_statement_guard(temp.path(), id));
+
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered[0].batch.num_rows(), 2, "the acked delete applies");
+    Ok(())
+}
+
+/// A crash between the guard write and the sidecar write leaves an orphan
+/// guard. Recovery must sweep it instead of gating the memtable's flush
+/// forever.
+#[test]
+fn orphan_guard_without_sidecar_is_swept_by_recovery() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "", &test_batch(&schema, &[1, 2])?)?;
+    assert!(delete_rows_guarded(
+        temp.path(),
+        id,
+        &[0],
+        &watermark_of(Uuid::new_v4(), 5),
+    )?);
+    // Simulate the crash-between-writes: the sidecar never landed.
+    let tail_dir = temp.path().join(TAIL_DIR);
+    for entry in std::fs::read_dir(&tail_dir)?.flatten() {
+        if entry.file_name().to_string_lossy().ends_with(".del") {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    assert!(memtable_has_statement_guard(temp.path(), id));
+
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered[0].batch.num_rows(), 2, "no delete was applied");
+    assert!(
+        !memtable_has_statement_guard(temp.path(), id),
+        "the orphan guard is swept"
+    );
+    Ok(())
+}
+
+/// A satisfied flush intent retires the image memtable's tail into a
+/// segment; the watermark check must still count those rows, so a flush
+/// that races a statement window cannot make recovery roll back a
+/// correctly committed statement.
+#[test]
+fn watermark_counts_rows_retired_into_segments_by_flush_intent() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let images = Uuid::new_v4();
+    let batch = test_batch(&schema, &[7, 8, 9])?;
+    persist(temp.path(), images, "", &batch)?;
+
+    let _intent = begin_flush(temp.path(), images, "seg_00001.dat", 3)?;
+    let mut writer = SegmentWriter::create(
+        &temp.path().join("seg_00001.dat"),
+        schema.clone(),
+        DEFAULT_ROW_GROUP_SIZE,
+        3,
+    )?;
+    writer.write_batch(&batch)?;
+    writer.seal()?;
+
+    // Retire the tail file: only the satisfied intent remains as proof.
+    let tail_dir = temp.path().join(TAIL_DIR);
+    for entry in std::fs::read_dir(&tail_dir)?.flatten() {
+        if entry.file_name().to_string_lossy().ends_with(".tail") {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    assert_eq!(
+        durable_tail_rows_for_memtable(temp.path(), images),
+        3,
+        "a satisfied flush intent must prove the rows durable"
+    );
+    Ok(())
+}

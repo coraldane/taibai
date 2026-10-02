@@ -45,6 +45,13 @@ impl ReplaceDeleteUndo {
         self.deleted_rows
     }
 
+    /// Memtables whose batches were filtered by this statement — the owners
+    /// of any guarded `.del` sidecars, for guard cleanup after the
+    /// statement's images become durable.
+    pub(crate) fn guarded_memtables(&self) -> impl Iterator<Item = &Arc<MemTable>> {
+        self.memtable_backups.iter().map(|(memtable, _)| memtable)
+    }
+
     pub(crate) fn merge(&mut self, other: ReplaceDeleteUndo) {
         self.segment_footers.extend(other.segment_footers);
         self.deleted_rows += other.deleted_rows;
@@ -397,13 +404,17 @@ pub(crate) fn plan_delete_memtable_rows(
 
 /// Apply previously planned memtable conflict deletes: swap each memtable's
 /// batch for the filtered one and rewrite its durable tail so crash recovery
-/// cannot resurrect removed rows. On any failure everything applied so far is
-/// restored before the error is returned.
+/// cannot resurrect removed rows. The durable delete runs under a statement
+/// guard naming the staged replacement rows' watermark: until those rows are
+/// durable, a crash must roll this delete back instead of losing the
+/// replaced rows. On any failure everything applied so far is restored
+/// before the error is returned.
 pub(crate) fn apply_replace_memtable_conflicts(
     engine: &Engine,
     db: &str,
     table: &str,
     plans: Vec<ReplaceMemtableConflictPlan>,
+    watermark: &[crate::storage::segment::reader::ImageDurabilityCheck],
 ) -> Result<ReplaceDeleteUndo> {
     let mut undo = ReplaceDeleteUndo::default();
     if plans.is_empty() {
@@ -432,28 +443,38 @@ pub(crate) fn apply_replace_memtable_conflicts(
         // ROLLBACK needs to undo.
         let tail_result = if plan.memtable.is_transactional() {
             Ok(())
-        } else if plan.filtered.num_rows() == 0 {
-            // Nothing survived the delete: a clear tombstone (fail-closed)
-            // replaces the memtable's tail instead of persisting an empty
-            // snapshot generation.
-            crate::storage::core::durable_tail::clear(&table_dir, plan.memtable.id())
         } else {
-            // Incremental first: a delete sidecar costs O(affected rows)
-            // instead of rewriting the whole tail snapshot (quadratic for
-            // repeated small deletes on a large memtable). Falls back to a
-            // full persist when no live tail exists to hang the sidecar on.
-            match crate::storage::core::durable_tail::delete_rows(
+            // Guarded incremental delete first: a sidecar costs O(affected
+            // rows) instead of rewriting the whole tail snapshot, and its
+            // statement guard lets recovery drop it while the staged
+            // replacement rows are not yet durable — the crash window
+            // between this fsync and the commit's tail fsync.
+            match crate::storage::core::durable_tail::delete_rows_guarded(
                 &table_dir,
                 plan.memtable.id(),
                 &plan.removed_positions,
+                watermark,
             ) {
                 Ok(true) => Ok(()),
-                Ok(false) => crate::storage::core::durable_tail::persist(
-                    &table_dir,
-                    plan.memtable.id(),
-                    plan.memtable.partition_key(),
-                    &plan.filtered,
-                ),
+                Ok(false) => {
+                    // No live tail: the memtable's rows were never durable,
+                    // so recovery cannot resurrect them and nothing needs
+                    // guarding. Persist the filtered snapshot (or clear an
+                    // emptied one) as before.
+                    if plan.filtered.num_rows() == 0 {
+                        crate::storage::core::durable_tail::clear(
+                            &table_dir,
+                            plan.memtable.id(),
+                        )
+                    } else {
+                        crate::storage::core::durable_tail::persist(
+                            &table_dir,
+                            plan.memtable.id(),
+                            plan.memtable.partition_key(),
+                            &plan.filtered,
+                        )
+                    }
+                }
                 Err(error) => Err(error),
             }
         };
@@ -467,6 +488,10 @@ pub(crate) fn apply_replace_memtable_conflicts(
                     &plan.original,
                 );
             }
+            crate::storage::core::durable_tail::clear_statement_guards(
+                &table_dir,
+                plan.memtable.id(),
+            );
             let _ = restore_replace_memtable_undo(engine, &undo);
             return Err(error);
         }
@@ -524,6 +549,14 @@ fn restore_replace_memtable_undo(engine: &Engine, undo: &ReplaceDeleteUndo) -> R
             if first_error.is_none() {
                 first_error = Some(error);
             }
+        } else {
+            // The restored snapshot supersedes the guarded sidecar: the
+            // rollback has decided the delete undone, so its guard must not
+            // gate this memtable's flush any longer.
+            crate::storage::core::durable_tail::clear_statement_guards(
+                &table_dir,
+                memtable.id(),
+            );
         }
     }
     match first_error {
@@ -1293,9 +1326,11 @@ pub fn exec_delete(
     // statement (0 for memtable-only deletes).
     let mut footers_rewritten: u64 = 0;
 
-    engine
-        .batch_writer()
-        .checkpoint_before_rewrite(db, table, 1)?;
+    engine.batch_writer().checkpoint_before_rewrite(
+        db,
+        table,
+        crate::storage::core::batch_writer::RewriteEstimate::SidecarMutation,
+    )?;
 
     // From here the statement rewrites memtables and segment tails; the work
     // is no longer safely abortable, so cancellation checks stop firing.
@@ -1333,7 +1368,11 @@ pub fn exec_delete(
                     deleted_events.push(&plan.original, &plan.removed_positions);
                 }
             }
-            let undo = apply_replace_memtable_conflicts(engine, db, table, memtable_plans)?;
+            // Auto-commit DELETE is a single-leg statement: no replacement
+            // images exist, so the memtable sidecar needs no guard (an empty
+            // watermark writes none).
+            let undo =
+                apply_replace_memtable_conflicts(engine, db, table, memtable_plans, &[])?;
             total_deleted += undo.deleted_rows();
         }
 

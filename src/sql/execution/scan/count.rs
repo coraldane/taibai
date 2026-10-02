@@ -125,7 +125,7 @@ fn count_with_single_eq(
             // aggregates already apply. The footer has no entry to align
             // or prune against, so `=` folds to one constant comparison
             // over the live rows.
-            if row_filter::any_predicate_column_absent(&spec.table_schema, &meta.schema, &[col_idx])
+            if row_filter::any_predicate_column_absent(&spec.table_schema, meta.footer_schema(), &[col_idx])
             {
                 let reader = segment_mgr.open_scan_reader(seg_path, spec.reader_txn_id)?;
                 *total_rows += count_eq_on_default_filled_segment(
@@ -142,8 +142,8 @@ fn count_with_single_eq(
             // Sidecar zone maps follow the segment's footer column order;
             // re-index the predicate onto it before comparing.
             let aligned_pred =
-                row_filter::align_predicate_to_footer(&spec.table_schema, &meta.schema, &pred)?;
-            if !row_group::prune_segment_by_zone_map(&aligned_pred, &meta.segment_zone_maps) {
+                row_filter::align_predicate_to_footer(&spec.table_schema, meta.footer_schema(), &pred)?;
+            if !row_group::prune_segment_by_zone_map(&aligned_pred, meta.footer_zone_maps()) {
                 continue;
             }
         }
@@ -223,7 +223,7 @@ fn count_with_predicates(
             // predicates over default-filled whole row groups instead.
             if row_filter::any_predicate_column_absent(
                 &spec.table_schema,
-                &meta.schema,
+                meta.footer_schema(),
                 &filter_columns,
             ) {
                 let reader = segment_mgr.open_scan_reader(seg_path, spec.reader_txn_id)?;
@@ -251,7 +251,7 @@ fn count_with_predicates(
             Some(meta) => {
                 let aligned = row_filter::align_prune_checks_to_footer(
                     &spec.table_schema,
-                    &meta.schema,
+                    meta.footer_schema(),
                     pred,
                     bloom_checks,
                     in_checks,
@@ -260,7 +260,7 @@ fn count_with_predicates(
                 )?;
                 if !row_group::prune_segment_by_zone_map(
                     &aligned.predicate,
-                    &meta.segment_zone_maps,
+                    meta.footer_zone_maps(),
                 ) {
                     Some(Vec::new())
                 } else {
@@ -268,7 +268,7 @@ fn count_with_predicates(
                     let set_in_refs = aligned.set_in_check_refs();
                     Some(
                         row_group::prune_row_group_meta(
-                            &meta.row_groups,
+                            meta.footer_row_groups(),
                             &aligned.predicate,
                             &aligned.bloom_checks,
                             &in_refs,

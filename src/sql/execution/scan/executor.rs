@@ -452,23 +452,15 @@ impl<'a> ScanExecutor<'a> {
                 for seg_path in &filtered_segments {
                     crate::common::query_cancel::check()?;
                     let meta = mgr.segment_meta(seg_path).ok().flatten();
-                    let meta_candidate_indices = meta.as_ref().map(|meta| {
-                        let pred = self.spec.to_row_group_predicate();
-                        if !super::row_group::prune_segment_by_zone_map(
-                            &pred,
-                            &meta.segment_zone_maps,
-                        ) {
-                            return Vec::new();
+                    // The gateway aligns the catalog-space spec onto the
+                    // footer's column order before consulting its metadata;
+                    // `Unaligned` (and an absent snapshot) fall back to
+                    // reader-side pruning below.
+                    let meta_candidate_indices = meta.as_ref().and_then(|meta| {
+                        match super::row_filter::meta_prune_row_groups(meta, &self.spec) {
+                            Ok(super::row_filter::MetaPrune::Candidates(indices)) => Some(indices),
+                            Ok(super::row_filter::MetaPrune::Unaligned) | Err(_) => None,
                         }
-                        super::row_group::prune_row_group_meta(
-                            &meta.row_groups,
-                            &pred,
-                            &super::row_group::build_bloom_check_list(&self.spec),
-                            &super::row_group::build_in_check_list(&self.spec),
-                            &super::row_group::build_set_check_list(&self.spec),
-                            &super::row_group::build_set_in_check_list(&self.spec),
-                        )
-                        .candidate_indices
                     });
                     if meta_candidate_indices
                         .as_ref()
@@ -777,25 +769,26 @@ impl<'a> ScanExecutor<'a> {
                             }
                         }
                     };
-                    let candidates = if let Ok(Some(meta)) = manager.segment_meta(path) {
-                        let predicate = self.spec.to_row_group_predicate();
-                        if !super::row_group::prune_segment_by_zone_map(
-                            &predicate,
-                            &meta.segment_zone_maps,
-                        ) {
-                            return Some(Ok((base + position, Vec::new())));
+                    let candidates = match manager.segment_meta(path) {
+                        Ok(Some(meta)) => {
+                            // Gateway prune: catalog-space spec aligned onto
+                            // the footer's own column order first. An empty
+                            // result means the zone maps pruned the whole
+                            // segment; `Unaligned` falls back to the reader.
+                            match super::row_filter::meta_prune_row_groups(&meta, &self.spec) {
+                                Ok(super::row_filter::MetaPrune::Candidates(indices))
+                                    if indices.is_empty() =>
+                                {
+                                    return Some(Ok((base + position, Vec::new())));
+                                }
+                                Ok(super::row_filter::MetaPrune::Candidates(indices)) => indices,
+                                Ok(super::row_filter::MetaPrune::Unaligned) | Err(_) => {
+                                    super::strategy::prune_segment(&self.spec, &reader)?
+                                        .candidate_indices
+                                }
+                            }
                         }
-                        super::row_group::prune_row_group_meta(
-                            &meta.row_groups,
-                            &predicate,
-                            &super::row_group::build_bloom_check_list(&self.spec),
-                            &super::row_group::build_in_check_list(&self.spec),
-                            &super::row_group::build_set_check_list(&self.spec),
-                            &super::row_group::build_set_in_check_list(&self.spec),
-                        )
-                        .candidate_indices
-                    } else {
-                        super::strategy::prune_segment(&self.spec, &reader)?.candidate_indices
+                        _ => super::strategy::prune_segment(&self.spec, &reader)?.candidate_indices,
                     };
                     // Row groups inside a segment decode in parallel as
                     // well; actual concurrency is bounded by the global

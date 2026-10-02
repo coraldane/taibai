@@ -87,9 +87,11 @@ pub fn exec_update(
         .collect::<Result<_>>()?;
     let assignments = resolved_assignments.as_slice();
 
-    engine
-        .batch_writer()
-        .checkpoint_before_rewrite(db, table, 1)?;
+    engine.batch_writer().checkpoint_before_rewrite(
+        db,
+        table,
+        crate::storage::core::batch_writer::RewriteEstimate::SidecarMutation,
+    )?;
 
     // From here the statement rewrites memtables and segment tails; the work
     // is no longer safely abortable, so cancellation checks stop firing.
@@ -377,63 +379,82 @@ pub fn exec_update(
         // and the staged inserts skip the catalog.
         let image_txn = engine.alloc_txn_id();
         let image_batches = std::mem::take(&mut segment_plan.image_batches);
+        // Stage the images and collect their durability watermark in ONE
+        // step through the shared staging entry. The watermark is only
+        // meaningful after the staging writes created the transaction's
+        // memtables; a collection placed before the staging once shipped an
+        // always-empty watermark, and recovery — unable to prove the images
+        // durable — rolled every leftover journal back, resurrecting updated
+        // rows next to their committed images.
+        let staged_images = match super::dml_staging::stage_image_transaction(
+            engine,
+            db,
+            table,
+            image_txn,
+            |txn_id| {
+                // The index feeds the test-only fault injection below.
+                #[allow(clippy::unused_enumerate_index)]
+                for (_batch_idx, batch) in image_batches.into_iter().enumerate() {
+                    #[cfg(test)]
+                    if _batch_idx == 1
+                        && crate::common::fault_injection::should_fail(
+                            crate::common::fault_injection::FaultPoint::UpdateImageAppend,
+                        )
+                    {
+                        return Err(TaibaiError::Internal(
+                            "forced UPDATE image append failure".into(),
+                        ));
+                    }
+                    super::dml_insert::write_batch_by_partition(
+                        engine,
+                        db,
+                        table,
+                        table_meta,
+                        batch,
+                        table_schema.clone(),
+                        txn_id,
+                        true,
+                        false,
+                    )?;
+                }
+                Ok(())
+            },
+        ) {
+            Ok(staged) => staged,
+            Err((txn_id, error)) => {
+                // Discard the staged (still-invisible) images. The clean-up is
+                // best-effort beyond this point — the original error wins.
+                if let Err(rollback_error) = engine.batch_writer().rollback_txn(txn_id) {
+                    tracing::error!(
+                        db,
+                        table,
+                        txn_id,
+                        error = %rollback_error,
+                        "UPDATE staging rollback failed; staged images may linger invisibly"
+                    );
+                }
+                let _ = engine.txn_mutations().remove(txn_id);
+                return Err(error);
+            }
+        };
+        let image_watermark = staged_images.watermark;
+        // Same id the staging ran under; read from the outcome so the pair
+        // cannot drift apart at a call site.
+        let image_txn = staged_images.txn_id;
         // Durability watermark for the deferred footer journals: the staged
         // images live in the private transaction's memtables; once their
         // tails are durable, recovery may keep the tombstones (roll forward),
         // otherwise it restores the pre-statement footers (roll back).
-        let image_checks: Vec<crate::storage::segment::reader::ImageDurabilityCheck> = engine
-            .memtable_manager()
-            .get_by_table(db, table)
-            .into_iter()
-            .filter(|memtable| memtable.txn_id() == image_txn)
-            .map(|memtable| {
-                crate::storage::segment::reader::ImageDurabilityCheck {
-                    memtable_id: memtable.id(),
-                    partition: memtable.partition_key().to_string(),
-                    expected_rows: memtable.row_count(),
-                }
-            })
-            .collect();
-        let staged: Result<()> = (|| {
-            // The index feeds the test-only fault injection below.
-            #[allow(clippy::unused_enumerate_index)]
-            for (_batch_idx, batch) in image_batches.into_iter().enumerate() {
-                #[cfg(test)]
-                if _batch_idx == 1
-                    && crate::common::fault_injection::should_fail(
-                        crate::common::fault_injection::FaultPoint::UpdateImageAppend,
-                    )
-                {
-                    return Err(TaibaiError::Internal(
-                        "forced UPDATE image append failure".into(),
-                    ));
-                }
-                super::dml_insert::write_batch_by_partition(
-                    engine,
-                    db,
-                    table,
-                    table_meta,
-                    batch,
-                    table_schema.clone(),
-                    image_txn,
-                    true,
-                    false,
-                )?;
-            }
-            segment_plan.apply_footers_deferred(mgr, &image_checks)?;
-            Ok(())
-        })();
-        if let Err(error) = staged {
-            // Discard the staged (still-invisible) images; any footers
-            // apply_footers already restored itself. Both clean-up steps are
-            // best-effort beyond this point — the original error wins.
+        if let Err(error) = segment_plan.apply_footers_deferred(mgr, image_watermark.as_slice()) {
+            // apply_footers undoes its own partial rewrites; discard the
+            // staged images (still invisible) as above.
             if let Err(rollback_error) = engine.batch_writer().rollback_txn(image_txn) {
                 tracing::error!(
                     db,
                     table,
                     txn_id = image_txn,
                     error = %rollback_error,
-                    "UPDATE staging rollback failed; staged images may linger invisibly"
+                    "UPDATE footer-apply rollback failed; staged images may linger invisibly"
                 );
             }
             let _ = engine.txn_mutations().remove(image_txn);
@@ -1160,6 +1181,16 @@ impl SegmentReinsertPlan {
         mgr: &crate::storage::segment_manager::SegmentManager,
         image_checks: &[crate::storage::segment::reader::ImageDurabilityCheck],
     ) -> Result<()> {
+        // Matched segment rows imply staged image rows imply a non-empty
+        // watermark. An empty watermark here means the collection ran before
+        // the staging (the regression this asserts against): every journal
+        // would carry a watermark that can never be satisfied, and any crash
+        // in the commit→clear window would resurrect the old rows next to
+        // the committed images.
+        debug_assert!(
+            self.footers.is_empty() || !image_checks.is_empty(),
+            "deferred footer journals of a matched UPDATE must carry a non-empty image watermark"
+        );
         let mut applied =
             std::collections::VecDeque::<(std::path::PathBuf, Vec<u8>, u64)>::new();
         for (seg_path, new_bitmap, new_deleted, (old_bitmap, old_deleted)) in &self.footers {

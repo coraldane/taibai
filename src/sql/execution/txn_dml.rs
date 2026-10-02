@@ -260,7 +260,10 @@ pub(crate) fn exec_delete_in_txn(
             .into_iter()
             .partition(|plan| plan.memtable.is_transactional());
         if !own_plans.is_empty() {
-            let undo = apply_replace_memtable_conflicts(engine, db, table, own_plans)?;
+            // Own transactional memtables have no durable tails (rows only
+            // reach a tail at COMMIT), so the guarded sidecar path never
+            // runs; an empty watermark documents the single-leg intent.
+            let undo = apply_replace_memtable_conflicts(engine, db, table, own_plans, &[])?;
             statement_deleted += undo.deleted_rows();
         }
         // Committed memtable rows are deferred: hide the positions from this
@@ -777,40 +780,112 @@ pub(crate) fn exec_update_in_txn(
 // COMMIT / ROLLBACK
 // ---------------------------------------------------------------------------
 
+/// Durable state written by [`materialize_txn_mutations_at_commit`] that must
+/// be finalized — journals and memtable guards cleared — once COMMIT's tail
+/// fsync (or its segment-flush rescue) makes the transaction's images
+/// durable. Kept opaque to the caller; consumed by
+/// [`finish_materialization`].
+#[derive(Default)]
+pub(crate) struct TxnMaterialization {
+    footers: Vec<(String, String, std::path::PathBuf, Vec<u8>, u64)>,
+    memtables: Vec<(String, String, uuid::Uuid)>,
+}
+
 /// Materialize the transaction's deferred mutations: physically remove the
 /// memtable rows, rewrite the segment footers with the union tombstones,
 /// publish the deferred change events, fix the catalog counters. Runs under
 /// the same table/partition mutation locks as auto-commit DML. Called by the
 /// engine right before the memtable visibility flip, so concurrent readers
 /// never observe old and new rows at the same time.
-pub(crate) fn materialize_txn_mutations_at_commit(engine: &Engine, txn_id: u64) -> Result<()> {
+///
+/// Every tombstone leg runs under the DEFERRED journal lifecycle carrying
+/// the transaction's own memtables as the image watermark, mirroring
+/// auto-commit UPDATE: a crash between this materialization and COMMIT's
+/// tail fsync rolls the tombstones back at startup instead of deleting rows
+/// whose replacement images were lost.
+pub(crate) fn materialize_txn_mutations_at_commit(
+    engine: &Engine,
+    txn_id: u64,
+) -> Result<TxnMaterialization> {
     let Some(mutations) = engine.txn_mutations().take(txn_id) else {
-        return Ok(());
+        return Ok(TxnMaterialization::default());
     };
-    if let Err(error) = materialize_tables(engine, &mutations) {
-        // Keep the plans so the transaction can retry COMMIT or ROLLBACK;
-        // the applied subset is idempotent (bitmap union, batch swap).
-        engine.txn_mutations().put_back(txn_id, mutations);
-        return Err(error);
+    match materialize_tables(engine, txn_id, &mutations) {
+        Ok(done) => Ok(done),
+        Err(error) => {
+            // Keep the plans so the transaction can retry COMMIT or ROLLBACK;
+            // the applied subset is idempotent (bitmap union, batch swap).
+            engine.txn_mutations().put_back(txn_id, mutations);
+            Err(error)
+        }
     }
-    Ok(())
 }
 
-fn materialize_tables(engine: &Engine, mutations: &TxnMutations) -> Result<()> {
+/// After COMMIT made the transaction's images durable (tail fsync or the
+/// segment-flush redrive), the deferred journals and memtable guards written
+/// by materialization are unconditionally correct: clear them under the same
+/// locks they were written under. The footer clear is ownership-checked, so
+/// a later statement's journal on the same segment is never discarded.
+/// Best-effort — a leftover is re-judged by startup recovery, which finds
+/// the watermark satisfied and rolls forward.
+pub(crate) fn finish_materialization(engine: &Engine, done: TxnMaterialization) {
     let mgr = engine.segment_mgr();
+    for (db, table, seg_path, bitmap, deleted) in &done.footers {
+        let table_dir = engine.data_dir().join(db).join(table);
+        let seg_path = seg_path.clone();
+        let bitmap = bitmap.clone();
+        let deleted = *deleted;
+        let _ = mgr.with_table_mutation_lock(db, table, || {
+            crate::storage::segment::reader::clear_deferred_delete_journal_for_statement(
+                &table_dir,
+                &seg_path,
+                &bitmap,
+                deleted,
+            );
+            Ok(())
+        });
+    }
+    for (db, table, memtable_id) in &done.memtables {
+        let table_dir = engine.data_dir().join(db).join(table);
+        crate::storage::core::durable_tail::clear_statement_guards(&table_dir, *memtable_id);
+    }
+}
+
+fn materialize_tables(
+    engine: &Engine,
+    txn_id: u64,
+    mutations: &TxnMutations,
+) -> Result<TxnMaterialization> {
+    let mgr = engine.segment_mgr();
+    let mut done = TxnMaterialization::default();
     for table_mutations in mutations.tables() {
         let db = table_mutations.db.as_str();
         let table = table_mutations.table.as_str();
+        // The transaction's own writes for this table ARE the images the
+        // tombstones below must wait for: their memtables' tails become
+        // durable in the COMMIT that follows this materialization. Journaling
+        // them as the watermark lets recovery roll the tombstones back when a
+        // crash lands before that durability — the same arbitration
+        // auto-commit UPDATE applies to its staged images.
+        let watermark = super::dml_staging::collect_txn_watermark(engine, db, table, txn_id);
         let materialize = || -> Result<()> {
             // 1. Committed memtable rows: swap the current batch for a
-            //    filtered one and rewrite the durable tail, so crash
-            //    recovery cannot resurrect removed rows.
+            //    filtered one and record the delete durably (guarded sidecar
+            //    first), so crash recovery cannot resurrect removed rows —
+            //    nor keep a delete whose images were lost.
             for entry in &table_mutations.memtables {
-                materialize_memtable(engine, &entry.memtable, &entry.positions)?;
+                materialize_memtable(engine, &entry.memtable, &entry.positions, watermark.as_slice())?;
+                done.memtables.push((
+                    table_mutations.db.clone(),
+                    table_mutations.table.clone(),
+                    entry.memtable.id(),
+                ));
             }
             // 2. Segment tombstones: union the recorded ids into the fresh
             //    footer bitmap (the segment may have grown since planning)
-            //    and rewrite via the journaled, idempotent path.
+            //    and rewrite via the journaled, idempotent path — DEFERRED,
+            //    carrying the watermark, so a crash before COMMIT's tail
+            //    fsync restores the pre-statement footers.
             for entry in &table_mutations.segments {
                 let reader = mgr.open_reader(&entry.path)?;
                 let total_rows = reader.row_count();
@@ -826,7 +901,21 @@ fn materialize_tables(engine: &Engine, mutations: &TxnMutations) -> Result<()> {
                 }
                 let deleted_count: u64 = bitmap.iter().map(|byte| byte.count_ones() as u64).sum();
                 drop(reader);
-                mgr.rewrite_delete_footer(&entry.path, &bitmap, deleted_count)?;
+                mgr.rewrite_delete_footer_with_mode(
+                    &entry.path,
+                    &bitmap,
+                    deleted_count,
+                    crate::storage::segment::reader::FooterRewriteMode::Deferred(
+                        watermark.as_slice().to_vec(),
+                    ),
+                )?;
+                done.footers.push((
+                    table_mutations.db.clone(),
+                    table_mutations.table.clone(),
+                    entry.path.clone(),
+                    bitmap,
+                    deleted_count,
+                ));
             }
             // 3. Deferred change events, matching the auto-commit order:
             //    deletions first, then the post-update images.
@@ -882,13 +971,14 @@ fn materialize_tables(engine: &Engine, mutations: &TxnMutations) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(done)
 }
 
 fn materialize_memtable(
     engine: &Engine,
     memtable: &Arc<MemTable>,
     positions: &BTreeSet<u32>,
+    watermark: &[crate::storage::segment::reader::ImageDurabilityCheck],
 ) -> Result<()> {
     let Some(snapshot) = memtable.read_snapshot_arc() else {
         return Err(TaibaiError::Internal(
@@ -896,17 +986,33 @@ fn materialize_memtable(
         ));
     };
     let filtered = filter_batch_excluding_positions(&snapshot, positions)?;
-    // Durable tail BEFORE the in-memory swap: this runs under the table's
-    // mutation lock, so a crash between the two steps restores the filtered
-    // tail (deletes preserved) instead of resurrecting the deleted rows next
-    // to a possibly already-rewritten tail.
     let table_dir = engine.data_dir().join(memtable.db()).join(memtable.table());
-    crate::storage::core::durable_tail::persist(
+    // Durable delete BEFORE the in-memory swap (this runs under the table's
+    // mutation lock). A GUARDED sidecar, not a whole-tail persist: recovery
+    // can drop a guarded sidecar while the transaction's images are not yet
+    // durable — restoring the pre-statement rows — while a persist rewrite
+    // would keep the delete even when the crash lost the images, silently
+    // deleting committed-then-rolled-back rows.
+    let position_slice: Vec<u32> = positions.iter().copied().collect();
+    match crate::storage::core::durable_tail::delete_rows_guarded(
         &table_dir,
         memtable.id(),
-        memtable.partition_key(),
-        &filtered,
-    )?;
+        &position_slice,
+        watermark,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            // No live tail: the memtable's rows were never durable, so
+            // recovery cannot resurrect them and nothing needs guarding.
+            crate::storage::core::durable_tail::persist(
+                &table_dir,
+                memtable.id(),
+                memtable.partition_key(),
+                &filtered,
+            )?;
+        }
+        Err(error) => return Err(error),
+    }
     if !memtable.replace_pending_batch(Arc::new(filtered.clone())) {
         return Err(TaibaiError::Internal(
             "deferred-DELETE memtable left pending state before COMMIT (a flush raced the transaction)"

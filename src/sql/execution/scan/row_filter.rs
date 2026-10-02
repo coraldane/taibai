@@ -1499,6 +1499,90 @@ pub(super) fn mapped_column(map: &std::collections::HashMap<usize, usize>, colum
     map.get(&column).copied().unwrap_or(column)
 }
 
+/// Result of pruning one segment against its sidecar meta snapshot.
+pub(super) enum MetaPrune {
+    /// The footer could not be aligned onto the catalog schema (or a check
+    /// references a column the footer genuinely lacks): NO pruning is
+    /// possible here. The caller must fall back to reader-side pruning,
+    /// which re-aligns per segment — catalog indices must never be used
+    /// positionally against footer-space metadata.
+    Unaligned,
+    /// Aligned and pruned: the row groups worth decoding. Empty means the
+    /// segment-level zone maps pruned the whole segment away.
+    Candidates(Vec<usize>),
+}
+
+/// The only sanctioned prune against a `SegmentMetaSnapshot`: aligns the
+/// catalog-space spec (predicate, bloom / in / set check lists) onto the
+/// footer's own column order BEFORE consulting its zone maps and row-group
+/// metadata.
+///
+/// The main scan paths once skipped this alignment and fed catalog indices
+/// straight into footer-space metadata. After any DDL that shifts catalog
+/// positions while sealed segments keep their old layout, they pruned with
+/// the wrong column's zone maps and silently skipped row groups containing
+/// matches. This gateway makes that mistake unrepresentable: there is no
+/// path from a `ScanSpec` to meta-snapshot pruning that skips the
+/// translation (the snapshot's raw fields are module-private, exposed only
+/// as `footer_*` accessors whose names carry the space).
+pub(super) fn meta_prune_row_groups(
+    meta: &crate::storage::segment::meta::SegmentMetaSnapshot,
+    spec: &super::spec::ScanSpec,
+) -> crate::common::error::Result<MetaPrune> {
+    let footer_schema = meta.footer_schema();
+    let predicate_columns = spec.all_predicate_columns();
+    if !predicate_columns.is_empty()
+        && any_predicate_column_absent(&spec.table_schema, footer_schema, &predicate_columns)
+    {
+        // A predicate on a column this segment predates cannot prune: every
+        // row logically carries the column's DEFAULT, so every row group
+        // stays a candidate (the reader gate routes drifted segments
+        // through default-filled evaluation).
+        return Ok(MetaPrune::Candidates(
+            (0..meta.footer_row_groups().len()).collect(),
+        ));
+    }
+    let aligned = match align_prune_checks_to_footer(
+        &spec.table_schema,
+        footer_schema,
+        &spec.to_row_group_predicate(),
+        &super::row_group::build_bloom_check_list(spec),
+        &super::row_group::build_in_check_list(spec),
+        &super::row_group::build_set_check_list(spec),
+        &super::row_group::build_set_in_check_list(spec),
+    ) {
+        Ok(aligned) => aligned,
+        Err(error) => {
+            // An unresolvable check column (e.g. a bloom-index column the
+            // footer predates) must not fail the query — decline pruning.
+            tracing::debug!(
+                error = %error,
+                "meta-snapshot prune declined: footer alignment failed"
+            );
+            return Ok(MetaPrune::Unaligned);
+        }
+    };
+    if !super::row_group::prune_segment_by_zone_map(
+        &aligned.predicate,
+        meta.footer_zone_maps(),
+    ) {
+        return Ok(MetaPrune::Candidates(Vec::new()));
+    }
+    let in_refs = aligned.in_check_refs();
+    let set_in_refs = aligned.set_in_check_refs();
+    Ok(MetaPrune::Candidates(
+        super::row_group::prune_row_group_meta(
+            meta.footer_row_groups(),
+            &aligned.predicate,
+            &aligned.bloom_checks,
+            &in_refs,
+            &aligned.set_checks,
+            &set_in_refs,
+        )
+        .candidate_indices,
+    ))
+}
+
 #[cfg(test)]
 #[path = "row_filter_test.rs"]
 mod tests;

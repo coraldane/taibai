@@ -14,6 +14,7 @@ mod lifecycle;
 mod p0_regressions;
 mod replace_semantics;
 mod unique_index;
+mod window_regressions;
 
 fn session() -> Session {
     Session::new("root".to_string(), "main".to_string())

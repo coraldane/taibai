@@ -181,6 +181,22 @@ pub(crate) struct PendingTailCommit {
     memtable: Arc<MemTable>,
 }
 
+/// What a statement is about to do to a table's memtable tails. This is an
+/// intent, not a row count: passing a fabricated count (the historical
+/// `affected_rows = 1`) made every small mutation look like a point rewrite
+/// and flushed whole tables on single-row statements.
+pub enum RewriteEstimate {
+    /// The statement will append ~`rows` new rows (REPLACE's staged insert).
+    /// A pre-checkpoint can save the coming tail work when the pending tail
+    /// dwarfs it.
+    Inserts(usize),
+    /// The statement mutates existing rows through O(affected) sidecars
+    /// (UPDATE's `.upd`, DELETE/REPLACE's guarded `.del`): it never rewrites
+    /// a whole tail, so a pre-checkpoint cannot save work — it can only add
+    /// a full-table flush.
+    SidecarMutation,
+}
+
 impl BatchWriter {
     pub fn new(
         config: BatchWriterConfig,
@@ -910,10 +926,10 @@ impl BatchWriter {
         &self,
         db: &str,
         table: &str,
-        affected_rows: usize,
+        estimate: RewriteEstimate,
     ) -> Result<bool> {
         let pending_rows = self.pending_committed_rows(db, table);
-        if !Self::should_checkpoint_before_rewrite(pending_rows, affected_rows) {
+        if !Self::should_checkpoint_before_rewrite(pending_rows, estimate) {
             return Ok(false);
         }
 
@@ -922,7 +938,6 @@ impl BatchWriter {
             db,
             table,
             pending_rows,
-            affected_rows,
             "checkpointed large pending tail before row rewrite"
         );
         Ok(true)
@@ -942,9 +957,15 @@ impl BatchWriter {
             .sum()
     }
 
-    fn should_checkpoint_before_rewrite(pending_rows: u64, affected_rows: usize) -> bool {
+    fn should_checkpoint_before_rewrite(pending_rows: u64, estimate: RewriteEstimate) -> bool {
         const MIN_REWRITE_ROWS: u64 = 4096;
         const MAX_AFFECTED_RATIO: u64 = 4;
+        let affected_rows = match estimate {
+            // A sidecar mutation costs O(affected) regardless of the pending
+            // tail's size: never trade it for a whole-table flush.
+            RewriteEstimate::SidecarMutation => return false,
+            RewriteEstimate::Inserts(rows) => rows,
+        };
         pending_rows >= MIN_REWRITE_ROWS
             && (affected_rows as u64).saturating_mul(MAX_AFFECTED_RATIO) < pending_rows
     }
@@ -1489,6 +1510,23 @@ impl BatchWriter {
         tail_committer: &Arc<TailCommitter>,
         flush_gate: &PartitionFlushGate,
     ) -> Result<()> {
+        // A pending statement guard means a multi-leg statement (REPLACE,
+        // transaction COMMIT) can still roll this memtable's delete back.
+        // Flushing would bake the delete into a segment irreversibly, with
+        // no tail left for the guard's recovery arbitration to act on.
+        // Skip this round: the guard is cleared — or crashed into
+        // arbitration — within the statement's lifetime.
+        if crate::storage::core::durable_tail::memtable_has_statement_guard(
+            &segment_mgr.table_dir(mt.db(), mt.table()),
+            mt.id(),
+        ) {
+            tracing::debug!(
+                db = mt.db(),
+                table = mt.table(),
+                "memtable flush deferred: a multi-leg statement guard is pending"
+            );
+            return Ok(());
+        }
         // A single memtable is a length-1 group; the group protocol is the
         // single protocol generalized.
         Self::flush_memtable_group(
@@ -1583,13 +1621,38 @@ impl BatchWriter {
             // Under the table mutation lock (close-of-day / FLUSH TABLE) the
             // caller already excludes appenders; otherwise the partition
             // mutation lock must be taken for the freeze.
+            //
+            // A member with a pending statement guard stays unflushed: its
+            // delete leg must remain recoverable until the multi-leg
+            // statement's images are durable (see flush_memtable).
+            let flushable = group
+                .iter()
+                .filter(|mt| {
+                    let gated = crate::storage::core::durable_tail::memtable_has_statement_guard(
+                        &segment_mgr.table_dir(mt.db(), mt.table()),
+                        mt.id(),
+                    );
+                    if gated {
+                        tracing::debug!(
+                            db = mt.db(),
+                            table = mt.table(),
+                            "group flush deferred for member: a multi-leg statement guard is pending"
+                        );
+                    }
+                    !gated
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if flushable.is_empty() {
+                return Ok(());
+            }
             let frozen = if table_lock_held {
-                group
+                flushable
                     .iter()
                     .filter_map(|mt| Self::freeze_memtable_locked(mt).map(|b| (mt.clone(), b)))
                     .collect::<Vec<_>>()
             } else {
-                Self::freeze_memtable_group_under_partition_lock(segment_mgr, group)?
+                Self::freeze_memtable_group_under_partition_lock(segment_mgr, &flushable)?
             };
             if frozen.is_empty() {
                 return Ok(());

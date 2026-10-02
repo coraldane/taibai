@@ -17,6 +17,7 @@ use crate::sql::execution::wal_helper::{
     serialize_batch_for_wal,
 };
 use crate::storage::segment::SegmentReader;
+use crate::storage::segment::reader::ImageDurabilityCheck;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
@@ -1481,6 +1482,29 @@ fn resolve_live_tail(
 /// against an earlier prefix stay valid. Returns `false` when the memtable
 /// has no live tail (caller falls back to a full `persist`).
 pub fn delete_rows(table_dir: &Path, id: Uuid, positions: &[u32]) -> Result<bool> {
+    delete_rows_impl(table_dir, id, positions, None)
+}
+
+/// Guarded variant for multi-leg statements (REPLACE's memtable delete leg,
+/// transaction COMMIT's materialization): the sidecar is written under a
+/// statement guard naming the statement's image watermark, so recovery drops
+/// it while the images are not durable — the crash rolled the statement
+/// back — instead of keeping a delete whose replacement rows were lost.
+pub fn delete_rows_guarded(
+    table_dir: &Path,
+    id: Uuid,
+    positions: &[u32],
+    watermark: &[ImageDurabilityCheck],
+) -> Result<bool> {
+    delete_rows_impl(table_dir, id, positions, Some(watermark))
+}
+
+fn delete_rows_impl(
+    table_dir: &Path,
+    id: Uuid,
+    positions: &[u32],
+    watermark: Option<&[ImageDurabilityCheck]>,
+) -> Result<bool> {
     if positions.is_empty() {
         return Ok(true);
     }
@@ -1500,6 +1524,13 @@ pub fn delete_rows(table_dir: &Path, id: Uuid, positions: &[u32]) -> Result<bool
         return Ok(false);
     }
     let sequence = next_sequence();
+    // The guard must be durable BEFORE the sidecar: a crash between the two
+    // leaves an orphan guard (swept by recovery) and no delete applied,
+    // while the reverse order could leave an unguarded delete of a
+    // statement whose images were lost.
+    if let Some(watermark) = watermark {
+        write_guard(&tail_dir, id, sequence, watermark)?;
+    }
     let tmp_path = tail_dir.join(format!(".{}.{}.del.tmp", id.simple(), sequence));
     let final_path = tail_dir.join(format!("{}.{}.del", id.simple(), sequence));
     write_new_synced(&tmp_path, &encode_delete_positions(&positions))?;
@@ -1508,6 +1539,172 @@ pub fn delete_rows(table_dir: &Path, id: Uuid, positions: &[u32]) -> Result<bool
     // otherwise a crash restores rows the caller believes are gone.
     sync_dir_best_effort(&tail_dir);
     Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// Statement guards: crash arbitration for multi-leg memtable writes
+//
+// A multi-leg statement (REPLACE, transaction COMMIT) deletes rows from
+// committed memtables while its replacement rows are still becoming durable
+// elsewhere. An unguarded `.del`/`.upd` sidecar is irreversible at recovery:
+// a crash in the window kept the delete and lost the images. The guard
+// (`<id>.<seq>.guard`) records the statement's image watermark next to the
+// sidecar; recovery keeps the sidecar only when the watermark is durable,
+// otherwise both are dropped and the deleted rows come back — the same
+// roll-forward/roll-back arbitration the segment `.del` V02 journal applies
+// to footer rewrites.
+// ---------------------------------------------------------------------------
+
+const GUARD_MAGIC: u32 = 0x5442_4752; // "TBGR"
+
+/// `<id>.<seq>.guard` — deliberately not a generation kind, so generation
+/// arbitration never sees it; it is found only by name.
+fn guard_path(tail_dir: &Path, id: Uuid, sequence: u64) -> PathBuf {
+    tail_dir.join(format!("{}.{}.guard", id.simple(), sequence))
+}
+
+/// Owner and sequence of a guard file, mirroring parse_generation's naming.
+fn parse_guard_path(path: &Path) -> Option<(Uuid, u64)> {
+    let name = path.file_name()?.to_str()?;
+    let mut parts = name.split('.');
+    let id = Uuid::parse_str(parts.next()?).ok()?;
+    let sequence = parts.next()?.parse::<u64>().ok()?;
+    if parts.next()? != "guard" || parts.next().is_some() {
+        return None;
+    }
+    Some((id, sequence))
+}
+
+fn encode_guard(watermark: &[ImageDurabilityCheck]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(8 + watermark.len() * 40);
+    bytes.extend_from_slice(&GUARD_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&(watermark.len() as u32).to_le_bytes());
+    for check in watermark {
+        bytes.extend_from_slice(check.memtable_id.as_bytes());
+        bytes.extend_from_slice(&(check.partition.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(check.partition.as_bytes());
+        bytes.extend_from_slice(&check.expected_rows.to_le_bytes());
+    }
+    append_crc(bytes)
+}
+
+fn decode_guard(bytes: &[u8]) -> Result<Vec<ImageDurabilityCheck>> {
+    let corrupt = |detail: &str| TaibaiError::Storage(format!("durable tail guard is corrupt: {detail}"));
+    let body = verify_crc(bytes)?;
+    if body.len() < 8 || u32::from_le_bytes(body[0..4].try_into().unwrap()) != GUARD_MAGIC {
+        return Err(corrupt("bad magic"));
+    }
+    let count = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+    let mut offset = 8usize;
+    let mut checks = Vec::with_capacity(count);
+    for _ in 0..count {
+        if offset + 16 > body.len() {
+            return Err(corrupt("truncated memtable id"));
+        }
+        let mut id_bytes = [0u8; 16];
+        id_bytes.copy_from_slice(&body[offset..offset + 16]);
+        offset += 16;
+        if offset + 4 > body.len() {
+            return Err(corrupt("truncated partition length"));
+        }
+        let partition_len = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if offset + partition_len + 8 > body.len() {
+            return Err(corrupt("truncated partition"));
+        }
+        let partition = String::from_utf8(body[offset..offset + partition_len].to_vec())
+            .map_err(|_| corrupt("invalid partition utf-8"))?;
+        offset += partition_len;
+        let expected_rows = u64::from_le_bytes(body[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        checks.push(ImageDurabilityCheck {
+            memtable_id: Uuid::from_bytes(id_bytes),
+            partition,
+            expected_rows,
+        });
+    }
+    if offset != body.len() {
+        return Err(corrupt("trailing bytes"));
+    }
+    Ok(checks)
+}
+
+/// Write the statement guard for `sequence`. An empty watermark (single-leg
+/// statement) needs no arbitration and writes nothing.
+fn write_guard(
+    tail_dir: &Path,
+    id: Uuid,
+    sequence: u64,
+    watermark: &[ImageDurabilityCheck],
+) -> Result<()> {
+    if watermark.is_empty() {
+        return Ok(());
+    }
+    let final_path = guard_path(tail_dir, id, sequence);
+    let tmp_path = tail_dir.join(format!(".{}.{}.guard.tmp", id.simple(), sequence));
+    write_new_synced(&tmp_path, &encode_guard(watermark))?;
+    fs::rename(&tmp_path, &final_path)?;
+    sync_dir_best_effort(tail_dir);
+    Ok(())
+}
+
+/// A guard's watermark is satisfied when every referenced image memtable is
+/// durable — tail rows frame-walked up to the recorded count, or retired
+/// into a segment by a satisfied flush intent.
+fn guard_satisfied(table_dir: &Path, checks: &[ImageDurabilityCheck]) -> bool {
+    checks.iter().all(|check| {
+        durable_tail_rows_for_memtable(table_dir, check.memtable_id) >= check.expected_rows
+    })
+}
+
+/// Remove guards whose sidecar no longer exists: a crash between the guard
+/// and sidecar writes (or a sidecar already consumed by arbitration) leaves
+/// a guard that protects nothing. Without this sweep such an orphan would
+/// gate the memtable's flush forever.
+fn sweep_orphan_guards(tail_dir: &Path) {
+    let Ok(entries) = fs::read_dir(tail_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some((guard_id, sequence)) = parse_guard_path(&path) else {
+            continue;
+        };
+        if !tail_dir.join(format!("{}.{}.del", guard_id.simple(), sequence)).exists()
+            && !tail_dir.join(format!("{}.{}.upd", guard_id.simple(), sequence)).exists()
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Remove every statement guard of `id`: the caller's images are durable, so
+/// the guarded sidecars are unconditionally correct now. Best-effort — a
+/// leftover guard is judged (and removed) by the next recovery.
+pub fn clear_statement_guards(table_dir: &Path, id: Uuid) {
+    let Ok(entries) = fs::read_dir(table_dir.join(TAIL_DIR)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if parse_guard_path(&path).is_some_and(|(guard_id, _)| guard_id == id) {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// True while a statement guard of `id` is pending. The flusher must not
+/// retire this memtable's tail into a segment while a multi-leg statement
+/// can still be rolled back: a flushed delete is irreversible, and the
+/// guard's recovery arbitration would have nothing left to arbitrate.
+pub fn memtable_has_statement_guard(table_dir: &Path, id: Uuid) -> bool {
+    let Ok(entries) = fs::read_dir(table_dir.join(TAIL_DIR)) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        parse_guard_path(&entry.path())
+            .is_some_and(|(guard_id, _)| guard_id == id)
+    })
 }
 
 /// Durably record a memtable UPDATE without rewriting its tail.
@@ -1842,6 +2039,33 @@ fn live_tail_with_sidecars(
         LiveTail::Found(path) => {
             let mut applied = Vec::with_capacity(sidecars_rev.len());
             for file in sidecars_rev.iter().rev() {
+                // Statement-guard arbitration: a guarded sidecar belongs to a
+                // multi-leg statement whose replacement rows may not be
+                // durable. Keep it only when the watermark is satisfied;
+                // otherwise drop sidecar and guard — the crash rolled the
+                // statement back and the deleted rows must come back.
+                if let Some(sequence) = parse_generation(&file.path)
+                    .map(|(_, generation)| generation.sequence)
+                {
+                    let guard = guard_path(tail_dir, id, sequence);
+                    if guard.exists() {
+                        let checks = fs::read(&guard)
+                            .map_err(TaibaiError::from)
+                            .and_then(|bytes| decode_guard(&bytes))?;
+                        if guard_satisfied(table_dir, &checks) {
+                            let _ = fs::remove_file(&guard);
+                        } else {
+                            tracing::warn!(
+                                memtable = %id,
+                                sequence,
+                                "statement guard unsatisfied; dropping guarded sidecar (multi-leg statement rolled back by crash)"
+                            );
+                            let _ = fs::remove_file(&guard);
+                            let _ = fs::remove_file(&file.path);
+                            continue;
+                        }
+                    }
+                }
                 applied.push(decode_sidecar(file)?);
             }
             Ok(Some((path, applied)))
@@ -1893,6 +2117,7 @@ fn resolve_live_tail_paths(table_dir: &Path) -> Result<Vec<(Uuid, PathBuf, Vec<D
         remove_other_generations_ex(&tail_dir, id, &path, true)?;
         resolved.push((id, path, sidecars));
     }
+    sweep_orphan_guards(&tail_dir);
     remove_empty_dir(&tail_dir);
     Ok(resolved)
 }
@@ -2471,12 +2696,27 @@ pub(crate) fn durable_tail_rows_for_memtable(table_dir: &Path, id: Uuid) -> u64 
         };
         // Only finalized tails (plain .tail); pending-rename tmp files are not
         // durable yet, and sidecar generations never match the suffix.
-        if !name.starts_with(&prefix) || !name.ends_with(".tail") {
+        if !name.starts_with(&prefix) {
             continue;
         }
-        if let Ok(bytes) = fs::read(entry.path()) {
-            if let Some(rows) = scan_tail_log_rows(&bytes) {
-                best = best.max(rows);
+        if name.ends_with(".tail") {
+            if let Ok(bytes) = fs::read(entry.path()) {
+                if let Some(rows) = scan_tail_log_rows(&bytes) {
+                    best = best.max(rows);
+                }
+            }
+        } else if name.ends_with(".flush") {
+            // A satisfied flush intent retires the tail into a segment: the
+            // recorded row-count watermark proves those rows durable even
+            // though the tail file is gone. Without this, a flush that raced
+            // a statement window would fail every watermark check and
+            // recovery would roll back a correctly committed statement.
+            if let Ok(bytes) = fs::read(entry.path()) {
+                if let Ok((_, Some(expected))) = decode_flush_target(&bytes) {
+                    if flush_intent_satisfied(table_dir, &bytes).unwrap_or(false) {
+                        best = best.max(expected);
+                    }
+                }
             }
         }
     }

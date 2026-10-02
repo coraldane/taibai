@@ -73,9 +73,13 @@ pub fn exec_replace(
     // Checkpoint large pending tails BEFORE taking the table mutation lock so
     // the flush I/O does not extend the critical section. Rows arriving after
     // the checkpoint are conflict-deleted in place below.
-    engine
-        .batch_writer()
-        .checkpoint_before_rewrite(db, table, physical_insert_rows as usize)?;
+    engine.batch_writer().checkpoint_before_rewrite(
+        db,
+        table,
+        crate::storage::core::batch_writer::RewriteEstimate::Inserts(
+            physical_insert_rows as usize,
+        ),
+    )?;
 
     // No pre-flush: rows still resident in memtables are conflict-deleted in
     // place below. The delete and the staged insert run under one lock, so
@@ -104,9 +108,12 @@ pub fn exec_replace(
 
                 // Stage the replacement rows FIRST, into the private
                 // transaction (invisible until commit; nothing durable is
-                // rewritten yet). The delete legs below then rewrite segment
-                // footers under the DEFERRED journal lifecycle, journaling
-                // this staging's durability watermark, so a crash between a
+                // rewritten yet), and collect the durability watermark in the
+                // same step through the shared staging entry — the watermark
+                // is only meaningful after the staging writes created the
+                // transaction's memtables. The delete legs below then rewrite
+                // segment footers under the DEFERRED journal lifecycle,
+                // journaling this staging's watermark, so a crash between a
                 // footer's tombstone fsync and the commit rolls the old rows
                 // back at startup instead of deleting them with no
                 // replacement — the same window UPDATE's stage-first order
@@ -115,57 +122,55 @@ pub fn exec_replace(
                 // while the old row still exists", which recovery cannot
                 // arbitrate; the staged-then-commit protocol keeps every
                 // crash outcome atomic.)
-                if let Err(error) = exec_materialized_insert_batch(
+                let staged_images = match crate::sql::execution::dml_staging::stage_image_transaction(
                     engine,
                     db,
                     table,
-                    &materialized.table_meta,
-                    materialized.schema,
-                    survivors,
                     internal_txn_id,
-                    false,
-                    false,
-                    false,
-                    true,
-                    materialized.missing_auto_inc,
-                    false,
-                    false,
-                ) {
-                    // Nothing else was mutated yet: discard the invisible
-                    // staged rows and fail. Best-effort cleanup — the
-                    // original error wins.
-                    if let Err(rollback_error) = engine.batch_writer().rollback_txn(internal_txn_id)
-                    {
-                        tracing::warn!(
+                    |txn_id| {
+                        exec_materialized_insert_batch(
+                            engine,
                             db,
                             table,
-                            txn_id = internal_txn_id,
-                            error = %rollback_error,
-                            "REPLACE staged-insert rollback failed; staged rows may linger invisibly"
-                        );
+                            &materialized.table_meta,
+                            materialized.schema,
+                            survivors,
+                            txn_id,
+                            false,
+                            false,
+                            false,
+                            true,
+                            materialized.missing_auto_inc,
+                            false,
+                            false,
+                        )
+                        .map(|_| ())
+                    },
+                ) {
+                    Ok(staged) => staged,
+                    Err((txn_id, error)) => {
+                        // Nothing else was mutated yet: discard the invisible
+                        // staged rows and fail. Best-effort cleanup — the
+                        // original error wins.
+                        if let Err(rollback_error) = engine.batch_writer().rollback_txn(txn_id) {
+                            tracing::warn!(
+                                db,
+                                table,
+                                txn_id,
+                                error = %rollback_error,
+                                "REPLACE staged-insert rollback failed; staged rows may linger invisibly"
+                            );
+                        }
+                        let _ = engine.txn_mutations().remove(txn_id);
+                        return Err(error);
                     }
-                    let _ = engine.txn_mutations().remove(internal_txn_id);
-                    return Err(error);
-                }
+                };
                 // Durability watermark for the deferred footer journals: the
                 // staged rows live in the private transaction's memtables;
                 // once their tails are durable, recovery keeps the
                 // tombstones (roll forward), otherwise it restores the
                 // pre-statement footers (roll back).
-                let image_checks: Vec<crate::storage::segment::reader::ImageDurabilityCheck> =
-                    engine
-                        .memtable_manager()
-                        .get_by_table(db, table)
-                        .into_iter()
-                        .filter(|memtable| memtable.txn_id() == internal_txn_id)
-                        .map(|memtable| {
-                            crate::storage::segment::reader::ImageDurabilityCheck {
-                                memtable_id: memtable.id(),
-                                partition: memtable.partition_key().to_string(),
-                                expected_rows: memtable.row_count(),
-                            }
-                        })
-                        .collect();
+                let image_checks = staged_images.watermark;
 
                 let mut undo = match super::dml_delete::delete_replace_conflicts_under_table_lock(
                     engine,
@@ -173,7 +178,7 @@ pub fn exec_replace(
                     table,
                     &materialized.table_meta,
                     &key_sets,
-                    &image_checks,
+                    image_checks.as_slice(),
                 ) {
                     Ok(undo) => undo,
                     Err(error) => {
@@ -205,6 +210,7 @@ pub fn exec_replace(
                     db,
                     table,
                     memtable_plans,
+                    image_checks.as_slice(),
                 ) {
                     Ok(memtable_undo) => undo.merge(memtable_undo),
                     Err(error) => {
@@ -360,6 +366,18 @@ pub fn exec_replace(
             }
             Ok(())
         });
+    }
+    // The replacement rows are durable, so the memtable legs' guarded
+    // sidecars are unconditionally correct: drop their guards (a leftover
+    // would needlessly gate the memtable's flush until the next recovery).
+    {
+        let table_dir = engine.data_dir().join(db).join(table);
+        for memtable in undo.guarded_memtables() {
+            crate::storage::core::durable_tail::clear_statement_guards(
+                &table_dir,
+                memtable.id(),
+            );
+        }
     }
     // The internal transaction is terminal — drop its registry entry (same
     // cleanup as UPDATE's image transaction).

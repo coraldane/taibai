@@ -442,8 +442,14 @@ impl Engine {
         if had_writes {
             // Deferred in-transaction DELETE/UPDATE must be durable (footer
             // rewrites, memtable tail rewrites) before the visibility flip
-            // inside commit_txn exposes the transaction's new rows.
-            super::txn_dml::materialize_txn_mutations_at_commit(self, txn_id)?;
+            // inside commit_txn exposes the transaction's new rows. Every
+            // tombstone leg runs under the DEFERRED journal lifecycle with
+            // the transaction's own memtables as the image watermark, so a
+            // crash before COMMIT's tail fsync rolls the tombstones back at
+            // startup instead of deleting rows whose images were lost.
+            let materialization =
+                super::txn_dml::materialize_txn_mutations_at_commit(self, txn_id)?;
+            let mut images_durable = false;
             if let Err(first_error) = self.batch_writer().commit_txn(txn_id) {
                 // By the time commit_txn reports an error, the visibility flip
                 // has usually already happened (the failure comes from the
@@ -463,12 +469,23 @@ impl Engine {
                         retry_error = %retry_error,
                         "COMMIT durable-tail wait failed and durability redrive failed; transaction fate ambiguous"
                     );
+                    // The journals and guards stay on disk: startup recovery
+                    // judges each leg against the watermark and keeps only
+                    // the tombstones whose images provably survived.
                     return Err(TaibaiError::Storage(format!(
                         "COMMIT applied but the durable-tail wait failed twice ({retry_error}); \
                          the transaction's changes are visible and ROLLBACK cannot undo them — \
                          verify the data with SELECT"
                     )));
                 }
+                // The redrive persisted the images as segments: that also
+                // satisfies every watermark.
+                images_durable = true;
+            } else {
+                images_durable = true;
+            }
+            if images_durable {
+                super::txn_dml::finish_materialization(self, materialization);
             }
         }
 
@@ -879,7 +896,18 @@ impl Engine {
         let mut max: Option<i64> = None;
         for seg in segments {
             let meta = self.segment_mgr.segment_meta(seg).ok().flatten()?;
-            let zone = meta.segment_zone_maps.get(pk_idx)?;
+            // `pk_idx` is a CATALOG index; the snapshot's zone maps are in the
+            // segment's own footer order. Resolve by name (current +
+            // previous), the same translation every prune path performs —
+            // positional access read the wrong column's zone map after any
+            // DDL drift.
+            let mut names = Vec::with_capacity(column.previous_names.len() + 1);
+            names.push(column.name.as_str());
+            names.extend(column.previous_names.iter().map(String::as_str));
+            let footer_idx = names
+                .iter()
+                .find_map(|name| meta.footer_schema().index_of(name))?;
+            let zone = meta.footer_zone_maps().get(footer_idx)?;
             if zone.row_count == 0 {
                 continue;
             }
