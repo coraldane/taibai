@@ -283,5 +283,9 @@ name = "grouped_metadata_fold_test"
 path = "tests/grouped_metadata_fold_test.rs"
 
 [[test]]
+name = "partition_int_calendar_test"
+path = "tests/partition_int_calendar_test.rs"
+
+[[test]]
 name = "retryable_error_test"
 path = "tests/retryable_error_test.rs"

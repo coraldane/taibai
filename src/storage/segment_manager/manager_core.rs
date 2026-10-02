@@ -761,6 +761,17 @@ impl SegmentManager {
         let segments = Self::discover_segments(table_dir)?;
 
         for seg_path in segments.iter().rev() {
+            // This search serves the unpartitioned bucket (empty partition
+            // key, regular `seg_*.dat` files) and unpartitioned tables.
+            // Partition files must be skipped: appending NULL-key rows to a
+            // `p<key>_*.dat` segment silently relocates them into a named
+            // partition, where filename-based partition pruning then hides
+            // them from every range-bounded scan.
+            if let Some(name) = seg_path.file_name().and_then(|n| n.to_str()) {
+                if crate::storage::partition::is_partition_segment(name) {
+                    continue;
+                }
+            }
             // A path excluded here is mid-seal outside the locks: its footer
             // is about to be finalized by its own seal, so it must never be
             // resumed for append or reported as an append target.
