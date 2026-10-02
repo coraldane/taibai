@@ -286,8 +286,9 @@ impl<'a> ScanExecutor<'a> {
             .join(self.db)
             .join(&self.spec.table_name);
         let batch = if table_dir.exists() {
-            super::aggregate_meta::compute_simple_aggregate(
+            super::aggregate_meta::compute_folded_aggregate(
                 &self.spec,
+                &[],
                 aggs,
                 &self.table_meta,
                 &self.table_schema,
@@ -299,8 +300,9 @@ impl<'a> ScanExecutor<'a> {
             )?
         } else {
             // No persisted segments; only memtable/hot store rows.
-            super::aggregate_meta::compute_simple_aggregate(
+            super::aggregate_meta::compute_folded_aggregate(
                 &self.spec,
+                &[],
                 aggs,
                 &self.table_meta,
                 &self.table_schema,

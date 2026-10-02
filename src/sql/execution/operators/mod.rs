@@ -1,5 +1,6 @@
 pub mod aggregate;
 pub mod filter;
+pub mod folded_aggregate;
 pub mod join;
 mod join_spill;
 pub mod limit;

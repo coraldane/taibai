@@ -1,18 +1,23 @@
-//! Metadata-driven fast path for "simple" aggregate queries.
+//! Metadata-driven folding engine for `Aggregate(single Scan)` queries.
 //!
-//! A simple aggregate query is one with no GROUP BY, no HAVING, no DISTINCT,
-//! and whose select list consists entirely of `COUNT(*)`, `COUNT(col)`,
-//! `MIN(col)` or `MAX(col)`. For such queries the answer can frequently be
-//! derived from row-group zone maps / footers without reading column data:
+//! The engine answers aggregate queries — with or without GROUP BY — by
+//! classifying every fold unit (segment / row group) and folding each one
+//! either from metadata (zero decoded rows) or from a targeted decode of just
+//! the columns the aggregates and group keys need:
 //!
 //! * `COUNT(*)`              -> Σ(row_count) − Σ(deleted_row_count)
 //! * `COUNT(col)` (no del)   -> Σ(row_count) − Σ(zone_map[col].null_count)
 //! * `MIN(col)` / `MAX(col)` -> min/max over candidate row groups'
 //!   `zone_map[col].min_value` / `max_value`
+//! * `SUM` / `AVG`           -> footer per-row-group `col_sums`, the partial
+//!   sum cache, or a data fold
 //!
-//! When the candidate segments contain deletes we fall back to reading the
-//! argument column for MIN/MAX (still only the relevant row groups) so the
-//! result remains correct.
+//! GROUP BY keys are folded per unit: a unit whose key columns are all
+//! single-valued in its zone maps (an invariant the day-partitioned /
+//! cluster-sorted layouts guarantee for nearly every unit) collapses into one
+//! group with zero decoding; split units decode only the key + argument
+//! columns and group row by row. The no-GROUP-BY shape is the degenerate
+//! single group and keeps its historical behaviour.
 //!
 //! All of this sits on top of the existing partition / row-group pruning
 //! machinery, so a `WHERE` clause still prunes segments and row groups exactly
@@ -42,13 +47,19 @@ use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
-/// Compute the result of a simple metadata-only aggregate query.
+/// Compute the result of an `Aggregate(single Scan)` query by folding segment
+/// metadata (and, where necessary, targeted column reads) per fold unit.
 ///
-/// `aggregates` are the (already logical-schema-indexed) aggregate expressions
-/// from the SELECT list. Returns a single-row result batch.
+/// `group_by` are the (already logical-schema-indexed) GROUP BY expressions;
+/// only bare column references are supported here — anything else declines.
+/// `aggregates` are the aggregate expressions from the SELECT list. The
+/// no-GROUP-BY shape returns a single-row batch; a grouped shape returns one
+/// row per group in first-seen order. `Ok(None)` declines and the caller
+/// falls back to the regular aggregate pipeline.
 #[allow(clippy::too_many_arguments)]
-pub fn compute_simple_aggregate(
+pub fn compute_folded_aggregate(
     spec: &ScanSpec,
+    group_by: &[LogicalExpr],
     aggregates: &[AggregateExpr],
     table_meta: &TableMeta,
     table_schema: &Schema,
@@ -58,6 +69,14 @@ pub fn compute_simple_aggregate(
     hot_mgr: &crate::storage::core::hot_store::HotStoreManager,
     db: &str,
 ) -> Result<Option<RecordBatch>> {
+    // Read-time TTL filtering is row-dependent and metadata folds cannot see
+    // it; a table with an active TTL keeps the regular scan pipeline (which
+    // filters the TTL column then aggregates). This gate used to live in the
+    // scan executor's routing; it belongs to the engine itself now that the
+    // folded operator calls the engine directly.
+    if table_meta.ttl.is_some() {
+        return Ok(None);
+    }
     // Cluster-key point shape (equality on the leading cluster column): the
     // generic pipeline's ClusterKeyRangeRead binary-searches the sorted key
     // and reads a sliver of the data, while this path would fold every
@@ -72,6 +91,33 @@ pub fn compute_simple_aggregate(
     if !aggregate_args_supported(aggregates, table_schema) {
         return Ok(None);
     }
+    // GROUP BY keys must be bare columns: unit-level folding derives each
+    // unit's key from zone maps / defaults, and per-row folding extracts it
+    // straight from the decoded column. Expression keys decline.
+    let mut key_columns: Vec<usize> = Vec::with_capacity(group_by.len());
+    for expr in group_by {
+        match expr {
+            LogicalExpr::Column(index) => {
+                if !key_columns.contains(index) {
+                    key_columns.push(*index);
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+    let grouped = !key_columns.is_empty();
+    let key_null_values: Vec<ScalarValue> = key_columns
+        .iter()
+        .map(|&index| {
+            ScalarValue::null_for_type(
+                table_schema
+                    .columns
+                    .get(index)
+                    .map(|column| column.data_type)
+                    .unwrap_or(DataType::VarChar),
+            )
+        })
+        .collect();
     let aggregate_columns: Vec<Option<usize>> = aggregates
         .iter()
         .map(|aggregate| match &*aggregate.arg {
@@ -80,37 +126,107 @@ pub fn compute_simple_aggregate(
             _ => None,
         })
         .collect();
-    let mut accumulators = aggregates
+    let template = aggregates
         .iter()
         .zip(&aggregate_columns)
         .map(|(aggregate, column)| AggAccum::new(aggregate.func, *column, table_schema))
         .collect::<Vec<_>>();
+    let mut groups = GroupFold::new(template, grouped);
+
+    // The spec becomes local: the hybrid mirror leg below amends it with the
+    // complementary `<= covers` range clause, like the streaming cursor does.
+    let mut spec = spec.clone();
+
+    // Hot-store legs, mirroring the streaming cursor's initialize: a fully
+    // resident mirror holds the scan's entire row set (then it is the whole
+    // answer — no segments, no memtables), and a hybrid mirror owns the rows
+    // above its coverage bound (then every other leg runs bounded to the
+    // complementary range so the two sides partition the table exactly).
+    let mut hot_spec = spec.clone();
+    let mut needed_columns: Vec<usize> = Vec::new();
+    for column in key_columns.iter().chain(aggregate_columns.iter().flatten()) {
+        if !needed_columns.contains(column) {
+            needed_columns.push(*column);
+        }
+    }
+    if !needed_columns.is_empty() {
+        hot_spec.projection = Some(needed_columns);
+    }
+    if let Some(batch) = scan_memtable::scan_resident_hot_store(
+        hot_mgr,
+        memtable_mgr,
+        db,
+        table_meta,
+        &hot_spec,
+    ) {
+        if fold_named_batch(
+            &mut groups,
+            &key_columns,
+            &aggregate_columns,
+            table_schema,
+            &batch,
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
+        return Ok(Some(finalize_folded(
+            groups,
+            &key_columns,
+            aggregates,
+            table_schema,
+        )?));
+    }
+    let mut hybrid_mirror_batch = None;
+    if spec.hot_mirror_bound.is_none() {
+        if let Some((batch, pk_idx, covers)) = scan_memtable::hybrid_hot_mirror_scan(
+            hot_mgr,
+            memtable_mgr,
+            db,
+            table_meta,
+            &hot_spec,
+        ) {
+            spec.range_predicates
+                .push(crate::storage::partition::pruning::RangeClause {
+                    column_index: pk_idx,
+                    op: crate::storage::partition::pruning::RangeOp::Le,
+                    value: covers.clone(),
+                });
+            spec.hot_mirror_bound = Some((pk_idx, covers));
+            hybrid_mirror_batch = Some(batch);
+        }
+    }
 
     let segment_files = if table_dir.as_os_str().is_empty() || !table_dir.exists() {
         Vec::new()
     } else {
         partition::prune_segments_by_partition(
             SegmentManager::discover_segments(table_dir)?,
-            spec,
+            &spec,
             Some(table_meta),
         )
     };
     let predicate = spec.to_row_group_predicate();
-    let bloom_checks = row_group::build_bloom_check_list(spec);
-    let in_checks = row_group::build_in_check_list(spec);
-    let set_checks = row_group::build_set_check_list(spec);
-    let set_in_checks = row_group::build_set_in_check_list(spec);
-    let source_columns = aggregate_source_columns(spec, &aggregate_columns);
+    let bloom_checks = row_group::build_bloom_check_list(&spec);
+    let in_checks = row_group::build_in_check_list(&spec);
+    let set_checks = row_group::build_set_check_list(&spec);
+    let set_in_checks = row_group::build_set_in_check_list(&spec);
+    let source_columns = aggregate_source_columns(&spec, &aggregate_columns);
 
-    let has_sum = accumulators
+    let has_sum = groups
+        .template
         .iter()
         .any(|a| a.func == crate::sql::planner::AggFunc::Sum && !a.sum_unsupported);
     // AVG has no zone-map answer either: row groups must fold from data
     // (batch folds, or the run-level fold planned below).
-    let has_avg = accumulators
+    let has_avg = groups
+        .template
         .iter()
         .any(|a| a.func == crate::sql::planner::AggFunc::Avg && !a.avg_unsupported);
     let needs_data_fold = has_sum || has_avg;
+    // Run-level folds aggregate a whole row group into one partial state and
+    // cannot emit per-run groups, so grouped queries decode+fold instead.
+    let run_folds_enabled = !grouped;
 
     for segment_path in &segment_files {
         // Footer sums/counts cannot see this transaction's deferred
@@ -208,7 +324,7 @@ pub fn compute_simple_aggregate(
                     // SUM/AVG fold the default arithmetically; a literal the
                     // accumulator cannot consume would be an invariant
                     // violation, so decline instead of erroring mid-fold.
-                    if accumulators.iter().any(|accumulator| {
+                    if groups.template.iter().any(|accumulator| {
                         matches!(accumulator.func, AggFunc::Sum | AggFunc::Avg)
                             && accumulator.column == Some(column)
                             && value.integer_i128().is_none()
@@ -217,6 +333,22 @@ pub fn compute_simple_aggregate(
                         return Ok(None);
                     }
                     defaults.insert(column, value);
+                }
+                FooterColumnDrift::NonConstantDefault => return Ok(None),
+            }
+        }
+        // GROUP BY key columns drift-classify like argument columns. A key
+        // column the footer predates with a constant DEFAULT is the strongest
+        // case: the whole unit's key is that constant. A non-constant default
+        // (CURRENT_TIMESTAMP) has no single key, so the query declines.
+        for &key in &key_columns {
+            if aggregate_cols.contains(&key) {
+                continue;
+            }
+            match footer_column_drift(table_schema, footer_schema, key) {
+                FooterColumnDrift::Present => footer_cols.push(key),
+                FooterColumnDrift::ConstantDefault(value) => {
+                    defaults.insert(key, value);
                 }
                 FooterColumnDrift::NonConstantDefault => return Ok(None),
             }
@@ -243,7 +375,8 @@ pub fn compute_simple_aggregate(
         // by the constant DEFAULT (default × rows / row count) — no footer
         // col_sums needed for it; resolved columns need the footer's
         // per-row-group sums plus a sum-supported type.
-        let sums_answerable_from_footer = accumulators
+        let sums_answerable_from_footer = groups
+            .template
             .iter()
             .filter(|a| matches!(a.func, AggFunc::Sum | AggFunc::Avg))
             .all(|a| {
@@ -263,14 +396,18 @@ pub fn compute_simple_aggregate(
         // accumulator with empty col_sums would leave avg_count at zero and
         // finalize to NULL, so a SUM+AVG query must stream whenever the
         // footer's per-row-group sums cannot answer both.
+        // The partial-sum cache stores one whole-segment SUM per column — a
+        // single-group answer. Grouped queries cannot use it (the segment's
+        // sum would have to split per key value).
         let sum_cache = if has_sum
             && !has_avg
+            && !grouped
             && !sums_answerable_from_footer
             && !spec.has_predicates()
             && meta_deleted == 0
             && meta.as_ref().is_some_and(|m| {
                 aggregates_foldable_from_metadata(
-                    &accumulators,
+                    &groups.template,
                     &aggregate_columns,
                     &column_map,
                     &defaults,
@@ -289,7 +426,7 @@ pub fn compute_simple_aggregate(
         if let Some(cached) = &sum_cache {
             if let Some(m) = &meta {
                 fold_metadata(
-                    &mut accumulators,
+                    groups.single_mut(),
                     &column_map,
                     &defaults,
                     m.footer_zone_maps(),
@@ -297,6 +434,7 @@ pub fn compute_simple_aggregate(
                     &[],
                 )?;
             }
+            let accumulators = groups.single_mut();
             let mut sum_idx = 0usize;
             for accumulator in accumulators.iter_mut() {
                 if accumulator.func != crate::sql::planner::AggFunc::Sum {
@@ -316,34 +454,52 @@ pub fn compute_simple_aggregate(
         // unless the footer's per-row-group sums answer it directly.
         // All-match row groups skip the predicate mask — every row matches —
         // so folding the raw batch there is still exact.
-        let streaming_sum = has_sum
+        let streaming_sum = !grouped
+            && has_sum
             && !sums_answerable_from_footer
             && sum_cache.is_none()
             && reader.deleted_row_count() == 0;
+        // Whole-segment fold: no predicates, no deletes, every aggregate
+        // answerable from the segment zone maps — and, for a grouped query,
+        // every key column single-valued across the segment (the day-
+        // partitioned layout guarantees this for the partition key, making
+        // the whole GROUP BY one footer walk).
         if !spec.has_predicates()
             && reader.deleted_row_count() == 0
             && !needs_data_fold
             && aggregates_foldable_from_metadata(
-                &accumulators,
+                &groups.template,
                 &aggregate_columns,
                 &column_map,
                 &defaults,
                 reader.segment_zone_maps(),
             )
         {
-            fold_metadata(
-                &mut accumulators,
-                &column_map,
+            if let Some(key) = unit_group_key(
+                &key_columns,
+                &key_null_values,
                 &defaults,
+                &column_map,
                 reader.segment_zone_maps(),
-                reader.row_count(),
-                &[],
-            )?;
-            continue;
+            ) {
+                fold_metadata(
+                    groups.group(key),
+                    &column_map,
+                    &defaults,
+                    reader.segment_zone_maps(),
+                    reader.row_count(),
+                    &[],
+                )?;
+                continue;
+            }
         }
 
-        let sum_before: Vec<(Option<i64>, Option<f64>)> = if has_sum {
-            accumulators.iter().map(|a| (a.sum_i, a.sum_f)).collect()
+        let sum_before: Vec<(Option<i64>, Option<f64>)> = if has_sum && !grouped {
+            groups
+                .single()
+                .iter()
+                .map(|a| (a.sum_i, a.sum_f))
+                .collect()
         } else {
             Vec::new()
         };
@@ -395,12 +551,19 @@ pub fn compute_simple_aggregate(
             read_columns: Vec<usize>,
             /// Aggregate argument positions within `read_columns`.
             positions: Vec<Option<usize>>,
+            /// GROUP BY key column positions within `read_columns` (empty for
+            /// the no-GROUP-BY shape).
+            key_positions: Vec<usize>,
             /// Whether the batch fold still evaluates predicates (false when
             /// every clause is zone-map vacuous for this row group).
             apply_mask: bool,
         }
-        let mut meta_folds: Vec<(&[crate::storage::partition::pruning::ZoneMap], u64, &[i64])> =
-            Vec::new();
+        let mut meta_folds: Vec<(
+            Vec<ScalarValue>,
+            &[crate::storage::partition::pruning::ZoneMap],
+            u64,
+            &[i64],
+        )> = Vec::new();
         let mut data_folds: Vec<DataFold> = Vec::new();
 
         // Per-clause zone-map classification is only sound without IN /
@@ -437,7 +600,8 @@ pub fn compute_simple_aggregate(
             // predates (folded arithmetically). A streaming_sum segment
             // folds every function from data instead.
             let rg_sums_available = sums_answerable_from_footer
-                && accumulators
+                && groups
+                    .template
                     .iter()
                     .filter(|a| matches!(a.func, AggFunc::Sum | AggFunc::Avg))
                     .all(|a| {
@@ -446,11 +610,22 @@ pub fn compute_simple_aggregate(
                                 && row_group_meta.col_sums.len()
                                     == row_group_meta.zone_maps.len())
                     });
+            // A grouped metadata fold additionally needs the unit to collapse
+            // into one group: every key column single-valued (or constant
+            // default) in this row group's zone maps.
+            let rg_unit_key = unit_group_key(
+                &key_columns,
+                &key_null_values,
+                &defaults,
+                &column_map,
+                &row_group_meta.zone_maps,
+            );
             if predicate_match == crate::storage::partition::pruning::PredicateMatch::All
                 && reader.delete_bitmap().is_empty()
                 && !streaming_sum
+                && rg_unit_key.is_some()
                 && aggregates_foldable_from_metadata(
-                    &accumulators,
+                    &groups.template,
                     &aggregate_columns,
                     &column_map,
                     &defaults,
@@ -459,6 +634,8 @@ pub fn compute_simple_aggregate(
                 && (!has_sum && !has_avg || rg_sums_available)
             {
                 meta_folds.push((
+                    rg_unit_key
+                        .expect("unit key checked above"),
                     &row_group_meta.zone_maps,
                     row_group_meta.row_count,
                     &row_group_meta.col_sums,
@@ -509,22 +686,22 @@ pub fn compute_simple_aggregate(
             }
 
             let mut run_fold = None;
-            if classifiable && discriminating {
+            if run_folds_enabled && classifiable && discriminating {
                 run_fold = plan_run_fold_on_column(
                     fold_column,
                     run_predicates,
-                    &accumulators,
+                    &groups.template,
                     table_schema,
                     &reader,
                 );
-            } else if classifiable && !predicate.clauses.is_empty() {
+            } else if run_folds_enabled && classifiable && !predicate.clauses.is_empty() {
                 // Every clause is vacuous. When the aggregates share one
                 // i64-domain argument column, folding its runs answers them
                 // without decoding anything (the encoding sniff falls back
                 // to the reduced batch read below for non-Rle columns).
                 run_fold = plan_vacuous_run_fold(
                     &aggregate_columns,
-                    &accumulators,
+                    &groups.template,
                     table_schema,
                     &column_map,
                     &row_group_meta.zone_maps,
@@ -534,8 +711,11 @@ pub fn compute_simple_aggregate(
 
             // Batch-fold read set: all-vacuous row groups need only the
             // aggregate argument columns and skip the (all-true) mask.
+            // Grouped queries always add their key columns (even constant-
+            // default ones — `read_data_fold_batch` splices the constant, so
+            // per-row keys come out uniform).
             let all_vacuous = classifiable && !discriminating;
-            let (read_columns, apply_mask): (Vec<usize>, bool) = if all_vacuous {
+            let (mut read_columns, apply_mask): (Vec<usize>, bool) = if all_vacuous {
                 let mut columns: Vec<usize> = Vec::with_capacity(source_columns.len());
                 for column in aggregate_columns.iter().flatten() {
                     if !columns.contains(column) {
@@ -546,10 +726,18 @@ pub fn compute_simple_aggregate(
             } else {
                 (source_columns.clone(), spec.has_predicates())
             };
+            for key in &key_columns {
+                if !read_columns.contains(key) {
+                    read_columns.push(*key);
+                }
+            }
             if read_columns.is_empty() {
                 // No aggregate reads a column (pure COUNT(*)) and every
-                // clause is vacuous: the footer answers it.
+                // clause is vacuous: the footer answers it. Grouped queries
+                // always carry key columns in the read set, so this is the
+                // no-GROUP-BY shape.
                 meta_folds.push((
+                    Vec::new(),
                     &row_group_meta.zone_maps,
                     row_group_meta.row_count,
                     &row_group_meta.col_sums,
@@ -563,6 +751,15 @@ pub fn compute_simple_aggregate(
                     column.and_then(|col| read_columns.iter().position(|&read| read == col))
                 })
                 .collect();
+            let key_positions = key_columns
+                .iter()
+                .map(|key| {
+                    read_columns
+                        .iter()
+                        .position(|&read| read == *key)
+                        .expect("key columns appended to the read set")
+                })
+                .collect();
 
             data_folds.push(DataFold {
                 row_group_index,
@@ -570,14 +767,15 @@ pub fn compute_simple_aggregate(
                 run_fold,
                 read_columns,
                 positions,
+                key_positions,
                 apply_mask,
             });
             row_start += row_group_meta.row_count;
         }
 
-        for (zone_maps, row_count, col_sums) in meta_folds {
+        for (key, zone_maps, row_count, col_sums) in meta_folds {
             fold_metadata(
-                &mut accumulators,
+                groups.group(key),
                 &column_map,
                 &defaults,
                 zone_maps,
@@ -652,16 +850,22 @@ pub fn compute_simple_aggregate(
                             .as_ref()
                             .expect("run outcome implies a run fold plan");
                         let col_type = table_schema.columns[plan.fold_column].data_type;
-                        fold_run_fold(&mut accumulators, col_type, &out)?;
+                        fold_run_fold(groups.single_mut(), col_type, &out)?;
                     }
                     RgOutcome::Batch(batch) => {
-                        fold_batch(&mut accumulators, &fold.positions, &batch)?;
+                        fold_grouped_data_batch(
+                            &mut groups,
+                            &fold.key_positions,
+                            &fold.positions,
+                            &batch,
+                        )?;
                     }
                 }
             }
         }
 
         if has_sum
+            && !grouped
             && !sums_answerable_from_footer
             && !spec.has_predicates()
             && reader.deleted_row_count() == 0
@@ -671,7 +875,8 @@ pub fn compute_simple_aggregate(
             // covers SUM aggregates exclusively, so zipping all accumulators
             // would pair the cache entry with COUNT's empty delta and store
             // a zero sum.
-            let deltas: Vec<SumCacheValue> = accumulators
+            let deltas: Vec<SumCacheValue> = groups
+                .single()
                 .iter()
                 .zip(sum_before.iter())
                 .filter(|(a, _)| a.func == crate::sql::planner::AggFunc::Sum)
@@ -703,36 +908,118 @@ pub fn compute_simple_aggregate(
     }
 
     let memtable_batches =
-        scan_memtable::scan_memtables(memtable_mgr, hot_mgr, db, &spec.table_name, spec)?;
-    for batch in &memtable_batches {
-        for (accumulator, column) in accumulators.iter_mut().zip(&aggregate_columns) {
-            let batch_column = column.and_then(|index| {
+        scan_memtable::scan_memtables(memtable_mgr, hot_mgr, db, &spec.table_name, &spec)?;
+    for memtable_batch in &memtable_batches {
+        if fold_named_batch(
+            &mut groups,
+            &key_columns,
+            &aggregate_columns,
+            table_schema,
+            memtable_batch,
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
+    }
+    if let Some(mirror_batch) = &hybrid_mirror_batch {
+        if fold_named_batch(
+            &mut groups,
+            &key_columns,
+            &aggregate_columns,
+            table_schema,
+            mirror_batch,
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(finalize_folded(
+        groups,
+        &key_columns,
+        aggregates,
+        table_schema,
+    )?))
+}
+
+/// Fold a hot-store / memtable batch (catalog-schema-aligned, columns
+/// resolved by name) into the group table. Returns `None` when a GROUP BY
+/// key column is missing, so the caller declines the whole query.
+fn fold_named_batch(
+    groups: &mut GroupFold,
+    key_columns: &[usize],
+    aggregate_columns: &[Option<usize>],
+    table_schema: &Schema,
+    batch: &RecordBatch,
+) -> Result<Option<()>> {
+    let aggregate_positions: Vec<Option<usize>> = aggregate_columns
+        .iter()
+        .map(|column| {
+            column.and_then(|index| {
                 table_schema
                     .columns
                     .get(index)
                     .and_then(|column| batch.schema.index_of(&column.name))
-            });
-            accumulator.fold_batch(batch, batch_column)?;
-        }
-    }
-
-    let results = accumulators
-        .into_iter()
-        .map(AggAccum::finalize)
-        .collect::<Vec<_>>();
-    let columns = aggregates
-        .iter()
-        .map(|aggregate| aggregate_result_column_def(aggregate, table_schema))
+            })
+        })
         .collect();
+    let key_positions = key_columns
+        .iter()
+        .map(|key| {
+            table_schema
+                .columns
+                .get(*key)
+                .and_then(|column| batch.schema.index_of(&column.name))
+        })
+        .collect::<Option<Vec<_>>>();
+    // Batches aligned to the catalog schema always carry the key columns;
+    // declining keeps the engine honest if that invariant ever breaks.
+    let Some(key_positions) = key_positions else {
+        return Ok(None);
+    };
+    fold_grouped_data_batch(groups, &key_positions, &aggregate_positions, batch)?;
+    Ok(Some(()))
+}
+
+/// Assemble the final result batch: key columns under their source names,
+/// then one column per aggregate — the same layout `grouped_output_schema`
+/// gives the HashAggregate pipeline, so the Project above maps both
+/// identically.
+fn finalize_folded(
+    groups: GroupFold,
+    key_columns: &[usize],
+    aggregates: &[AggregateExpr],
+    table_schema: &Schema,
+) -> Result<RecordBatch> {
+    let mut columns: Vec<crate::types::batch::ColumnDef> =
+        Vec::with_capacity(key_columns.len() + aggregates.len());
+    for &key in key_columns {
+        let def = &table_schema.columns[key];
+        columns.push(crate::types::batch::ColumnDef::new(def.name.as_str(), def.data_type));
+    }
+    for aggregate in aggregates {
+        columns.push(aggregate_result_column_def(aggregate, table_schema));
+    }
     let schema = Schema::new(columns);
     let mut batch = RecordBatch::new(schema);
-    for (index, value) in results.into_iter().enumerate() {
-        batch
-            .column_mut(index)
-            .ok_or_else(|| crate::common::error::TaibaiError::Internal("agg col".into()))?
-            .push(&value)?;
+    for (key, accumulators) in groups.into_rows() {
+        for (index, value) in key.into_iter().enumerate() {
+            batch
+                .column_mut(index)
+                .ok_or_else(|| TaibaiError::Internal("group key col".into()))?
+                .push(&value)?;
+        }
+        for (offset, accumulator) in accumulators.into_iter().enumerate() {
+            let index = key_columns.len() + offset;
+            batch
+                .column_mut(index)
+                .ok_or_else(|| TaibaiError::Internal("agg col".into()))?
+                .push(&accumulator.finalize())?;
+        }
     }
-    Ok(Some(batch))
+    Ok(batch)
 }
 
 /// Columns the partial-sum cache needs: (column name, is-float) per SUM
@@ -778,6 +1065,213 @@ fn fold_metadata(
     for accumulator in accumulators {
         let default = accumulator.column.and_then(|column| defaults.get(&column));
         accumulator.fold_metadata(default, zone_maps, row_count, col_sums, column_map)?;
+    }
+    Ok(())
+}
+
+/// One accumulator set per distinct group key, in first-seen order over the
+/// deterministic (segment → row group → row) unit traversal — the same order
+/// the streaming aggregate pipeline would discover groups in. The no-GROUP-BY
+/// shape is a single pre-created group with the empty key, so the folded
+/// single-row behaviour falls out of the same machinery.
+struct GroupFold {
+    keys: Vec<Vec<ScalarValue>>,
+    index: std::collections::HashMap<Vec<ScalarValue>, usize>,
+    rows: Vec<Vec<AggAccum>>,
+    grouped: bool,
+    /// Prototype accumulator set cloned for every new group (shape queries
+    /// like `has_sum` checks also read it).
+    template: Vec<AggAccum>,
+}
+
+impl GroupFold {
+    fn new(template: Vec<AggAccum>, grouped: bool) -> Self {
+        let mut this = Self {
+            keys: Vec::new(),
+            index: std::collections::HashMap::new(),
+            rows: Vec::new(),
+            grouped,
+            template,
+        };
+        if !grouped {
+            this.keys.push(Vec::new());
+            this.rows.push(this.template.clone());
+        }
+        this
+    }
+
+    /// The accumulator set for `key`, creating the group on first sight.
+    /// The no-GROUP-BY shape ignores the key (there is exactly one group).
+    fn group(&mut self, key: Vec<ScalarValue>) -> &mut Vec<AggAccum> {
+        if !self.grouped {
+            return &mut self.rows[0];
+        }
+        let index = match self.index.get(&key) {
+            Some(&index) => index,
+            None => {
+                let index = self.keys.len();
+                self.keys.push(key.clone());
+                self.rows.push(self.template.clone());
+                self.index.insert(key, index);
+                index
+            }
+        };
+        &mut self.rows[index]
+    }
+
+    /// The single accumulator set (no-GROUP-BY shape).
+    fn single_mut(&mut self) -> &mut Vec<AggAccum> {
+        debug_assert!(!self.grouped);
+        &mut self.rows[0]
+    }
+
+    fn single(&self) -> &Vec<AggAccum> {
+        debug_assert!(!self.grouped);
+        &self.rows[0]
+    }
+
+    fn into_rows(self) -> impl Iterator<Item = (Vec<ScalarValue>, Vec<AggAccum>)> {
+        self.keys.into_iter().zip(self.rows)
+    }
+}
+
+/// What a fold unit's zone maps say about one GROUP BY key column.
+enum KeyZone {
+    /// Every row of the unit carries this exact value (all-NULL included).
+    Single(ScalarValue),
+    /// Rows split across values, or the statistics are missing: the unit
+    /// must fold from data so each row lands in its own group.
+    Split,
+}
+
+fn key_column_zone_value(
+    key: usize,
+    null_value: &ScalarValue,
+    defaults: &std::collections::HashMap<usize, ScalarValue>,
+    column_map: &std::collections::HashMap<usize, usize>,
+    zone_maps: &[ZoneMap],
+) -> KeyZone {
+    // A key column the footer predates carries one constant DEFAULT on
+    // every row: the unit's key is that constant.
+    if let Some(default) = defaults.get(&key) {
+        return KeyZone::Single(default.clone());
+    }
+    let Some(zone_map) = zone_maps.get(row_filter::mapped_column(column_map, key)) else {
+        return KeyZone::Split;
+    };
+    if !zone_map.is_computed() {
+        return KeyZone::Split;
+    }
+    if zone_map.min_value.is_null() && zone_map.max_value.is_null() {
+        // `min_value` is only ever set from a non-null value, so both ends
+        // NULL means the unit holds no non-null rows: one NULL group.
+        return KeyZone::Single(null_value.clone());
+    }
+    if !zone_map.min_value.is_null()
+        && !zone_map.max_value.is_null()
+        && zone_map.min_value == zone_map.max_value
+        && zone_map.null_count == 0
+    {
+        return KeyZone::Single(zone_map.min_value.clone());
+    }
+    // Mixed values, or value rows plus NULL rows: only a pure COUNT(*) could
+    // split those arithmetically — keep it conservative and fold from data.
+    KeyZone::Split
+}
+
+/// The single group key a whole fold unit collapses into, or `None` when any
+/// key column splits across values (the unit must then fold from data). The
+/// no-GROUP-BY shape always returns the empty key.
+fn unit_group_key(
+    key_columns: &[usize],
+    key_null_values: &[ScalarValue],
+    defaults: &std::collections::HashMap<usize, ScalarValue>,
+    column_map: &std::collections::HashMap<usize, usize>,
+    zone_maps: &[ZoneMap],
+) -> Option<Vec<ScalarValue>> {
+    let mut key = Vec::with_capacity(key_columns.len());
+    for (position, &column) in key_columns.iter().enumerate() {
+        match key_column_zone_value(
+            column,
+            &key_null_values[position],
+            defaults,
+            column_map,
+            zone_maps,
+        ) {
+            KeyZone::Single(value) => key.push(value),
+            KeyZone::Split => return None,
+        }
+    }
+    Some(key)
+}
+
+/// The single group key a decoded batch collapses into when every key column
+/// is batch-singular (one value, or all NULL) — the common clustered case,
+/// letting the whole batch fold vectorized into one group.
+fn batch_group_key(batch: &RecordBatch, key_positions: &[usize]) -> Option<Vec<ScalarValue>> {
+    let rows = batch.num_rows();
+    if rows == 0 {
+        return None;
+    }
+    let mut key = Vec::with_capacity(key_positions.len());
+    for &position in key_positions {
+        let values = batch.column(position)?;
+        let data_type = batch.schema.columns.get(position)?.data_type;
+        let non_null = values.col_count_non_null();
+        if non_null == 0 {
+            key.push(ScalarValue::null_for_type(data_type));
+            continue;
+        }
+        if non_null != rows as u64 {
+            return None;
+        }
+        let (Some(min), Some(max)) = (values.col_min(), values.col_max()) else {
+            return None;
+        };
+        if min != max {
+            return None;
+        }
+        key.push(min);
+    }
+    Some(key)
+}
+
+/// Fold one decoded fold-unit batch into the group table. Batch-singular key
+/// sets fold vectorized into a single group; split keys fall to a per-row
+/// loop that extracts each row's key and folds its argument values.
+fn fold_grouped_data_batch(
+    groups: &mut GroupFold,
+    key_positions: &[usize],
+    aggregate_positions: &[Option<usize>],
+    batch: &RecordBatch,
+) -> Result<()> {
+    if batch.num_rows() == 0 {
+        return Ok(());
+    }
+    if !groups.grouped {
+        return fold_batch(groups.single_mut(), aggregate_positions, batch);
+    }
+    if let Some(key) = batch_group_key(batch, key_positions) {
+        return fold_batch(groups.group(key), aggregate_positions, batch);
+    }
+    let rows = batch.num_rows();
+    for row in 0..rows {
+        let key: Vec<ScalarValue> = key_positions
+            .iter()
+            .map(|&position| batch.column(position).expect("key position checked").scalar(row))
+            .collect();
+        let accumulators = groups.group(key);
+        for (accumulator, position) in accumulators.iter_mut().zip(aggregate_positions) {
+            match position {
+                None => accumulator.fold_row(None)?,
+                Some(column) => accumulator.fold_row(Some(
+                    &batch
+                        .column(*column)
+                        .expect("aggregate position checked")
+                        .scalar(row),
+                ))?,
+            }
+        }
     }
     Ok(())
 }
@@ -1116,6 +1610,7 @@ fn raw_i64_scalar(dt: DataType, value: i64) -> ScalarValue {
     }
 }
 
+#[derive(Clone)]
 struct AggAccum {
     func: AggFunc,
     column: Option<usize>,
@@ -1355,6 +1850,50 @@ impl AggAccum {
                         .unwrap_or(0.0);
                     self.avg_sum_f = Some(self.avg_sum_f.unwrap_or(0.0) + part);
                     self.avg_count += n;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold one row's argument value (per-row grouped data folds). `None` is
+    /// the COUNT(*) shape — every row counts regardless of any value.
+    fn fold_row(&mut self, value: Option<&ScalarValue>) -> Result<()> {
+        let count_star = self.func == AggFunc::Count && self.column.is_none();
+        let Some(value) = value else {
+            if count_star {
+                self.count += 1;
+            }
+            return Ok(());
+        };
+        if value.is_null() {
+            if count_star {
+                self.count += 1;
+            }
+            return Ok(());
+        }
+        match self.func {
+            AggFunc::Count => self.count += 1,
+            AggFunc::Min => self.merge_min(value.clone()),
+            AggFunc::Max => self.merge_max(value.clone()),
+            AggFunc::Sum => match self.col_type {
+                DataType::Float32 | DataType::Float64 => {
+                    if let Some(part) = value.numeric_f64() {
+                        self.sum_f = Some(self.sum_f.unwrap_or(0.0) + part);
+                    }
+                }
+                _ => {
+                    if let Some(part) = value.integer_i128() {
+                        let part = i64::try_from(part)
+                            .map_err(|_| TaibaiError::Sql("SUM overflow".to_string()))?;
+                        self.add_i64(part)?;
+                    }
+                }
+            },
+            AggFunc::Avg => {
+                if let Some(part) = value.numeric_f64() {
+                    self.avg_sum_f = Some(self.avg_sum_f.unwrap_or(0.0) + part);
+                    self.avg_count += 1;
                 }
             }
         }
@@ -1925,8 +2464,9 @@ mod tests {
                 distinct: false,
             },
         ];
-        let batch = compute_simple_aggregate(
+        let batch = compute_folded_aggregate(
             &spec,
+            &[],
             &aggregates,
             &table_meta,
             &table_schema,
@@ -1989,8 +2529,9 @@ mod tests {
             arg: Box::new(LogicalExpr::Column(created_idx)),
             distinct: false,
         }];
-        let batch = compute_simple_aggregate(
+        let batch = compute_folded_aggregate(
             &spec,
+            &[],
             &aggregates,
             &table_meta,
             &table_schema,
@@ -2005,6 +2546,170 @@ mod tests {
             batch.is_none(),
             "CURRENT_TIMESTAMP default must decline the metadata fast path"
         );
+        engine.segment_mgr().shutdown();
+    }
+
+    /// Engine-level: a day-partitioned table's GROUP BY partition key folds
+    /// entirely from segment metadata (returns `Some`), one row per day in
+    /// first-seen order — no row data is decoded.
+    #[test]
+    fn compute_folded_aggregate_answers_group_by_partition_key_from_metadata() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let engine = crate::sql::execution::engine::Engine::new(dir.path(), "main")
+            .expect("engine");
+        let mut session = crate::net::session::Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE t (id INT64, deal_date INT64) PARTITION BY DAY(deal_date)",
+            )
+            .expect("create");
+        let mut sql = String::from("INSERT INTO t (id, deal_date) VALUES ");
+        let mut id = 0i64;
+        let mut first = true;
+        for day in [20240101i64, 20240102, 20240103] {
+            for _ in 0..10 {
+                if !first {
+                    sql.push_str(", ");
+                }
+                first = false;
+                id += 1;
+                sql.push_str(&format!("({}, {})", id, day));
+            }
+        }
+        engine.execute(&mut session, &sql).expect("insert");
+        engine.flush_table_buffers("main", "t").expect("flush");
+
+        let table_meta = engine.get_table_meta("main", "t").expect("table meta");
+        let table_schema = Schema::new(table_meta.columns.clone());
+        let mut spec = ScanSpec::new("t");
+        spec.table_schema = table_schema.clone();
+        let date_idx = table_schema.index_of("deal_date").expect("date column");
+        let group_by = vec![LogicalExpr::Column(date_idx)];
+        let aggregates = vec![AggregateExpr {
+            func: AggFunc::Count,
+            arg: Box::new(LogicalExpr::Wildcard),
+            distinct: false,
+        }];
+        let batch = compute_folded_aggregate(
+            &spec,
+            &group_by,
+            &aggregates,
+            &table_meta,
+            &table_schema,
+            &dir.path().join("main").join("t"),
+            engine.segment_mgr(),
+            engine.memtable_manager(),
+            engine.hot_store_manager(),
+            "main",
+        )
+        .expect("compute")
+        .expect("day-partitioned GROUP BY must fold from metadata");
+        assert_eq!(batch.num_rows(), 3, "one row per day");
+        assert_eq!(batch.num_columns(), 2, "group key + count columns");
+        for (row, day) in [(0usize, 20240101i64), (1, 20240102), (2, 20240103)] {
+            assert_eq!(batch.scalar(row, 0), Some(ScalarValue::Int64(Some(day))));
+            assert_eq!(batch.scalar(row, 1), Some(ScalarValue::Int64(Some(10))));
+        }
+        engine.segment_mgr().shutdown();
+    }
+
+    /// Engine-level: an active TTL makes every row's visibility row-
+    /// dependent, which metadata folds cannot see — the engine must decline
+    /// so the regular scan pipeline filters the TTL column first.
+    #[test]
+    fn compute_folded_aggregate_declines_active_ttl() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let engine = crate::sql::execution::engine::Engine::new(dir.path(), "main")
+            .expect("engine");
+        let mut session = crate::net::session::Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE t (id INT64, ts TIMESTAMP) PARTITION BY DAY(ts) TTL (ts, 3600)",
+            )
+            .expect("create");
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO t (id, ts) VALUES (1, '2024-01-01 00:00:00')",
+            )
+            .expect("insert");
+        engine.flush_table_buffers("main", "t").expect("flush");
+
+        let table_meta = engine.get_table_meta("main", "t").expect("table meta");
+        let table_schema = Schema::new(table_meta.columns.clone());
+        let mut spec = ScanSpec::new("t");
+        spec.table_schema = table_schema.clone();
+        let ts_idx = table_schema.index_of("ts").expect("ts column");
+        let group_by = vec![LogicalExpr::Column(ts_idx)];
+        let aggregates = vec![AggregateExpr {
+            func: AggFunc::Count,
+            arg: Box::new(LogicalExpr::Wildcard),
+            distinct: false,
+        }];
+        let batch = compute_folded_aggregate(
+            &spec,
+            &group_by,
+            &aggregates,
+            &table_meta,
+            &table_schema,
+            &dir.path().join("main").join("t"),
+            engine.segment_mgr(),
+            engine.memtable_manager(),
+            engine.hot_store_manager(),
+            "main",
+        )
+        .expect("compute");
+        assert!(batch.is_none(), "active TTL must decline the folding engine");
+        engine.segment_mgr().shutdown();
+    }
+
+    /// Engine-level: expression GROUP BY keys decline (`None`), leaving the
+    /// regular pipeline in charge.
+    #[test]
+    fn compute_folded_aggregate_declines_expression_group_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let engine = crate::sql::execution::engine::Engine::new(dir.path(), "main")
+            .expect("engine");
+        let mut session = crate::net::session::Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")
+            .expect("create");
+        engine
+            .execute(&mut session, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)")
+            .expect("insert");
+        engine.flush_table_buffers("main", "t").expect("flush");
+
+        let table_meta = engine.get_table_meta("main", "t").expect("table meta");
+        let table_schema = Schema::new(table_meta.columns.clone());
+        let mut spec = ScanSpec::new("t");
+        spec.table_schema = table_schema.clone();
+        let v_idx = table_schema.index_of("v").expect("v column");
+        let group_by = vec![LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(v_idx)),
+            op: crate::sql::parser::ast::BinOp::Add,
+            right: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(1)))),
+        }];
+        let aggregates = vec![AggregateExpr {
+            func: AggFunc::Count,
+            arg: Box::new(LogicalExpr::Wildcard),
+            distinct: false,
+        }];
+        let batch = compute_folded_aggregate(
+            &spec,
+            &group_by,
+            &aggregates,
+            &table_meta,
+            &table_schema,
+            &dir.path().join("main").join("t"),
+            engine.segment_mgr(),
+            engine.memtable_manager(),
+            engine.hot_store_manager(),
+            "main",
+        )
+        .expect("compute");
+        assert!(batch.is_none(), "expression group keys must decline");
         engine.segment_mgr().shutdown();
     }
 }

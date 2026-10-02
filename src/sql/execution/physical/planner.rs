@@ -4,6 +4,7 @@ use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::sql::execution::operators::aggregate::{aggregate_result_column_def, HashAggregateExec};
 use crate::sql::execution::operators::filter::FilterExec;
+use crate::sql::execution::operators::folded_aggregate::FoldedAggregateExec;
 use crate::sql::execution::operators::join::HashJoinExec;
 use crate::sql::execution::operators::limit::LimitExec;
 use crate::sql::execution::operators::profile::{ProfiledExec, QueryProfile, ScanProfileSeed};
@@ -355,21 +356,35 @@ fn build_operator_with_limit(
                     )
                 }
             };
-            let input = build_operator_with_limit(
-                *agg.input,
-                ctx,
-                None,
-                table_batches,
-                scan_seeds,
-                profile,
-                depth + 1,
-            )?;
-            let mut exec =
-                HashAggregateExec::new(agg.group_by, agg.aggregates, input, input_schema);
-            if let Some(having) = agg.having {
-                exec = exec.with_having(having);
+            // Metadata-folded aggregate: when the aggregate reads a single
+            // table scan directly, the folding engine may answer it per
+            // group from zone maps / footers without streaming row data.
+            // Shape mismatches decline here; runtime declines (inside the
+            // operator) fall back to the HashAggregate pipeline below.
+            let folded = if table_batches.is_none() {
+                try_folded_aggregate_exec(&agg, ctx)
+            } else {
+                None
+            };
+            if let Some(folded) = folded {
+                Ok(Box::new(folded))
+            } else {
+                let input = build_operator_with_limit(
+                    *agg.input,
+                    ctx,
+                    None,
+                    table_batches,
+                    scan_seeds,
+                    profile,
+                    depth + 1,
+                )?;
+                let mut exec =
+                    HashAggregateExec::new(agg.group_by, agg.aggregates, input, input_schema);
+                if let Some(having) = agg.having {
+                    exec = exec.with_having(having);
+                }
+                Ok(Box::new(exec))
             }
-            Ok(Box::new(exec))
         }
         LogicalPlan::Join(join) => {
             let build_left = if join.join_type == JoinType::Inner {
@@ -2233,6 +2248,58 @@ fn set_scan_projection(plan: LogicalPlan, cols: &[usize]) -> LogicalPlan {
         }
         other => other,
     }
+}
+
+/// Try to compile an `Aggregate` over a single table scan into the
+/// metadata-folded operator. Declines (returns `None`) for every shape the
+/// folding engine cannot own: HAVING, DISTINCT aggregates, expression keys
+/// or arguments, and any input that is not a plain scan — residual `Filter`
+/// nodes carry predicates `compile_scan_spec` does not extract, so those
+/// keep the regular HashAggregate pipeline. WHERE clauses the optimizer
+/// pushed into `ScanPlan::pushed_filter` are covered: they land in the spec.
+fn try_folded_aggregate_exec(
+    agg: &crate::sql::planner::AggregatePlan,
+    ctx: &PhysicalContext<'_>,
+) -> Option<FoldedAggregateExec> {
+    if agg.having.is_some() {
+        return None;
+    }
+    if agg.group_by
+        .iter()
+        .any(|expr| !matches!(expr, LogicalExpr::Column(_)))
+    {
+        return None;
+    }
+    for aggregate in &agg.aggregates {
+        if aggregate.distinct {
+            return None;
+        }
+        match &*aggregate.arg {
+            LogicalExpr::Column(_) | LogicalExpr::Wildcard => {}
+            _ => return None,
+        }
+    }
+    // `materialize_aggregate_arguments` inserts a Project for expression
+    // arguments — already declined above, but stay defensive: only a bare
+    // Scan compiles into a spec whose predicate set is complete.
+    let LogicalPlan::Scan(scan) = &*agg.input else {
+        return None;
+    };
+    let scan_name = scan.table_name.clone();
+    let table_ref = ctx.table_ref(&scan_name)?;
+    let schema = ctx.schema(&scan_name)?.clone();
+    let meta = ctx.meta(&scan_name)?.clone();
+    let mut spec = compile_scan_spec(&agg.input, &scan_name, &schema, &meta);
+    spec.table_name = table_ref.table.clone();
+    Some(FoldedAggregateExec::new(
+        agg.group_by.clone(),
+        agg.aggregates.clone(),
+        spec,
+        ctx.scan_runtime.clone(),
+        schema,
+        meta,
+        table_ref.database.clone(),
+    ))
 }
 
 #[cfg(test)]

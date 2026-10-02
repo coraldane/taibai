@@ -279,5 +279,9 @@ name = "aggregate_drift_fastpath_test"
 path = "tests/aggregate_drift_fastpath_test.rs"
 
 [[test]]
+name = "grouped_metadata_fold_test"
+path = "tests/grouped_metadata_fold_test.rs"
+
+[[test]]
 name = "retryable_error_test"
 path = "tests/retryable_error_test.rs"
