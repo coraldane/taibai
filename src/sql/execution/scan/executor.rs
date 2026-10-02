@@ -309,31 +309,20 @@ impl<'a> ScanExecutor<'a> {
             } else {
                 for seg_path in &filtered_segments {
                     crate::common::query_cancel::check()?;
-                    let meta = mgr.segment_meta(seg_path).ok().flatten();
-                    // The gateway aligns the catalog-space spec onto the
-                    // footer's column order before consulting its metadata;
-                    // `Unaligned` (and an absent snapshot) fall back to
-                    // reader-side pruning below.
-                    let meta_candidate_indices = meta.as_ref().and_then(|meta| {
-                        match super::row_filter::meta_prune_row_groups(meta, &self.spec) {
-                            Ok(super::row_filter::MetaPrune::Candidates(indices)) => Some(indices),
-                            Ok(super::row_filter::MetaPrune::Unaligned) | Err(_) => None,
-                        }
-                    });
-                    if meta_candidate_indices
-                        .as_ref()
-                        .is_some_and(|candidates| candidates.is_empty())
-                    {
-                        continue;
-                    }
-
-                    let reader = match mgr.open_scan_reader(seg_path, self.spec.reader_txn_id) {
-                        Ok(r) => r,
+                    // Shared candidate enumeration: sidecar meta prune first
+                    // (skips the segment without opening it when nothing
+                    // survives), reader prune on fallback. A concurrent
+                    // compaction may legitimately remove a segment mid-scan;
+                    // anything else must fail the query instead of silently
+                    // skipping the whole segment's rows.
+                    let opened = match super::candidates::open_segment_with_candidates(
+                        &mgr,
+                        seg_path,
+                        &self.spec,
+                    ) {
+                        Ok(Some(opened)) => opened,
+                        Ok(None) => continue,
                         Err(error) => {
-                            // A concurrent compaction may legitimately remove
-                            // a segment mid-scan; anything else (IO error,
-                            // corrupt footer) must fail the query instead of
-                            // silently skipping the whole segment's rows.
                             if !seg_path.exists() {
                                 tracing::warn!(
                                     segment = %seg_path.display(),
@@ -344,23 +333,14 @@ impl<'a> ScanExecutor<'a> {
                             return Err(error);
                         }
                     };
+                    let reader = opened.reader;
+                    let candidate_indices = opened.indices;
 
                     if let Some(s) = self.stats.as_deref_mut() {
                         s.entry(self.spec.table_name.clone())
                             .or_default()
                             .segments_opened += 1;
                     }
-
-                    let candidate_indices = if let Some(candidates) = meta_candidate_indices {
-                        candidates
-                    } else {
-                        let Some(prune_result) =
-                            super::strategy::prune_segment(&self.spec, &reader)
-                        else {
-                            continue;
-                        };
-                        prune_result.candidate_indices
-                    };
 
                     if let Some(s) = self.stats.as_deref_mut() {
                         let stats_entry = s.entry(self.spec.table_name.clone()).or_default();

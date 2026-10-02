@@ -439,6 +439,47 @@ fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec
         LogicalPlan::Aggregate(a) => {
             spec.has_aggregate = true;
             spec.has_group_by = !a.group_by.is_empty();
+            // Aggregate projection pushdown (materialized path): reading
+            // directly off this table's scan, restrict the read to GROUP BY
+            // keys + aggregate arguments — the same rule the physical
+            // pipeline applies via `pushdown_aggregate_projection`. Without
+            // it, the materialized path decoded the whole row width for
+            // aggregate queries. Only a bare Scan input qualifies: a residual
+            // Filter below the aggregate evaluates over the scan output and
+            // needs its own columns.
+            if let LogicalPlan::Scan(scan) = &*a.input {
+                if scan.table_name.eq_ignore_ascii_case(table_name) {
+                    let mut cols: Vec<usize> = Vec::new();
+                    let mut bare = true;
+                    for expr in &a.group_by {
+                        if let LogicalExpr::Column(index) = expr {
+                            cols.push(*index);
+                        } else {
+                            bare = false;
+                            break;
+                        }
+                    }
+                    if bare {
+                        for aggregate in &a.aggregates {
+                            match &*aggregate.arg {
+                                LogicalExpr::Column(index) => cols.push(*index),
+                                LogicalExpr::Wildcard => {}
+                                _ => {
+                                    bare = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if bare {
+                        cols.sort_unstable();
+                        cols.dedup();
+                        if !cols.is_empty() && cols.len() < scan.schema.columns.len() {
+                            spec.projection = Some(cols);
+                        }
+                    }
+                }
+            }
             collect_from_plan(&a.input, table_name, schema, spec);
         }
         LogicalPlan::Sort(s) => {

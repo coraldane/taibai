@@ -553,40 +553,18 @@ impl ScanCursor {
 
     fn open_current_segment(&mut self) -> Result<()> {
         let segment = &self.segments[self.segment_pos];
-        // Gateway prune: the catalog-space spec is aligned onto the footer's
-        // own column order before its zone maps / row-group metadata are
-        // consulted. `Unaligned` (or an absent snapshot) falls back to
-        // reader-side pruning below.
-        let meta_candidates = self
-            .runtime
-            .segment_mgr()
-            .segment_meta(segment)
-            .ok()
-            .flatten()
-            .and_then(|meta| {
-                match super::row_filter::meta_prune_row_groups(&meta, &self.spec) {
-                    Ok(super::row_filter::MetaPrune::Candidates(indices)) => Some(indices),
-                    Ok(super::row_filter::MetaPrune::Unaligned) | Err(_) => None,
-                }
-            });
-        if meta_candidates
-            .as_ref()
-            .is_some_and(|candidates| candidates.is_empty())
-        {
-            self.current_reader = None;
-            return Ok(());
-        }
-        let reader = match self
-            .runtime
-            .segment_mgr()
-            .open_scan_reader(segment, self.spec.reader_txn_id)
-        {
-            Ok(r) => r,
+        // Shared candidate enumeration: sidecar meta prune first (skips the
+        // segment without opening it when nothing survives), reader prune on
+        // fallback. A concurrent compaction may legitimately remove a
+        // segment mid-scan, but anything else (IO error, corrupt footer)
+        // must fail the query instead of silently dropping its rows.
+        let opened = match super::candidates::open_segment_with_candidates(
+            self.runtime.segment_mgr(),
+            segment,
+            &self.spec,
+        ) {
+            Ok(opened) => opened,
             Err(error) => {
-                // Same contract as the executor's inline path: a concurrent
-                // compaction may legitimately remove a segment mid-scan, but
-                // anything else (IO error, corrupt footer) must fail the
-                // query instead of silently dropping the segment's rows.
                 self.current_reader = None;
                 if segment.exists() {
                     return Err(error);
@@ -598,14 +576,13 @@ impl ScanCursor {
                 return Ok(());
             }
         };
-        let candidates = meta_candidates.unwrap_or_else(|| {
-            strategy::prune_segment(&self.spec, &reader)
-                .map(|r: RowGroupPruneResult| r.candidate_indices)
-                .unwrap_or_default()
-        });
-        self.current_candidates = candidates;
+        let Some(opened) = opened else {
+            self.current_reader = None;
+            return Ok(());
+        };
+        self.current_candidates = opened.indices;
         self.candidate_pos = 0;
-        self.current_reader = Some(reader);
+        self.current_reader = Some(opened.reader);
         Ok(())
     }
 
