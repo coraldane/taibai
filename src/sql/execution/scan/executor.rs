@@ -324,6 +324,12 @@ impl<'a> ScanExecutor<'a> {
     fn execute_scan(&mut self) -> Result<Vec<RecordBatch>> {
         let mut output = LimitedBatchSink::new(None);
         self.execute_scan_into(&mut output)?;
+        if output.over_cap {
+            return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
+                "scan input materialization exceeded the query memory budget ({} > {} bytes); raise query_memory_limit_mb",
+                output.bytes, output.byte_cap
+            )));
+        }
         Ok(output.finish())
     }
 
@@ -958,14 +964,32 @@ struct LimitedBatchSink {
     batches: Vec<RecordBatch>,
     limit: Option<usize>,
     rows_emitted: usize,
+    /// Bytes accumulated by the sink. The streaming cursor covers nearly
+    /// every query shape now; what still lands here (COUNT fast paths,
+    /// cursor-declined shapes) must not materialize past the query budget
+    /// — 0 disables the cap.
+    bytes: u64,
+    byte_cap: u64,
+    over_cap: bool,
 }
 
 impl LimitedBatchSink {
     fn new(limit: Option<usize>) -> Self {
+        let byte_cap = {
+            let mb = crate::common::config::query_limits().query_memory_limit_mb;
+            if mb == 0 {
+                u64::MAX
+            } else {
+                mb.saturating_mul(1024 * 1024) as u64
+            }
+        };
         Self {
             batches: Vec::new(),
             limit,
             rows_emitted: 0,
+            bytes: 0,
+            byte_cap,
+            over_cap: false,
         }
     }
 
@@ -982,6 +1006,16 @@ impl BatchSink for LimitedBatchSink {
     fn push(&mut self, batch: RecordBatch) -> bool {
         if batch.num_rows() == 0 {
             return true;
+        }
+
+        self.bytes = self
+            .bytes
+            .saturating_add(batch.estimated_size_bytes() as u64);
+        if self.bytes > self.byte_cap {
+            // Remember and keep collecting would only deepen the overrun;
+            // the executor turns this into a clean budget error.
+            self.over_cap = true;
+            return false;
         }
 
         let Some(limit) = self.limit else {

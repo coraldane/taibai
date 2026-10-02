@@ -751,11 +751,15 @@ impl ScanCursor {
 }
 
 fn is_streamable(spec: &ScanSpec) -> bool {
-    !spec.is_count_star
-        && !spec.has_aggregate
-        && !spec.has_order_by
-        && !spec.has_group_by
-        && !spec.has_join
+    // COUNT(*) keeps its dedicated metadata fast paths and ORDER BY keeps
+    // the executor's ordered-cluster early termination (the cursor's
+    // ordered path diverges on multi-column cluster orders); aggregates,
+    // GROUP BY and JOINs consume batches incrementally (the aggregate
+    // operators fold per batch, the join sides are budgeted), so feeding
+    // them from the streaming cursor removes the whole-input
+    // materialization without changing the batch sequence (both sides
+    // share the same ScanPlanner, hence the same limit pushdown).
+    !spec.is_count_star && !spec.has_order_by
 }
 
 impl Drop for ScanCursor {
