@@ -272,14 +272,40 @@ pub fn compute_folded_aggregate(
             continue;
         }
 
-        // Footer-persisted per-row-group sums (new-format segments) answer
-        // SUM/AVG without reading any data — when present for every row
-        // group and every Sum/Avg argument has an exact i64 view. Segments
-        // without them keep the partial-sum cache / streaming fold below.
-        // The sidecar meta decides without touching the segment file; when
-        // it has not been written yet (first query after restart), the
-        // cached reader's already-parsed footer answers the same question.
-        let reader = segment_mgr.open_scan_reader(segment_path, spec.reader_txn_id)?;
+        // The sidecar meta snapshot answers everything up to and including
+        // the whole-segment fold below without opening the segment file —
+        // the hot shapes (plain COUNT(*), day-partitioned GROUP BY) then
+        // never touch a reader at all. The overlay case (no meta) opens the
+        // overlay-aware reader here and keeps it for the row-group loop;
+        // every other segment opens its reader lazily, right before the
+        // row-group work that genuinely needs it.
+        let mut overlay_reader: Option<std::sync::Arc<SegmentReader>> = None;
+        let (footer_schema, seg_zone_maps, seg_row_count, seg_deleted, footer_sums) = match &meta {
+            Some(m) => (
+                m.footer_schema().clone(),
+                m.footer_zone_maps().to_vec(),
+                m.row_count,
+                m.deleted_row_count,
+                m.footer_row_groups()
+                    .first()
+                    .is_some_and(|rg| rg.col_sums.len() == rg.zone_maps.len()),
+            ),
+            None => {
+                let reader = segment_mgr.open_scan_reader(segment_path, spec.reader_txn_id)?;
+                let view = (
+                    reader.schema().clone(),
+                    reader.segment_zone_maps().to_vec(),
+                    reader.row_count(),
+                    reader.deleted_row_count(),
+                    reader
+                        .footer_row_groups()
+                        .first()
+                        .is_some_and(|rg| rg.col_sums.len() == rg.zone_maps.len()),
+                );
+                overlay_reader = Some(reader);
+                view
+            }
+        };
         // Schema drift is resolved per column, by name — not by whole-schema
         // equality. A blanket decline made one ALTER (ADD/DROP/RENAME COLUMN)
         // permanently degrade every SUM/COUNT/MIN/MAX metadata fold to a full
@@ -300,10 +326,9 @@ pub fn compute_folded_aggregate(
         // predates would need default-filled evaluation, which this fast
         // path does not implement. Decline; the regular pipeline evaluates
         // the predicate on the materialized default batch.
-        let footer_schema = reader.schema();
         if row_filter::any_predicate_column_absent(
             table_schema,
-            footer_schema,
+            &footer_schema,
             &spec.all_predicate_columns(),
         ) {
             return Ok(None);
@@ -318,7 +343,7 @@ pub fn compute_folded_aggregate(
             std::collections::HashMap::new();
         let mut footer_cols: Vec<usize> = Vec::with_capacity(aggregate_cols.len());
         for &column in &aggregate_cols {
-            match footer_column_drift(table_schema, footer_schema, column) {
+            match footer_column_drift(table_schema, &footer_schema, column) {
                 FooterColumnDrift::Present => footer_cols.push(column),
                 FooterColumnDrift::ConstantDefault(value) => {
                     // SUM/AVG fold the default arithmetically; a literal the
@@ -345,7 +370,7 @@ pub fn compute_folded_aggregate(
             if aggregate_cols.contains(&key) {
                 continue;
             }
-            match footer_column_drift(table_schema, footer_schema, key) {
+            match footer_column_drift(table_schema, &footer_schema, key) {
                 FooterColumnDrift::Present => footer_cols.push(key),
                 FooterColumnDrift::ConstantDefault(value) => {
                     defaults.insert(key, value);
@@ -353,24 +378,16 @@ pub fn compute_folded_aggregate(
                 FooterColumnDrift::NonConstantDefault => return Ok(None),
             }
         }
-        let column_map = row_filter::align_column_map(table_schema, footer_schema, &footer_cols)?;
+        let column_map = row_filter::align_column_map(table_schema, &footer_schema, &footer_cols)?;
         let aligned_checks = row_filter::align_prune_checks_to_footer(
             table_schema,
-            footer_schema,
+            &footer_schema,
             &predicate,
             &bloom_checks,
             &in_checks,
             &set_checks,
             &set_in_checks,
         )?;
-        let footer_sums = if let Some(first) = meta.as_ref().and_then(|m| m.footer_row_groups().first()) {
-            first.col_sums.len() == first.zone_maps.len()
-        } else {
-            reader
-                .footer_row_groups()
-                .first()
-                .is_some_and(|rg| rg.col_sums.len() == rg.zone_maps.len())
-        };
         // A SUM/AVG whose argument column this footer predates is answered
         // by the constant DEFAULT (default × rows / row count) — no footer
         // col_sums needed for it; resolved columns need the footer's
@@ -458,21 +475,22 @@ pub fn compute_folded_aggregate(
             && has_sum
             && !sums_answerable_from_footer
             && sum_cache.is_none()
-            && reader.deleted_row_count() == 0;
+            && seg_deleted == 0;
         // Whole-segment fold: no predicates, no deletes, every aggregate
         // answerable from the segment zone maps — and, for a grouped query,
         // every key column single-valued across the segment (the day-
         // partitioned layout guarantees this for the partition key, making
-        // the whole GROUP BY one footer walk).
+        // the whole GROUP BY one footer walk). Runs entirely on the meta
+        // view; a hit never opens the segment file.
         if !spec.has_predicates()
-            && reader.deleted_row_count() == 0
+            && seg_deleted == 0
             && !needs_data_fold
             && aggregates_foldable_from_metadata(
                 &groups.template,
                 &aggregate_columns,
                 &column_map,
                 &defaults,
-                reader.segment_zone_maps(),
+                &seg_zone_maps,
             )
         {
             if let Some(key) = unit_group_key(
@@ -480,19 +498,23 @@ pub fn compute_folded_aggregate(
                 &key_null_values,
                 &defaults,
                 &column_map,
-                reader.segment_zone_maps(),
+                &seg_zone_maps,
             ) {
                 fold_metadata(
                     groups.group(key),
                     &column_map,
                     &defaults,
-                    reader.segment_zone_maps(),
-                    reader.row_count(),
+                    &seg_zone_maps,
+                    seg_row_count,
                     &[],
                 )?;
                 continue;
             }
         }
+        let reader = match overlay_reader {
+            Some(reader) => reader,
+            None => segment_mgr.open_scan_reader(segment_path, spec.reader_txn_id)?,
+        };
 
         let sum_before: Vec<(Option<i64>, Option<f64>)> = if has_sum && !grouped {
             groups
