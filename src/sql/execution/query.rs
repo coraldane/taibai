@@ -51,7 +51,6 @@ where
         _ => from_clause,
     };
     let table_refs = extract_table_refs(resolved_from, db);
-    let table_names: Vec<String> = table_refs.iter().map(|table| table.key.clone()).collect();
     let mut table_schemas = HashMap::new();
     let mut table_metas = HashMap::new();
     {
@@ -77,14 +76,11 @@ where
         &resolved_stmt,
         &table_schemas,
     )?);
-    if detect_count_star(&resolved_stmt, &table_names)
-        || detect_simple_metadata_aggregate(&resolved_stmt, &table_names)
-        || !can_use_physical_pipeline(&plan)
-    {
+    if !can_use_physical_pipeline(&plan) {
         return Ok(None);
     }
     let mut physical_ctx =
-        PhysicalContext::new(engine, &table_refs, &table_schemas, &table_metas, false);
+        PhysicalContext::new(engine, &table_refs, &table_schemas, &table_metas);
     let mut pipeline = build_physical_pipeline(plan, &mut physical_ctx)?;
     let mut schema = None;
     loop {
@@ -570,49 +566,19 @@ fn exec_table_select(
         }
     };
 
-    let is_count_star = !has_derived && !has_correlated && detect_count_star(stmt, &table_names);
-    // Simple metadata-aggregate fast path: COUNT/MIN/MAX without GROUP BY.
-    // Only detected on a single-table, committed-read query with no stats sink.
-    let simple_metadata_aggregates = if reader_txn_id == 0
-        && stats.is_none()
-        && !is_count_star
-        && !has_derived
-        && !has_correlated
-        && table_names.len() == 1
-        && detect_simple_metadata_aggregate(stmt, &table_names)
-        && !where_pins_leading_cluster_column(
-            stmt,
-            &table_metas
-                .get(&table_names[0])
-                .map(|meta| meta.cluster_key.clone())
-                .unwrap_or_default(),
-        ) {
-        extract_simple_metadata_aggregates(
-            &plan,
-            table_schemas
-                .get(&table_names[0])
-                .unwrap_or(&crate::types::batch::Schema::empty()),
-        )
-    } else {
-        None
-    };
-    let is_simple_metadata = simple_metadata_aggregates.is_some();
-
+    // Aggregate fast paths (metadata folding for `Aggregate(single Scan)`
+    // shapes, including plain COUNT(*)) are decided inside the two execution
+    // backends below: the physical pipeline's Aggregate branch compiles a
+    // FoldedAggregateExec, and the materialized path extracts the same fold
+    // request from the plan into the scan spec. No AST-level detection here.
     if reader_txn_id == 0
         && stats.is_none()
-        && !is_count_star
-        && !is_simple_metadata
         && !has_derived
         && !has_correlated
         && can_use_physical_pipeline(&plan)
     {
-        let mut physical_ctx = PhysicalContext::new(
-            engine,
-            &table_refs,
-            &table_schemas,
-            &table_metas,
-            is_count_star,
-        );
+        let mut physical_ctx =
+            PhysicalContext::new(engine, &table_refs, &table_schemas, &table_metas);
         let pipeline = build_physical_pipeline(plan, &mut physical_ctx)?;
         tracing::debug!("query: physical pipeline built, starting next_batch loop");
         let (schema, batches) = drain_pipeline(pipeline)?;
@@ -631,8 +597,6 @@ fn exec_table_select(
         table_cluster_keys,
         table_metas,
         plan,
-        is_count_star,
-        simple_metadata_aggregates,
         stats,
         reader_txn_id,
         profile,
@@ -651,8 +615,6 @@ fn exec_table_select_materialized(
     table_cluster_keys: HashMap<String, Vec<String>>,
     table_metas: HashMap<String, crate::storage::catalog::schema::TableMeta>,
     plan: LogicalPlan,
-    is_count_star: bool,
-    simple_metadata_aggregates: Option<Vec<crate::sql::planner::AggregateExpr>>,
     mut stats: Option<&mut HashMap<String, ScanStats>>,
     reader_txn_id: u64,
     profile: Option<&QueryProfile>,
@@ -678,13 +640,14 @@ fn exec_table_select_materialized(
         let mut spec = compile_scan_spec(&plan, table_name, &schema, &meta);
         spec.table_name = table_ref.table.clone();
         spec.reader_txn_id = reader_txn_id;
-
-        if is_count_star && profile.is_none() {
-            spec.is_count_star = true;
-        }
-        if simple_metadata_aggregates.is_some() {
-            spec.simple_metadata_aggregates = simple_metadata_aggregates.clone();
-        }
+        // Folded-aggregate fast path: the same plan-driven extraction the
+        // physical pipeline's Aggregate branch performs. The engine carries
+        // its own decline conditions (TTL, txn overlays, drift), so this
+        // routes committed reads, explicit transactions and EXPLAIN ANALYZE
+        // through one code path.
+        spec.metadata_fold = crate::sql::execution::scan::spec::extract_metadata_fold(
+            &plan, table_name,
+        );
 
         let mut executor = ScanExecutor::new(&spec, engine, schema, meta, &table_ref.database);
         if let Some(ref mut s) = stats {
@@ -722,23 +685,29 @@ fn exec_table_select_materialized(
             spec.has_predicates() && spec.remaining_predicate.is_none(),
         );
 
-        if spec.is_count_star {
-            let result_schema = if let Some(b) = batches.first() {
-                b.schema.clone()
-            } else {
-                Schema::new(vec![ColumnDef::new("count(*)", DataType::Int64)])
-            };
-            return Ok(ExecResult::Query {
-                schema: result_schema,
-                batches,
-            });
-        }
-        if spec.simple_metadata_aggregates.is_some() && metadata_answered {
-            // The scan executor produced the single aggregate result row via
-            // the metadata fast path; do not feed it through the pipeline.
-            // When the path declined (metadata_answered == false), the
-            // batches are raw scanned rows and the pipeline below must apply
-            // the aggregate operator as usual.
+        if spec.metadata_fold.is_some() && metadata_answered {
+            // The scan executor produced the final aggregate rows via the
+            // metadata folding engine; do not feed them through the pipeline
+            // again. When the engine declined (metadata_answered == false),
+            // the batches are raw scanned rows and the pipeline below must
+            // apply the aggregate operator as usual. The extraction's
+            // identity-projection guard makes the returned column order the
+            // pipeline's own.
+            if let Some(profile) = profile {
+                // Surface the folded answer in EXPLAIN ANALYZE as its own
+                // operator (no scan ran, so without this the operator
+                // metrics section would be empty and the profile would
+                // misrepresent what executed).
+                let operator = profile.register(
+                    0,
+                    format!("AggregateFold {}", table_ref.table),
+                    1,
+                );
+                operator.add_elapsed(scan_start.elapsed());
+                for batch in &batches {
+                    operator.observe_batch(batch);
+                }
+            }
             let result_schema = if let Some(b) = batches.first() {
                 b.schema.clone()
             } else {
@@ -782,7 +751,7 @@ fn exec_table_select_materialized(
     }
     let mut pipeline = if let Some(profile) = profile {
         let mut physical_ctx =
-            PhysicalContext::new(engine, table_refs, &table_schemas, &table_metas, false)
+            PhysicalContext::new(engine, table_refs, &table_schemas, &table_metas)
                 .with_subqueries(subqueries.cloned());
         build_profiled_materialized_pipeline(
             plan,
@@ -1368,212 +1337,6 @@ fn remove_redundant_pushed_filter(plan: LogicalPlan, table_name: &str) -> Logica
             LogicalPlan::Window(window)
         }
         other => other,
-    }
-}
-
-fn detect_count_star(stmt: &Statement, table_names: &[String]) -> bool {
-    let (select_list, group_by, having) = match stmt {
-        Statement::Select {
-            select_list,
-            group_by,
-            having,
-            ..
-        } => (select_list, group_by, having),
-        _ => return false,
-    };
-
-    if having.is_some() || !group_by.is_empty() || table_names.len() != 1 || select_list.len() != 1
-    {
-        return false;
-    }
-
-    match &select_list[0] {
-        SelectItem::Expr(
-            Expr::Function {
-                name,
-                args,
-                distinct: false,
-            },
-            _,
-        ) => {
-            name.eq_ignore_ascii_case("count")
-                && args.len() == 1
-                && matches!(&args[0], Expr::Column(col) if col == "*")
-        }
-        _ => false,
-    }
-}
-
-/// Equality on the leading cluster column (e.g. `WHERE symbol = ?` on
-/// `CLUSTER BY (symbol, ...)`) turns the scan into a sorted-key binary
-/// search on the streaming pipeline. The metadata aggregate path would
-/// instead fold every zone-map-surviving row group, so keep such queries
-/// unrouted.
-fn where_pins_leading_cluster_column(stmt: &Statement, cluster_key: &[String]) -> bool {
-    let Some(leading) = cluster_key.first() else {
-        return false;
-    };
-    let Statement::Select {
-        where_clause: Some(expr),
-        ..
-    } = stmt
-    else {
-        return false;
-    };
-    expr_pins_column_eq(expr, leading)
-}
-
-fn expr_pins_column_eq(expr: &crate::sql::parser::ast::Expr, column: &str) -> bool {
-    use crate::sql::parser::ast::{BinOp, Expr};
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => expr_pins_column_eq(left, column) || expr_pins_column_eq(right, column),
-        Expr::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-        } => {
-            bare_column_name(left).is_some_and(|name| name.eq_ignore_ascii_case(column))
-                || bare_column_name(right).is_some_and(|name| name.eq_ignore_ascii_case(column))
-        }
-        _ => false,
-    }
-}
-
-fn bare_column_name(expr: &crate::sql::parser::ast::Expr) -> Option<&str> {
-    use crate::sql::parser::ast::Expr;
-    match expr {
-        Expr::Column(name) => Some(name),
-        Expr::QualifiedColumn { column, .. } => Some(column),
-        _ => None,
-    }
-}
-
-/// Detect a "simple" aggregate query answerable from row-group metadata:
-/// single table, no GROUP BY/HAVING, and every select item is a non-distinct
-/// `COUNT(*)` / `COUNT(col)` / `MIN(col)` / `MAX(col)` / `SUM(col)` / `AVG(col)`.
-fn detect_simple_metadata_aggregate(stmt: &Statement, table_names: &[String]) -> bool {
-    let (select_list, group_by, having) = match stmt {
-        Statement::Select {
-            select_list,
-            group_by,
-            having,
-            ..
-        } => (select_list, group_by, having),
-        _ => return false,
-    };
-    if !group_by.is_empty() || having.is_some() || table_names.len() != 1 {
-        return false;
-    }
-    if select_list.is_empty() {
-        return false;
-    }
-    select_list.iter().all(|item| match item {
-        SelectItem::Expr(
-            Expr::Function {
-                name,
-                args,
-                distinct: false,
-            },
-            _,
-        ) => {
-            let ok_func = name.eq_ignore_ascii_case("count")
-                || name.eq_ignore_ascii_case("min")
-                || name.eq_ignore_ascii_case("max")
-                || name.eq_ignore_ascii_case("sum")
-                || name.eq_ignore_ascii_case("avg");
-            ok_func
-                && args.len() == 1
-                && match &args[0] {
-                    Expr::Column(col) if col == "*" => name.eq_ignore_ascii_case("count"),
-                    Expr::Column(_) => true,
-                    _ => false,
-                }
-        }
-        _ => false,
-    })
-}
-
-/// Pull the aggregate expressions out of the plan root (must be an
-/// `Aggregate` with no GROUP BY). Returns None on any shape mismatch so the
-/// caller falls back to the normal path.
-fn extract_simple_metadata_aggregates(
-    plan: &LogicalPlan,
-    schema: &crate::types::batch::Schema,
-) -> Option<Vec<crate::sql::planner::AggregateExpr>> {
-    // The optimizer may wrap the aggregate in a projection; unwrap one level.
-    let plan = match plan {
-        LogicalPlan::Project(plan) => plan.input.as_ref(),
-        other => other,
-    };
-    match plan {
-        LogicalPlan::Aggregate(agg) if agg.group_by.is_empty() && !agg.distinct => {
-            // Restrict to COUNT/MIN/MAX/SUM/AVG to match
-            // detect_simple_metadata_aggregate. SUM additionally requires a
-            // numeric argument column: the metadata path answers it with the
-            // argument's integer/float representation, and a routed query
-            // never reaches the aggregate pipeline, so unanswerable shapes
-            // must stay unrouted. AVG also needs a numeric argument (the
-            // answer is always sum/count as Float64, so Decimal is fine —
-            // the fold sums the raw i64 view like the regular pipeline's
-            // col_sum_i64 does).
-            let all_supported = agg.aggregates.iter().all(|a| {
-                if a.distinct {
-                    return false;
-                }
-                match a.func {
-                    crate::sql::planner::AggFunc::Count
-                    | crate::sql::planner::AggFunc::Min
-                    | crate::sql::planner::AggFunc::Max => true,
-                    crate::sql::planner::AggFunc::Sum => match &*a.arg {
-                        crate::sql::planner::LogicalExpr::Column(idx) => schema
-                            .columns
-                            .get(*idx)
-                            .map(|c| {
-                                matches!(
-                                    c.data_type,
-                                    crate::protocol::types::DataType::Int64
-                                        | crate::protocol::types::DataType::Int32
-                                        | crate::protocol::types::DataType::Int16
-                                        | crate::protocol::types::DataType::Int8
-                                        | crate::protocol::types::DataType::Float64
-                                        | crate::protocol::types::DataType::Float32
-                                )
-                            })
-                            .unwrap_or(false),
-                        _ => false,
-                    },
-                    crate::sql::planner::AggFunc::Avg => match &*a.arg {
-                        crate::sql::planner::LogicalExpr::Column(idx) => schema
-                            .columns
-                            .get(*idx)
-                            .map(|c| {
-                                matches!(
-                                    c.data_type,
-                                    crate::protocol::types::DataType::Int64
-                                        | crate::protocol::types::DataType::Int32
-                                        | crate::protocol::types::DataType::Int16
-                                        | crate::protocol::types::DataType::Int8
-                                        | crate::protocol::types::DataType::Float64
-                                        | crate::protocol::types::DataType::Float32
-                                        | crate::protocol::types::DataType::Decimal
-                                )
-                            })
-                            .unwrap_or(false),
-                        _ => false,
-                    },
-                }
-            });
-            if all_supported {
-                Some(agg.aggregates.clone())
-            } else {
-                None
-            }
-        }
-        _ => None,
     }
 }
 

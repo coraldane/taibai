@@ -8,12 +8,11 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use super::cluster_prune;
-use super::count;
 use super::memtable;
 use super::partition;
 use super::row_filter;
 use super::runtime::ScanRuntime;
-use super::spec::ScanSpec;
+use super::spec::{MetadataFoldRequest, ScanSpec};
 
 pub struct ScanExecutor<'a> {
     /// Owned clone of the caller's spec: the hybrid partial-residency leg
@@ -88,9 +87,11 @@ impl<'a> ScanExecutor<'a> {
     }
 
     fn execute_unlocked(&mut self) -> Result<Vec<RecordBatch>> {
-        // Metadata fast paths (DISTINCT / simple aggregates) fold zone maps
+        // Metadata fast paths (DISTINCT / folded aggregates) fold zone maps
         // and footers directly and never apply the read-time TTL filter, so
-        // a table with an active TTL must take the regular scan path.
+        // a table with an active TTL must take the regular scan path. The
+        // folding engine carries the same gate internally; this one stays
+        // for the DISTINCT path.
         let ttl_active = self.table_meta.ttl.is_some();
         if let Some(column) = self.spec.distinct_column.clone() {
             if !ttl_active {
@@ -100,163 +101,18 @@ impl<'a> ScanExecutor<'a> {
                 }
             }
         }
-        if let Some(aggs) = self.spec.simple_metadata_aggregates.clone() {
-            if !ttl_active {
-                return self.execute_simple_metadata_aggregate(&aggs);
-            }
-        }
-        if self.spec.is_count_star {
-            return self.execute_count_star();
+        if let Some(fold) = self.spec.metadata_fold.clone() {
+            return self.execute_folded_aggregate(&fold);
         }
         self.execute_scan()
     }
 
-    /// Wrap a row count as the single-batch COUNT(*) reply.
-    fn count_star_batches(count: u64) -> Result<Vec<RecordBatch>> {
-        let result = count::build_count_star_result(count);
-        Ok(match result {
-            crate::sql::execution::engine::ExecResult::Query { batches, .. } => batches,
-            _ => Vec::new(),
-        })
-    }
-
-    /// Rows visible in live memtables, preferring the hot-mirror-aware count
-    /// (`None` means the hot store cannot prove coverage for this shape, so
-    /// the plain memtable count answers).
-    fn live_memtable_rows(&self) -> u64 {
-        memtable::count_hot_memtable_rows(
-            self.runtime.memtable_manager(),
-            self.runtime.hot_store_manager(),
-            self.db,
-            &self.spec.table_name,
-            &self.spec,
-        )
-        .unwrap_or_else(|| {
-            memtable::count_memtable_rows(
-                self.runtime.memtable_manager(),
-                self.db,
-                &self.spec.table_name,
-                &self.spec,
-            )
-        })
-    }
-
-    /// COUNT(*) resolves through a chain of increasingly general strategies;
-    /// the first that applies answers. Each is guarded by its own
-    /// eligibility, so a later strategy never runs when an earlier one
-    /// engaged.
-    fn execute_count_star(&mut self) -> Result<Vec<RecordBatch>> {
-        // 1. Hybrid partial residency: the hot mirror covers rows above its
-        //    coverage bound; the complementary range is counted through
-        //    segments and memtables.
-        if let Some((mirror_count, pk_idx, covers)) = memtable::hybrid_hot_mirror_count(
-            self.runtime.hot_store_manager(),
-            self.runtime.memtable_manager(),
-            self.db,
-            &self.table_meta,
-            &self.spec,
-        ) {
-            return self.execute_hybrid_count_star(mirror_count, pk_idx, covers);
-        }
-
-        // 2. Fully resident: the hot store answers alone.
-        if let Some(count) = self.try_resident_hot_count()? {
-            return Self::count_star_batches(count);
-        }
-
-        // 3. Active TTL: visibility is row-dependent, so COUNT(*) must scan
-        //    (only) the TTL column and count the rows that survive it.
-        if self.table_meta.ttl.is_some() {
-            let mut ttl_spec = self.spec.clone();
-            ttl_spec.is_count_star = false;
-            ttl_spec.projection = self
-                .table_meta
-                .get_ttl_column_index_cached()
-                .map(|idx| vec![idx]);
-            let mut executor = ScanExecutor::from_runtime(
-                &ttl_spec,
-                self.runtime.clone(),
-                self.table_schema.clone(),
-                self.table_meta.clone(),
-                self.db,
-            );
-            let count = executor
-                .execute_scan()?
-                .iter()
-                .map(|batch| batch.num_rows() as u64)
-                .sum();
-            return Self::count_star_batches(count);
-        }
-
-        // 4. No segment directory yet: only live memtable rows exist.
-        let table_dir = self
-            .runtime
-            .data_dir()
-            .join(self.db)
-            .join(&self.spec.table_name);
-        if !table_dir.exists() {
-            return Self::count_star_batches(self.live_memtable_rows());
-        }
-
-        // 5. General: segments plus live memtables.
-        let count = count::count_star(
-            &self.spec,
-            &self.table_meta,
-            &table_dir,
-            self.runtime.segment_mgr(),
-            self.runtime.memtable_manager(),
-            self.db,
-            self.stats.as_deref_mut(),
-        )?;
-        Self::count_star_batches(count)
-    }
-
-    /// Hybrid partial-residency count: the mirror answered the rows above the
-    /// coverage bound (`mirror_count`); count the complementary
-    /// `partition_column <= covers` range through the regular segment and
-    /// memtable paths. The added range clause keeps zone-map pruning effective
-    /// (date-pure row groups above the bound prune to nothing).
-    fn execute_hybrid_count_star(
-        &mut self,
-        mirror_count: u64,
-        pk_idx: usize,
-        covers: crate::types::scalar::ScalarValue,
-    ) -> Result<Vec<RecordBatch>> {
-        self.spec
-            .range_predicates
-            .push(crate::storage::partition::pruning::RangeClause {
-                column_index: pk_idx,
-                op: crate::storage::partition::pruning::RangeOp::Le,
-                value: covers,
-            });
-        let table_dir = self
-            .runtime
-            .data_dir()
-            .join(self.db)
-            .join(&self.spec.table_name);
-        let count = if !table_dir.exists() {
-            self.live_memtable_rows()
-        } else {
-            count::count_star(
-                &self.spec,
-                &self.table_meta,
-                &table_dir,
-                self.runtime.segment_mgr(),
-                self.runtime.memtable_manager(),
-                self.db,
-                self.stats.as_deref_mut(),
-            )?
-        };
-        let total = mirror_count.saturating_add(count);
-        Self::count_star_batches(total)
-    }
-
-    /// Metadata-driven fast path for simple aggregate queries (no GROUP BY,
-    /// select list is only COUNT/MIN/MAX). Answers from row-group zone maps /
-    /// footers without streaming the data.
+    /// Metadata-folded aggregate fast path: answer the fold request from
+    /// row-group zone maps / footers (per fold unit, per group) without
+    /// streaming row data. COUNT(*) is the degenerate no-GROUP-BY request.
     /// Single-column DISTINCT answered from row-group zone maps. Returns
     /// `None` when the fast path declines (caller falls back to the normal
-    /// scan + DistinctExec pipeline).
+    /// scan + aggregate pipeline).
     fn execute_distinct_metadata(&mut self, column: &str) -> Result<Option<RecordBatch>> {
         let table_dir = self
             .runtime
@@ -276,9 +132,9 @@ impl<'a> ScanExecutor<'a> {
         )
     }
 
-    fn execute_simple_metadata_aggregate(
+    fn execute_folded_aggregate(
         &mut self,
-        aggs: &[crate::sql::planner::AggregateExpr],
+        fold: &MetadataFoldRequest,
     ) -> Result<Vec<RecordBatch>> {
         let table_dir = self
             .runtime
@@ -288,8 +144,8 @@ impl<'a> ScanExecutor<'a> {
         let batch = if table_dir.exists() {
             super::aggregate_meta::compute_folded_aggregate(
                 &self.spec,
-                &[],
-                aggs,
+                &fold.group_by,
+                &fold.aggregates,
                 &self.table_meta,
                 &self.table_schema,
                 &table_dir,
@@ -302,8 +158,8 @@ impl<'a> ScanExecutor<'a> {
             // No persisted segments; only memtable/hot store rows.
             super::aggregate_meta::compute_folded_aggregate(
                 &self.spec,
-                &[],
-                aggs,
+                &fold.group_by,
+                &fold.aggregates,
                 &self.table_meta,
                 &self.table_schema,
                 std::path::Path::new(""),
@@ -861,16 +717,6 @@ impl<'a> ScanExecutor<'a> {
             }
         }
         Ok(output)
-    }
-
-    fn try_resident_hot_count(&self) -> Result<Option<u64>> {
-        Ok(memtable::count_resident_hot_store(
-            self.runtime.hot_store_manager(),
-            self.runtime.memtable_manager(),
-            self.db,
-            &self.table_meta,
-            &self.spec,
-        ))
     }
 
     fn ordered_cluster_segments_are_monotonic(&self, segments: &[PathBuf], col_idx: usize) -> bool {

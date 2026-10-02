@@ -95,7 +95,7 @@ pub fn exec_explain(
     let query_shape = plan_shape(&plan);
     let fingerprint = stable_fingerprint(&query_shape);
     let physical_ctx =
-        PhysicalContext::new(engine, &table_refs, &table_schemas, &table_metas, false);
+        PhysicalContext::new(engine, &table_refs, &table_schemas, &table_metas);
     let plan = prepare_physical_plan(plan, &physical_ctx);
 
     let mut out = String::new();

@@ -16,7 +16,6 @@ pub struct ScanSpec {
 
     pub projection: Option<Vec<usize>>,
 
-    pub is_count_star: bool,
     pub has_aggregate: bool,
     pub has_order_by: bool,
     pub has_group_by: bool,
@@ -50,11 +49,11 @@ pub struct ScanSpec {
     /// above the bound (`TableMeta::hot_mirror_covers_from`).
     pub hot_mirror_bound: Option<(usize, ScalarValue)>,
 
-    /// Simple metadata-only aggregate fast path (COUNT/MIN/MAX/SUM/AVG, no
-    /// GROUP BY).
-    /// When set, the scan executor answers the query from row-group zone maps
-    /// / footers instead of streaming the data.
-    pub simple_metadata_aggregates: Option<Vec<AggregateExpr>>,
+    /// Metadata-folded aggregate fast path: the scan executor answers the
+    /// aggregate from row-group zone maps / footers (per fold unit, per
+    /// group) instead of streaming the data. Set from the query plan via
+    /// [`extract_metadata_fold`].
+    pub metadata_fold: Option<MetadataFoldRequest>,
 
     /// DISTINCT fast path target column (name in the table schema). Set only
     /// for single-column, predicate-free `SELECT DISTINCT` scans.
@@ -75,6 +74,79 @@ pub struct ScanSpec {
 pub struct InPredicate {
     pub column_index: usize,
     pub values: Vec<ScalarValue>,
+}
+
+/// A foldable `Aggregate(single Scan)` request: bare-column GROUP BY keys
+/// and non-DISTINCT COUNT/SUM/MIN/MAX/AVG over bare columns / wildcard, with
+/// no HAVING. The folding engine (`scan::aggregate_meta`) answers it from
+/// segment metadata, declining at runtime to the regular pipeline.
+#[derive(Debug, Clone)]
+pub struct MetadataFoldRequest {
+    pub group_by: Vec<LogicalExpr>,
+    pub aggregates: Vec<AggregateExpr>,
+}
+
+/// Extract the fold request for `table_name` from a query plan. The plan
+/// must be `Project?(Aggregate(Scan of table_name))` where the projection is
+/// positional identity over the aggregate output (`Column(i)` at position
+/// `i`) — the executor returns the aggregate rows directly, so any reorder,
+/// computed column or wrapper above declines here and keeps the pipeline.
+/// WHERE clauses the optimizer pushed into `ScanPlan::pushed_filter` are
+/// covered (they land in the compiled spec); residual `Filter` nodes carry
+/// predicates the spec never sees, so those decline too.
+pub fn extract_metadata_fold(
+    plan: &LogicalPlan,
+    table_name: &str,
+) -> Option<MetadataFoldRequest> {
+    let inner = match plan {
+        LogicalPlan::Project(project) => &*project.input,
+        other => other,
+    };
+    let LogicalPlan::Aggregate(agg) = inner else {
+        return None;
+    };
+    if agg.having.is_some() || agg.distinct {
+        return None;
+    }
+    if agg.group_by
+        .iter()
+        .any(|expr| !matches!(expr, LogicalExpr::Column(_)))
+    {
+        return None;
+    }
+    for aggregate in &agg.aggregates {
+        if aggregate.distinct {
+            return None;
+        }
+        match &*aggregate.arg {
+            LogicalExpr::Column(_) | LogicalExpr::Wildcard => {}
+            _ => return None,
+        }
+    }
+    let LogicalPlan::Scan(scan) = &*agg.input else {
+        return None;
+    };
+    if !scan.table_name.eq_ignore_ascii_case(table_name) {
+        return None;
+    }
+    // The identity-projection guard: when a Project sits above the
+    // Aggregate, its expressions must map the aggregate output
+    // position-for-position, otherwise the rows this path returns would have
+    // the wrong column order (or drop computed select items).
+    if let LogicalPlan::Project(project) = plan {
+        let identity = project
+            .expressions
+            .iter()
+            .enumerate()
+            .all(|(position, expr)| matches!(expr, LogicalExpr::Column(index) if *index == position));
+        if !identity {
+            return None;
+        }
+    }
+    Some(MetadataFoldRequest {
+        group_by: agg.group_by.clone(),
+        aggregates: agg.aggregates.clone(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +172,6 @@ impl ScanSpec {
             in_predicates: Vec::new(),
             remaining_predicate: None,
             projection: None,
-            is_count_star: false,
             has_aggregate: false,
             has_distinct_or_window: false,
             has_order_by: false,
@@ -116,7 +187,7 @@ impl ScanSpec {
             reader_txn_id: 0,
             ttl_active: false,
             hot_mirror_bound: None,
-            simple_metadata_aggregates: None,
+            metadata_fold: None,
             distinct_column: None,
             table_schema: Schema::empty(),
         }

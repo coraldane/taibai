@@ -733,13 +733,28 @@ pub fn compute_folded_aggregate(
             }
             if read_columns.is_empty() {
                 // No aggregate reads a column (pure COUNT(*)) and every
-                // clause is vacuous: the footer answers it. Grouped queries
-                // always carry key columns in the read set, so this is the
-                // no-GROUP-BY shape.
+                // clause is vacuous: the footer answers it — minus this row
+                // group's deleted rows, which the delete bitmap owns even
+                // though nothing needs decoding. (This shape used to be
+                // served by the dedicated COUNT(*) chain, which subtracted
+                // deleted rows up front; unified routing made the subtraction
+                // this branch's job.) Grouped queries always carry key
+                // columns in the read set, so this is the no-GROUP-BY shape.
+                let live_rows = if reader.delete_bitmap().is_empty() {
+                    row_group_meta.row_count
+                } else {
+                    row_group_meta.row_count.saturating_sub(
+                        delete_bitmap::row_range_deleted_count(
+                            reader.delete_bitmap(),
+                            row_start,
+                            row_group_meta.row_count,
+                        ),
+                    )
+                };
                 meta_folds.push((
                     Vec::new(),
                     &row_group_meta.zone_maps,
-                    row_group_meta.row_count,
+                    live_rows,
                     &row_group_meta.col_sums,
                 ));
                 row_start += row_group_meta.row_count;

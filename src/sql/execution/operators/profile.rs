@@ -76,7 +76,7 @@ impl OperatorProfile {
         state.peak_memory_bytes = state.peak_memory_bytes.max(bytes as u64);
     }
 
-    fn observe_batch(&self, batch: &RecordBatch) {
+    pub(crate) fn observe_batch(&self, batch: &RecordBatch) {
         let mut state = self.state.lock().unwrap();
         state.actual_rows = state.actual_rows.saturating_add(batch.num_rows() as u64);
         state.output_batches = state.output_batches.saturating_add(1);

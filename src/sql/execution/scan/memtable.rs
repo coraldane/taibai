@@ -493,22 +493,6 @@ pub fn scan_hot_store_by_key(
     Some(projected)
 }
 
-pub fn count_hot_memtable_rows(
-    memtable_mgr: &MemTableManager,
-    hot_mgr: &HotStoreManager,
-    db: &str,
-    table_name: &str,
-    spec: &ScanSpec,
-) -> Option<u64> {
-    let store = hot_mgr.get(db, table_name)?;
-    hot_count_key_partition_values(&store, spec)?;
-    let (has_live_memtable_data, watermark) =
-        live_memtables_and_watermark(memtable_mgr, db, table_name, spec.reader_txn_id, &store);
-    if !has_live_memtable_data {
-        return None;
-    }
-    count_hot_store_by_key(&store, spec, watermark)
-}
 
 pub fn count_hot_store_by_key(store: &HotStore, spec: &ScanSpec, watermark: u64) -> Option<u64> {
     let (key_value, partition_value) = hot_count_key_partition_values(store, spec)?;
@@ -546,109 +530,6 @@ fn hot_count_key_partition_values<'a>(
     Some((key_value, partition_value))
 }
 
-pub fn count_memtable_rows(
-    memtable_mgr: &MemTableManager,
-    db: &str,
-    table_name: &str,
-    spec: &ScanSpec,
-) -> u64 {
-    let memtables = memtable_mgr
-        .get_readable_by_table(db, table_name)
-        .into_iter()
-        .filter(|mt| mt.is_visible_to(spec.reader_txn_id))
-        .collect::<Vec<_>>();
-    let mut total: u64 = 0;
-
-    for mt in &memtables {
-        let txn_positions = if spec.reader_txn_id != 0 {
-            memtable_mgr
-                .txn_mutations()
-                .and_then(|registry| registry.memtable_positions(spec.reader_txn_id, mt.id()))
-        } else {
-            None
-        };
-        if let Some(count) = mt.read_with(|mt_batch| {
-            if mt_batch.num_rows() == 0 {
-                return 0;
-            }
-
-            // Counting is read-only: work through a reference. The old
-            // committed-read branch deep-cloned the whole batch (all
-            // columns of every memtable, every count query) only to then
-            // use it by reference.
-            let filtered_holder;
-            let mt_batch: &RecordBatch = match &txn_positions {
-                Some(positions) => {
-                    match crate::storage::core::txn_mutations::filter_batch_excluding_positions(
-                        mt_batch, positions,
-                    ) {
-                        Ok(filtered) => {
-                            filtered_holder = filtered;
-                            &filtered_holder
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "memtable overlay filter failed");
-                            return 0;
-                        }
-                    }
-                }
-                None => mt_batch,
-            };
-            // Same catalog alignment as the SELECT scan: predicate column
-            // indices are catalog-space, and columns the memtable predates
-            // carry their DEFAULT.
-            let aligned_holder;
-            let mt_batch: &RecordBatch =
-                if memtable_batch_needs_alignment(mt_batch, &spec.table_schema) {
-                    aligned_holder = match crate::storage::core::memtable::align_batch_to_schema(mt_batch, &spec.table_schema) {
-                        Ok(batch) => batch,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "memtable catalog alignment failed");
-                            return 0;
-                        }
-                    };
-                    &aligned_holder
-                } else {
-                    mt_batch
-                };
-
-            if spec.eq_predicates.len() == 1
-                && spec.range_predicates.is_empty()
-                && spec.in_predicates.is_empty()
-                && spec.remaining_predicate.is_none()
-            {
-                let (col_idx, value) = &spec.eq_predicates[0];
-                if let Some(col) = mt_batch.column(*col_idx) {
-                    let mask = col.eq_vec(value);
-                    mask.iter().filter(|&&m| m).count() as u64
-                } else {
-                    0
-                }
-            } else if spec.has_predicates() {
-                let filtered = match super::row_filter::apply_predicates(
-                    mt_batch,
-                    &spec.eq_predicates,
-                    &spec.range_predicates,
-                    &spec.in_predicates,
-                    spec.remaining_predicate.as_ref(),
-                ) {
-                    Ok(filtered) => filtered,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "memtable count predicate failed");
-                        return 0;
-                    }
-                };
-                filtered.num_rows() as u64
-            } else {
-                mt_batch.num_rows() as u64
-            }
-        }) {
-            total += count;
-        }
-    }
-
-    total
-}
 
 fn apply_projection(batch: &RecordBatch, projection: &[usize]) -> RecordBatch {
     let mut col_defs = Vec::with_capacity(projection.len());

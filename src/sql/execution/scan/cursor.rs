@@ -733,15 +733,17 @@ impl ScanCursor {
 }
 
 fn is_streamable(spec: &ScanSpec) -> bool {
-    // COUNT(*) keeps its dedicated metadata fast paths and ORDER BY keeps
-    // the executor's ordered-cluster early termination (the cursor's
-    // ordered path diverges on multi-column cluster orders); aggregates,
-    // GROUP BY and JOINs consume batches incrementally (the aggregate
-    // operators fold per batch, the join sides are budgeted), so feeding
-    // them from the streaming cursor removes the whole-input
-    // materialization without changing the batch sequence (both sides
-    // share the same ScanPlanner, hence the same limit pushdown).
-    !spec.is_count_star && !spec.has_order_by
+    // ORDER BY keeps the executor's ordered-cluster early termination (the
+    // cursor's ordered path diverges on multi-column cluster orders);
+    // aggregates (metadata-folded or not), GROUP BY and JOINs consume
+    // batches incrementally (the aggregate operators fold per batch, the
+    // join sides are budgeted), so feeding them from the streaming cursor
+    // removes the whole-input materialization without changing the batch
+    // sequence (both sides share the same ScanPlanner, hence the same limit
+    // pushdown). COUNT(*) no longer needs an exception: its metadata folding
+    // now happens in the Aggregate branch's FoldedAggregateExec, above the
+    // scan, not inside the cursor.
+    !spec.has_order_by
 }
 
 impl Drop for ScanCursor {

@@ -220,9 +220,6 @@ fn build_operator_with_limit(
                 if let Some(limit) = limit_hint {
                     spec.limit = Some(spec.limit.map_or(limit, |current| current.min(limit)));
                 }
-                if ctx.is_count_star {
-                    spec.is_count_star = true;
-                }
                 Ok(Box::new(ScanExec::deferred(
                     spec,
                     ctx.scan_runtime.clone(),

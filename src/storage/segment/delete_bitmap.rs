@@ -7,6 +7,19 @@ pub fn is_deleted(bitmap: &[u8], row_id: u64) -> bool {
     bitmap.get(byte).is_some_and(|b| (b & (1u8 << bit)) != 0)
 }
 
+/// Number of deleted rows in `[start_row, start_row + row_count)`. Bits past
+/// the end of the bitmap count as not deleted (matching [`is_deleted`]).
+pub fn row_range_deleted_count(bitmap: &[u8], start_row: u64, row_count: u64) -> u64 {
+    let end_row = start_row.saturating_add(row_count);
+    let mut count = 0u64;
+    for row in start_row..end_row {
+        if is_deleted(bitmap, row) {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Word-at-a-time variant of [`is_deleted`] over a row range: the DELETE and
 /// COUNT paths test every candidate row group against the bitmap, so the
 /// per-row division/modulo/branch cost showed up as O(total rows) on every
