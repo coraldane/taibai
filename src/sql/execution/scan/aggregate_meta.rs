@@ -164,20 +164,64 @@ pub fn compute_simple_aggregate(
         // it has not been written yet (first query after restart), the
         // cached reader's already-parsed footer answers the same question.
         let reader = segment_mgr.open_scan_reader(segment_path, spec.reader_txn_id)?;
-        // Everything below folds zone maps positionally with table-schema
-        // column indices. A segment written before an ALTER ADD/DROP COLUMN
-        // has a different column layout, and a mis-indexed zone map would
-        // silently skip the segment (COUNT/SUM under-count, MIN/MAX miss the
-        // pinned default) or read the wrong column after a DROP. Decline the
-        // fast path; the regular pipeline remaps columns by name.
-        if super::strategy::reader_schema_differs(reader.schema(), table_schema) {
+        // Schema drift is resolved per column, by name — not by whole-schema
+        // equality. A blanket decline made one ALTER (ADD/DROP/RENAME COLUMN)
+        // permanently degrade every SUM/COUNT/MIN/MAX metadata fold to a full
+        // scan until compaction rewrote the drifted segment. The fold below
+        // is already name-aligned (`align_column_map` and friends resolve by
+        // current + previous names), so:
+        //
+        // * RENAME COLUMN drift resolves through previous_names;
+        // * DROP COLUMN drift leaves extra footer columns the query never
+        //   mentions — name resolution ignores them;
+        // * a column the footer genuinely predates (ADD COLUMN afterwards)
+        //   carries its DEFAULT on every row of this segment. A constant
+        //   (or absent → NULL) default folds mathematically below;
+        //   DEFAULT CURRENT_TIMESTAMP is not constant across post-ALTER
+        //   writes, so such segments still decline the fast path.
+        //
+        // Predicates keep the strict rule: a clause on a column the footer
+        // predates would need default-filled evaluation, which this fast
+        // path does not implement. Decline; the regular pipeline evaluates
+        // the predicate on the materialized default batch.
+        let footer_schema = reader.schema();
+        if row_filter::any_predicate_column_absent(
+            table_schema,
+            footer_schema,
+            &spec.all_predicate_columns(),
+        ) {
             return Ok(None);
         }
-        // Everything below indexes footer-space metadata (zone maps, bloom
-        // filters, value sets, col_sums) with catalog column numbers. The
-        // gate above normally makes this a no-op; translating by name keeps
-        // the fold exact if the gate is ever relaxed for drifted segments.
-        let footer_schema = reader.schema();
+        let mut aggregate_cols: Vec<usize> = Vec::new();
+        for column in aggregate_columns.iter().flatten() {
+            if !aggregate_cols.contains(column) {
+                aggregate_cols.push(*column);
+            }
+        }
+        let mut defaults: std::collections::HashMap<usize, ScalarValue> =
+            std::collections::HashMap::new();
+        let mut footer_cols: Vec<usize> = Vec::with_capacity(aggregate_cols.len());
+        for &column in &aggregate_cols {
+            match footer_column_drift(table_schema, footer_schema, column) {
+                FooterColumnDrift::Present => footer_cols.push(column),
+                FooterColumnDrift::ConstantDefault(value) => {
+                    // SUM/AVG fold the default arithmetically; a literal the
+                    // accumulator cannot consume would be an invariant
+                    // violation, so decline instead of erroring mid-fold.
+                    if accumulators.iter().any(|accumulator| {
+                        matches!(accumulator.func, AggFunc::Sum | AggFunc::Avg)
+                            && accumulator.column == Some(column)
+                            && value.integer_i128().is_none()
+                            && value.numeric_f64().is_none()
+                    }) {
+                        return Ok(None);
+                    }
+                    defaults.insert(column, value);
+                }
+                FooterColumnDrift::NonConstantDefault => return Ok(None),
+            }
+        }
+        let column_map = row_filter::align_column_map(table_schema, footer_schema, &footer_cols)?;
         let aligned_checks = row_filter::align_prune_checks_to_footer(
             table_schema,
             footer_schema,
@@ -187,14 +231,6 @@ pub fn compute_simple_aggregate(
             &set_checks,
             &set_in_checks,
         )?;
-        let mut aggregate_cols: Vec<usize> = Vec::new();
-        for column in aggregate_columns.iter().flatten() {
-            if !aggregate_cols.contains(column) {
-                aggregate_cols.push(*column);
-            }
-        }
-        let column_map =
-            row_filter::align_column_map(table_schema, footer_schema, &aggregate_cols)?;
         let footer_sums = if let Some(first) = meta.as_ref().and_then(|m| m.row_groups.first()) {
             first.col_sums.len() == first.zone_maps.len()
         } else {
@@ -203,11 +239,18 @@ pub fn compute_simple_aggregate(
                 .first()
                 .is_some_and(|rg| rg.col_sums.len() == rg.zone_maps.len())
         };
-        let sums_answerable_from_footer = footer_sums
-            && accumulators
-                .iter()
-                .filter(|a| matches!(a.func, AggFunc::Sum | AggFunc::Avg))
-                .all(|a| crate::storage::segment::column_sum_supported(a.col_type));
+        // A SUM/AVG whose argument column this footer predates is answered
+        // by the constant DEFAULT (default × rows / row count) — no footer
+        // col_sums needed for it; resolved columns need the footer's
+        // per-row-group sums plus a sum-supported type.
+        let sums_answerable_from_footer = accumulators
+            .iter()
+            .filter(|a| matches!(a.func, AggFunc::Sum | AggFunc::Avg))
+            .all(|a| {
+                a.column.is_some_and(|column| defaults.contains_key(&column))
+                    || (footer_sums
+                        && crate::storage::segment::column_sum_supported(a.col_type))
+            });
         // SUM has no zone-map representation: either the per-segment
         // partial-sum cache answers (COUNT/MIN/MAX fold from the zone maps
         // and SUM from the cache — no column reads at all), or the segment
@@ -230,6 +273,7 @@ pub fn compute_simple_aggregate(
                     &accumulators,
                     &aggregate_columns,
                     &column_map,
+                    &defaults,
                     &m.segment_zone_maps,
                 )
             }) {
@@ -247,6 +291,7 @@ pub fn compute_simple_aggregate(
                 fold_metadata(
                     &mut accumulators,
                     &column_map,
+                    &defaults,
                     &m.segment_zone_maps,
                     m.row_count,
                     &[],
@@ -282,12 +327,14 @@ pub fn compute_simple_aggregate(
                 &accumulators,
                 &aggregate_columns,
                 &column_map,
+                &defaults,
                 reader.segment_zone_maps(),
             )
         {
             fold_metadata(
                 &mut accumulators,
                 &column_map,
+                &defaults,
                 reader.segment_zone_maps(),
                 reader.row_count(),
                 &[],
@@ -385,11 +432,20 @@ pub fn compute_simple_aggregate(
             }
             // The metadata-only fold cannot produce SUM or AVG — unless the
             // footer's per-row-group sums answer them (this row group's
-            // extension present; the argument types were checked above). A
-            // streaming_sum segment folds every function from data instead.
+            // extension present; the argument types were checked above) or
+            // the argument column carries a constant DEFAULT this segment
+            // predates (folded arithmetically). A streaming_sum segment
+            // folds every function from data instead.
             let rg_sums_available = sums_answerable_from_footer
-                && !row_group_meta.zone_maps.is_empty()
-                && row_group_meta.col_sums.len() == row_group_meta.zone_maps.len();
+                && accumulators
+                    .iter()
+                    .filter(|a| matches!(a.func, AggFunc::Sum | AggFunc::Avg))
+                    .all(|a| {
+                        a.column.is_some_and(|column| defaults.contains_key(&column))
+                            || (!row_group_meta.zone_maps.is_empty()
+                                && row_group_meta.col_sums.len()
+                                    == row_group_meta.zone_maps.len())
+                    });
             if predicate_match == crate::storage::partition::pruning::PredicateMatch::All
                 && reader.delete_bitmap().is_empty()
                 && !streaming_sum
@@ -397,6 +453,7 @@ pub fn compute_simple_aggregate(
                     &accumulators,
                     &aggregate_columns,
                     &column_map,
+                    &defaults,
                     &row_group_meta.zone_maps,
                 )
                 && (!has_sum && !has_avg || rg_sums_available)
@@ -522,6 +579,7 @@ pub fn compute_simple_aggregate(
             fold_metadata(
                 &mut accumulators,
                 &column_map,
+                &defaults,
                 zone_maps,
                 row_count,
                 col_sums,
@@ -557,14 +615,14 @@ pub fn compute_simple_aggregate(
                     // onto this segment's footer layout for the physical
                     // read. The batch keeps the request order, so the
                     // positional mapping in `fold.positions` still holds.
-                    let aligned_read_columns = row_filter::align_indices_to_footer(
+                    // Columns the footer predates splice in as their
+                    // constant DEFAULT instead of decoding.
+                    let mut batch = read_data_fold_batch(
+                        &reader,
                         table_schema,
-                        reader.schema(),
-                        &fold.read_columns,
-                    )?;
-                    let mut batch = reader.read_row_group_with_projection(
                         fold.row_group_index,
-                        &aligned_read_columns,
+                        &fold.read_columns,
+                        &defaults,
                     )?;
                     if !delete_bitmap_is_empty {
                         batch = delete_bitmap::filter_batch(
@@ -712,14 +770,141 @@ fn aggregate_source_columns(spec: &ScanSpec, aggregate_columns: &[Option<usize>]
 fn fold_metadata(
     accumulators: &mut [AggAccum],
     column_map: &std::collections::HashMap<usize, usize>,
+    defaults: &std::collections::HashMap<usize, ScalarValue>,
     zone_maps: &[crate::storage::partition::pruning::ZoneMap],
     row_count: u64,
     col_sums: &[i64],
 ) -> Result<()> {
     for accumulator in accumulators {
-        accumulator.fold_metadata(zone_maps, row_count, col_sums, column_map)?;
+        let default = accumulator.column.and_then(|column| defaults.get(&column));
+        accumulator.fold_metadata(default, zone_maps, row_count, col_sums, column_map)?;
     }
     Ok(())
+}
+
+/// How one catalog-space aggregate argument column relates to a segment
+/// footer schema, resolved by name (current name, then previous names).
+#[derive(Debug, PartialEq)]
+enum FooterColumnDrift {
+    /// The footer carries the column (possibly under a previous name, or
+    /// with extra columns the query never mentions after DROP COLUMN).
+    Present,
+    /// The footer predates the column: every row of this segment logically
+    /// carries this constant DEFAULT (an absent default is a constant NULL).
+    ConstantDefault(ScalarValue),
+    /// The footer predates the column and its DEFAULT is not a compile-time
+    /// constant (CURRENT_TIMESTAMP) — the metadata fold cannot answer it.
+    NonConstantDefault,
+}
+
+/// Classify one column of `table_schema` against `footer_schema`. Reuses the
+/// catalog's `previous_names` exactly like the count fast paths and the
+/// regular pipeline's name-based remapping (`align_indices_against_schema`).
+fn footer_column_drift(
+    table_schema: &Schema,
+    footer_schema: &Schema,
+    column: usize,
+) -> FooterColumnDrift {
+    let Some(col_def) = table_schema.columns.get(column) else {
+        // Out-of-range catalog index: let the regular alignment surface its
+        // own error instead of guessing here.
+        return FooterColumnDrift::Present;
+    };
+    let mut names = Vec::with_capacity(col_def.previous_names.len() + 1);
+    names.push(col_def.name.clone());
+    names.extend(col_def.previous_names.iter().cloned());
+    if names.iter().any(|name| footer_schema.index_of(name).is_some()) {
+        return FooterColumnDrift::Present;
+    }
+    match &col_def.default_value {
+        Some(crate::types::batch::ColumnDefaultValue::Literal(value)) => {
+            FooterColumnDrift::ConstantDefault(value.clone())
+        }
+        Some(crate::types::batch::ColumnDefaultValue::CurrentTimestamp) => {
+            FooterColumnDrift::NonConstantDefault
+        }
+        None => FooterColumnDrift::ConstantDefault(ScalarValue::null_for_type(
+            col_def.data_type,
+        )),
+    }
+}
+
+/// The data-fold batch for one row group, in `read_columns` (catalog) order:
+/// footer-resolvable columns decode from the row group, columns the footer
+/// predates splice in as their constant DEFAULT — the same value
+/// `read_row_group_columns_aligned` materializes on the regular path, so the
+/// two paths can never disagree. Synthesis happens before the delete/mask
+/// filters so the default column follows the surviving row count.
+fn read_data_fold_batch(
+    reader: &SegmentReader,
+    table_schema: &Schema,
+    row_group_index: usize,
+    read_columns: &[usize],
+    defaults: &std::collections::HashMap<usize, ScalarValue>,
+) -> Result<RecordBatch> {
+    let mut present: Vec<usize> = Vec::with_capacity(read_columns.len());
+    for &column in read_columns {
+        if !defaults.contains_key(&column) {
+            present.push(column);
+        }
+    }
+    let projected = if present.is_empty() {
+        None
+    } else {
+        let aligned_read_columns =
+            row_filter::align_indices_to_footer(table_schema, reader.schema(), &present)?;
+        Some(reader.read_row_group_with_projection(
+            row_group_index,
+            &aligned_read_columns,
+        )?)
+    };
+    let rows = projected
+        .as_ref()
+        .map(|batch| batch.num_rows())
+        .unwrap_or_else(|| reader.row_group_rows(row_group_index) as usize);
+    let mut present_columns = projected
+        .map(|batch| batch.columns)
+        .unwrap_or_else(Vec::new);
+    let mut present_iter = present_columns.drain(..);
+    let mut columns = Vec::with_capacity(read_columns.len());
+    let mut col_defs = Vec::with_capacity(read_columns.len());
+    for &column in read_columns {
+        let col_def = table_schema
+            .columns
+            .get(column)
+            .ok_or_else(|| {
+                TaibaiError::Internal(format!(
+                    "aggregate column index {column} out of range"
+                ))
+            })?
+            .clone();
+        if let Some(default) = defaults.get(&column) {
+            columns.push(constant_scalar_column(col_def.data_type, default, rows)?);
+        } else {
+            columns.push(present_iter.next().ok_or_else(|| {
+                TaibaiError::Internal(format!(
+                    "data-fold column {column} missing from projected read"
+                ))
+            })?);
+        }
+        col_defs.push(col_def);
+    }
+    RecordBatch::try_new(Schema::new(col_defs), columns)
+        .map_err(|e| TaibaiError::Internal(e.to_string()))
+}
+
+/// A full-length column whose every row holds the same scalar (the constant
+/// DEFAULT of a column this segment predates).
+fn constant_scalar_column(
+    data_type: DataType,
+    value: &ScalarValue,
+    row_count: usize,
+) -> Result<crate::types::array::ColumnArray> {
+    let mut column = crate::types::array::ColumnArray::empty(data_type);
+    for _ in 0..row_count {
+        column.push(value)?;
+    }
+    Ok(column)
 }
 
 /// Whether every aggregate can fold from these zone maps: each argument
@@ -729,20 +914,26 @@ fn fold_metadata(
 /// from a genuinely all-null row group — folding those from metadata would
 /// miscount NULLs for COUNT(col) and return NULL for MIN/MAX (the same
 /// defect once fixed for SUM/AVG). Such segments must fold from data.
-/// COUNT(*) has no argument column and is always foldable.
+/// Columns carrying a constant DEFAULT (the footer predates them) fold
+/// arithmetically and are always answerable. COUNT(*) has no argument
+/// column and is always foldable.
 fn aggregates_foldable_from_metadata(
     accumulators: &[AggAccum],
     aggregate_columns: &[Option<usize>],
     column_map: &std::collections::HashMap<usize, usize>,
+    defaults: &std::collections::HashMap<usize, ScalarValue>,
     zone_maps: &[crate::storage::partition::pruning::ZoneMap],
 ) -> bool {
     accumulators
         .iter()
         .zip(aggregate_columns)
         .all(|(_, column)| match column {
-            Some(col) => zone_maps
-                .get(row_filter::mapped_column(column_map, *col))
-                .is_some_and(ZoneMap::is_computed),
+            Some(col) => {
+                defaults.contains_key(col)
+                    || zone_maps
+                        .get(row_filter::mapped_column(column_map, *col))
+                        .is_some_and(ZoneMap::is_computed)
+            }
             None => true,
         })
 }
@@ -824,6 +1015,11 @@ fn plan_vacuous_run_fold(
         return None;
     }
     let has_count_star = accumulators.iter().any(|a| a.column.is_none());
+    // A column the footer predates (folded via its constant DEFAULT) has no
+    // runs and no zone map. Resolve by name before the zone-map lookup so
+    // the identity fallback of `mapped_column` can never index an unrelated
+    // footer slot.
+    reader.schema().index_of(&table_schema.columns.get(column)?.name)?;
     let footer_column = row_filter::mapped_column(column_map, column);
     if has_count_star && zone_maps.get(footer_column)?.null_count != 0 {
         return None;
@@ -994,6 +1190,7 @@ impl AggAccum {
 
     fn fold_metadata(
         &mut self,
+        default: Option<&ScalarValue>,
         zone_maps: &[crate::storage::partition::pruning::ZoneMap],
         row_count: u64,
         col_sums: &[i64],
@@ -1005,6 +1202,12 @@ impl AggAccum {
             }
             return Ok(());
         };
+        // A column this segment's footer predates carries one constant
+        // DEFAULT on every row: fold it arithmetically instead of indexing
+        // the (absent) zone map / col_sum slot.
+        if let Some(default) = default {
+            return self.fold_constant_default(default, row_count);
+        }
         // zone_maps / col_sums are indexed by the segment's footer column
         // order: resolve the catalog argument column onto it by name.
         let footer_column = row_filter::mapped_column(column_map, column);
@@ -1037,6 +1240,57 @@ impl AggAccum {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Fold `row_count` rows that all carry one constant DEFAULT (a column
+    /// this segment's footer predates, e.g. SUM(new_col) over pre-ALTER
+    /// rows). Semantics mirror the zone-map fold exactly:
+    ///
+    /// * callers only reach here for delete-free row groups, so `row_count`
+    ///   is the live row count (deleted rows never contribute);
+    /// * a NULL default is an all-NULL column: it contributes nothing —
+    ///   COUNT(col) adds no row, SUM/MIN/MAX stay unmaterialized (the same
+    ///   "footer sum 0 must not materialize a zero" rule as `has_values`);
+    /// * SUM/AVG accumulate default × rows through the shared overflow
+    ///   checked accumulation point (`add_i64`), reporting "SUM overflow"
+    ///   instead of wrapping.
+    fn fold_constant_default(&mut self, default: &ScalarValue, row_count: u64) -> Result<()> {
+        if row_count == 0 || default.is_null() {
+            return Ok(());
+        }
+        match self.func {
+            AggFunc::Count => self.count += row_count,
+            AggFunc::Min => self.merge_min(default.clone()),
+            AggFunc::Max => self.merge_max(default.clone()),
+            AggFunc::Sum => match self.col_type {
+                DataType::Float32 | DataType::Float64 => {
+                    if let Some(value) = default.numeric_f64() {
+                        self.sum_f = Some(self.sum_f.unwrap_or(0.0) + value * row_count as f64);
+                    }
+                }
+                _ => {
+                    let value = default.integer_i128().ok_or_else(|| {
+                        TaibaiError::Internal(format!(
+                            "constant default {:?} not foldable as {} SUM",
+                            default, self.col_type
+                        ))
+                    })?;
+                    let product = value
+                        .checked_mul(i128::from(row_count))
+                        .and_then(|product| i64::try_from(product).ok())
+                        .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?;
+                    self.add_i64(product)?;
+                }
+            },
+            AggFunc::Avg => {
+                if let Some(value) = default.numeric_f64() {
+                    self.avg_sum_f =
+                        Some(self.avg_sum_f.unwrap_or(0.0) + value * row_count as f64);
+                    self.avg_count += row_count;
+                }
+            }
         }
         Ok(())
     }
@@ -1507,5 +1761,250 @@ mod tests {
             })
             .expect_err("cached-partial overflow must error");
         assert!(error.to_string().contains("SUM overflow"), "got: {error}");
+    }
+
+    /// The drift classifier: RENAME (previous_names) and DROP COLUMN (extra
+    /// footer columns) resolve as Present; a missing column folds its
+    /// constant DEFAULT (absent default = constant NULL); CURRENT_TIMESTAMP
+    /// is not constant and must decline.
+    #[test]
+    fn footer_column_drift_classifies_by_name() {
+        let mut renamed = ColumnDef::new("total", DataType::Int64);
+        renamed.previous_names.push("v".to_string());
+        let table = Schema::new(vec![
+            ColumnDef::new("id", DataType::Int64),
+            renamed,
+            ColumnDef::new("score", DataType::Int64).with_default_value(Some(
+                crate::types::batch::ColumnDefaultValue::Literal(ScalarValue::Int64(Some(7))),
+            )),
+            ColumnDef::new("note", DataType::Int64),
+            ColumnDef::new("created", DataType::Timestamp).with_default_value(Some(
+                crate::types::batch::ColumnDefaultValue::CurrentTimestamp,
+            )),
+        ]);
+        // Segment written before the RENAME and before every ADD: footer
+        // keeps the old names and none of the new columns. Extra footer
+        // columns (a later DROP COLUMN) would be ignored the same way.
+        let footer = Schema::new(vec![
+            ColumnDef::new("dropped_extra", DataType::Int64),
+            ColumnDef::new("id", DataType::Int64),
+            ColumnDef::new("v", DataType::Int64),
+        ]);
+
+        assert_eq!(
+            footer_column_drift(&table, &footer, 0),
+            FooterColumnDrift::Present
+        );
+        assert_eq!(
+            footer_column_drift(&table, &footer, 1),
+            FooterColumnDrift::Present,
+            "RENAME drift resolves through previous_names"
+        );
+        assert_eq!(
+            footer_column_drift(&table, &footer, 2),
+            FooterColumnDrift::ConstantDefault(ScalarValue::Int64(Some(7)))
+        );
+        assert_eq!(
+            footer_column_drift(&table, &footer, 3),
+            FooterColumnDrift::ConstantDefault(ScalarValue::Int64(None)),
+            "absent default folds as a constant NULL"
+        );
+        assert_eq!(
+            footer_column_drift(&table, &footer, 4),
+            FooterColumnDrift::NonConstantDefault
+        );
+    }
+
+    /// The constant-DEFAULT fold must mirror the zone-map fold semantics:
+    /// a NULL default (or zero rows) contributes nothing, a non-null
+    /// default contributes to every aggregate, and SUM reports overflow
+    /// instead of wrapping.
+    #[test]
+    fn fold_constant_default_matches_zone_map_semantics() {
+        let schema = sum_schema();
+        let seven = ScalarValue::Int64(Some(7));
+
+        let mut sum = AggAccum::new(AggFunc::Sum, Some(0), &schema);
+        sum.fold_constant_default(&seven, 50).unwrap();
+        assert_eq!(sum.finalize(), ScalarValue::Int64(Some(350)));
+
+        // NULL default: all-NULL column — SUM stays NULL, not 0.
+        let mut sum_null = AggAccum::new(AggFunc::Sum, Some(0), &schema);
+        sum_null
+            .fold_constant_default(&ScalarValue::Int64(None), 50)
+            .unwrap();
+        assert_eq!(sum_null.finalize(), ScalarValue::Int64(None));
+
+        // Zero rows contribute nothing (MIN stays NULL).
+        let mut min = AggAccum::new(AggFunc::Min, Some(0), &schema);
+        min.fold_constant_default(&seven, 0).unwrap();
+        assert_eq!(min.finalize(), ScalarValue::Int64(None));
+        let mut min = AggAccum::new(AggFunc::Min, Some(0), &schema);
+        min.fold_constant_default(&seven, 10).unwrap();
+        assert_eq!(min.finalize(), ScalarValue::Int64(Some(7)));
+
+        let mut max = AggAccum::new(AggFunc::Max, Some(0), &schema);
+        max.fold_constant_default(&seven, 10).unwrap();
+        assert_eq!(max.finalize(), ScalarValue::Int64(Some(7)));
+
+        let mut count = AggAccum::new(AggFunc::Count, Some(0), &schema);
+        count.fold_constant_default(&seven, 10).unwrap();
+        count
+            .fold_constant_default(&ScalarValue::Int64(None), 5)
+            .unwrap();
+        assert_eq!(count.finalize(), ScalarValue::Int64(Some(10)));
+
+        let mut avg = AggAccum::new(AggFunc::Avg, Some(0), &schema);
+        avg.fold_constant_default(&seven, 21).unwrap();
+        match avg.finalize() {
+            ScalarValue::Float64(Some(value)) => assert_eq!(value, 7.0),
+            other => panic!("expected 7.0, got {other:?}"),
+        }
+
+        let mut sum_overflow = AggAccum::new(AggFunc::Sum, Some(0), &schema);
+        sum_overflow
+            .fold_batch(&batch_of(&[i64::MAX - 1]), Some(0))
+            .unwrap();
+        let error = sum_overflow
+            .fold_constant_default(&seven, u64::MAX)
+            .expect_err("default x rows overflow must error");
+        assert!(error.to_string().contains("SUM overflow"), "got: {error}");
+    }
+
+    /// Engine-level: after ALTER ADD COLUMN with a constant default, the
+    /// pre-ALTER segment's footer drifts from the catalog. The metadata
+    /// fast path must NOT decline (the old whole-schema gate returned
+    /// None): SUM(new_col) folds default x rows, COUNT folds the row count,
+    /// and a RENAME-drifted SUM resolves by previous name and folds the
+    /// footer's per-row-group col_sums.
+    #[test]
+    fn compute_simple_aggregate_keeps_fast_path_across_add_and_rename_drift() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let engine = crate::sql::execution::engine::Engine::new(dir.path(), "main")
+            .expect("engine");
+        let mut session = crate::net::session::Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")
+            .expect("create");
+        let mut sql = String::from("INSERT INTO t (id, v) VALUES ");
+        for i in 0..50i64 {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("({}, {})", i + 1, i + 1));
+        }
+        engine.execute(&mut session, &sql).expect("insert");
+        engine.flush_table_buffers("main", "t").expect("flush");
+        engine
+            .execute(&mut session, "ALTER TABLE t ADD COLUMN score INT64 DEFAULT 7")
+            .expect("add column");
+        engine
+            .execute(&mut session, "ALTER TABLE t RENAME COLUMN v TO value")
+            .expect("rename");
+
+        let table_meta = engine.get_table_meta("main", "t").expect("table meta");
+        let table_schema = Schema::new(table_meta.columns.clone());
+        let mut spec = ScanSpec::new("t");
+        spec.table_schema = table_schema.clone();
+        let score_idx = table_schema.index_of("score").expect("score column");
+        let value_idx = table_schema.index_of("value").expect("value column");
+        let aggregates = vec![
+            AggregateExpr {
+                func: AggFunc::Sum,
+                arg: Box::new(LogicalExpr::Column(score_idx)),
+                distinct: false,
+            },
+            AggregateExpr {
+                func: AggFunc::Count,
+                arg: Box::new(LogicalExpr::Column(score_idx)),
+                distinct: false,
+            },
+            AggregateExpr {
+                func: AggFunc::Sum,
+                arg: Box::new(LogicalExpr::Column(value_idx)),
+                distinct: false,
+            },
+        ];
+        let batch = compute_simple_aggregate(
+            &spec,
+            &aggregates,
+            &table_meta,
+            &table_schema,
+            &dir.path().join("main").join("t"),
+            engine.segment_mgr(),
+            engine.memtable_manager(),
+            engine.hot_store_manager(),
+            "main",
+        )
+        .expect("compute")
+        .expect("drifted footer (ADD COLUMN default + RENAME) must keep the fast path");
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            batch.scalar(0, 0),
+            Some(ScalarValue::Int64(Some(350))),
+            "SUM(score) = default 7 x 50 drifted rows"
+        );
+        assert_eq!(
+            batch.scalar(0, 1),
+            Some(ScalarValue::Int64(Some(50))),
+            "COUNT(score) counts the default rows"
+        );
+        assert_eq!(
+            batch.scalar(0, 2),
+            Some(ScalarValue::Int64(Some(1275))),
+            "SUM(value) folds the renamed column's footer sums"
+        );
+        engine.segment_mgr().shutdown();
+    }
+
+    /// Engine-level boundary: DEFAULT CURRENT_TIMESTAMP is not a constant,
+    /// so a segment predating the column still declines the fast path.
+    #[test]
+    fn compute_simple_aggregate_declines_current_timestamp_default() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let engine = crate::sql::execution::engine::Engine::new(dir.path(), "main")
+            .expect("engine");
+        let mut session = crate::net::session::Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")
+            .expect("create");
+        engine
+            .execute(&mut session, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)")
+            .expect("insert");
+        engine.flush_table_buffers("main", "t").expect("flush");
+        engine
+            .execute(
+                &mut session,
+                "ALTER TABLE t ADD COLUMN created TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            )
+            .expect("add column");
+
+        let table_meta = engine.get_table_meta("main", "t").expect("table meta");
+        let table_schema = Schema::new(table_meta.columns.clone());
+        let mut spec = ScanSpec::new("t");
+        spec.table_schema = table_schema.clone();
+        let created_idx = table_schema.index_of("created").expect("created column");
+        let aggregates = vec![AggregateExpr {
+            func: AggFunc::Min,
+            arg: Box::new(LogicalExpr::Column(created_idx)),
+            distinct: false,
+        }];
+        let batch = compute_simple_aggregate(
+            &spec,
+            &aggregates,
+            &table_meta,
+            &table_schema,
+            &dir.path().join("main").join("t"),
+            engine.segment_mgr(),
+            engine.memtable_manager(),
+            engine.hot_store_manager(),
+            "main",
+        )
+        .expect("compute");
+        assert!(
+            batch.is_none(),
+            "CURRENT_TIMESTAMP default must decline the metadata fast path"
+        );
+        engine.segment_mgr().shutdown();
     }
 }

@@ -443,7 +443,7 @@ impl Handler {
                         if has_query_database {
                             session.database = original_database;
                         }
-                        return Ok(vec![build_error(&error.to_string())]);
+                        return Ok(vec![build_query_error(&error)]);
                     }
                 }
             }
@@ -491,7 +491,7 @@ impl Handler {
                 let msg = build_binary_query_result_with_timings(&schema, &batches, timings);
                 let msg = match self.validate_query_response(msg) {
                     Ok(msg) => msg,
-                    Err(error) => return Ok(vec![build_error(&error.to_string())]),
+                    Err(error) => return Ok(vec![build_query_error(&error)]),
                 };
                 log_query_if_needed(
                     should_log_query,
@@ -516,7 +516,7 @@ impl Handler {
                     &status,
                     server_start.elapsed(),
                 );
-                Ok(vec![build_error(&e.to_string())])
+                Ok(vec![build_query_error(&e)])
             }
         }
     }
@@ -869,11 +869,11 @@ impl Handler {
                 let msg = build_binary_query_result_with_timings(&schema, &batches, timings);
                 let msg = match self.validate_query_response(msg) {
                     Ok(msg) => msg,
-                    Err(error) => return Ok(vec![build_error(&error.to_string())]),
+                    Err(error) => return Ok(vec![build_query_error(&error)]),
                 };
                 Ok(vec![msg])
             }
-            Err(e) => Ok(vec![build_error(&e.to_string())]),
+            Err(e) => Ok(vec![build_query_error(&e)]),
         }
     }
 
@@ -1984,6 +1984,39 @@ pub fn build_error(msg: &str) -> Message {
     Message::new(MSG_TYPE_ERROR, Bytes::from(msg.to_string()))
 }
 
+/// Error response for the SQL execution paths (`MSG_TYPE_QUERY` /
+/// `MSG_TYPE_EXECUTE`). The wire protocol carries error payloads as plain
+/// text with no error-code or classification field, so transient
+/// resource-busy conditions (concurrent DML inside the ALTER convergence
+/// window, hot-store backpressure, join/semi-join budget) get the stable
+/// [`RETRYABLE_ERROR_PREFIX`] marker instead — the minimal extension that
+/// lets clients distinguish "back off and re-issue" from "fail the
+/// statement". Everything else keeps the plain one-shot error text.
+/// Connection-layer and authentication errors intentionally do NOT pass
+/// through here: they are not transient.
+fn build_query_error(error: &TaibaiError) -> Message {
+    match error {
+        TaibaiError::ResourceBusy(message) => {
+            // Budget overruns are DETERMINISTIC: retrying just redoes the
+            // same doomed work four times over. Only contention-shaped
+            // busy (lock windows, backpressure) is transient.
+            let budget_error = message.contains("memory budget")
+                || message.contains("transaction budget")
+                || message.contains("exceeded the budget");
+            if budget_error {
+                build_error(&format!("resource busy: {message}"))
+            } else {
+                build_error(&format!(
+                    "{} resource busy: {} (transient server-side contention; the                      built-in client auto-retries this only for read-only statements                      — SELECT/SHOW/EXPLAIN; writes must be retried by the application)",
+                    crate::net::client::RETRYABLE_ERROR_PREFIX,
+                    message
+                ))
+            }
+        }
+        other => build_error(&other.to_string()),
+    }
+}
+
 fn append_server_timings(msg: Message, timings: ServerTimings) -> Message {
     let mut payload = Vec::with_capacity(msg.payload.len() + 28);
     payload.extend_from_slice(&msg.payload);
@@ -2013,6 +2046,33 @@ fn build_binary_query_result_with_timings(
     let mut encoded = crate::protocol::result::encode_binary_result_batches(schema, batches);
     append_server_timing_trailer(&mut encoded, timings);
     Message::new(MSG_TYPE_BINARY_QUERY_RESULT, Bytes::from(encoded))
+}
+
+#[cfg(test)]
+mod query_error_tests {
+    use super::*;
+
+    #[test]
+    fn resource_busy_maps_to_retryable_marker() {
+        let msg = build_query_error(&TaibaiError::ResourceBusy(
+            "hot store over limit".into(),
+        ));
+        assert_eq!(msg.msg_type, MSG_TYPE_ERROR);
+        let text = String::from_utf8_lossy(&msg.payload);
+        assert!(
+            text.starts_with(crate::net::client::RETRYABLE_ERROR_PREFIX),
+            "marker must lead the message, got {text:?}"
+        );
+        assert!(text.contains("hot store over limit"));
+    }
+
+    #[test]
+    fn non_busy_errors_keep_plain_text() {
+        let msg = build_query_error(&TaibaiError::Sql("syntax error".into()));
+        let text = String::from_utf8_lossy(&msg.payload);
+        assert!(!text.contains(crate::net::client::RETRYABLE_ERROR_PREFIX));
+        assert!(text.contains("syntax error"));
+    }
 }
 
 #[cfg(test)]

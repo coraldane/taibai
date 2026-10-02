@@ -31,6 +31,62 @@ const MAX_BINARY_RESULT_COLUMNS: usize = 4_096;
 /// payload; anything denser is malformed.
 const MAX_BINARY_RESULT_ROWS_PER_BYTE: u64 = 1;
 
+/// Stable marker the server prefixes onto transient (resource-busy) SQL
+/// errors. The wire protocol has no error-code or classification field —
+/// `MSG_TYPE_ERROR` payloads are plain message text — so this prefix is the
+/// minimal extension letting a client tell "back off and re-issue" apart
+/// from "fail the statement". See `Handler::build_query_error`.
+pub const RETRYABLE_ERROR_PREFIX: &str = "[RETRYABLE]";
+
+/// Automatic retries a read-only statement gets when the server answers
+/// with a retryable (resource-busy) error before the client gives up and
+/// surfaces the error to the caller.
+const RETRYABLE_MAX_RETRIES: usize = 3;
+
+/// Backoff before retry attempt `n` (0-based): 10ms / 40ms / 160ms plus
+/// jitter of up to +50%, so a cohort of clients hitting the same busy
+/// resource de-synchronizes instead of retrying in lockstep.
+fn retry_backoff_delay(attempt: usize) -> Duration {
+    let base_ms = 10u64.saturating_mul(1u64 << (2 * attempt.min(6) as u32));
+    let base_ms = base_ms.min(160);
+    // No rand dependency: hash the wall clock. The goal is de-synchronization,
+    // not cryptographic quality.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let jitter = nanos % (base_ms / 2 + 1);
+    Duration::from_millis(base_ms + jitter)
+}
+
+/// Whether a server error message carries the retryable marker.
+pub fn is_retryable_error_message(message: &str) -> bool {
+    message
+        .trim_start()
+        .starts_with(RETRYABLE_ERROR_PREFIX)
+}
+
+/// Whether `sql` is a statement the client may safely re-issue after a
+/// retryable server error. ONLY leading-keyword SELECT / SHOW / EXPLAIN
+/// qualify: they are idempotent reads, so a retry can never commit anything
+/// twice.
+///
+/// Everything else — INSERT/UPDATE/DELETE/REPLACE, DDL, transaction control,
+/// and read/write CTEs (`WITH ... INSERT`) — is deliberately excluded: the
+/// first attempt may have committed before the error was raised (or the
+/// retry may commit twice), so auto-retrying a write is an
+/// at-least-once/at-most-once gamble the CLIENT cannot resolve. For those
+/// statements the retryable marker is passed straight through to the caller
+/// (see [`Client::query`]); the application decides whether and how to
+/// retry.
+pub fn statement_is_read_only(sql: &str) -> bool {
+    let first_word = sql.trim_start().split_whitespace().next().unwrap_or("");
+    matches!(
+        first_word.to_ascii_uppercase().as_str(),
+        "SELECT" | "SHOW" | "EXPLAIN"
+    )
+}
+
 pub struct Client {
     framed: Framed<tokio::net::TcpStream, MessageCodec>,
     session_id: Option<String>,
@@ -196,7 +252,42 @@ impl Client {
         Ok(start.elapsed())
     }
 
+    /// Execute `sql` and return the full result.
+    ///
+    /// Retry boundary: when the server answers a READ-ONLY statement
+    /// (leading SELECT/SHOW/EXPLAIN, see [`statement_is_read_only`]) with a
+    /// retryable error ([`RETRYABLE_ERROR_PREFIX`] — transient resource
+    /// busy), the client automatically re-issues it up to
+    /// [`RETRYABLE_MAX_RETRIES`] times with 10ms/40ms/160ms (+jitter)
+    /// backoff. Write statements are NEVER auto-retried here: a retried
+    /// INSERT may commit twice, so their retryable errors are returned
+    /// as-is (marker intact) and the application decides.
     pub async fn query(&mut self, sql: &str) -> Result<QueryResult> {
+        let read_only = statement_is_read_only(sql);
+        for attempt in 0..=RETRYABLE_MAX_RETRIES {
+            let result = self.query_once(sql).await?;
+            let QueryResult::Error(message) = &result else {
+                return Ok(result);
+            };
+            if attempt == RETRYABLE_MAX_RETRIES
+                || !read_only
+                || !is_retryable_error_message(message)
+            {
+                return Ok(result);
+            }
+            let delay = retry_backoff_delay(attempt);
+            tracing::debug!(
+                attempt,
+                delay_ms = delay.as_millis() as u64,
+                sql,
+                "retryable server error on read-only statement; backing off before retry"
+            );
+            tokio::time::sleep(delay).await;
+        }
+        unreachable!("the loop returns on the final attempt")
+    }
+
+    async fn query_once(&mut self, sql: &str) -> Result<QueryResult> {
         let mut payload = Vec::new();
         write_len_prefixed_string(&mut payload, "");
         write_len_prefixed_string(&mut payload, sql);
@@ -292,6 +383,14 @@ impl Client {
         Ok(result)
     }
 
+    /// Stream `sql` result batch-by-batch.
+    ///
+    /// No automatic retry here, by design: batches are handed to `on_batch`
+    /// as they arrive, so a mid-stream retry would re-deliver rows the
+    /// callback has already seen — not idempotent from the consumer's
+    /// perspective. Retryable errors surface as `Err(TaibaiError::Sql(msg))`
+    /// with the [`RETRYABLE_ERROR_PREFIX`] marker intact; re-issue from the
+    /// caller if the statement is read-only.
     pub async fn query_each_batch<F>(
         &mut self,
         sql: &str,
@@ -340,6 +439,12 @@ impl Client {
         }
     }
 
+    /// Execute a (typically write) statement and return rows_affected.
+    ///
+    /// Delegates to [`Client::query`](Self::query), so read-only statements
+    /// benefit from its automatic retryable-error retry; write statements
+    /// are not retried there, and their retryable marker travels unchanged
+    /// inside the returned error for the application to act on.
     pub async fn execute(&mut self, sql: &str) -> Result<u64> {
         match self.query(sql).await? {
             QueryResult::Ok { rows_affected, .. } => Ok(rows_affected),
@@ -1486,6 +1591,68 @@ fn parse_scaled_decimal_text(s: &str, scale: i32) -> Result<i64> {
 #[cfg(test)]
 #[path = "client_test.rs"]
 mod tests;
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    /// Only leading-keyword SELECT/SHOW/EXPLAIN auto-retry: reads are
+    /// idempotent, writes are not (a retried INSERT may commit twice).
+    #[test]
+    fn read_only_classification_follows_the_leading_keyword() {
+        for sql in [
+            "SELECT * FROM t",
+            "select 1",
+            "  SHOW TABLES",
+            "show databases",
+            "EXPLAIN SELECT COUNT(*) FROM t",
+            "explain analyze",
+        ] {
+            assert!(statement_is_read_only(sql), "{sql:?} should retry");
+        }
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "insert into t values (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "REPLACE INTO t VALUES (1)",
+            "CREATE TABLE u (a INT)",
+            "BEGIN",
+            "WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c",
+        ] {
+            assert!(
+                !statement_is_read_only(sql),
+                "{sql:?} must be left to the application"
+            );
+        }
+    }
+
+    #[test]
+    fn retryable_marker_is_detected_by_stable_prefix() {
+        assert!(is_retryable_error_message(
+            "[RETRYABLE] resource busy: hot store over limit"
+        ));
+        assert!(is_retryable_error_message("  [RETRYABLE] resource busy: x"));
+        assert!(!is_retryable_error_message(
+            "resource busy: [RETRYABLE] embedded"
+        ));
+        assert!(!is_retryable_error_message("SQL error: bad syntax"));
+        assert!(!is_retryable_error_message(""));
+    }
+
+    /// 10ms / 40ms / 160ms with up to +50% jitter, capped at 160ms.
+    #[test]
+    fn backoff_schedule_is_ten_forty_one_sixty_plus_jitter() {
+        let first = retry_backoff_delay(0).as_millis();
+        assert!((10..=15).contains(&first), "first backoff {first}ms");
+        let second = retry_backoff_delay(1).as_millis();
+        assert!((40..=60).contains(&second), "second backoff {second}ms");
+        let third = retry_backoff_delay(2).as_millis();
+        assert!((160..=240).contains(&third), "third backoff {third}ms");
+        let capped = retry_backoff_delay(9).as_millis();
+        assert!((160..=240).contains(&capped), "capped backoff {capped}ms");
+    }
+}
 
 fn encode_scalar_param(buf: &mut Vec<u8>, val: &ScalarValue) {
     match val {

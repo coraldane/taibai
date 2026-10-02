@@ -273,3 +273,11 @@ path = "tests/join_fast_path_test.rs"
 [[test]]
 name = "alter_column_drift_test"
 path = "tests/alter_column_drift_test.rs"
+
+[[test]]
+name = "aggregate_drift_fastpath_test"
+path = "tests/aggregate_drift_fastpath_test.rs"
+
+[[test]]
+name = "retryable_error_test"
+path = "tests/retryable_error_test.rs"
