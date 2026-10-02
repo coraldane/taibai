@@ -325,10 +325,10 @@ impl Compactor {
             return Ok(CompactStats::default());
         }
 
-        let mut stats = CompactStats {
-            segments_read: partition_groups.iter().map(|(_, files)| files.len()).sum(),
-            ..CompactStats::default()
-        };
+        // `segments_read` counts segments actually consumed by the rewrite
+        // (dirty inputs only on the non-clustered path), not every discovered
+        // segment: clean segments are left untouched, so they are not read.
+        let mut stats = CompactStats::default();
 
         let partition_count = partition_groups.len();
         let partition_stats = partition_groups
@@ -369,6 +369,7 @@ impl Compactor {
             })
             .collect::<Result<Vec<_>>>()?;
         for part_stats in partition_stats {
+            stats.segments_read += part_stats.segments_read;
             stats.segments_written += part_stats.segments_written;
             stats.rows_written += part_stats.rows_written;
             stats.rows_dropped += part_stats.rows_dropped;
@@ -735,6 +736,55 @@ impl Compactor {
         if segment_files.is_empty() {
             return Ok(PreparedCompaction::Skipped);
         }
+        let partition_label = partition_key.unwrap_or("<unpartitioned>");
+        // `bloom_column_indices` is always the table's cluster-key column set
+        // (both call sites pass `cluster_key_indices`), so it doubles as the
+        // "is this table clustered" signal for the input selection below.
+        let table_is_clustered = !bloom_column_indices.is_empty();
+        let segment_files = if sort_key_indices.is_empty() && !table_is_clustered {
+            // Non-clustered table: only dirty (or under-full, merge-worthy)
+            // segments enter the rewrite; clean full-size segments are never
+            // rewritten — rewriting them would be pure write amplification.
+            match self.select_noncluster_compaction_inputs(
+                db,
+                table,
+                partition_key,
+                &segment_files,
+                output_row_group_rows,
+            )? {
+                Some(inputs) => inputs,
+                None => return Ok(PreparedCompaction::Skipped),
+            }
+        } else {
+            // Clustered tables keep the full-partition merge on every path:
+            // global cluster order is an invariant, and leaving clean
+            // segments out of the merge to save IO would break it. The
+            // unsorted background delete-cleanup still preserves the whole
+            // partition's source order across the merged output. The only
+            // clean-input optimization kept here is the single-segment skip:
+            // with one segment there is no cross-file order to preserve, so a
+            // clean compact one is left alone. A segment can contain
+            // thousands of tiny row groups after many small flushes; this
+            // check keeps OPTIMIZE able to repair the main source of read
+            // amplification.
+            if sort_key_indices.is_empty() && segment_files.len() == 1 {
+                let reader = self.segment_mgr.open_reader_cached(&segment_files[0])?;
+                let compact_row_groups =
+                    reader.row_count().div_ceil(output_row_group_rows as u64) as usize;
+                let needs_row_group_compaction = reader.num_row_groups() > compact_row_groups.max(1);
+                if reader.deleted_row_count() == 0 && !needs_row_group_compaction {
+                    tracing::info!(
+                        db,
+                        table,
+                        partition_key = partition_key.unwrap_or("<none>"),
+                        segment = %segment_files[0].display(),
+                        "skipping clean single-segment optimization"
+                    );
+                    return Ok(PreparedCompaction::Skipped);
+                }
+            }
+            segment_files
+        };
         let identities = segment_files
             .iter()
             .map(|path| compaction_input_identity(&self.segment_mgr, path))
@@ -748,29 +798,6 @@ impl Compactor {
                 ))
             })?;
         let segments_read = segment_files.len();
-        let partition_label = partition_key.unwrap_or("<unpartitioned>");
-
-        // A clean single segment can only be skipped when this operation has
-        // no physical ordering requirement and its row groups are already
-        // compact. A segment can contain thousands of tiny row groups after
-        // many small flushes; skipping it makes OPTIMIZE unable to repair
-        // the main source of read amplification.
-        if sort_key_indices.is_empty() && segment_files.len() == 1 {
-            let reader = self.segment_mgr.open_reader_cached(&segment_files[0])?;
-            let compact_row_groups =
-                reader.row_count().div_ceil(output_row_group_rows as u64) as usize;
-            let needs_row_group_compaction = reader.num_row_groups() > compact_row_groups.max(1);
-            if reader.deleted_row_count() == 0 && !needs_row_group_compaction {
-                tracing::info!(
-                    db,
-                    table,
-                    partition_key = partition_key.unwrap_or("<none>"),
-                    segment = %segment_files[0].display(),
-                    "skipping clean single-segment optimization"
-                );
-                return Ok(PreparedCompaction::Skipped);
-            }
-        }
 
         tracing::info!(
             db,
@@ -967,6 +994,92 @@ impl Compactor {
             rows_dropped: deleted_rows,
             rows_dropped_ttl: ttl_dropped,
         })
+    }
+
+    /// Dirty-segment input selection for non-clustered tables: pick the
+    /// subset of a partition's discovered segments the rewrite may touch.
+    ///
+    /// A segment joins the input set when it is dirty (footer tombstones or
+    /// row-group fragmentation — rewriting it alone already pays for itself)
+    /// or under-full (fewer rows than one target row group, the readable
+    /// proxy for "file below the segment seal size": the seal threshold
+    /// itself is private to `SegmentManager`). Under-full but otherwise clean
+    /// segments merge only in company with other inputs: a lone one would be
+    /// rewritten into the same lone small file. Clean segments that already
+    /// hold a full row group of compact live data are never rewritten — that
+    /// would be pure write amplification. Returns `None` when nothing
+    /// qualifies (the whole partition is skipped).
+    fn select_noncluster_compaction_inputs(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: Option<&str>,
+        segment_files: &[PathBuf],
+        output_row_group_rows: usize,
+    ) -> Result<Option<Vec<PathBuf>>> {
+        #[derive(Clone, Copy, PartialEq)]
+        enum InputClass {
+            /// Tombstoned or row-group fragmented: worth rewriting alone.
+            Rewrite,
+            /// Clean but under-full: only worth rewriting together with
+            /// other inputs.
+            MergeSmall,
+            /// Clean and full: must be kept as-is.
+            Keep,
+        }
+
+        let mut classes = Vec::with_capacity(segment_files.len());
+        let mut rewrite_count = 0usize;
+        let mut small_count = 0usize;
+        for path in segment_files {
+            let reader = self.segment_mgr.open_reader_cached(path)?;
+            let compact_row_groups =
+                reader.row_count().div_ceil(output_row_group_rows as u64) as usize;
+            let fragmented = reader.num_row_groups() > compact_row_groups.max(1);
+            let tombstoned = reader.deleted_row_count() > 0;
+            let under_full = reader.row_count() < output_row_group_rows as u64;
+            let class = if tombstoned || fragmented {
+                rewrite_count += 1;
+                InputClass::Rewrite
+            } else if under_full {
+                small_count += 1;
+                InputClass::MergeSmall
+            } else {
+                InputClass::Keep
+            };
+            classes.push(class);
+        }
+
+        let merge_smalls = rewrite_count > 0 || small_count > 1;
+        let selected = segment_files
+            .iter()
+            .zip(classes.iter())
+            .filter(|(_, &class)| match class {
+                InputClass::Rewrite => true,
+                InputClass::MergeSmall => merge_smalls,
+                InputClass::Keep => false,
+            })
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            tracing::info!(
+                db,
+                table,
+                partition_key = partition_key.unwrap_or("<none>"),
+                segments = segment_files.len(),
+                "all segments clean and full; skipping non-clustered compaction"
+            );
+            return Ok(None);
+        }
+        tracing::info!(
+            db,
+            table,
+            partition_key = partition_key.unwrap_or("<none>"),
+            rewrite_inputs = selected.len(),
+            clean_kept = segment_files.len() - selected.len(),
+            "non-clustered compaction selected dirty/under-full segments only"
+        );
+        Ok(Some(selected))
     }
 
     /// Commit phase, run under the target partition's mutation lock:

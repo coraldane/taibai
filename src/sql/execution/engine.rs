@@ -379,6 +379,14 @@ fn start_auto_compaction_thread(
                     collect_fragmentation,
                 ) {
                     Ok(health) if health.needs_delete_cleanup(&config) => {
+                        // With a resident active segment, the no-seal cleanup
+                        // could not see its tombstones, so the table would
+                        // stay past the dirtiness gate forever: route through
+                        // the fragmentation compaction, which seals the
+                        // active segment first. The sealed segment only joins
+                        // the rewrite when it is itself dirty or under-full
+                        // (the compactor's dirty-segment input selection);
+                        // clean full-size segments are never rewritten.
                         let compact_result =
                             if segment_mgr.active_partition_keys(&db, &table).is_empty() {
                                 compactor.compact_table_for_delete_cleanup(&db, &table, &table_meta)
