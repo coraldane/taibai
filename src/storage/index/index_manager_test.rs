@@ -982,3 +982,73 @@ fn legacy_decoded_snapshot_serves_lookups_from_memory_blocks() -> Result<()> {
     );
     Ok(())
 }
+
+/// Regression: an in-flight base snapshot must keep reading its OWN file
+/// bytes after a compaction publish renames a new base over the same path.
+/// The base pins an open handle at `open` time for exactly this reason;
+/// reading by path paired the old block directory (offsets, first keys,
+/// path table) with the new file's bytes and surfaced
+/// "corrupt unique index block key prefix / path reference" or an
+/// UnexpectedEof on concurrent INSERT probes.
+#[test]
+fn base_block_loads_survive_publish_rename_over_the_path() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let base_path = dir.path().join("uk.keys.tbi");
+    // Keys are fixed-width zero-padded strings: encoded-byte order matches
+    // generation order, satisfying the writer's encoded-sorted contract
+    // (the on-disk order is by encoded bytes, not by integer value).
+    let write_base = |path: &std::path::Path,
+                      seg_path: &str,
+                      count: usize|
+     -> Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = UniqueIndexBaseWriter::new(
+            std::io::BufWriter::new(file),
+            "db",
+            "ticks",
+            "uk_value",
+            vec!["value".to_string()],
+        )?;
+        for value in 0..count {
+            writer.push_entry(
+                &encode_unique_key(&[ScalarValue::VarChar(Some(format!("k{value:06}")))])?,
+                &UniqueRowLocation {
+                    segment_path: seg_path.to_string(),
+                    row_id: value as u64,
+                },
+            )?;
+        }
+        writer.finish(None, &HashMap::new())?;
+        Ok(())
+    };
+
+    // Snapshot A: 600 sorted keys across three 256-entry blocks.
+    write_base(&base_path, "/tmp/a/seg_00000.dat", 600)?;
+    let state_a = UniqueIndexBase::open(&base_path)?;
+
+    // A compaction publish rewrites the path with a shorter, differently
+    // laid-out file B via tmp+rename — a NEW file identity replacing the
+    // directory entry, never a truncate of the open file (on Windows a
+    // truncate would shrink the very bytes the pinned handle reads).
+    let tmp_path = dir.path().join("uk.keys.tbi.tmp");
+    write_base(&tmp_path, "/tmp/b/seg_00000.dat", 10)?;
+    std::fs::rename(&tmp_path, &base_path)?;
+
+    // The in-flight state must resolve its own keys from its pinned handle:
+    // every lookup below loads blocks on demand AFTER the overwrite.
+    for value in [0usize, 255, 256, 512, 599] {
+        let locations = state_a.find_locations(&encode_unique_key(&[ScalarValue::VarChar(Some(
+            format!("k{value:06}"),
+        ))])?)?;
+        assert_eq!(
+            locations,
+            vec![UniqueRowLocation {
+                segment_path: "/tmp/a/seg_00000.dat".to_string(),
+                row_id: value as u64,
+            }],
+            "value {value} must resolve against snapshot A's own bytes"
+        );
+    }
+    assert_eq!(state_a.entry_count, 600);
+    Ok(())
+}

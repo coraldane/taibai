@@ -158,8 +158,16 @@ pub(super) struct UniqueIndexBlockEntries {
 }
 
 enum BlockBacking {
-    /// Entry runs live in the file named by `path`; blocks are read on demand.
-    File { path: PathBuf },
+    /// Entry runs live in the base file, read on demand through the handle
+    /// pinned at [`UniqueIndexBase::open`] time. Pinning the HANDLE — not
+    /// the path — is what makes an in-flight state immune to the compaction
+    /// publish's tmp+rename over the path: the old state keeps reading its
+    /// own snapshot's bytes while fresh states open the renamed file.
+    /// Reading by path instead paired an old block directory (offsets,
+    /// first keys, path table) with a NEW file's bytes and surfaced
+    /// "corrupt unique index block key prefix / path reference" and
+    /// UnexpectedEof errors on concurrent INSERT probes.
+    File { file: Mutex<std::fs::File> },
     /// Every block is already resident in the cache (legacy V5 files are
     /// fully decoded on load until the next compaction rewrites them V6).
     Memory,
@@ -349,7 +357,7 @@ impl UniqueIndexBase {
             segment_watermarks,
             paths,
             backing: BlockBacking::File {
-                path: path.to_path_buf(),
+                file: Mutex::new(file),
             },
             cache: Mutex::new(BlockCache::new(UNIQUE_INDEX_BLOCK_CACHE_BLOCKS)),
         })
@@ -417,16 +425,19 @@ impl UniqueIndexBase {
             .blocks
             .get(idx)
             .ok_or_else(|| TaibaiError::Storage("unique index block out of range".to_string()))?;
-        let BlockBacking::File { path } = &self.backing else {
+        let BlockBacking::File { file } = &self.backing else {
             return Err(TaibaiError::Storage(
                 "unique index memory-backed block missing from cache".to_string(),
             ));
         };
         use std::io::{Read, Seek, SeekFrom};
-        let mut file = std::fs::File::open(path)?;
+        // Short seek+read under the handle lock; loads are cache misses on a
+        // 1024-block LRU, so contention is bounded and reads stay sequential.
+        let mut file = file.lock().unwrap();
         file.seek(SeekFrom::Start(block_ref.data_offset))?;
         let mut bytes = vec![0u8; block_ref.data_len as usize];
         file.read_exact(&mut bytes)?;
+        drop(file);
         Ok(Arc::new(decode_unique_index_block_run(
             &bytes,
             &block_ref.first_key,

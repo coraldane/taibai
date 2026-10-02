@@ -514,6 +514,18 @@ pub fn exec_drop_table(
             );
 
             let step_start = Instant::now();
+            // Index states pin open handles into the directory being staged
+            // away; drop them so the staging rename cannot be blocked by an
+            // open handle (Windows). The staged directory keeps the files.
+            engine.index_manager().drop_table_index_states(db, name);
+            tracing::info!(
+                db,
+                table = name,
+                elapsed_ms = step_start.elapsed().as_millis(),
+                "drop table: dropped cached index states"
+            );
+
+            let step_start = Instant::now();
             tracing::info!(db, table = name, path = %table_dir.display(), "drop table: staging table directory");
             let tombstone = stage_table_directory(&table_dir).map_err(|error| {
                 tracing::error!(db, table = name, path = %table_dir.display(), error = %error, elapsed_ms = step_start.elapsed().as_millis(), "drop table: failed to stage table directory");
@@ -716,6 +728,10 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
             engine
                 .segment_mgr()
                 .invalidate_readers_under(&old_table_dir);
+            // Index states pin open handles into the table directory; on
+            // Windows the directory rename below fails while any handle is
+            // still open.
+            engine.index_manager().drop_table_index_states(db, name);
             engine.invalidate_hot_segment_hint(db, name);
             // Sum-cache entries keyed under the old path survive the rename;
             // a future CREATE TABLE reusing this name restarts segment
@@ -1611,6 +1627,10 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
             engine.batch_writer().drain_table_tail(db, table)?;
                 engine.segment_mgr().close_table_state_handles(db, table);
             engine.segment_mgr().invalidate_readers_under(&table_dir);
+            // Index states pin open handles into the directory being staged
+            // away; drop them so the rename below cannot be blocked by an
+            // open handle (Windows) — the staged directory keeps the files.
+            engine.index_manager().drop_table_index_states(db, table);
 
             write_before_meta(&operation_dir, &before_meta)?;
             let fresh_data = operation_dir.join(FRESH_DATA_DIR);

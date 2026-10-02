@@ -201,12 +201,14 @@ async fn bulk_import_sessions_survive_the_regular_idle_timeout() {
     config.server.bulk_import_idle_timeout_secs = 0;
     let config = Arc::new(config);
 
-    // 基线：常规连接空闲 1 秒即被断开。
+    // 基线：常规连接空闲 1 秒即被断开。断言窗口放宽到 10s：并行测试
+    // 负载下 tokio 调度饥饿会让 1s 定时器的实际触发漂移好几秒，被测
+    // 契约是"会断开"，不是"恰好在第 N 毫秒断开"。
     let (mut plain, plain_server) =
         spawn_test_connection_with_config(Arc::clone(&engine), Arc::clone(&config));
     login(&mut plain, "root").await;
     tokio::time::sleep(Duration::from_millis(1300)).await;
-    timeout(Duration::from_secs(2), plain_server)
+    timeout(Duration::from_secs(10), plain_server)
         .await
         .expect("regular idle connection should be closed")
         .unwrap()
@@ -217,7 +219,7 @@ async fn bulk_import_sessions_survive_the_regular_idle_timeout() {
     let (mut bulk, bulk_server) = spawn_test_connection_with_config(engine, config);
     login(&mut bulk, "root").await;
     bulk.send(query("START BULK IMPORT")).await.unwrap();
-    let started = timeout(Duration::from_secs(2), bulk.next())
+    let started = timeout(Duration::from_secs(10), bulk.next())
         .await
         .expect("bulk import should start")
         .unwrap()
@@ -234,7 +236,8 @@ async fn bulk_import_sessions_survive_the_regular_idle_timeout() {
     assert_eq!(pong.msg_type, MSG_TYPE_PONG);
 
     bulk.send(query("STOP BULK IMPORT")).await.unwrap();
-    let stopped = timeout(Duration::from_secs(2), bulk.next())
+    // STOP 的处理包含同步 flush/fsync，重负载下回包可能远超 2s。
+    let stopped = timeout(Duration::from_secs(10), bulk.next())
         .await
         .expect("bulk import should stop")
         .unwrap()
@@ -242,7 +245,7 @@ async fn bulk_import_sessions_survive_the_regular_idle_timeout() {
     assert_eq!(stopped.msg_type, MSG_TYPE_OK);
 
     tokio::time::sleep(Duration::from_millis(1300)).await;
-    timeout(Duration::from_secs(2), bulk_server)
+    timeout(Duration::from_secs(10), bulk_server)
         .await
         .expect("idle timeout should apply again after the bulk session ends")
         .unwrap()

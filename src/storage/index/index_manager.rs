@@ -1178,6 +1178,23 @@ impl IndexManager {
             .remove(&unique_index_key(db, table, index_name));
     }
 
+    /// Evict every cached index state of the table WITHOUT touching the
+    /// on-disk files. Base states pin open file handles (the rename-race
+    /// fix in `UniqueIndexBase`), so directory-level operations — RENAME
+    /// TABLE, TRUNCATE's staged move, DROP TABLE — must call this first:
+    /// on Windows, renaming or removing a directory that still has an open
+    /// handle inside fails with PermissionDenied.
+    pub fn drop_table_index_states(&self, db: &str, table: &str) {
+        self.primary_key_indexes
+            .write()
+            .unwrap()
+            .remove(&format!("{}\0{}", db, table));
+        self.unique_indexes
+            .write()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&format!("{}\0{}\0", db, table)));
+    }
+
     pub fn invalidate_table_unique_index_snapshots(
         &self,
         db: &str,
