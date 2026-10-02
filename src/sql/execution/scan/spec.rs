@@ -733,6 +733,41 @@ fn coerce_scalar(
     }
 }
 
+/// A scan-side row cap that survived the pushdown-safety gate. Constructed
+/// only by [`pushdown_safe_limit`] — fast paths that truncate reads at a
+/// LIMIT (segment scan trim, memtable shortcut, hot-store key lookup, mirror
+/// legs) must take their cap from there. A hand-rolled `spec.limit` filter
+/// forgets a shape (aggregate, GROUP BY, DISTINCT, window, residual
+/// predicate) and silently truncates correct results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PushdownLimit(usize);
+
+impl PushdownLimit {
+    pub fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// The single gate for turning a plan LIMIT into a scan-side row cap.
+/// `ordered_lookup` says whether THIS path can serve the ORDER BY faithfully
+/// (ordered cluster scan / ordered hot lookup); when it cannot, an ORDER BY
+/// LIMIT must see every row to pick the right ones.
+pub(crate) fn pushdown_safe_limit(spec: &ScanSpec, ordered_lookup: bool) -> Option<PushdownLimit> {
+    let limit = spec.limit?;
+    if spec.has_aggregate
+        || spec.has_group_by
+        || spec.has_join
+        || spec.has_distinct_or_window
+        || spec.remaining_predicate.is_some()
+    {
+        return None;
+    }
+    if spec.has_order_by && !ordered_lookup {
+        return None;
+    }
+    Some(PushdownLimit(limit))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

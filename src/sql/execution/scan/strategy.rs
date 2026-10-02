@@ -91,19 +91,8 @@ impl<'a> ScanPlanner<'a> {
     }
 
     fn effective_scan_limit(&self) -> Option<usize> {
-        let limit = self.spec.limit?;
-        if self.spec.has_aggregate
-            || self.spec.has_group_by
-            || self.spec.has_join
-            || self.spec.has_distinct_or_window
-            || self.spec.remaining_predicate.is_some()
-        {
-            return None;
-        }
-        if self.spec.has_order_by && self.ordered_cluster_order().is_none() {
-            return None;
-        }
-        Some(limit)
+        super::spec::pushdown_safe_limit(self.spec, self.ordered_cluster_order().is_some())
+            .map(|limit| limit.get())
     }
 
     fn ordered_cluster_order(&self) -> Option<OrderedClusterLimit> {

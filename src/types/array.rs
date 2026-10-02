@@ -616,7 +616,7 @@ impl ColumnArray {
 
     pub fn numeric_i64_at(&self, row: usize) -> Option<i64> {
         // Zero-copy views read through their materialized form.
-        if let ColumnArray::Selected { .. } = self {
+        if let ColumnArray::Selected { .. } | ColumnArray::Rle { .. } = self {
             return self.flattened().numeric_i64_at(row);
         }
         if self.bitmap().is_null(row) {
@@ -643,7 +643,7 @@ impl ColumnArray {
 
     pub fn numeric_f64_at(&self, row: usize) -> Option<f64> {
         // Zero-copy views read through their materialized form.
-        if let ColumnArray::Selected { .. } = self {
+        if let ColumnArray::Selected { .. } | ColumnArray::Rle { .. } = self {
             return self.flattened().numeric_f64_at(row);
         }
         if self.bitmap().is_null(row) {
@@ -698,6 +698,15 @@ impl ColumnArray {
     /// Expand run-length values into the plain typed column. Run values are
     /// exact i64 views of every run-decodable type (narrow ints round-trip
     /// through the wider stored value by construction).
+    ///
+    /// The expansion is DENSE — `data.len() == len`, with run values placed on
+    /// valid rows in order and a placeholder on null rows. `constant_column`'s
+    /// all-null form carries a full-length single run whose values are never
+    /// consumed; both it and the decoder's nulls-excluded runs flatten to the
+    /// same dense layout every positional consumer (`scalar`, `take`, sum
+    /// kernels) already assumes. A values-only expansion used to leave
+    /// `data.len() == len - null_count`, misaligning rows after the first
+    /// null and panicking on the tail rows.
     fn expand_runs(&self) -> ColumnArray {
         let ColumnArray::Rle {
             runs,
@@ -711,10 +720,9 @@ impl ColumnArray {
         };
         macro_rules! build {
             ($variant:ident, $ty:ty) => {{
-                let mut data = Vec::with_capacity(*len);
-                for &(value, count) in runs.iter() {
-                    data.extend(std::iter::repeat_n(value as $ty, count as usize));
-                }
+                let data: Vec<$ty> = Self::dense_run_values(runs, bitmap, *len)
+                    .map(|v| v as $ty)
+                    .collect();
                 ColumnArray::$variant {
                     data,
                     bitmap: bitmap.clone(),
@@ -753,6 +761,37 @@ impl ColumnArray {
             bitmap,
             len: row_count,
             flat: OnceLock::new(),
+        }
+    }
+
+    /// Dense positional expansion of run values (see [`ColumnArray::expand_runs`]).
+    /// Null rows yield a placeholder; valid rows consume run values in order.
+    /// Null-free columns keep the per-run memcpy expansion.
+    fn dense_run_values<'a>(
+        runs: &'a [(i64, u32)],
+        bitmap: &'a NullBitmap,
+        len: usize,
+    ) -> impl Iterator<Item = i64> + 'a {
+        let null_count = bitmap.null_count();
+        if null_count == 0 {
+            Box::new(
+                runs.iter()
+                    .flat_map(|&(value, count)| std::iter::repeat_n(value, count as usize)),
+            ) as Box<dyn Iterator<Item = i64> + 'a>
+        } else {
+            let mut run_values = runs
+                .iter()
+                .flat_map(|&(value, count)| std::iter::repeat_n(value, count as usize));
+            Box::new((0..len).map(move |row| {
+                if bitmap.is_null(row) {
+                    0
+                } else {
+                    // A short run set (corrupt input or constant_column's
+                    // full-length all-null form) degrades to placeholders
+                    // instead of panicking.
+                    run_values.next().unwrap_or(0)
+                }
+            }))
         }
     }
 

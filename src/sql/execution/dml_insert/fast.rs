@@ -85,6 +85,13 @@ fn try_exec_fast_insert_sql_inner(
         return FastInsertOutcome::Unsupported;
     }
     let table_raw = &sql[table_start..pos];
+    // This scanner has no grammar: a quoted identifier (`"order"`,
+    // "`group`", `db."tbl"`) would reach the catalog as a literal with
+    // quotes glued on — permission checks and lookups against that string
+    // always miss. Anything quoted is the standard parser's problem.
+    if table_raw.contains('"') || table_raw.contains('`') || table_raw.contains('[') {
+        return FastInsertOutcome::Unsupported;
+    }
     let (db, table) = if let Some((db, table)) = table_raw.split_once('.') {
         (db, table)
     } else {
@@ -114,12 +121,13 @@ fn try_exec_fast_insert_sql_inner(
     {
         Some(meta) => meta,
         None => {
-            let missing = if catalogs.get(db).is_none() {
-                format!("database '{}' does not exist", db)
-            } else {
-                format!("table '{}.{}' does not exist", db, table)
-            };
-            return FastInsertOutcome::Executed(Err(TaibaiError::Sql(missing)));
+            // A miss is NOT this path's error to report: the fast scanner
+            // cannot distinguish a genuinely missing table from syntax it
+            // mis-tokenized (qualified names, odd spacing, future grammar).
+            // Falling back lets the standard parser produce the real verdict
+            // — including its own permission and existence errors — instead
+            // of a wrong "table does not exist" for valid SQL.
+            return FastInsertOutcome::Unsupported;
         }
     };
     drop(catalogs);

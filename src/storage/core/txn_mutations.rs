@@ -106,9 +106,25 @@ pub struct TxnMutations {
     mutation_bytes: u64,
 }
 
+/// Shared with [`set_txn_mutation_budget_for_tests`]; see that function.
+#[cfg(test)]
+thread_local! {
+    static TEST_BUDGET_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// Deferred-mutation budget per transaction (row ids, tombstone positions,
 /// deferred change-event batches). Overridable for large-import workloads.
 pub fn txn_mutation_budget_bytes() -> u64 {
+    // Tests drive the budget down without env vars (the OnceLock below is
+    // process-global and `cargo test --lib` runs threads in parallel). Every
+    // charge site runs on the session thread, so a thread-local override
+    // cannot leak into other tests.
+    #[cfg(test)]
+    {
+        if let Some(bytes) = TEST_BUDGET_OVERRIDE.with(|override_| override_.get()) {
+            return bytes;
+        }
+    }
     static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
         std::env::var("TAIBAI_TXN_MUTATION_BUDGET_BYTES")
@@ -117,6 +133,13 @@ pub fn txn_mutation_budget_bytes() -> u64 {
             .filter(|&bytes| bytes > 0)
             .unwrap_or(512 * 1024 * 1024)
     })
+}
+
+/// Test-only budget override for the current thread; `None` restores the
+/// configured/env value. Tests must reset to `None` before returning.
+#[cfg(test)]
+pub fn set_txn_mutation_budget_for_tests(bytes: Option<u64>) {
+    TEST_BUDGET_OVERRIDE.with(|override_| override_.set(bytes));
 }
 
 /// Rough per-entry cost of a BTreeSet row id / tombstone position (key bytes
@@ -297,6 +320,121 @@ impl TxnMutationRegistry {
         let _table = Self::table_entry(&mut inner, txn_id, db, table, None);
         let txn = inner.get_mut(&txn_id).expect("table_entry just ensured it");
         txn.charge_insert(bytes)
+    }
+
+    /// Bytes this transaction has already charged. Statement planners use it
+    /// to pre-check that ALL of a statement's upcoming charges fit the
+    /// budget before the first side effect — a mid-statement budget failure
+    /// after registrations used to leave tombstones that COMMIT materialized
+    /// without their replacement images.
+    pub fn mutation_bytes_of(&self, txn_id: u64) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&txn_id)
+            .map(|txn| txn.mutation_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Statement-scope undo of [`Self::register_segment_tombstones`]: a
+    /// failed statement must not leave tombstones behind that a later COMMIT
+    /// would materialize. Registered row ids never coincide with
+    /// footer-deleted rows (the DML scan skips them), so clearing their bits
+    /// from the composed bitmap leaves exactly footer ∪ other-statements'
+    /// ids. Charges are refunded; an emptied segment entry is dropped.
+    pub fn unregister_segment_tombstones(
+        &self,
+        txn_id: u64,
+        db: &str,
+        table: &str,
+        path: &Path,
+        row_ids: &[u64],
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(txn) = inner.get_mut(&txn_id) else {
+            return;
+        };
+        let Some(entry) = txn
+            .tables
+            .iter_mut()
+            .find(|entry| entry.db == db && entry.table == table)
+        else {
+            return;
+        };
+        let Some(index) = entry.segments.iter().position(|seg| seg.path == path) else {
+            return;
+        };
+        let mut removed = 0u64;
+        {
+            let segment = &mut entry.segments[index];
+            let composed = std::sync::Arc::make_mut(&mut segment.composed);
+            for &row_id in row_ids {
+                if segment.row_ids.remove(&row_id) {
+                    removed += 1;
+                    let byte = (row_id / 8) as usize;
+                    if byte < composed.len() {
+                        composed[byte] &= !(1u8 << (row_id % 8));
+                    }
+                }
+            }
+        }
+        if entry.segments[index].row_ids.is_empty() {
+            entry.segments.swap_remove(index);
+        }
+        if removed > 0 {
+            let txn = inner.get_mut(&txn_id).expect("entry borrowed above");
+            txn.mutation_bytes = txn
+                .mutation_bytes
+                .saturating_sub(removed.saturating_mul(POSITION_CHARGE_BYTES));
+        }
+    }
+
+    /// Statement-scope undo of [`Self::register_memtable_tombstones`],
+    /// mirroring [`Self::unregister_segment_tombstones`].
+    pub fn unregister_memtable_tombstones(
+        &self,
+        txn_id: u64,
+        db: &str,
+        table: &str,
+        memtable_id: Uuid,
+        positions: &[u32],
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(txn) = inner.get_mut(&txn_id) else {
+            return;
+        };
+        let Some(entry) = txn
+            .tables
+            .iter_mut()
+            .find(|entry| entry.db == db && entry.table == table)
+        else {
+            return;
+        };
+        let Some(index) = entry
+            .memtables
+            .iter()
+            .position(|entry| entry.memtable.id() == memtable_id)
+        else {
+            return;
+        };
+        let mut removed = 0u64;
+        {
+            let set = std::sync::Arc::make_mut(&mut entry.memtables[index].positions);
+            for &position in positions {
+                if set.remove(&position) {
+                    removed += 1;
+                }
+            }
+        }
+        if entry.memtables[index].positions.is_empty() {
+            entry.memtables.swap_remove(index);
+        }
+        if removed > 0 {
+            let txn = inner.get_mut(&txn_id).expect("entry borrowed above");
+            txn.mutation_bytes = txn
+                .mutation_bytes
+                .saturating_sub(removed.saturating_mul(POSITION_CHARGE_BYTES));
+        }
     }
 
     /// Account one INSERT statement's catalog `row_count` increment so

@@ -421,9 +421,16 @@ pub fn scan_hot_store_by_key(
 
     let ordered_lookup = ordered_cluster_order_for_schema(store.schema(), spec);
     let reverse_lookup = ordered_lookup.as_ref().is_some_and(|order| order.desc);
-    let lookup_limit = spec
-        .limit
-        .filter(|_| direct_filter_lookup && (!spec.has_order_by || ordered_lookup.is_some()));
+    // The shared pushdown gate — the hot path must not re-derive limit
+    // safety. It used to hand `spec.limit` straight to the lookup, so a
+    // `SELECT DISTINCT ... LIMIT n` over a resident store truncated the
+    // dedup input and aggregate shapes under-counted.
+    let lookup_limit = if direct_filter_lookup {
+        super::spec::pushdown_safe_limit(spec, ordered_lookup.is_some())
+    } else {
+        None
+    }
+    .map(|limit| limit.get());
     let batch = match store.lookup_filtered(
         key_value,
         partition_value,
@@ -891,5 +898,88 @@ mod audit_tests {
         // by the authoritative table-meta check.
         spec.ttl_active = false;
         assert!(scan_resident_hot_store(&hot_mgr, &memtable_mgr, "main", &meta, &spec).is_none());
+    }
+
+    /// P0: the resident hot-store lookup consumed `spec.limit` as a row cap
+    /// even when a DISTINCT / aggregate / window wrapper above the scan needs
+    /// every row — the dedup or aggregate then ran over truncated input and
+    /// returned wrong results. The shared pushdown gate must refuse a cap for
+    /// those shapes.
+    #[test]
+    fn resident_hot_scan_does_not_truncate_distinct_or_aggregate_shapes() {
+        use crate::storage::catalog::schema::TableMeta;
+
+        let schema = Schema::new(vec![
+            ColumnDef::new("category", DataType::VarChar),
+            ColumnDef::new("ts", DataType::Timestamp),
+            ColumnDef::new("volume", DataType::Int64),
+        ]);
+        let mut meta = TableMeta::new("main", "events", schema.columns.clone());
+        meta.cluster_key = vec!["category".to_string(), "ts".to_string()];
+        meta.hot_time_column = Some("ts".to_string());
+
+        let hot_mgr = crate::storage::core::hot_store::HotStoreManager::new();
+        let memtable_mgr = MemTableManager::new(10_000, 60, 2, 3600);
+        let mut batch = RecordBatch::new(schema.clone());
+        for i in 0..6i64 {
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::VarChar(Some("alpha".into())))
+                .unwrap();
+            batch
+                .column_mut(1)
+                .unwrap()
+                .push(&ScalarValue::Timestamp(Some(1_000 + i)))
+                .unwrap();
+            batch
+                .column_mut(2)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(i / 2)))
+                .unwrap();
+        }
+        hot_mgr.try_append("main", "events", &meta, &batch).unwrap();
+        hot_mgr
+            .get("main", "events")
+            .unwrap()
+            .mark_full_resident();
+
+        let base_spec = |has_distinct: bool| {
+            let mut spec = ScanSpec::new("events");
+            spec.table_schema = schema.clone();
+            spec.eq_predicates.push((0, ScalarValue::VarChar(Some("alpha".into()))));
+            spec.limit = Some(2);
+            spec.has_distinct_or_window = has_distinct;
+            spec
+        };
+
+        // Control: a plain shape keeps the pushed cap.
+        let plain = base_spec(false);
+        let batch = scan_resident_hot_store(&hot_mgr, &memtable_mgr, "main", &meta, &plain)
+            .expect("plain shape keeps the resident shortcut");
+        assert_eq!(batch.num_rows(), 2, "plain LIMIT shape is capped at 2");
+
+        // DISTINCT wrapper: the scan must return every matching row so the
+        // dedup above sees all of them (3 distinct volumes among 6 rows).
+        let distinct = base_spec(true);
+        let batch = scan_resident_hot_store(&hot_mgr, &memtable_mgr, "main", &meta, &distinct)
+            .expect("distinct shape still uses the resident shortcut");
+        assert_eq!(
+            batch.num_rows(),
+            6,
+            "DISTINCT must not be truncated by the pushed LIMIT"
+        );
+
+        // Aggregate wrapper: same contract.
+        let mut aggregate = base_spec(false);
+        aggregate.has_distinct_or_window = false;
+        aggregate.has_aggregate = true;
+        let batch = scan_resident_hot_store(&hot_mgr, &memtable_mgr, "main", &meta, &aggregate)
+            .expect("aggregate shape still uses the resident shortcut");
+        assert_eq!(
+            batch.num_rows(),
+            6,
+            "aggregates must not be truncated by the pushed LIMIT"
+        );
     }
 }

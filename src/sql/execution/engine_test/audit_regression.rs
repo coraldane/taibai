@@ -491,8 +491,13 @@ fn update_unique_violations_abort_cleanly() -> Result<()> {
     // present) must be REUSABLE — dead-row keys must not falsely collide.
     engine.execute(&mut session, "DELETE FROM t WHERE id = 2")?;
     engine.execute(&mut session, "INSERT INTO t VALUES (4, 20)")?; // reuses 20
+    // Free key 10 as well: its only physical occurrence must be a tombstoned
+    // row before the reuse below is legal. (The old assertion updated to 10
+    // while row 1 still held it — that only passed because the pre-fix
+    // validation could not see keys in WHERE-pruned segments.)
+    engine.execute(&mut session, "DELETE FROM t WHERE id = 1")?;
     let result = engine.execute(&mut session, "UPDATE t SET code = 10 WHERE id = 4");
-    assert!(result.is_ok(), "updating to a still-live key is the only error case");
+    assert!(result.is_ok(), "a key freed by DELETE must be reusable: {result:?}");
     let code = first_i64(
         engine.execute(&mut session, "SELECT code FROM t WHERE id = 4")?,
         0,

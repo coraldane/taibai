@@ -762,9 +762,26 @@ impl SegmentManager {
     }
 
     pub fn next_segment_path(&self, table_dir: &Path, _partition_key: &str) -> Result<PathBuf> {
-        let state = self.get_or_create_state_for_table_dir(table_dir)?;
-        let seq = state.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        Ok(table_dir.join(store::regular_segment_filename(seq)))
+        loop {
+            let state = self.get_or_create_state_for_table_dir(table_dir)?;
+            let seq = state.seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let path = table_dir.join(store::regular_segment_filename(seq));
+            if !path.exists() {
+                return Ok(path);
+            }
+            // The in-process counter fell behind the directory — a scan-based
+            // allocation (compaction replacement) owns this sequence. Reseed
+            // from the on-disk truth and retry; opening with truncate would
+            // silently destroy the replacement segment.
+            let dir_max = store::max_segment_seq_by_scan(table_dir, None)?;
+            tracing::warn!(
+                seq,
+                dir_max,
+                table_dir = %table_dir.display(),
+                "segment sequence collision; reseeding counter from directory"
+            );
+            state.seq.fetch_max(dir_max, Ordering::Relaxed);
+        }
     }
 
     pub fn next_partition_segment_path(
@@ -772,14 +789,31 @@ impl SegmentManager {
         table_dir: &Path,
         partition_key: &str,
     ) -> Result<PathBuf> {
-        let state = self.get_or_create_state_for_table_dir(table_dir)?;
-        let seq = {
+        loop {
+            let state = self.get_or_create_state_for_table_dir(table_dir)?;
+            let seq = {
+                let mut partition_seq = state.partition_seq.lock().unwrap();
+                let entry = partition_seq.entry(partition_key.to_string()).or_insert(0);
+                *entry += 1;
+                *entry
+            };
+            let path = table_dir.join(store::partition_segment_filename(partition_key, seq));
+            if !path.exists() {
+                return Ok(path);
+            }
+            let dir_max = store::max_segment_seq_by_scan(table_dir, Some(partition_key))?;
+            tracing::warn!(
+                seq,
+                dir_max,
+                partition_key,
+                table_dir = %table_dir.display(),
+                "partition segment sequence collision; reseeding counter from directory"
+            );
             let mut partition_seq = state.partition_seq.lock().unwrap();
-            let entry = partition_seq.entry(partition_key.to_string()).or_insert(0);
-            *entry += 1;
-            *entry
-        };
-        Ok(table_dir.join(store::partition_segment_filename(partition_key, seq)))
+            if let Some(entry) = partition_seq.get_mut(partition_key) {
+                *entry = (*entry).max(dir_max);
+            }
+        }
     }
 
     pub fn next_replacement_segment_path(
@@ -787,7 +821,36 @@ impl SegmentManager {
         table_dir: &Path,
         partition_key: Option<&str>,
     ) -> Result<PathBuf> {
-        store::next_segment_path_by_scan(table_dir, partition_key)
+        let path = store::next_segment_path_by_scan(table_dir, partition_key)?;
+        // Fold the scan-based allocation back into the in-process counters so
+        // `next_segment_path`/`next_partition_segment_path` can never hand out
+        // the same sequence again (their `truncate`-on-create would destroy
+        // this replacement segment). Failure to sync is non-fatal: the
+        // exists-check loop in the counter allocators still self-heals.
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            let seq = match partition_key {
+                Some(key) => store::parse_partition_seq(name, key),
+                None => store::parse_regular_seq(name),
+            };
+            if let Some(seq) = seq {
+                if let Ok(state) = self.get_or_create_state_for_table_dir(table_dir) {
+                    match partition_key {
+                        Some(key) => {
+                            let mut partition_seq = state.partition_seq.lock().unwrap();
+                            if let Some(entry) = partition_seq.get_mut(key) {
+                                *entry = (*entry).max(seq);
+                            } else {
+                                partition_seq.insert(key.to_string(), seq);
+                            }
+                        }
+                        None => {
+                            state.seq.fetch_max(seq, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(path)
     }
 
     pub fn open_reader(&self, path: &Path) -> Result<SegmentReader> {

@@ -11,6 +11,7 @@ mod cancellation;
 mod dml;
 mod durability;
 mod lifecycle;
+mod p0_regressions;
 mod replace_semantics;
 mod unique_index;
 

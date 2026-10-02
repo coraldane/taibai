@@ -389,6 +389,12 @@ impl ColumnArray {
     /// value or the column type is not i64-viewable — the same contract as
     /// [`Self::col_sum_i64`].
     pub fn col_sum_i64_range(&self, offset: usize, count: usize) -> Option<i64> {
+        // Run-form columns read through their materialized expansion; the
+        // lazy flatten is cached, so repeated range sums over the same column
+        // expand once.
+        if let ColumnArray::Rle { .. } = self {
+            return self.flattened().col_sum_i64_range(offset, count);
+        }
         let bitmap = self.bitmap();
         macro_rules! int_sum_range {
             ($data:expr, $cast:ty) => {{
@@ -446,6 +452,9 @@ impl ColumnArray {
     /// Column-wide sum as f64 for float columns (vectorized). Returns None if
     /// all values are null or the column type is not float.
     pub fn col_sum_f64(&self) -> Option<f64> {
+        if let ColumnArray::Rle { .. } = self {
+            return self.flattened().col_sum_f64();
+        }
         let bitmap = self.bitmap();
         match self {
             ColumnArray::Float64 { data, .. } => {

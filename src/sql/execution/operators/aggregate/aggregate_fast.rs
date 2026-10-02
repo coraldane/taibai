@@ -1014,6 +1014,16 @@ pub(super) fn fast_group_update(
     let group_array = batch
         .column(gb_col)
         .ok_or_else(|| TaibaiError::Internal("fast group: group column missing".into()))?;
+    // Adaptive encoding picks per row group, while the fast-path eligibility
+    // probe ran on the first batch only: a later batch may hand the same
+    // column over in run form. Read through the cached materialization
+    // instead of erroring (Rle is numeric-backed, so the typed arms below
+    // cover the expansion).
+    let group_array = if let ColumnArray::Rle { .. } = group_array {
+        group_array.flattened()
+    } else {
+        group_array
+    };
     let group_col = match group_array {
         ColumnArray::VarChar { data, bitmap } => FastGroupCol::Str(data, bitmap),
         ColumnArray::Dictionary {

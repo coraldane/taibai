@@ -319,6 +319,8 @@ pub(crate) fn exec_delete_in_txn(
         }
 
         let publish_deletes = engine.pubsub().has_subscribers();
+        let mut staged_segment_tombstones: Vec<(std::path::PathBuf, Vec<u8>, Vec<u64>)> =
+            Vec::new();
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
             let total_rows = reader.row_count();
@@ -471,6 +473,14 @@ pub(crate) fn exec_update_in_txn(
         // as the DELETE planner), so a second UPDATE of the same row cannot
         // append a second copy of its new image at COMMIT.
         let txn_mutations = engine.txn_mutations();
+        // Statement staging (P0): registrations and deferred events are
+        // COLLECTED here and only applied after the whole planning pass and
+        // a budget pre-check succeed. A statement that failed midway used to
+        // leave already-registered tombstones behind; the transaction's
+        // later COMMIT then deleted those rows without inserting their
+        // replacement images — silent data loss with no IO failure needed.
+        let mut staged_memtable_tombstones: Vec<(Arc<crate::storage::core::memtable::MemTable>, Vec<u32>)> = Vec::new();
+        let mut staged_events: Vec<RecordBatch> = Vec::new();
         super::dml_delete::for_each_visible_memtable(
             engine,
             db,
@@ -507,25 +517,13 @@ pub(crate) fn exec_update_in_txn(
                     Some(map) => matched_rows.iter().map(|&pos| map[pos as usize]).collect(),
                     None => matched_rows.clone(),
                 };
-                txn_mutations.register_memtable_tombstones(
-                    reader_txn_id,
-                    db,
-                    table,
-                    partitions.as_deref(),
-                    Arc::clone(&memtable),
-                    absolute_rows.iter().copied(),
-                )?;
+                staged_memtable_tombstones.push((Arc::clone(&memtable), absolute_rows));
                 let updated_rows = new_batch.take_rows(&matched_rows)?;
                 // C8: memtable-sourced images count toward the same
                 // incremental budget as segment-sourced ones.
                 charge_updated_image_bytes(&mut updated_image_bytes, &updated_rows)?;
                 if publish_updates {
-                    engine.txn_mutations().defer_update_event(
-                        reader_txn_id,
-                        db,
-                        table,
-                        updated_rows.clone(),
-                    )?;
+                    staged_events.push(updated_rows.clone());
                 }
                 new_rows.push((memtable.partition_key().to_string(), updated_rows));
                 Ok(())
@@ -555,6 +553,8 @@ pub(crate) fn exec_update_in_txn(
             )?;
         }
 
+        let mut staged_segment_tombstones: Vec<(std::path::PathBuf, Vec<u8>, Vec<u64>)> =
+            Vec::new();
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
             if !super::helpers::segment_may_match(&reader, &table_schema, predicate) {
@@ -632,15 +632,7 @@ pub(crate) fn exec_update_in_txn(
                 continue;
             }
             let footer_bitmap = reader.delete_bitmap().to_vec();
-            engine.txn_mutations().register_segment_tombstones(
-                reader_txn_id,
-                db,
-                table,
-                partitions.as_deref(),
-                &seg_path,
-                &footer_bitmap,
-                newly_deleted,
-            )?;
+            staged_segment_tombstones.push((seg_path.clone(), footer_bitmap, newly_deleted));
             let partition_key = seg_path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -649,14 +641,42 @@ pub(crate) fn exec_update_in_txn(
             for image in updated_images {
                 statement_updated += image.num_rows() as u64;
                 if publish_updates {
-                    engine.txn_mutations().defer_update_event(
-                        reader_txn_id,
-                        db,
-                        table,
-                        image.clone(),
-                    )?;
+                    staged_events.push(image.clone());
                 }
                 new_rows.push((partition_key.clone(), image));
+            }
+        }
+
+        // Budget pre-check: every charge this statement is about to make —
+        // the write path's authoritative per-batch image charges plus the
+        // position charges of the staged tombstones — must fit the remaining
+        // budget BEFORE the first side effect. Failing mid-append or
+        // mid-registration is what used to strand half a statement.
+        {
+            let image_append_bytes: u64 = new_rows
+                .iter()
+                .map(|(_, batch)| batch.estimated_size_bytes() as u64)
+                .sum();
+            let position_bytes: u64 = staged_segment_tombstones
+                .iter()
+                .map(|(_, _, ids)| (ids.len() as u64).saturating_mul(48))
+                .chain(
+                    staged_memtable_tombstones
+                        .iter()
+                        .map(|(_, positions)| (positions.len() as u64).saturating_mul(48)),
+                )
+                .sum();
+            let budget = crate::storage::core::txn_mutations::txn_mutation_budget_bytes();
+            let projected = engine
+                .txn_mutations()
+                .mutation_bytes_of(reader_txn_id)
+                .saturating_add(image_append_bytes)
+                .saturating_add(position_bytes);
+            if projected > budget {
+                return Err(TaibaiError::ResourceBusy(format!(
+                    "transaction UPDATE would charge {} bytes against the {} byte in-memory mutation budget; commit or roll back and split the work",
+                    projected, budget
+                )));
             }
         }
 
@@ -664,6 +684,14 @@ pub(crate) fn exec_update_in_txn(
         for (partition, batch) in new_rows {
             if batch.num_rows() == 0 {
                 continue;
+            }
+            #[cfg(test)]
+            if crate::common::fault_injection::should_fail(
+                crate::common::fault_injection::FaultPoint::TxnImageAppend,
+            ) {
+                return Err(TaibaiError::Internal(
+                    "forced transactional UPDATE image append failure".into(),
+                ));
             }
             engine
                 .batch_writer()
@@ -676,6 +704,64 @@ pub(crate) fn exec_update_in_txn(
                     reader_txn_id,
                     false,
                 )?;
+        }
+
+        // Apply the staged registrations. The budget pre-check above makes
+        // these charges non-failing; any other failure (corruption class)
+        // unregisters what already applied so COMMIT cannot materialize a
+        // half-statement.
+        let mut applied_segments: Vec<(std::path::PathBuf, Vec<u64>)> = Vec::new();
+        for (seg_path, footer_bitmap, ids) in &staged_segment_tombstones {
+            if let Err(error) = engine.txn_mutations().register_segment_tombstones(
+                reader_txn_id,
+                db,
+                table,
+                partitions.as_deref(),
+                seg_path,
+                footer_bitmap,
+                ids.iter().copied(),
+            ) {
+                for (path, applied_ids) in &applied_segments {
+                    engine
+                        .txn_mutations()
+                        .unregister_segment_tombstones(reader_txn_id, db, table, path, applied_ids);
+                }
+                return Err(error);
+            }
+            applied_segments.push((seg_path.clone(), ids.clone()));
+        }
+        let mut applied_memtables: Vec<(uuid::Uuid, Vec<u32>)> = Vec::new();
+        for (memtable, positions) in &staged_memtable_tombstones {
+            if let Err(error) = engine.txn_mutations().register_memtable_tombstones(
+                reader_txn_id,
+                db,
+                table,
+                partitions.as_deref(),
+                Arc::clone(memtable),
+                positions.iter().copied(),
+            ) {
+                for (path, applied_ids) in &applied_segments {
+                    engine
+                        .txn_mutations()
+                        .unregister_segment_tombstones(reader_txn_id, db, table, path, applied_ids);
+                }
+                for (applied_id, applied_positions) in &applied_memtables {
+                    engine.txn_mutations().unregister_memtable_tombstones(
+                        reader_txn_id,
+                        db,
+                        table,
+                        *applied_id,
+                        applied_positions,
+                    );
+                }
+                return Err(error);
+            }
+            applied_memtables.push((memtable.id(), positions.clone()));
+        }
+        for event in staged_events {
+            engine
+                .txn_mutations()
+                .defer_update_event(reader_txn_id, db, table, event)?;
         }
 
         Ok(statement_updated)

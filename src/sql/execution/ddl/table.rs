@@ -544,12 +544,16 @@ pub fn exec_drop_table(
             }
 
             let step_start = Instant::now();
-            engine.hot_store_manager().remove(db, name);
+            // invalidate (not bare remove): this also clears the memtable
+            // manager's hot_unfed_rows bookkeeping, which otherwise outlived
+            // the DROP and permanently disabled the same-name recreate's
+            // resident fast paths.
+            engine.invalidate_hot_store(db, name);
             tracing::info!(
                 db,
                 table = name,
                 elapsed_ms = step_start.elapsed().as_millis(),
-                "drop table: removed resident hot store"
+                "drop table: invalidated resident hot store"
             );
 
             let step_start = Instant::now();

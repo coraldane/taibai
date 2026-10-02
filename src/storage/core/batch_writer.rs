@@ -467,7 +467,21 @@ impl BatchWriter {
         };
         log_insert_profile("memtable_get", row_count as usize, get_start.elapsed());
         let append_start = Instant::now();
-        let insert_bytes = (txn_id > 0).then(|| batch.estimated_size_bytes() as u64);
+        // Budget is charged BEFORE the append: charging after it left the
+        // failed statement's rows inside the transaction memtable, and a
+        // subsequent COMMIT published them as ghost rows whose unique-index
+        // keys were never recorded. If the append itself fails after a
+        // successful charge, the bytes stay charged — a conservative
+        // over-count of at most one batch that only shrinks the remaining
+        // budget.
+        if txn_id > 0 {
+            self.charge_txn_insert_bytes(
+                txn_id,
+                db,
+                table,
+                batch.estimated_size_bytes() as u64,
+            )?;
+        }
         let pending = if txn_id == 0 {
             // `PreparedTailAppend` already owns the durable representation of
             // this delta, so the materialized column buffers can move into the
@@ -487,9 +501,6 @@ impl BatchWriter {
             mt.append_owned(batch)?;
             None
         };
-        if let Some(insert_bytes) = insert_bytes {
-            self.charge_txn_insert_bytes(txn_id, db, table, insert_bytes)?;
-        }
         log_insert_profile(
             "memtable_append",
             row_count as usize,
@@ -615,6 +626,17 @@ impl BatchWriter {
 
     pub fn commit_txn(&self, txn_id: u64) -> Result<()> {
         let pending = self.commit_txn_submit_inner(txn_id, false)?;
+        self.wait_pending_tail_commits(pending)
+    }
+
+    /// Commit a transaction whose caller already holds the table (or target
+    /// partition-set) mutation lock. [`Self::commit_txn`] re-acquires the
+    /// partition mutation lock on the submit side, which self-deadlocks
+    /// against the caller's lock on non-partitioned tables (partition "" IS
+    /// the table lock). The tail-commit wait still runs under the caller's
+    /// lock — the same trade-off REPLACE's under-lock write makes.
+    pub fn commit_txn_under_table_lock(&self, txn_id: u64) -> Result<()> {
+        let pending = self.commit_txn_submit_under_table_lock(txn_id)?;
         self.wait_pending_tail_commits(pending)
     }
 

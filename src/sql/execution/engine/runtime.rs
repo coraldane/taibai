@@ -584,13 +584,24 @@ impl Engine {
             .cloned()
             .collect::<Vec<_>>();
         let mut total = 0u64;
-        for (db, table) in tables {
-            total = total.saturating_add(self.flush_table_buffers(&db, &table)?);
-            self.bulk_dirty_tables.lock().unwrap().remove(&(db, table));
-        }
+        // The resume must run even when a table's flush errors: skipping it
+        // left unique-index compaction paused FOREVER (the error paths of
+        // both callers only log). Flush failures keep the table queued for
+        // the next end-of-bulk attempt; the pause does not get a second
+        // chance.
+        let flush_all = |tables: &[(String, String)]| -> Result<u64> {
+            let mut total = 0u64;
+            for (db, table) in tables {
+                total = total.saturating_add(self.flush_table_buffers(db, table)?);
+                self.bulk_dirty_tables.lock().unwrap().remove(&(db.clone(), table.clone()));
+            }
+            Ok(total)
+        };
+        let result = flush_all(&tables);
         if !self.is_bulk_mode() {
             self.index_manager.resume_unique_index_compaction();
         }
+        total = result?;
         Ok(total)
     }
 

@@ -109,3 +109,103 @@ fn test_extend_from_run_form_source() {
     assert_eq!(dst2.len(), 2);
     assert_eq!(dst2.scalar(1), ScalarValue::Int64(Some(4)));
 }
+
+#[test]
+fn null_rle_flatten_is_dense() {
+    use crate::types::bitmap::NullBitmap;
+    // rows: [7, NULL, 9]; runs cover non-null rows only per constructor
+    // contract. The expansion must be dense — one data slot per row — or
+    // positional reads misalign after the first null and panic on tail rows.
+    let col = ColumnArray::rle(
+        vec![(7, 1), (9, 1)],
+        DataType::Int64,
+        NullBitmap::from_bools(&[false, true, false]),
+        3,
+    );
+    let flat = col.flattened();
+    let ColumnArray::Int64 { data, bitmap } = flat else {
+        panic!("not int64");
+    };
+    assert_eq!(data.len(), 3, "expansion must be dense (len == row count)");
+    assert_eq!(bitmap.null_count(), 1);
+    assert_eq!(col.scalar(0), ScalarValue::Int64(Some(7)));
+    assert_eq!(col.scalar(1), ScalarValue::Int64(None));
+    assert_eq!(col.scalar(2), ScalarValue::Int64(Some(9)));
+}
+
+/// Representation equivalence (P0): the same logical column must answer
+/// identically whether stored flat or in run form. Every consumer kernel
+/// that had no `Rle` arm used to silently drop the column from SUM/AVG or
+/// panic on positional reads; this pins the contract for the numeric
+/// kernels, per-row accessors and scalar reads, with and without nulls.
+#[test]
+fn run_form_matches_flat_form_across_numeric_kernels() {
+    use crate::types::bitmap::NullBitmap;
+
+    let cases: Vec<(Vec<Option<i64>>, &str)> = vec![
+        (
+            (0..200).map(|i| Some(i % 7)).collect(),
+            "low-cardinality, null-free",
+        ),
+        (
+            (0..200)
+                .map(|i| if i % 5 == 0 { None } else { Some(1000 + i / 10) })
+                .collect(),
+            "with nulls",
+        ),
+        ((0..130).map(|i| Some(i)).collect(), "distinct values"),
+    ];
+
+    for (values, label) in cases {
+        let len = values.len();
+        let null_flags: Vec<bool> = values.iter().map(|v| v.is_none()).collect();
+        let bitmap = NullBitmap::from_bools(&null_flags);
+
+        let mut flat = ColumnArray::empty(DataType::Int64);
+        for value in &values {
+            match value {
+                Some(v) => flat.push(&ScalarValue::Int64(Some(*v))).unwrap(),
+                None => flat.push(&ScalarValue::Int64(None)).unwrap(),
+            }
+        }
+        // Runs cover the non-null rows in order (the decoder's contract).
+        let mut runs: Vec<(i64, u32)> = Vec::new();
+        for value in values.iter().flatten() {
+            match runs.last_mut() {
+                Some((last, count)) if *last == *value => *count += 1,
+                _ => runs.push((*value, 1)),
+            }
+        }
+        let rle = ColumnArray::rle(runs, DataType::Int64, bitmap, len);
+
+        // Column-wide sum: the aggregate kernels' entry point.
+        assert_eq!(flat.col_sum_i64(), rle.col_sum_i64(), "col_sum_i64 [{label}]");
+        assert_eq!(
+            flat.col_count_non_null(),
+            rle.col_count_non_null(),
+            "col_count_non_null [{label}]"
+        );
+        // Range sums (group-boundary partial aggregation).
+        for (offset, count) in [(0, 64), (64, 64), (13, 87)] {
+            assert_eq!(
+                flat.col_sum_i64_range(offset, count),
+                rle.col_sum_i64_range(offset, count),
+                "col_sum_i64_range({offset}, {count}) [{label}]"
+            );
+        }
+        // Per-row accessors: the generic GROUP BY and comparison paths.
+        for row in 0..len {
+            assert_eq!(
+                flat.numeric_i64_at(row),
+                rle.numeric_i64_at(row),
+                "numeric_i64_at({row}) [{label}]"
+            );
+            assert_eq!(
+                flat.numeric_f64_at(row),
+                rle.numeric_f64_at(row),
+                "numeric_f64_at({row}) [{label}]"
+            );
+            assert_eq!(flat.scalar(row), rle.scalar(row), "scalar({row}) [{label}]");
+        }
+    }
+}

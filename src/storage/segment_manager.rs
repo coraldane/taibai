@@ -182,3 +182,7 @@ mod compression_level_tests;
 #[cfg(test)]
 #[path = "segment_manager/seal_outside_lock_test.rs"]
 mod seal_outside_lock_tests;
+
+#[cfg(test)]
+#[path = "segment_manager/seq_allocation_test.rs"]
+mod seq_allocation_tests;
