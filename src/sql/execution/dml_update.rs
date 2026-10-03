@@ -163,14 +163,9 @@ pub fn exec_update(
         } else {
             Vec::new()
         };
-        let mut staged_segments: Vec<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> =
-            Vec::new();
-        let mut segments_removed = 0usize;
         // Assignments are constant per statement; resolve them once for every
         // segment/row group below.
         let assigned = precompute_assigned_values(assignments, &table_schema)?;
-        let compression_level = mgr.table_compression_level(db, table);
-        let row_group_target = mgr.row_group_target_rows();
 
         // Validation set up front: the segment dry-run below gathers the
         // surviving rows' key columns while it scans, so no second

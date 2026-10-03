@@ -463,9 +463,7 @@ fn grouped_sum_overflow_errors_instead_of_wrapping() {
 #[test]
 fn nan_keys_share_one_canonical_encoding() {
     use crate::types::array::ColumnArray;
-    use crate::types::batch::{ColumnDef, Schema};
     use crate::protocol::types::DataType as Dt;
-    let schema = Schema::new(vec![ColumnDef::new("f", Dt::Float64)]);
     let mut col = ColumnArray::empty(Dt::Float64);
     for v in [f64::NAN, -f64::NAN] {
         col.push(&crate::types::scalar::ScalarValue::Float64(Some(v))).unwrap();

@@ -629,7 +629,9 @@ impl SegmentManager {
     }
 
     /// Effective level for the table right now: its DDL override, or the
-    /// global configured level when unset.
+    /// global configured level when unset. Test-only observation point —
+    /// production writers resolve through `table_compression_level_for_path`.
+    #[cfg(test)]
     pub(crate) fn table_compression_level(&self, db: &str, table: &str) -> i32 {
         let key = table_key(db, table);
         let tables = self.tables.read().unwrap();

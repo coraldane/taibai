@@ -199,39 +199,11 @@ impl SegmentManager {
             .ok_or_else(|| TaibaiError::Storage("active segment path has no file name".into()))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    /// Legacy no-intent entry; production flushes route through
-    /// [`Self::flush_memtable_batch_with_intents_under_table_lock`].
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn flush_memtable_batch_if_under_table_lock(
-        &self,
-        db: &str,
-        table: &str,
-        partition_key: &str,
-        batch: &RecordBatch,
-        txn_id: u64,
-        should_write: impl FnOnce() -> bool,
-        on_written: impl FnOnce(),
-    ) -> Result<bool> {
-        self.flush_memtable_batch_with_intents_under_table_lock(
-            db,
-            table,
-            partition_key,
-            batch,
-            txn_id,
-            &mut |_, _| Ok(()),
-            should_write,
-            on_written,
-        )
-        .map(|outcome| outcome.wrote)
-    }
-
-    /// [`Self::flush_memtable_batch_if_under_table_lock`] whose durable
-    /// flush intents are written by `write_intents` INSIDE the append's
-    /// active_segments critical section, stamped with the authoritative
-    /// pre-append watermark of the very segment receiving the rows. Returns
-    /// the wrote flag plus `(segment_file, expected_total_rows)` for
-    /// logging/recovery bookkeeping.
+    /// Memtable flush whose durable flush intents are written by
+    /// `write_intents` INSIDE the append's active_segments critical section,
+    /// stamped with the authoritative pre-append watermark of the very
+    /// segment receiving the rows. Returns the wrote flag plus
+    /// `(segment_file, expected_total_rows)` for logging/recovery bookkeeping.
     pub(crate) fn flush_memtable_batch_with_intents_under_table_lock(
         &self,
         db: &str,

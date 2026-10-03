@@ -506,7 +506,6 @@ impl Engine {
             // startup instead of deleting rows whose images were lost.
             let materialization =
                 super::txn_dml::materialize_txn_mutations_at_commit(self, txn_id)?;
-            let mut images_durable = false;
             if let Err(first_error) = self.batch_writer().commit_txn(txn_id) {
                 // By the time commit_txn reports an error, the visibility flip
                 // has usually already happened (the failure comes from the
@@ -536,14 +535,10 @@ impl Engine {
                     )));
                 }
                 // The redrive persisted the images as segments: that also
-                // satisfies every watermark.
-                images_durable = true;
-            } else {
-                images_durable = true;
+                // satisfies every watermark, so fall through to finish
+                // materialization like the success path.
             }
-            if images_durable {
-                super::txn_dml::finish_materialization(self, materialization);
-            }
+            super::txn_dml::finish_materialization(self, materialization);
         }
 
         // The published index entries are authoritative now; drop the
@@ -657,7 +652,6 @@ impl Engine {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        let mut total = 0u64;
         // The resume must run even when a table's flush errors: skipping it
         // left unique-index compaction paused FOREVER (the error paths of
         // both callers only log). Flush failures keep the table queued for
@@ -675,8 +669,7 @@ impl Engine {
         if !self.is_bulk_mode() {
             self.index_manager.resume_unique_index_compaction();
         }
-        total = result?;
-        Ok(total)
+        result
     }
 
     fn begin_operation(&self) -> EngineOperationGuard<'_> {
