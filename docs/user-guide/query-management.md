@@ -57,6 +57,7 @@ server:
 | `connection_idle_timeout_secs` | — | 连接无任何协议帧的最长时间，超时断开（0 关闭） |
 | `bulk_import_idle_timeout_secs` | 3600 | bulk 导入会话存续期间的空闲断连超时：导入客户端会长时间静默（解码输入文件、攒批），仅靠 keepalive PING 续命，间隔与常规空闲打平时会误杀进行中的导入（0 = bulk 会话完全不受空闲断连） |
 | `max_concurrent_requests` | 8 | CPU/磁盘重请求的最大并发数 |
+| `reserved_bulk_slots` | 2 | 为 bulk 写入保留的重请求槽位数：查询类请求（`MSG_TYPE_QUERY`）最多占用 `max_concurrent_requests - reserved_bulk_slots` 个槽，bulk 写入始终使用完整池。查询风暴期间 bulk 导入的提交不会再被排队超时拒绝（0 关闭保留） |
 
 过载与超时错误会返回给客户端，应用侧应将其视为可重试信号。
 

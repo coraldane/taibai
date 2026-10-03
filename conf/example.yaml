@@ -3,6 +3,10 @@ server:
   port: 5151
   max_connections: 1024
   max_concurrent_requests: 8
+  # 为 bulk 写入保留的重请求槽位数：查询类请求最多占用
+  # max_concurrent_requests - reserved_bulk_slots 个槽，保证查询压满服务端时
+  # bulk 导入仍有槽位可提交，不会因排队超时被过载拒绝。0 关闭保留
+  reserved_bulk_slots: 2
   # 列式批量导入消息（0x23）的接收上限；批量导入的载荷随批次行数增长，
   # 因此独立于通用 max_message_size
   max_bulk_message_size: 134217728

@@ -20,6 +20,10 @@ fn default_max_concurrent_requests() -> usize {
         .max(4)
 }
 
+fn default_reserved_bulk_slots() -> usize {
+    2
+}
+
 fn default_connection_idle_timeout_secs() -> u64 {
     300
 }
@@ -593,6 +597,15 @@ pub struct ServerSettings {
     /// These requests run outside Tokio's networking worker threads.
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
+    /// Heavy-request slots kept out of reach of ad-hoc queries so bulk
+    /// imports keep committing while analytical queries saturate the rest
+    /// of the pool. Only MSG_TYPE_QUERY admission is capped (to
+    /// `max_concurrent_requests - reserved_bulk_slots`); bulk writes and
+    /// every other heavy request keep using the full pool. Clamped to
+    /// `max_concurrent_requests - 1`; set to 0 to restore the legacy
+    /// single-pool behavior.
+    #[serde(default = "default_reserved_bulk_slots")]
+    pub reserved_bulk_slots: usize,
     /// Disconnect clients that send no protocol frame for this many seconds.
     /// Set to 0 to disable the idle timeout.
     #[serde(default = "default_connection_idle_timeout_secs")]
@@ -971,6 +984,7 @@ fn default_server_settings() -> ServerSettings {
         max_bulk_message_size: default_max_bulk_message_size(),
         max_connections: default_max_connections(),
         max_concurrent_requests: default_max_concurrent_requests(),
+        reserved_bulk_slots: default_reserved_bulk_slots(),
         connection_idle_timeout_secs: default_connection_idle_timeout_secs(),
         bulk_import_idle_timeout_secs: default_bulk_import_idle_timeout_secs(),
         tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
