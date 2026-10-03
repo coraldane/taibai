@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -23,6 +23,118 @@ use crate::storage::segment::SegmentReader;
 /// rather than by `capacity` entries of up to ~255 MB each.
 pub(super) const AVG_READER_COST_BYTES: u64 = 256 * 1024;
 
+/// O(1) intrusive LRU order over paths: a slab-backed doubly-linked list
+/// with a path→slot index. `touch`, `push`, `pop_front` and `remove` are all
+/// constant time. This replaces the previous `VecDeque` whose `touch` and
+/// `invalidate` scanned up to `capacity` `PathBuf`s per operation — on the
+/// scan hot path, once per segment lookup.
+struct LruOrder {
+    index: HashMap<PathBuf, u32>,
+    slots: Vec<Slot>,
+    free: Vec<u32>,
+    head: Option<u32>,
+    tail: Option<u32>,
+}
+
+struct Slot {
+    path: PathBuf,
+    prev: Option<u32>,
+    next: Option<u32>,
+}
+
+impl LruOrder {
+    fn new() -> Self {
+        Self {
+            index: HashMap::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            head: None,
+            tail: None,
+        }
+    }
+
+    fn unlink(&mut self, id: u32) {
+        let (prev, next) = {
+            let slot = &self.slots[id as usize];
+            (slot.prev, slot.next)
+        };
+        match prev {
+            Some(prev) => self.slots[prev as usize].next = next,
+            None => self.head = next,
+        }
+        match next {
+            Some(next) => self.slots[next as usize].prev = prev,
+            None => self.tail = prev,
+        }
+    }
+
+    fn push_back(&mut self, path: PathBuf) {
+        // A re-push of a live path is a touch (the old slot moves to the
+        // back); callers otherwise remove before pushing a fresh key.
+        if self.index.contains_key(&path) {
+            self.touch(&path);
+            return;
+        }
+        let id = match self.free.pop() {
+            Some(id) => id,
+            None => {
+                self.slots.push(Slot {
+                    path: path.clone(),
+                    prev: None,
+                    next: None,
+                });
+                let id = (self.slots.len() - 1) as u32;
+                self.link_at_tail(id);
+                self.index.insert(path, id);
+                return;
+            }
+        };
+        let slot = &mut self.slots[id as usize];
+        slot.path = path.clone();
+        self.link_at_tail(id);
+        self.index.insert(path, id);
+    }
+
+    fn link_at_tail(&mut self, id: u32) {
+        let old_tail = self.tail;
+        self.slots[id as usize].prev = old_tail;
+        self.slots[id as usize].next = None;
+        match old_tail {
+            Some(old_tail) => self.slots[old_tail as usize].next = Some(id),
+            None => self.head = Some(id),
+        }
+        self.tail = Some(id);
+    }
+
+    fn touch(&mut self, path: &Path) {
+        let Some(&id) = self.index.get(path) else {
+            return;
+        };
+        if self.tail == Some(id) {
+            return;
+        }
+        self.unlink(id);
+        self.link_at_tail(id);
+    }
+
+    fn pop_front(&mut self) -> Option<PathBuf> {
+        let head = self.head?;
+        self.unlink(head);
+        let path = self.slots[head as usize].path.clone();
+        self.index.remove(&path);
+        self.free.push(head);
+        Some(path)
+    }
+
+    fn remove(&mut self, path: &Path) {
+        let Some(id) = self.index.remove(path) else {
+            return;
+        };
+        self.unlink(id);
+        self.free.push(id);
+    }
+}
+
 pub(super) struct ReaderCache {
     budget_bytes: u64,
     used_bytes: u64,
@@ -30,7 +142,7 @@ pub(super) struct ReaderCache {
     /// remembered per entry so `invalidate`/eviction can release exactly what
     /// was reserved, including after a same-path re-put with a new cost.
     entries: HashMap<PathBuf, (Arc<SegmentReader>, u64)>,
-    order: VecDeque<PathBuf>,
+    order: LruOrder,
 }
 
 impl ReaderCache {
@@ -43,14 +155,13 @@ impl ReaderCache {
             budget_bytes: capacity.max(1) as u64 * AVG_READER_COST_BYTES,
             used_bytes: 0,
             entries: HashMap::new(),
-            order: VecDeque::new(),
+            order: LruOrder::new(),
         }
     }
 
     pub(super) fn get(&mut self, path: &Path) -> Option<Arc<SegmentReader>> {
-        let key = path.to_path_buf();
-        let (reader, _) = self.entries.get(&key)?.clone();
-        self.touch(&key);
+        let (reader, _) = self.entries.get(path)?.clone();
+        self.order.touch(path);
         Some(reader)
     }
 
@@ -82,13 +193,10 @@ impl ReaderCache {
     }
 
     pub(super) fn invalidate(&mut self, path: &Path) {
-        let key = path.to_path_buf();
-        if let Some((_, cost)) = self.entries.remove(&key) {
+        if let Some((_, cost)) = self.entries.remove(path) {
             self.used_bytes -= cost;
         }
-        if let Some(pos) = self.order.iter().position(|p| p == &key) {
-            self.order.remove(pos);
-        }
+        self.order.remove(path);
     }
 
     pub(super) fn invalidate_under(&mut self, dir: &Path) {
@@ -101,13 +209,6 @@ impl ReaderCache {
         for key in keys {
             self.invalidate(&key);
         }
-    }
-
-    fn touch(&mut self, path: &PathBuf) {
-        if let Some(pos) = self.order.iter().position(|p| p == path) {
-            self.order.remove(pos);
-        }
-        self.order.push_back(path.clone());
     }
 
     fn evict_if_needed(&mut self) {
@@ -159,6 +260,37 @@ mod tests {
 
     fn owned_reader(path: &Path) -> SegmentReader {
         SegmentReader::open_owned(path).unwrap()
+    }
+
+    #[test]
+    fn lru_order_moves_and_removes_in_constant_time_shape() {
+        let mut lru = LruOrder::new();
+        let a = PathBuf::from("a");
+        let b = PathBuf::from("b");
+        let c = PathBuf::from("c");
+        lru.push_back(a.clone());
+        lru.push_back(b.clone());
+        lru.push_back(c.clone());
+        lru.touch(&a);
+        assert_eq!(lru.pop_front(), Some(b.clone()));
+        lru.remove(&c);
+        assert_eq!(lru.pop_front(), Some(a.clone()));
+        assert_eq!(lru.pop_front(), None);
+        assert_eq!(lru.index.len(), 0);
+        // Slot recycling: a remove+re-push reuses the freed slot instead of
+        // growing the slab, so its size tracks the live count.
+        for i in 0..10 {
+            lru.push_back(PathBuf::from(format!("p{i}")));
+        }
+        assert_eq!(lru.slots.len(), 10);
+        lru.remove(Path::new("p3"));
+        lru.push_back(PathBuf::from("p_new"));
+        assert_eq!(
+            lru.slots.len(),
+            10,
+            "the freed slot is recycled, not regrown"
+        );
+        
     }
 
     #[test]

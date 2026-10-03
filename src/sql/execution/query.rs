@@ -2166,15 +2166,40 @@ fn bind_correlated_subquery(
                         .collect::<Vec<_>>(),
                 );
             } else {
-                let (schema, batches) = snapshot_table(engine, &table_ref)?;
+                // Shared per query through the registry: every occurrence of
+                // a correlated subquery over this table reuses one snapshot
+                // instead of re-reading and re-materializing the full table.
+                // The lock is held only around the map access — never across
+                // the snapshot execution.
+                let (schema, batches) = {
+                    let cached = registry
+                        .lock()
+                        .unwrap()
+                        .table_snapshots
+                        .get(&table_ref.key)
+                        .cloned();
+                    match cached {
+                        Some((schema, batches)) => (schema, batches),
+                        None => {
+                            let (schema, batches) = snapshot_table(engine, &table_ref)?;
+                            let batches = batches
+                                .into_iter()
+                                .map(std::sync::Arc::new)
+                                .collect::<Vec<_>>();
+                            registry
+                                .lock()
+                                .unwrap()
+                                .table_snapshots
+                                .insert(
+                                    table_ref.key.clone(),
+                                    (schema.clone(), batches.clone()),
+                                );
+                            (schema, batches)
+                        }
+                    }
+                };
                 snapshot_schemas.insert(table_ref.key.clone(), schema);
-                snapshot_batches.insert(
-                    table_ref.key.clone(),
-                    batches
-                        .into_iter()
-                        .map(std::sync::Arc::new)
-                        .collect::<Vec<_>>(),
-                );
+                snapshot_batches.insert(table_ref.key.clone(), batches);
             }
         }
     }

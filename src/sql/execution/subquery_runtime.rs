@@ -38,6 +38,11 @@ pub struct CorrelatedSnapshot {
 
 pub struct SubqueryRegistryInner {
     pub snapshots: HashMap<u64, CorrelatedSnapshot>,
+    /// Per-query cache of inner-table snapshots shared by every correlated
+    /// subquery occurrence of one statement: N occurrences of subqueries
+    /// over the same table materialize it ONCE instead of N times (each
+    /// occurrence used to pay a full-table read + copy).
+    pub table_snapshots: HashMap<String, (crate::types::batch::Schema, Vec<std::sync::Arc<crate::types::batch::RecordBatch>>)>,
     next_id: u64,
 }
 
@@ -51,6 +56,7 @@ impl SubqueryRegistryInner {
     pub fn new() -> Self {
         Self {
             snapshots: HashMap::new(),
+            table_snapshots: HashMap::new(),
             next_id: 0,
         }
     }
