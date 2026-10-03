@@ -773,9 +773,9 @@ impl HashJoinExec {
                     rr = 0;
                     continue;
                 }
-                for i in 0..left_ncols {
+                for (i, column) in columns.iter_mut().take(left_ncols).enumerate() {
                     let v = left_batch.scalar(l, i).unwrap_or(ScalarValue::Int64(None));
-                    columns[i].push(&v)?;
+                    column.push(&v)?;
                 }
                 for i in 0..right_ncols {
                     let v = right_batch

@@ -1821,7 +1821,7 @@ impl ColumnArray {
                 // unreachable!() — one new caller with a run-form column in
                 // hand would have panicked a session instead of extending.
                 let flattened = other.flattened();
-                self.extend(&flattened)
+                self.extend(flattened)
             }
         }
     }
@@ -1879,7 +1879,7 @@ impl ColumnArray {
             }};
         }
 
-        match (&mut *self, &*other) {
+        match (&mut *self, other) {
             (ColumnArray::Bool { .. }, ColumnArray::Bool { .. }) => {
                 extend_range_column!(Bool)
             }

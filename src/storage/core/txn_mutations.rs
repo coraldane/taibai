@@ -210,6 +210,7 @@ impl TxnMutationRegistry {
         txn.tables.last_mut().expect("just pushed")
     }
 
+    #[allow(clippy::too_many_arguments)]
     /// Record newly deleted segment rows for `txn_id`. `footer_bitmap` is the
     /// segment's current footer bitmap; the composed reader bitmap is
     /// recomputed as footer ∪ existing entry ∪ `newly_deleted`.
@@ -903,7 +904,7 @@ mod tests {
                 *byte |= (next() & 0x03) as u8;
             }
             let new_ids: Vec<u64> = (0..(next() as usize) % 12)
-                .map(|_| (next() as u64) % 96)
+                .map(|_| next() % 96)
                 .collect();
 
             registry

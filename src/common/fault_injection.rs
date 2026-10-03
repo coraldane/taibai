@@ -9,6 +9,9 @@
 //! (undo/staging/drop) run exactly as a real IO failure would.
 
 #[cfg(test)]
+pub use imp::{arm, should_fail, FaultPoint};
+
+#[cfg(test)]
 mod imp {
     use std::cell::RefCell;
     use std::collections::HashSet;
@@ -38,6 +41,3 @@ mod imp {
         ARMED.with(|armed| armed.borrow_mut().remove(&point))
     }
 }
-
-#[cfg(test)]
-pub use imp::{arm, should_fail, FaultPoint};

@@ -182,12 +182,11 @@ fn build_operator_with_limit(
     });
     let operator: Result<Box<dyn ExecutionOp>> = match plan {
         LogicalPlan::Scan(scan) => {
-            if table_batches.is_some() {
+            if let Some(table_batches) = table_batches {
                 // Materialized path: pseudo tables (derived tables,
                 // decorrelated subquery snapshots) carry their schema in the
                 // plan and have no storage metadata.
                 let batches = table_batches
-                    .unwrap()
                     .get(&scan.table_name)
                     .cloned()
                     .unwrap_or_default();
@@ -2279,7 +2278,8 @@ fn try_folded_aggregate_exec(
     if agg.having.is_some() {
         return None;
     }
-    if agg.group_by
+    if agg
+        .group_by
         .iter()
         .any(|expr| !matches!(expr, LogicalExpr::Column(_)))
     {

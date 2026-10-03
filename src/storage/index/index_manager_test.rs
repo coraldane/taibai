@@ -387,11 +387,11 @@ fn background_compaction_preserves_appends_that_raced_the_merge() -> Result<()> 
     assert!(job.publish(snapshot.delta_bytes.len(), &tmp_path)?);
 
     assert_eq!(
-        manager.unique_keys_exist("db", "t", "uk", &int64_keys(&[5, 25, 45]))?,
+        manager.unique_keys_exist("db", "t", "uk", int64_keys(&[5, 25, 45]))?,
         Some(true)
     );
     assert_eq!(
-        manager.unique_keys_exist("db", "t", "uk", &int64_keys(&[99]))?,
+        manager.unique_keys_exist("db", "t", "uk", int64_keys(&[99]))?,
         Some(false)
     );
 
@@ -415,11 +415,11 @@ fn background_compaction_preserves_appends_that_raced_the_merge() -> Result<()> 
         dir.path().to_path_buf(),
     );
     assert_eq!(
-        manager2.unique_keys_exist("db", "t", "uk", &int64_keys(&[5, 25, 45]))?,
+        manager2.unique_keys_exist("db", "t", "uk", int64_keys(&[5, 25, 45]))?,
         Some(true)
     );
     assert_eq!(
-        manager2.unique_keys_exist("db", "t", "uk", &int64_keys(&[99]))?,
+        manager2.unique_keys_exist("db", "t", "uk", int64_keys(&[99]))?,
         Some(false)
     );
     Ok(())
@@ -456,7 +456,7 @@ fn superseded_compaction_job_leaves_files_untouched() -> Result<()> {
     assert_eq!(std::fs::read(job.delta_path())?, delta_before);
     assert_eq!(std::fs::read(job.base_path())?, base_before);
     assert!(manager
-        .unique_keys_exist("db", "t", "uk", &int64_keys(&[5]))?
+        .unique_keys_exist("db", "t", "uk", int64_keys(&[5]))?
         .is_none());
     Ok(())
 }
@@ -509,11 +509,11 @@ fn dispatched_delta_compaction_publishes_new_base_and_resets_flag() -> Result<()
         .exists());
 
     assert_eq!(
-        manager.unique_keys_exist("db", "t", "uk", &int64_keys(&[5, 55]))?,
+        manager.unique_keys_exist("db", "t", "uk", int64_keys(&[5, 55]))?,
         Some(true)
     );
     assert_eq!(
-        manager.unique_keys_exist("db", "t", "uk", &int64_keys(&[99]))?,
+        manager.unique_keys_exist("db", "t", "uk", int64_keys(&[99]))?,
         Some(false)
     );
 
@@ -522,7 +522,7 @@ fn dispatched_delta_compaction_publishes_new_base_and_resets_flag() -> Result<()
         dir.path().to_path_buf(),
     );
     assert_eq!(
-        manager2.unique_keys_exist("db", "t", "uk", &int64_keys(&[5, 55]))?,
+        manager2.unique_keys_exist("db", "t", "uk", int64_keys(&[5, 55]))?,
         Some(true)
     );
     Ok(())
@@ -997,10 +997,7 @@ fn base_block_loads_survive_publish_rename_over_the_path() -> Result<()> {
     // Keys are fixed-width zero-padded strings: encoded-byte order matches
     // generation order, satisfying the writer's encoded-sorted contract
     // (the on-disk order is by encoded bytes, not by integer value).
-    let write_base = |path: &std::path::Path,
-                      seg_path: &str,
-                      count: usize|
-     -> Result<()> {
+    let write_base = |path: &std::path::Path, seg_path: &str, count: usize| -> Result<()> {
         let file = std::fs::File::create(path)?;
         let mut writer = UniqueIndexBaseWriter::new(
             std::io::BufWriter::new(file),
@@ -1037,9 +1034,9 @@ fn base_block_loads_survive_publish_rename_over_the_path() -> Result<()> {
     // The in-flight state must resolve its own keys from its pinned handle:
     // every lookup below loads blocks on demand AFTER the overwrite.
     for value in [0usize, 255, 256, 512, 599] {
-        let locations = state_a.find_locations(&encode_unique_key(&[ScalarValue::VarChar(Some(
-            format!("k{value:06}"),
-        ))])?)?;
+        let locations = state_a.find_locations(&encode_unique_key(&[ScalarValue::VarChar(
+            Some(format!("k{value:06}")),
+        )])?)?;
         assert_eq!(
             locations,
             vec![UniqueRowLocation {

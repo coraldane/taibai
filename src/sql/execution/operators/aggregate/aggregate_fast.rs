@@ -15,6 +15,13 @@
 
 use std::collections::HashMap;
 
+/// Drained fast-path state: accumulators per interned group key, plus the
+/// group key values per group (merge order kept).
+type GroupedAccumulators = (
+    HashMap<Vec<u8>, Vec<Accumulator>>,
+    Vec<(Vec<u8>, Vec<ScalarValue>)>,
+);
+
 use rayon::prelude::*;
 
 use crate::common::error::{Result, TaibaiError};
@@ -226,8 +233,8 @@ impl FastGroups {
         } = other;
         for (key, scalar, mut accumulators) in keys
             .into_iter()
-            .zip(scalars.into_iter())
-            .zip(accs.into_iter())
+            .zip(scalars)
+            .zip(accs)
             .map(|((k, s), a)| (k, s, a))
         {
             // Resolve the target group in this table, creating it (with the
@@ -294,12 +301,7 @@ impl FastGroups {
     }
 
     /// Convert into the generic grouping structures (merge order kept).
-    pub(super) fn into_maps(
-        self,
-    ) -> (
-        HashMap<Vec<u8>, Vec<Accumulator>>,
-        Vec<(Vec<u8>, Vec<ScalarValue>)>,
-    ) {
+    pub(super) fn into_maps(self) -> GroupedAccumulators {
         let mut groups = HashMap::with_capacity(self.accs.len());
         for (i, accs) in self.accs.into_iter().enumerate() {
             groups.insert(self.keys[i].clone(), accs);
@@ -307,7 +309,7 @@ impl FastGroups {
         let group_keys: Vec<(Vec<u8>, Vec<ScalarValue>)> = self
             .keys
             .into_iter()
-            .zip(self.scalars.into_iter())
+            .zip(self.scalars)
             .map(|(key, scalar)| (key, vec![scalar]))
             .collect();
         (groups, group_keys)
@@ -492,81 +494,61 @@ impl FastGroups {
                         }
                     },
                     Accumulator::SumI(value) => match &arg_views[k] {
-                        FastArgCol::I64(data, bitmap) => {
-                            if !bitmap.is_null(row) {
-                                *value =
-                                    Some(value.unwrap_or(0).checked_add(data[row]).ok_or_else(
-                                        || TaibaiError::Sql("SUM overflow".to_string()),
-                                    )?);
-                            }
+                        FastArgCol::I64(data, bitmap) if !bitmap.is_null(row) => {
+                            *value = Some(
+                                value
+                                    .unwrap_or(0)
+                                    .checked_add(data[row])
+                                    .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
+                            );
                         }
-                        FastArgCol::I32(data, bitmap) => {
-                            if !bitmap.is_null(row) {
-                                *value = Some(
-                                    value
-                                        .unwrap_or(0)
-                                        .checked_add(data[row] as i64)
-                                        .ok_or_else(|| {
-                                            TaibaiError::Sql("SUM overflow".to_string())
-                                        })?,
-                                );
-                            }
+                        FastArgCol::I32(data, bitmap) if !bitmap.is_null(row) => {
+                            *value = Some(
+                                value
+                                    .unwrap_or(0)
+                                    .checked_add(data[row] as i64)
+                                    .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
+                            );
                         }
                         _ => {}
                     },
                     Accumulator::SumF(value) => match &arg_views[k] {
-                        FastArgCol::F64(data, bitmap) => {
-                            if !bitmap.is_null(row) {
-                                *value = Some(value.unwrap_or(0.0) + data[row]);
-                            }
+                        FastArgCol::F64(data, bitmap) if !bitmap.is_null(row) => {
+                            *value = Some(value.unwrap_or(0.0) + data[row]);
                         }
-                        FastArgCol::F32(data, bitmap) => {
-                            if !bitmap.is_null(row) {
-                                *value = Some(value.unwrap_or(0.0) + data[row] as f64);
-                            }
+                        FastArgCol::F32(data, bitmap) if !bitmap.is_null(row) => {
+                            *value = Some(value.unwrap_or(0.0) + data[row] as f64);
                         }
-                        FastArgCol::I64(data, bitmap) => {
-                            if !bitmap.is_null(row) {
-                                *value = Some(value.unwrap_or(0.0) + data[row] as f64);
-                            }
+                        FastArgCol::I64(data, bitmap) if !bitmap.is_null(row) => {
+                            *value = Some(value.unwrap_or(0.0) + data[row] as f64);
                         }
-                        FastArgCol::I32(data, bitmap) => {
-                            if !bitmap.is_null(row) {
-                                *value = Some(value.unwrap_or(0.0) + data[row] as f64);
-                            }
+                        FastArgCol::I32(data, bitmap) if !bitmap.is_null(row) => {
+                            *value = Some(value.unwrap_or(0.0) + data[row] as f64);
                         }
                         _ => {}
                     },
                     Accumulator::Avg {
                         sum, count, any, ..
                     } => match &arg_views[k] {
-                        FastArgCol::I64(data, bitmap) => {
-                            if !bitmap.is_null(row) {
-                                *sum += data[row] as f64;
-                                *count += 1;
-                                *any = true;
-                            }
+                        FastArgCol::I64(data, bitmap) if !bitmap.is_null(row) => {
+                            *sum += data[row] as f64;
+                            *count += 1;
+                            *any = true;
                         }
-                        FastArgCol::I32(data, bitmap) => {
-                            if !bitmap.is_null(row) {
-                                *sum += data[row] as f64;
-                                *count += 1;
-                                *any = true;
-                            }
+                        FastArgCol::I32(data, bitmap) if !bitmap.is_null(row) => {
+                            *sum += data[row] as f64;
+                            *count += 1;
+                            *any = true;
                         }
-                        FastArgCol::F64(data, bitmap) => {
-                            if !bitmap.is_null(row) {
-                                *sum += data[row];
-                                *count += 1;
-                                *any = true;
-                            }
+                        FastArgCol::F64(data, bitmap) if !bitmap.is_null(row) => {
+                            *sum += data[row];
+                            *count += 1;
+                            *any = true;
                         }
-                        FastArgCol::F32(data, bitmap) => {
-                            if !bitmap.is_null(row) {
-                                *sum += data[row] as f64;
-                                *count += 1;
-                                *any = true;
-                            }
+                        FastArgCol::F32(data, bitmap) if !bitmap.is_null(row) => {
+                            *sum += data[row] as f64;
+                            *count += 1;
+                            *any = true;
                         }
                         _ => {}
                     },
@@ -757,8 +739,16 @@ impl FastGroups {
             self.dict_gid.resize(dict.len(), None);
         }
         for row in start..end {
-            let group_id =
-                self.dict_group_id(ids[row] as usize, dict, row, batch, gb_col, aggregates, physical_schema, max_groups)?;
+            let group_id = self.dict_group_id(
+                ids[row] as usize,
+                dict,
+                row,
+                batch,
+                gb_col,
+                aggregates,
+                physical_schema,
+                max_groups,
+            )?;
             let accs = &mut self.accs[group_id as usize];
             for (k, kind) in kinds.iter().enumerate() {
                 match *kind {
@@ -1104,10 +1094,8 @@ pub(super) fn fast_group_update(
     }
 
     // Each batch carries its own dictionary; entry ids are batch-local.
-    for table in tables.iter_mut() {
-        if let Some(f) = table {
-            f.dict_gid.clear();
-        }
+    for f in tables.iter_mut().flatten() {
+        f.dict_gid.clear();
     }
 
     let rows = batch.num_rows();
@@ -1254,7 +1242,7 @@ fn locate_run(runs: &[(i64, u32)], row: usize) -> (usize, usize) {
 
 /// Merge every slot table into one (slot order, then each slot's insertion
 /// order), ready for `into_maps`.
-pub(super) fn merge_slot_tables(tables: &mut Vec<Option<FastGroups>>) -> Result<FastGroups> {
+pub(super) fn merge_slot_tables(tables: &mut [Option<FastGroups>]) -> Result<FastGroups> {
     let mut merged = FastGroups::new();
     for table in tables.iter_mut() {
         if let Some(f) = table.take() {

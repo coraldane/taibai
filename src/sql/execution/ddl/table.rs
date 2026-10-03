@@ -536,7 +536,9 @@ pub fn exec_drop_table(
             catalog.drop_table(name)?;
             let meta_dir = engine.data_dir().join("meta");
             if let Err(save_error) = catalog.save(&meta_dir) {
-                catalog.tables.insert(name.to_string(), std::sync::Arc::new(table_meta.clone()));
+                catalog
+                    .tables
+                    .insert(name.to_string(), std::sync::Arc::new(table_meta.clone()));
                 if let Some(tombstone) = tombstone.as_deref() {
                     if let Err(restore_error) =
                         restore_staged_table_directory(tombstone, &table_dir)
@@ -724,7 +726,7 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
             }
             engine.batch_writer().drain_table_tail(db, name)?;
             engine.segment_mgr().flush_table_active(db, name)?;
-                engine.segment_mgr().close_table_state_handles(db, name);
+            engine.segment_mgr().close_table_state_handles(db, name);
             engine
                 .segment_mgr()
                 .invalidate_readers_under(&old_table_dir);
@@ -936,7 +938,9 @@ fn exec_partition_change(
 
             let meta_dir = engine.data_dir().join("meta");
             if let Err(error) = catalog.save(&meta_dir) {
-                catalog.tables.insert(name.to_string(), std::sync::Arc::new(before_meta.clone()));
+                catalog
+                    .tables
+                    .insert(name.to_string(), std::sync::Arc::new(before_meta.clone()));
                 restore_partition_files(&operation_dir, &table_dir)?;
                 return Err(error);
             }
@@ -1049,7 +1053,9 @@ fn exec_set_hot(engine: &Engine, db: &str, name: &str, hot: &HotDef) -> Result<E
 
             let meta_dir = engine.data_dir().join("meta");
             if let Err(error) = catalog.save(&meta_dir) {
-                catalog.tables.insert(name.to_string(), std::sync::Arc::new(before_meta.clone()));
+                catalog
+                    .tables
+                    .insert(name.to_string(), std::sync::Arc::new(before_meta.clone()));
                 return Err(error);
             }
 
@@ -1184,7 +1190,6 @@ fn alter_column_catalog_only(
     operations: &[AlterOperation],
     width_changing: bool,
 ) -> Result<ExecResult> {
-
     let mut catalogs = engine.catalogs().write().unwrap();
     let catalog = catalogs
         .get_mut(db)
@@ -1213,7 +1218,10 @@ fn alter_column_catalog_only(
                     .with_default_value(default_value);
                 // Pin CURRENT_TIMESTAMP backfill at ALTER time: pre-existing
                 // rows must read a stable value, not the query instant.
-                if matches!(col_def.default_value, Some(ColumnDefaultValue::CurrentTimestamp)) {
+                if matches!(
+                    col_def.default_value,
+                    Some(ColumnDefaultValue::CurrentTimestamp)
+                ) {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -1398,7 +1406,7 @@ fn alter_column_catalog_only(
                 meta.clear_ttl();
             }
             AlterOperation::SetCompressionLevel { level } => {
-                validate_compression_level(&level)?;
+                validate_compression_level(level)?;
                 let meta = catalog.get_table_mut(name).ok_or_else(|| {
                     TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name))
                 })?;
@@ -1625,7 +1633,7 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
 
         let mut op = || {
             engine.batch_writer().drain_table_tail(db, table)?;
-                engine.segment_mgr().close_table_state_handles(db, table);
+            engine.segment_mgr().close_table_state_handles(db, table);
             engine.segment_mgr().invalidate_readers_under(&table_dir);
             // Index states pin open handles into the directory being staged
             // away; drop them so the rename below cannot be blocked by an

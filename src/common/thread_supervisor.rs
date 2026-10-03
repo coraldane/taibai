@@ -264,7 +264,6 @@ mod tests {
                 if stop_body.load(Ordering::Acquire) {
                     // Simulate a round body that exits without doing work
                     // once its owner asked for shutdown.
-                    return;
                 }
             },
         );

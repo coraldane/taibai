@@ -281,7 +281,7 @@ pub(crate) fn exec_delete_in_txn(
             statement_deleted += plan.removed_positions.len() as u64;
             staged_memtable_tombstones.push((
                 Arc::clone(&plan.memtable),
-                plan.removed_positions.iter().copied().collect(),
+                plan.removed_positions.to_vec(),
             ));
             if engine.pubsub().has_subscribers() {
                 match plan.original.take_rows(&plan.removed_positions) {
@@ -302,19 +302,19 @@ pub(crate) fn exec_delete_in_txn(
         let mut segment_files = if table_dir.exists() {
             prune_segments_by_partition(
                 crate::storage::segment_manager::SegmentManager::discover_segments(&table_dir)?,
-                &resolved_where_clause,
-                &table_schema,
-                &table_meta,
+                resolved_where_clause,
+                table_schema,
+                table_meta,
             )
         } else {
             Vec::new()
         };
-        if let Some(ref pred) = predicate {
+        if let Some(pred) = predicate {
             segment_files = prune_segments_by_cluster_key(
                 segment_files,
                 mgr,
-                &table_schema,
-                &table_meta,
+                table_schema,
+                table_meta,
                 pred,
             )?;
         }
@@ -325,22 +325,24 @@ pub(crate) fn exec_delete_in_txn(
             engine,
             db,
             table,
-            &resolved_where_clause,
-            &table_schema,
+            resolved_where_clause,
+            table_schema,
             table_meta,
         )? {
             segment_files = located;
         }
 
         let publish_deletes = engine.pubsub().has_subscribers();
+        let mut staged_segment_tombstones: Vec<(std::path::PathBuf, Vec<u8>, Vec<u64>)> =
+            Vec::new();
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
             let total_rows = reader.row_count();
             if total_rows == 0 {
                 continue;
             }
-            if let Some(ref pred) = predicate {
-                if !super::helpers::segment_may_match(&reader, &table_schema, Some(pred)) {
+            if let Some(pred) = predicate {
+                if !super::helpers::segment_may_match(&reader, table_schema, Some(pred)) {
                     continue;
                 }
             }
@@ -573,7 +575,7 @@ pub(crate) fn exec_update_in_txn(
             engine,
             db,
             table,
-            &table_schema,
+            table_schema,
             reader_txn_id,
             narrowed_partition,
             |memtable, _original, batch, live_positions| {
@@ -582,8 +584,8 @@ pub(crate) fn exec_update_in_txn(
                 let (new_batch, affected, matched_rows, _assigned_pairs) =
                     super::dml_update::update_memtable_batch(
                         assignments,
-                        &resolved_where_clause,
-                        &table_schema,
+                        resolved_where_clause,
+                        table_schema,
                         batch,
                     )?;
                 let Some(new_batch) = new_batch else {
@@ -620,23 +622,23 @@ pub(crate) fn exec_update_in_txn(
 
         // Segment rows: tombstone ids + new row images; no rewrite, no seal,
         // so everything here is reversible until COMMIT.
-        let assigned = super::dml_update::precompute_assigned_values(assignments, &table_schema)?;
+        let assigned = super::dml_update::precompute_assigned_values(assignments, table_schema)?;
         let mut segment_files = if table_dir.exists() {
             super::dml_delete::prune_segments_by_partition(
                 crate::storage::segment_manager::SegmentManager::discover_segments(&table_dir)?,
-                &resolved_where_clause,
-                &table_schema,
-                &table_meta,
+                resolved_where_clause,
+                table_schema,
+                table_meta,
             )
         } else {
             Vec::new()
         };
-        if let Some(ref pred) = predicate {
+        if let Some(pred) = predicate {
             segment_files = super::dml_delete::prune_segments_by_cluster_key(
                 segment_files,
                 mgr,
-                &table_schema,
-                &table_meta,
+                table_schema,
+                table_meta,
                 pred,
             )?;
         }
@@ -645,7 +647,7 @@ pub(crate) fn exec_update_in_txn(
             Vec::new();
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
-            if !super::helpers::segment_may_match(&reader, &table_schema, predicate) {
+            if !super::helpers::segment_may_match(&reader, table_schema, predicate) {
                 continue;
             }
             let prior_ids = engine
@@ -664,7 +666,7 @@ pub(crate) fn exec_update_in_txn(
         // segment and losing updates.
         let aligned_predicate = predicate
             .as_ref()
-            .and_then(|pred| reader.align_row_group_predicate(&table_schema, pred).ok());
+            .and_then(|pred| reader.align_row_group_predicate(table_schema, pred).ok());
 
         for rg_idx in 0..reader.num_row_groups() {
             if let Some(ref pred) = aligned_predicate {
@@ -675,15 +677,15 @@ pub(crate) fn exec_update_in_txn(
                 let mask = super::dml_update::build_update_mask(
                     &reader,
                     rg_idx,
-                    &resolved_where_clause,
-                    &predicate_projection,
-                    &table_schema,
+                    resolved_where_clause,
+                    predicate_projection,
+                    table_schema,
                 )?;
                 if !mask.iter().any(|m| *m) {
                     continue;
                 }
                 // Catalog-ordered read: `assigned` maps catalog indices.
-                let batch = reader.read_row_group_columns_aligned(rg_idx, &table_schema)?;
+                let batch = reader.read_row_group_columns_aligned(rg_idx, table_schema)?;
                 let start_row = reader.row_group_start_row(rg_idx);
                 let footer_bitmap = reader.delete_bitmap();
                 let mut matched: Vec<u32> = Vec::new();
@@ -724,7 +726,7 @@ pub(crate) fn exec_update_in_txn(
             let partition_key = seg_path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .and_then(|name| crate::storage::partition::parse_partition_key(name))
+                .and_then(crate::storage::partition::parse_partition_key)
                 .unwrap_or_default();
             for image in updated_images {
                 statement_updated += image.num_rows() as u64;

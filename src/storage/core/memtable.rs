@@ -815,7 +815,7 @@ impl MemTableManager {
     /// Standby replication: the primary's segment now durably holds these
     /// memtables' rows; retire the local spilled copies.
     pub fn retire_replicated_memtables(&self, ids: &[Uuid]) {
-        let memtables = self.memtables.write().unwrap();
+        let memtables = self.memtables.read().unwrap();
         for mt in memtables.iter() {
             if ids.contains(&mt.id()) {
                 mt.set_state(MemTableState::Flushed);

@@ -1391,7 +1391,7 @@ fn sum_valid_range_words<T: Copy>(
             any = true;
         } else {
             for (bit, &v) in data[start..word_end].iter().enumerate() {
-                if word & (1u64 << (start + bit) % 64) == 0 {
+                if word & (1u64 << ((start + bit) % 64)) == 0 {
                     sum = sum.wrapping_add(cvt(v));
                     any = true;
                 }

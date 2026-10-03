@@ -557,7 +557,7 @@ fn encode_i64_bitpacked_payload(values: &[i64]) -> Option<Vec<u8>> {
         out.push(width as u8);
         out.extend_from_slice(&min.to_le_bytes());
 
-        let packed_len = ((block_end - block_start) * width as usize + 7) / 8;
+        let packed_len = ((block_end - block_start) * width as usize).div_ceil(8);
         let packed_start = out.len();
         out.resize(packed_start + packed_len, 0);
         let mut acc = 0u64;
@@ -643,7 +643,7 @@ pub(crate) fn decode_i64_bitpacked_payload(
                 values.push(prev);
             }
         } else {
-            let packed_len = (len * width as usize + 7) / 8;
+            let packed_len = (len * width as usize).div_ceil(8);
             if pos + packed_len > bitstream.len() {
                 return Err(TaibaiError::Storage("bitpacked block truncated".into()));
             }

@@ -42,7 +42,13 @@ pub struct SubqueryRegistryInner {
     /// subquery occurrence of one statement: N occurrences of subqueries
     /// over the same table materialize it ONCE instead of N times (each
     /// occurrence used to pay a full-table read + copy).
-    pub table_snapshots: HashMap<String, (crate::types::batch::Schema, Vec<std::sync::Arc<crate::types::batch::RecordBatch>>)>,
+    pub table_snapshots: HashMap<
+        String,
+        (
+            crate::types::batch::Schema,
+            Vec<std::sync::Arc<crate::types::batch::RecordBatch>>,
+        ),
+    >,
     next_id: u64,
 }
 
@@ -217,9 +223,7 @@ fn eval_row(
                             rows += 1;
                             if first.is_none() {
                                 first = Some(
-                                    batch
-                                        .scalar(row_idx, 0)
-                                        .unwrap_or(ScalarValue::Int64(None)),
+                                    batch.scalar(row_idx, 0).unwrap_or(ScalarValue::Int64(None)),
                                 );
                             }
                         }
@@ -238,11 +242,7 @@ fn eval_row(
                             continue;
                         }
                         for row_idx in 0..batch.num_rows() {
-                            list.push(
-                                batch
-                                    .scalar(row_idx, 0)
-                                    .unwrap_or(ScalarValue::Int64(None)),
-                            );
+                            list.push(batch.scalar(row_idx, 0).unwrap_or(ScalarValue::Int64(None)));
                         }
                     }
                     CachedResult::InList(list)

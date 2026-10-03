@@ -581,6 +581,7 @@ fn is_running_prefix_frame(plan: &WindowFuncPlan) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Running prefix aggregate over each partition. RANGE semantics include
 /// ORDER BY peers, so the prefix flushes at peer-group boundaries; every row
 /// inside a peer group reports the value including the whole group.
@@ -700,6 +701,7 @@ fn compute_running_aggregate(
 
 const COUNT_ONE: ScalarValue = ScalarValue::Int64(Some(1));
 
+#[allow(clippy::too_many_arguments)]
 fn running_value(
     func: &AggFunc,
     any: bool,

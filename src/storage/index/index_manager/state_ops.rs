@@ -133,7 +133,13 @@ pub(super) fn stream_merge_unique_index_base<W: Write>(
                 // for the same key still merge in.
                 if delta_key_is_current {
                     for location in &delta_keys[delta_pos].1 {
-                        emit(writer, key, location, &tombstone_index, &mut placeholder_seen)?;
+                        emit(
+                            writer,
+                            key,
+                            location,
+                            &tombstone_index,
+                            &mut placeholder_seen,
+                        )?;
                     }
                     delta_pos += 1;
                 }
@@ -148,7 +154,13 @@ pub(super) fn stream_merge_unique_index_base<W: Write>(
             )?;
             if delta_key_is_current {
                 for location in &delta_keys[delta_pos].1 {
-                    emit(writer, key, location, &tombstone_index, &mut placeholder_seen)?;
+                    emit(
+                        writer,
+                        key,
+                        location,
+                        &tombstone_index,
+                        &mut placeholder_seen,
+                    )?;
                 }
                 delta_pos += 1;
             }
@@ -323,15 +335,13 @@ impl UniqueTombstoneIndex {
     }
 
     pub(super) fn contains(&self, location: &UniqueRowLocation) -> bool {
-        self.by_path
-            .contains(&(
-                normalize_unique_segment_path(&location.segment_path),
-                location.row_id,
-            ))
-            || self.by_name.contains(&(
-                unique_segment_file_name(&location.segment_path).unwrap_or_default(),
-                location.row_id,
-            ))
+        self.by_path.contains(&(
+            normalize_unique_segment_path(&location.segment_path),
+            location.row_id,
+        )) || self.by_name.contains(&(
+            unique_segment_file_name(&location.segment_path).unwrap_or_default(),
+            location.row_id,
+        ))
     }
 }
 

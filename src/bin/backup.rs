@@ -299,7 +299,7 @@ fn copy_tree(
             fs::copy(&path, &target)?;
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             let relative = target
-                .strip_prefix(&dest)
+                .strip_prefix(dest)
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| name);
             manifest.push(ManifestEntry {

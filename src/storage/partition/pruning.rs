@@ -105,6 +105,12 @@ pub struct ScanStats {
     /// Rows served by the hybrid hot-mirror leg (partial residency) instead
     /// of being decoded from segments.
     pub hot_mirror_rows: u64,
+    /// Scan fast-path chain observability: the node that answered (if any)
+    /// and the nodes that really declined, in chain order. The skeleton TTL
+    /// gate records as `ttl_gate`. Written only when stats are attached
+    /// (EXPLAIN ANALYZE).
+    pub fast_path_answered: Option<&'static str>,
+    pub fast_path_declined: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Default)]

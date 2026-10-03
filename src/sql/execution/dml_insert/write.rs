@@ -883,7 +883,7 @@ fn exec_materialized_insert_batch(
         if txn_id > 0 {
             engine
                 .txn_mutations()
-                .note_inserted_rows(txn_id, db, table, row_count as u64);
+                .note_inserted_rows(txn_id, db, table, row_count);
         }
         engine.record_inserted_rows(
             db,

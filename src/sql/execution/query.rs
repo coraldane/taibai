@@ -79,8 +79,7 @@ where
     if !can_use_physical_pipeline(&plan) {
         return Ok(None);
     }
-    let mut physical_ctx =
-        PhysicalContext::new(engine, &table_refs, &table_schemas, &table_metas);
+    let mut physical_ctx = PhysicalContext::new(engine, &table_refs, &table_schemas, &table_metas);
     let mut pipeline = build_physical_pipeline(plan, &mut physical_ctx)?;
     let mut schema = None;
     loop {
@@ -193,7 +192,9 @@ pub fn exec_union_with_txn(
     // row itself cloned every cell a second time into the HashSet (a third
     // copy for INTERSECT/EXCEPT), while the key holds one boxed enum per row.
     fn row_key(row: &[ScalarValue]) -> Vec<super::join_hashtable::ScalarValueHashable> {
-        row.iter().map(super::join_hashtable::ScalarValueHashable::from_scalar).collect()
+        row.iter()
+            .map(super::join_hashtable::ScalarValueHashable::from_scalar)
+            .collect()
     }
 
     match op {
@@ -645,9 +646,8 @@ fn exec_table_select_materialized(
         // its own decline conditions (TTL, txn overlays, drift), so this
         // routes committed reads, explicit transactions and EXPLAIN ANALYZE
         // through one code path.
-        spec.metadata_fold = crate::sql::execution::scan::spec::extract_metadata_fold(
-            &plan, table_name,
-        );
+        spec.metadata_fold =
+            crate::sql::execution::scan::spec::extract_metadata_fold(&plan, table_name);
 
         let mut executor = ScanExecutor::new(&spec, engine, schema, meta, &table_ref.database);
         if let Some(ref mut s) = stats {
@@ -698,11 +698,7 @@ fn exec_table_select_materialized(
                 // operator (no scan ran, so without this the operator
                 // metrics section would be empty and the profile would
                 // misrepresent what executed).
-                let operator = profile.register(
-                    0,
-                    format!("AggregateFold {}", table_ref.table),
-                    1,
-                );
+                let operator = profile.register(0, format!("AggregateFold {}", table_ref.table), 1);
                 operator.add_elapsed(scan_start.elapsed());
                 for batch in &batches {
                     operator.observe_batch(batch);
@@ -830,7 +826,9 @@ pub(crate) fn statement_contains_subquery(stmt: &Statement) -> bool {
                 || where_clause.as_ref().is_some_and(expr_contains_subquery)
                 || group_by.iter().any(expr_contains_subquery)
                 || having.as_ref().is_some_and(expr_contains_subquery)
-                || order_by.iter().any(|item| expr_contains_subquery(&item.expr))
+                || order_by
+                    .iter()
+                    .any(|item| expr_contains_subquery(&item.expr))
                 || limit.as_ref().is_some_and(expr_contains_subquery)
                 || offset.as_ref().is_some_and(expr_contains_subquery)
         }
@@ -844,7 +842,9 @@ pub(crate) fn statement_contains_subquery(stmt: &Statement) -> bool {
         } => {
             statement_contains_subquery(left)
                 || statement_contains_subquery(right)
-                || order_by.iter().any(|item| expr_contains_subquery(&item.expr))
+                || order_by
+                    .iter()
+                    .any(|item| expr_contains_subquery(&item.expr))
                 || limit.as_ref().is_some_and(expr_contains_subquery)
                 || offset.as_ref().is_some_and(expr_contains_subquery)
         }
@@ -856,7 +856,9 @@ pub(crate) fn statement_contains_subquery(stmt: &Statement) -> bool {
             where_clause,
             ..
         } => {
-            assignments.iter().any(|assign| expr_contains_subquery(&assign.value))
+            assignments
+                .iter()
+                .any(|assign| expr_contains_subquery(&assign.value))
                 || where_clause.as_ref().is_some_and(expr_contains_subquery)
         }
         Statement::Delete { where_clause, .. } => {
@@ -895,7 +897,9 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
         Expr::In { expr, values, .. } => {
             expr_contains_subquery(expr) || values.iter().any(expr_contains_subquery)
         }
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             expr_contains_subquery(expr)
                 || expr_contains_subquery(low)
                 || expr_contains_subquery(high)
@@ -911,9 +915,9 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
             else_clause,
         } => {
             operand.as_deref().is_some_and(expr_contains_subquery)
-                || when_clauses
-                    .iter()
-                    .any(|(when, then)| expr_contains_subquery(when) || expr_contains_subquery(then))
+                || when_clauses.iter().any(|(when, then)| {
+                    expr_contains_subquery(when) || expr_contains_subquery(then)
+                })
                 || else_clause.as_deref().is_some_and(expr_contains_subquery)
         }
         Expr::Like { expr, pattern, .. } => {
@@ -926,11 +930,14 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
             ..
         } => {
             partition_by.iter().any(expr_contains_subquery)
-                || order_by.iter().any(|item| expr_contains_subquery(&item.expr))
+                || order_by
+                    .iter()
+                    .any(|item| expr_contains_subquery(&item.expr))
         }
-        Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) | Expr::QualifiedColumn { .. } => {
-            false
-        }
+        Expr::Literal(_)
+        | Expr::Placeholder(_)
+        | Expr::Column(_)
+        | Expr::QualifiedColumn { .. } => false,
     }
 }
 
@@ -1514,21 +1521,26 @@ pub(crate) fn collect_read_tables(
         }
         Statement::Update {
             assignments,
-            where_clause,
+            where_clause: Some(expr),
             ..
         } => {
             for assignment in assignments {
                 collect_expr_tables(&assignment.value, default_db, out);
             }
-            if let Some(expr) = where_clause {
-                collect_expr_tables(expr, default_db, out);
+            collect_expr_tables(expr, default_db, out);
+        }
+        Statement::Update { assignments, .. } => {
+            for assignment in assignments {
+                collect_expr_tables(&assignment.value, default_db, out);
             }
         }
-        Statement::Delete { where_clause, .. } => {
-            if let Some(expr) = where_clause {
-                collect_expr_tables(expr, default_db, out);
-            }
+        Statement::Delete {
+            where_clause: Some(expr),
+            ..
+        } => {
+            collect_expr_tables(expr, default_db, out);
         }
+        Statement::Delete { .. } => {}
         Statement::Insert { values, .. } | Statement::Replace { values, .. } => {
             for row in values {
                 for expr in row {
@@ -2190,10 +2202,7 @@ fn bind_correlated_subquery(
                                 .lock()
                                 .unwrap()
                                 .table_snapshots
-                                .insert(
-                                    table_ref.key.clone(),
-                                    (schema.clone(), batches.clone()),
-                                );
+                                .insert(table_ref.key.clone(), (schema.clone(), batches.clone()));
                             (schema, batches)
                         }
                     }

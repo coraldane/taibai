@@ -510,7 +510,7 @@ fn fast_insert_falls_back_for_quoted_table_names() -> Result<()> {
     // A miss falls back instead of short-circuiting with the fast path's own
     // error text: the standard parser still reports the missing table.
     let missing = engine.execute(&mut session, "INSERT INTO no_such_table (id) VALUES (1)");
-    let error = missing.err().expect("missing table must error");
+    let error = missing.expect_err("missing table must error");
     assert!(
         error.to_string().contains("no_such_table"),
         "standard parser must own the missing-table verdict: {error}"

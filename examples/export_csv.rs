@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let mut out =
                 std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&out_path)?);
-            let names: Vec<String> = schema.column_names().map(|s| csv_escape(&s)).collect();
+            let names: Vec<String> = schema.column_names().map(csv_escape).collect();
             writeln!(out, "{}", names.join(","))?;
             let mut total = 0usize;
             for batch in &batches {
@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     buf.push('\n');
                     total += 1;
-                    if total % flush_every == 0 {
+                    if total.is_multiple_of(flush_every) {
                         out.write_all(buf.as_bytes())?;
                         buf.clear();
                     }

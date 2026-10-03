@@ -519,7 +519,7 @@ impl SegmentManager {
             let tmp = path.with_extension("epoch.tmp");
             if let Err(error) = std::fs::create_dir_all(parent).and_then(|_| {
                 std::fs::write(&tmp, value.to_string())?;
-                std::fs::rename(&tmp, &path)
+                std::fs::rename(&tmp, path)
             }) {
                 let _ = std::fs::remove_file(&tmp);
                 tracing::error!(

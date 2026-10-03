@@ -11,6 +11,28 @@ use super::engine::{Engine, ExecResult};
 use super::helpers::{eval_expr_to_scalar, eval_where_clause_batch};
 use crate::sql::parser::ast::{Assignment, Expr};
 
+/// One staged memtable UPDATE: (memtable, rewritten image batch, tombstoned
+/// positions, staged assignment values).
+type StagedMemtableUpdate = (
+    Arc<crate::storage::core::memtable::MemTable>,
+    Arc<RecordBatch>,
+    Vec<u32>,
+    Vec<(usize, ScalarValue)>,
+);
+
+/// [`update_memtable_batch`] outcome: (rewritten image batch, deleted row
+/// count, tombstoned positions, staged assignment values).
+type MemtableUpdateOutcome = (
+    Option<RecordBatch>,
+    u64,
+    Vec<u32>,
+    Vec<(usize, ScalarValue)>,
+);
+
+/// Per segment: (path, full-length new bitmap, new deleted count, undo =
+/// previous bitmap bytes + previous deleted count).
+type FooterReinsertEntry = (std::path::PathBuf, Vec<u8>, u64, (Vec<u8>, u64));
+
 pub fn exec_update(
     engine: &Engine,
     db: &str,
@@ -107,25 +129,20 @@ pub fn exec_update(
         let publish_updates = engine.pubsub().has_subscribers();
         let mut updated_events = super::helpers::ChangeEventBuffer::new("update", db, table);
         let mut updated_count = 0u64;
-        let mut memtable_updates: Vec<(
-            Arc<crate::storage::core::memtable::MemTable>,
-            Arc<RecordBatch>,
-            Vec<u32>,
-            Vec<(usize, ScalarValue)>,
-        )> = Vec::new();
+        let mut memtable_updates: Vec<StagedMemtableUpdate> = Vec::new();
         let narrowed_partition = target_partition_key;
         super::dml_delete::for_each_visible_memtable(
             engine,
             db,
             table,
-            &table_schema,
+            table_schema,
             reader_txn_id,
             narrowed_partition,
             |memtable, _original, batch, _live_positions| {
                 // C9: `batch` (the Arc) is consumed — update_memtable_batch
                 // moves untouched columns out of it when it is the sole owner.
                 let (new_batch, affected, matched_rows, assigned_pairs) =
-                    update_memtable_batch(assignments, where_clause, &table_schema, batch)?;
+                    update_memtable_batch(assignments, where_clause, table_schema, batch)?;
                 if let Some(new_batch) = new_batch {
                     updated_count += affected;
                     if publish_updates {
@@ -147,7 +164,7 @@ pub fn exec_update(
         // A background memtable flush may have produced an active segment.
         // Seal only this table's active writers before replacing segment files;
         // pending memtables remain resident and are not flushed here.
-        if let Some(partition_key) = target_partition_key.as_deref() {
+        if let Some(partition_key) = target_partition_key {
             mgr.seal_partition_active_under_table_lock(db, table, partition_key)?;
         } else {
             mgr.seal_table_active_under_table_lock(db, table)?;
@@ -157,22 +174,22 @@ pub fn exec_update(
             super::dml_delete::prune_segments_by_partition(
                 SegmentManager::discover_segments(&table_dir)?,
                 where_clause,
-                &table_schema,
-                &table_meta,
+                table_schema,
+                table_meta,
             )
         } else {
             Vec::new()
         };
         // Assignments are constant per statement; resolve them once for every
         // segment/row group below.
-        let assigned = precompute_assigned_values(assignments, &table_schema)?;
+        let assigned = precompute_assigned_values(assignments, table_schema)?;
 
         // Validation set up front: the segment dry-run below gathers the
         // surviving rows' key columns while it scans, so no second
         // validation sweep over the table is needed.
         let indexes_to_validate = indexes_touched_by_assignments(
             &table_meta.unique_indexes,
-            &table_schema,
+            table_schema,
             assigned.keys().copied().collect(),
         );
         let (validation_schema, validation_indices): (Schema, Vec<usize>) =
@@ -212,7 +229,7 @@ pub fn exec_update(
         let mut segment_plan = plan_segment_rows_for_reinsert(
             mgr,
             table_meta,
-            &table_schema,
+            table_schema,
             segment_files,
             predicate,
             where_clause,
@@ -285,10 +302,8 @@ pub fn exec_update(
             // self-assignment (SET uk = <current value>) must not collide
             // with its own image. Memtable-resident markers (empty segment
             // path) are covered by the memtable checks above.
-            let mut planned_tombstones: std::collections::HashMap<
-                std::path::PathBuf,
-                Vec<u8>,
-            > = std::collections::HashMap::new();
+            let mut planned_tombstones: std::collections::HashMap<std::path::PathBuf, Vec<u8>> =
+                std::collections::HashMap::new();
             for (seg_path, new_bitmap, _, _) in &segment_plan.footers {
                 planned_tombstones.insert(seg_path.clone(), new_bitmap.clone());
             }
@@ -298,24 +313,25 @@ pub fn exec_update(
                     continue;
                 };
                 for key in &keys {
-                    match engine
-                        .index_manager()
-                        .unique_key_locations(db, table, &index.name, std::iter::once(key))?
-                    {
+                    match engine.index_manager().unique_key_locations(
+                        db,
+                        table,
+                        &index.name,
+                        std::iter::once(key),
+                    )? {
                         Some(locations) => {
                             for location in locations {
                                 if location.segment_path.is_empty() {
                                     continue;
                                 }
                                 let path = std::path::PathBuf::from(&location.segment_path);
-                                let tombstoned = planned_tombstones.get(&path).is_some_and(
-                                    |bitmap| {
+                                let tombstoned =
+                                    planned_tombstones.get(&path).is_some_and(|bitmap| {
                                         crate::storage::segment::delete_bitmap::is_deleted(
                                             bitmap,
                                             location.row_id,
                                         )
-                                    },
-                                );
+                                    });
                                 if !tombstoned {
                                     // Nothing durable has happened yet — clean abort.
                                     return Err(validator.probe_collision_error(&index.name, key));
@@ -337,7 +353,7 @@ pub fn exec_update(
                 for_each_surviving_key_row_group(
                     mgr,
                     &table_dir,
-                    &table_schema,
+                    table_schema,
                     &validation_indices,
                     &planned_tombstones,
                     &mut |projected| {
@@ -377,29 +393,34 @@ pub fn exec_update(
             .filter(|(_, column)| column.primary_key)
             .map(|(idx, _)| idx)
             .collect();
-        let mut unique_index_entries: Vec<(String, Vec<crate::storage::index::index_manager::UniqueIndexEntry>)> = Vec::new();
+        let mut unique_index_entries: Vec<(
+            String,
+            Vec<crate::storage::index::index_manager::UniqueIndexEntry>,
+        )> = Vec::new();
         let mut primary_keys: Vec<Vec<ScalarValue>> = Vec::new();
         for batch in &segment_plan.image_batches {
             if !unique_constraints.is_empty() {
-                unique_index_entries.extend(super::dml_insert::build_unique_index_entries_for_batch(
-                    table_meta,
-                    &table_schema,
-                    batch,
-                    &unique_constraints,
-                )?);
+                unique_index_entries.extend(
+                    super::dml_insert::build_unique_index_entries_for_batch(
+                        table_meta,
+                        table_schema,
+                        batch,
+                        &unique_constraints,
+                    )?,
+                );
             }
             if !primary_key_indices.is_empty() {
                 unique_index_entries.push((
                     crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME.to_string(),
                     super::dml_insert::primary_location_entries_for_batch(
-                        &table_schema,
+                        table_schema,
                         batch,
                         &primary_key_indices,
                     ),
                 ));
                 primary_keys.extend(super::dml_insert::primary_keys_for_batch(
                     batch,
-                    &table_schema,
+                    table_schema,
                     &primary_key_indices,
                 )?);
             }
@@ -532,7 +553,9 @@ pub fn exec_update(
         // precise-maintenance row cap tripped — fall back to snapshot
         // invalidation (DELETE's contract), never a rebuild.
         if !segment_plan.index_maintenance.apply(engine, db, table) {
-            engine.index_manager().invalidate_primary_key_index(db, table);
+            engine
+                .index_manager()
+                .invalidate_primary_key_index(db, table);
             let unique_index_names = table_meta
                 .unique_indexes
                 .iter()
@@ -560,7 +583,9 @@ pub fn exec_update(
                         .index_manager()
                         .invalidate_unique_index_snapshot(db, table, &index.name);
                 }
-                engine.index_manager().invalidate_primary_key_index(db, table);
+                engine
+                    .index_manager()
+                    .invalidate_primary_key_index(db, table);
             }
         }
         if !primary_keys.is_empty() {
@@ -574,7 +599,9 @@ pub fn exec_update(
                     error = %error,
                     "UPDATE primary-key append failed; invalidating location index"
                 );
-                engine.index_manager().invalidate_primary_key_index(db, table);
+                engine
+                    .index_manager()
+                    .invalidate_primary_key_index(db, table);
             }
         }
 
@@ -617,10 +644,7 @@ pub fn exec_update(
             // freeze would race concurrent appends in OTHER partitions.
             // Flush just the pruned partition, whose appenders this
             // statement's partition lock already excludes.
-            if let Some(partition) = target_partition_key
-                .as_deref()
-                .filter(|key| !key.is_empty())
-            {
+            if let Some(partition) = target_partition_key.filter(|key| !key.is_empty()) {
                 engine
                     .batch_writer()
                     .flush_partition_under_partition_lock(db, table, partition)?;
@@ -651,10 +675,7 @@ pub fn exec_update(
         Ok(updated_count)
     };
 
-    let update_outcome = match target_partition_key
-        .as_deref()
-        .filter(|key| !key.is_empty())
-    {
+    let update_outcome = match target_partition_key.filter(|key| !key.is_empty()) {
         Some(partition) => {
             mgr.with_partition_set_mutation_lock(db, table, &[partition], update_body)
         }
@@ -735,12 +756,7 @@ pub(crate) fn update_memtable_batch(
     where_clause: &Option<Expr>,
     table_schema: &Schema,
     batch: Arc<RecordBatch>,
-) -> Result<(
-    Option<RecordBatch>,
-    u64,
-    Vec<u32>,
-    Vec<(usize, ScalarValue)>,
-)> {
+) -> Result<MemtableUpdateOutcome> {
     let mask = if let Some(where_expr) = where_clause.as_ref() {
         // Resolve against the batch's OWN schema first: a resident memtable
         // written before a DROP/RENAME COLUMN keeps its insert-time column
@@ -771,9 +787,9 @@ pub(crate) fn update_memtable_batch(
     for assign in assignments {
         if let Some(local_idx) = batch.schema.index_of(&assign.column) {
             let col_type = batch.schema.columns[local_idx].data_type;
-            if !assigned.contains_key(&local_idx) {
+            if let std::collections::hash_map::Entry::Vacant(e) = assigned.entry(local_idx) {
                 let value = eval_expr_to_scalar(&assign.value, &col_type)?;
-                assigned.insert(local_idx, value);
+                e.insert(value);
             }
         }
     }
@@ -901,10 +917,10 @@ pub(crate) fn precompute_assigned_values(
             .iter()
             .position(|column| column.name == assign.column)
         {
-            if !assigned.contains_key(&col_idx) {
+            if let std::collections::hash_map::Entry::Vacant(e) = assigned.entry(col_idx) {
                 let value =
                     eval_expr_to_scalar(&assign.value, &table_schema.columns[col_idx].data_type)?;
-                assigned.insert(col_idx, value);
+                e.insert(value);
             }
         } else {
             // A silent skip used to report rows_affected while changing
@@ -965,7 +981,6 @@ pub(crate) fn build_update_mask(
     Ok(mask)
 }
 
-
 /// Dry-run plan of the segment leg of an auto-commit UPDATE (tombstone +
 /// reinsert). Phase 1 (`collect`) scans and gathers everything the
 /// validation needs WITHOUT touching a single footer; phase 2 (`apply`)
@@ -976,7 +991,7 @@ pub(crate) fn build_update_mask(
 struct SegmentReinsertPlan {
     /// Per segment: (path, full-length new bitmap, new deleted count,
     /// undo = previous bitmap bytes + previous deleted count).
-    footers: Vec<(std::path::PathBuf, Vec<u8>, u64, (Vec<u8>, u64))>,
+    footers: Vec<FooterReinsertEntry>,
     image_batches: Vec<RecordBatch>,
     index_maintenance: crate::sql::execution::dml_delete::DeleteIndexMaintenance,
     updated_count: u64,
@@ -1073,8 +1088,8 @@ fn plan_segment_rows_for_reinsert(
         if !super::helpers::segment_may_match(&reader, table_schema, predicate) {
             continue;
         }
-        let aligned_predicate = predicate
-            .and_then(|pred| reader.align_row_group_predicate(table_schema, pred).ok());
+        let aligned_predicate =
+            predicate.and_then(|pred| reader.align_row_group_predicate(table_schema, pred).ok());
         let footer_bitmap = reader.delete_bitmap().to_vec();
         let base_deleted = reader.deleted_row_count();
         // Compose a FULL-LENGTH bitmap (footer bitmaps only cover rows that
@@ -1085,8 +1100,8 @@ fn plan_segment_rows_for_reinsert(
         let copy_len = footer_bitmap.len().min(bitmap_bytes);
         new_bitmap[..copy_len].copy_from_slice(&footer_bitmap[..copy_len]);
         let mut newly_deleted = 0u64;
-        let segment_id = maintaining
-            .then(|| index_maintenance.intern_segment(&seg_path.to_string_lossy()));
+        let segment_id =
+            maintaining.then(|| index_maintenance.intern_segment(&seg_path.to_string_lossy()));
         let mut segment_matched = false;
 
         for rg_idx in 0..reader.num_row_groups() {
@@ -1232,16 +1247,13 @@ impl SegmentReinsertPlan {
             self.footers.is_empty() || !image_checks.is_empty(),
             "deferred footer journals of a matched UPDATE must carry a non-empty image watermark"
         );
-        let mut applied =
-            std::collections::VecDeque::<(std::path::PathBuf, Vec<u8>, u64)>::new();
+        let mut applied = std::collections::VecDeque::<(std::path::PathBuf, Vec<u8>, u64)>::new();
         for (seg_path, new_bitmap, new_deleted, (old_bitmap, old_deleted)) in &self.footers {
             if let Err(error) = mgr.rewrite_delete_footer_with_mode(
                 seg_path,
                 new_bitmap,
                 *new_deleted,
-                crate::storage::segment::reader::FooterRewriteMode::Deferred(
-                    image_checks.to_vec(),
-                ),
+                crate::storage::segment::reader::FooterRewriteMode::Deferred(image_checks.to_vec()),
             ) {
                 // Roll the applied footers back: the statement aborts with
                 // the table exactly as it was.

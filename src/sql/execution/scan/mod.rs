@@ -3,6 +3,7 @@ mod candidates;
 pub(crate) mod cluster_prune;
 pub mod cursor;
 pub mod executor;
+pub(crate) mod fast_path;
 pub mod memtable;
 pub mod partition;
 pub mod row_filter;

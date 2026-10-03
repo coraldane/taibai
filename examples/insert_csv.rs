@@ -85,11 +85,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         sql.push(')');
         total += 1;
-        if total % batch_rows == 0 {
+        if total.is_multiple_of(batch_rows) {
             client.send_execute(&sql).await?;
             client.recv_execute_result().await?;
             sql.clear();
-            if total % 100_000 == 0 {
+            if total.is_multiple_of(100_000) {
                 client.recv_execute_result().await?;
                 eprintln!("inserted {} rows, elapsed {:?}", total, start.elapsed());
             }

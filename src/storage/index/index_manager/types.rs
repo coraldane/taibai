@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -310,9 +310,7 @@ impl UniqueIndexBase {
                 ));
             }
             expected_start = start + len;
-            if data_offset >= file_len
-                || data_len as u64 > file_len - data_offset
-            {
+            if data_offset >= file_len || data_len as u64 > file_len - data_offset {
                 return Err(TaibaiError::Storage(
                     "corrupt unique index block data window".to_string(),
                 ));

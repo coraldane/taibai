@@ -584,10 +584,10 @@ fn append_column_cell(line: &mut String, col: &types::array::ColumnArray, row: u
 
     match col {
         types::array::ColumnArray::Selected { .. } | types::array::ColumnArray::Rle { .. } => {
-            return append_column_cell(line, col.flattened(), row, scale);
+            append_column_cell(line, col.flattened(), row, scale)
         }
         types::array::ColumnArray::Dictionary { .. } => {
-            return append_column_cell(line, &col.materialize_varchar(), row, scale);
+            append_column_cell(line, &col.materialize_varchar(), row, scale)
         }
         types::array::ColumnArray::Bool { data, .. } => {
             line.push_str(if data[row] != 0 { "true" } else { "false" });

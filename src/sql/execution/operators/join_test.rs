@@ -228,8 +228,15 @@ fn inner_join_scalar_path_drains_skewed_key_in_chunks() {
             batch_sizes.push(batch.num_rows());
         }
         assert_eq!(total, 10_000, "build_left={build_left}");
-        assert_eq!(batch_sizes, vec![bs, bs, 10_000 - 2 * bs], "build_left={build_left}");
-        assert!(batch_sizes.len() > 1, "skewed key must span multiple batches");
+        assert_eq!(
+            batch_sizes,
+            vec![bs, bs, 10_000 - 2 * bs],
+            "build_left={build_left}"
+        );
+        assert!(
+            batch_sizes.len() > 1,
+            "skewed key must span multiple batches"
+        );
     }
 }
 
@@ -444,7 +451,10 @@ fn full_join_scalar_path_resume_keeps_matched_any_across_chunks() {
         batch_sizes.push(batch.num_rows());
     }
     assert_eq!(both, 5_000);
-    assert_eq!(null_right, 1, "probe row (7,5000) matched, must not null-extend");
+    assert_eq!(
+        null_right, 1,
+        "probe row (7,5000) matched, must not null-extend"
+    );
     assert_eq!(null_left, 5_000);
     // 5000 joined rows in two chunks, the key-unmatched probe row, then
     // the 5000 residual-rejected build rows in two finalize chunks.
@@ -516,7 +526,10 @@ fn full_join_scalar_path_skewed_key_null_extends_when_no_match_survives() {
         }
         batch_sizes.push(batch.num_rows());
     }
-    assert_eq!(null_right, 1, "the unmatched probe row null-extends exactly once");
+    assert_eq!(
+        null_right, 1,
+        "the unmatched probe row null-extends exactly once"
+    );
     assert_eq!(null_left, 10_000, "every build row null-extends");
     // 1 null-extended probe row, then 10k unmatched build rows chunked.
     assert_eq!(batch_sizes, vec![1, bs, bs, 10_000 - 2 * bs]);

@@ -936,7 +936,7 @@ fn write_append_group(
     by_tail
         .into_iter()
         .map(|(key, acc)| WrittenTailGroup {
-            rep_payload: (!acc.frames.is_empty()).then(|| TailAppendPayload {
+            rep_payload: (!acc.frames.is_empty()).then_some(TailAppendPayload {
                 db: acc.db,
                 table: acc.table,
                 partition: acc.partition,
@@ -2179,7 +2179,7 @@ fn live_tail_with_sidecars(
     tail_dir: &Path,
     table_dir: &Path,
     id: Uuid,
-    generations: &mut Vec<Generation>,
+    generations: &mut [Generation],
 ) -> Result<Option<(PathBuf, Vec<DecodedSidecar>)>> {
     generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
     let mut sidecars_rev = Vec::new();

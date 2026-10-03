@@ -269,7 +269,7 @@ fn finish_flush_batch_removes_tails_and_markers_in_one_pass() -> Result<()> {
     // removing it under them raced their create (see create_tail_log_file).
     // Recovery tidies an empty directory instead.
     let tail_dir = temp.path().join(TAIL_DIR);
-    assert!(!std::fs::read_dir(&tail_dir)?.next().is_some());
+    assert!(std::fs::read_dir(&tail_dir)?.next().is_none());
     Ok(())
 }
 
@@ -704,7 +704,7 @@ fn delete_sidecar_round_trips_through_recovery() -> Result<()> {
         &test_batch(&schema, &[0, 1, 2, 3, 4, 5])?,
     )?;
 
-    assert!(delete_rows(temp.path(), id, &mut [1, 3])?);
+    assert!(delete_rows(temp.path(), id, &[1, 3])?);
     // A sidecar pend: rows still exist, but the tail is no longer "plain"
     // (a spill must not run over it).
     assert!(has_tail(temp.path(), id));
@@ -740,10 +740,10 @@ fn stacked_delete_sidecars_apply_oldest_first() -> Result<()> {
         &test_batch(&schema, &[10, 20, 30, 40])?,
     )?;
     // First delete speaks in the original batch's coordinates (removes 20)...
-    delete_rows(temp.path(), id, &mut [1])?;
+    delete_rows(temp.path(), id, &[1])?;
     // ...the second in the post-first-delete batch's coordinates:
     // [10, 30, 40], position 0 removes 10.
-    delete_rows(temp.path(), id, &mut [0])?;
+    delete_rows(temp.path(), id, &[0])?;
 
     let recovered = recover(temp.path(), &schema)?;
     assert_eq!(recovered[0].batch.num_rows(), 2);
@@ -764,7 +764,7 @@ fn insert_delta_after_delete_keeps_positions_prefix_stable() -> Result<()> {
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
     let id = Uuid::new_v4();
     persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
-    delete_rows(temp.path(), id, &mut [1])?;
+    delete_rows(temp.path(), id, &[1])?;
     // New rows append at the end; recorded positions must keep referring to
     // the original prefix.
     append(temp.path(), id, "2026", &test_batch(&schema, &[4])?)?;
@@ -786,7 +786,7 @@ fn torn_delete_sidecar_fails_recovery_closed() -> Result<()> {
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
     let id = Uuid::new_v4();
     persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
-    delete_rows(temp.path(), id, &mut [0])?;
+    delete_rows(temp.path(), id, &[0])?;
 
     // Simulate on-disk corruption: a truncated sidecar must fail the whole
     // recovery instead of silently resurrecting the deleted row.
@@ -809,7 +809,7 @@ fn persist_supersedes_pending_sidecars() -> Result<()> {
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
     let id = Uuid::new_v4();
     persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
-    delete_rows(temp.path(), id, &mut [0])?;
+    delete_rows(temp.path(), id, &[0])?;
     // The DELETE statement's in-memory result, persisted as a fresh
     // generation: sidecars below it are superseded and must not re-apply.
     persist(temp.path(), id, "2026", &test_batch(&schema, &[2, 3])?)?;
@@ -830,7 +830,7 @@ fn clear_tombstone_removes_sidecars_too() -> Result<()> {
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
     let id = Uuid::new_v4();
     persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2])?)?;
-    delete_rows(temp.path(), id, &mut [0])?;
+    delete_rows(temp.path(), id, &[0])?;
     clear(temp.path(), id)?;
     assert!(recover(temp.path(), &schema)?.is_empty());
     assert!(!has_tail(temp.path(), id));
@@ -846,7 +846,7 @@ fn recover_index_folds_pending_sidecars_into_a_plain_tail() -> Result<()> {
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
     let id = Uuid::new_v4();
     persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
-    delete_rows(temp.path(), id, &mut [0])?;
+    delete_rows(temp.path(), id, &[0])?;
 
     let indexed = recover_index(temp.path(), &schema)?;
     assert_eq!(indexed.len(), 1);

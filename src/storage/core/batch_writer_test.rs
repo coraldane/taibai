@@ -522,10 +522,9 @@ fn flush_under_lock_skips_transactional_and_pinned_memtables() -> Result<()> {
     )?;
 
     // Another session's in-flight transaction: a transactional memtable.
-    let txn_memtable =
-        writer
-            .memtable_mgr
-            .get_or_create_with_txn(TEST_DB, TEST_TABLE, "", &schema, 77);
+    let txn_memtable = writer
+        .memtable_mgr
+        .get_or_create_with_txn(TEST_DB, TEST_TABLE, "", &schema, 77);
     txn_memtable.append_owned(make_batch(&schema, 100, 3)?)?;
 
     writer.flush_table_under_table_lock(TEST_DB, TEST_TABLE)?;

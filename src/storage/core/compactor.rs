@@ -757,6 +757,7 @@ impl Compactor {
         Ok((sources, global_row_base))
     }
 
+    #[allow(clippy::too_many_arguments)]
     /// Decode every source column into one contiguous partition batch,
     /// purge deleted and TTL-expired rows from the global index, and sort it
     /// by the cluster key. In-memory only: the caller has already checked
@@ -929,7 +930,8 @@ impl Compactor {
                 let reader = self.segment_mgr.open_reader_cached(&segment_files[0])?;
                 let compact_row_groups =
                     reader.row_count().div_ceil(output_row_group_rows as u64) as usize;
-                let needs_row_group_compaction = reader.num_row_groups() > compact_row_groups.max(1);
+                let needs_row_group_compaction =
+                    reader.num_row_groups() > compact_row_groups.max(1);
                 if reader.deleted_row_count() == 0 && !needs_row_group_compaction {
                     tracing::info!(
                         db,
@@ -1231,12 +1233,7 @@ impl Compactor {
                 small_count += 1;
                 InputClass::MergeSmall
             } else if ttl.is_some_and(|(ttl_col, secs)| {
-                segment_ttl_fully_expired(
-                    &reader,
-                    ttl_col,
-                    secs.saturating_mul(1_000_000),
-                    now_us,
-                )
+                segment_ttl_fully_expired(&reader, ttl_col, secs.saturating_mul(1_000_000), now_us)
             }) {
                 // Clean and full, but provably past the TTL horizon: the
                 // only way these rows ever leave the disk is a rewrite.
@@ -1564,7 +1561,7 @@ impl Compactor {
                 });
                 rows_per_source.push(reader.row_group_rows(rg_idx) as usize);
                 row_base_per_source.push(segment_row_base);
-                segment_row_base += reader.row_group_rows(rg_idx) as u64;
+                segment_row_base += reader.row_group_rows(rg_idx);
             }
         }
 
@@ -1663,10 +1660,8 @@ impl Compactor {
             while current_runs.len() > CLUSTERED_MERGE_MAX_RUNS {
                 wave += 1;
                 let mut next_runs = Vec::new();
-                let mut next_seq = 0usize;
-                for group in current_runs.chunks(CLUSTERED_MERGE_MAX_RUNS) {
+                for (next_seq, group) in current_runs.chunks(CLUSTERED_MERGE_MAX_RUNS).enumerate() {
                     let merged_path = merge_wave_path(final_path, wave, next_seq);
-                    next_seq += 1;
                     let mut writer = SegmentWriter::create(
                         &merged_path,
                         schema.clone(),
@@ -1818,8 +1813,7 @@ impl Compactor {
                 .collect())
         };
 
-        for file_idx in 0..file_bounds.len() {
-            let (start, end) = file_bounds[file_idx];
+        for &(start, end) in &file_bounds {
             // First NON-EMPTY row group of the file (a leading empty row
             // group must not hide the rest of the file).
             let mut first_source = start;
@@ -2055,12 +2049,7 @@ fn estimated_row_width_bytes(schema: &Schema) -> usize {
             // Variable-width columns (VarChar/Blob/Vector) carry a
             // conservative per-value allowance: underestimating them let
             // external-merge runs overshoot the memory budget.
-            let base = col
-                .data_type
-                .fixed_size()
-                .map(|w| w as usize)
-                .unwrap_or(0)
-                .max(8);
+            let base = col.data_type.fixed_size().unwrap_or(0).max(8);
             let variable_extra = if col.data_type.fixed_size().is_none() {
                 64
             } else {

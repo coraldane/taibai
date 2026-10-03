@@ -325,10 +325,7 @@ impl SegmentManager {
             log_profile("append", written as usize, append_start.elapsed());
             Ok((written, pending_seals))
         });
-        let (written, pending_seals) = match result {
-            Ok(pair) => pair,
-            Err(error) => return Err(error),
-        };
+        let (written, pending_seals) = result?;
         let mut sealed_any = false;
         let mut first_seal_error: Option<TaibaiError> = None;
         for mut pending in pending_seals {

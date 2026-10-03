@@ -372,9 +372,7 @@ fn parse_insert_column_list(sql: &str, bytes: &[u8], pos: &mut usize) -> Option<
             let mut name = String::new();
             let mut seg_start = *pos;
             loop {
-                let Some(&c) = bytes.get(*pos) else {
-                    return None;
-                };
+                let &c = bytes.get(*pos)?;
                 if c == quote {
                     if bytes.get(*pos + 1) == Some(&quote) {
                         name.push_str(&sql[seg_start..*pos]);

@@ -910,7 +910,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                     }
                     let result = super::dml_insert::exec_insert(
                         self,
-                        &db,
+                        db,
                         &table.name,
                         columns,
                         chunk.as_slice(),

@@ -13,7 +13,9 @@ use crate::common::error::Result;
 use crate::sql::execution::operators::aggregate::HashAggregateExec;
 use crate::sql::execution::operators::scan::ScanExec;
 use crate::sql::execution::operators::ExecutionOp;
-use crate::sql::execution::scan::aggregate_meta;
+use crate::sql::execution::scan::fast_path::{
+    FastPathContext, FastPathOutcome, FoldedAggregateFastPath, ScanFastPath,
+};
 use crate::sql::execution::scan::runtime::ScanRuntime;
 use crate::sql::execution::scan::spec::ScanSpec;
 use crate::sql::planner::{AggregateExpr, LogicalExpr};
@@ -26,7 +28,8 @@ enum FoldedState {
     /// The engine answered: emit its batch, then end the stream.
     Answered(Option<RecordBatch>),
     /// The engine declined: delegate to the regular aggregate pipeline.
-    Fallback(HashAggregateExec),
+    /// Boxed: `HashAggregateExec` is far larger than the other variants.
+    Fallback(Box<HashAggregateExec>),
 }
 
 pub struct FoldedAggregateExec {
@@ -65,42 +68,30 @@ impl FoldedAggregateExec {
 
     /// Run the folding engine once, under the same table flush read lock the
     /// scan executor uses, so segment discovery and footer reads see one
-    /// consistent snapshot.
+    /// consistent snapshot. The folded fast-path node carries the same
+    /// universal TTL gate the scan executor's chain enforces.
     fn resolve(&mut self) -> Result<()> {
         let segment_mgr = self.runtime.segment_mgr().clone();
         let db = self.db.clone();
         let table = self.spec.table_name.clone();
-        let batch = segment_mgr.with_table_flush_read_lock(&db, &table, || {
-            let table_dir = self
-                .runtime
-                .data_dir()
-                .join(&self.db)
-                .join(&self.spec.table_name);
-            let table_dir = if table_dir.exists() {
-                table_dir
-            } else {
-                // No persisted segments; only memtable / hot store rows.
-                std::path::PathBuf::new()
-            };
-            aggregate_meta::compute_folded_aggregate(
+        let outcome = segment_mgr.with_table_flush_read_lock(&db, &table, || {
+            let ctx = FastPathContext::from_runtime(
                 &self.spec,
-                &self.group_by,
-                &self.aggregates,
                 &self.table_meta,
                 &self.table_schema,
-                &table_dir,
-                self.runtime.segment_mgr(),
-                self.runtime.memtable_manager(),
-                self.runtime.hot_store_manager(),
                 &self.db,
-            )
+                &self.runtime,
+            );
+            let node = FoldedAggregateFastPath::new(&self.group_by, &self.aggregates);
+            node.try_answer(&ctx)
         })?;
-        self.state = match batch {
-            Some(batch) => FoldedState::Answered(Some(batch)),
-            None => {
-                // Declined: build the regular pipeline over the same scan.
-                // ScanExec::deferred is lazy, so nothing was opened for the
-                // folded attempt.
+        self.state = match outcome {
+            FastPathOutcome::FinalAnswer(batch) => FoldedState::Answered(Some(batch)),
+            // The folded node never produces ScanRows; any other outcome is
+            // a decline. Build the regular pipeline over the same scan.
+            // ScanExec::deferred is lazy, so nothing was opened for the
+            // folded attempt.
+            FastPathOutcome::Declined(_) | FastPathOutcome::ScanRows(_) => {
                 let scan = ScanExec::deferred(
                     self.spec.clone(),
                     self.runtime.clone(),
@@ -108,12 +99,12 @@ impl FoldedAggregateExec {
                     self.table_meta.clone(),
                     self.db.clone(),
                 );
-                FoldedState::Fallback(HashAggregateExec::new(
+                FoldedState::Fallback(Box::new(HashAggregateExec::new(
                     self.group_by.clone(),
                     self.aggregates.clone(),
                     Box::new(scan),
                     self.table_schema.clone(),
-                ))
+                )))
             }
         };
         Ok(())

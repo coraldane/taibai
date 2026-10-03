@@ -714,8 +714,8 @@ impl ExecutionOp for HashAggregateExec {
             // and accumulate through pre-resolved typed column views across
             // per-lane tables merged at the end. Falls back to the generic
             // per-row loop for any unsupported shape.
-            if !fast_unsupported && fast_tables.is_empty() {
-                if !fast_group_supported(
+            if !fast_unsupported && fast_tables.is_empty()
+                && !fast_group_supported(
                     &group_by,
                     &gb_indices,
                     &aggregates,
@@ -724,7 +724,6 @@ impl ExecutionOp for HashAggregateExec {
                 ) {
                     fast_unsupported = true;
                 }
-            }
             if !fast_unsupported {
                 let phys = physical_schema.as_ref().unwrap_or(&self.input_schema);
                 fast_group_update(
@@ -1236,6 +1235,7 @@ struct GroupSpillMerge {
 }
 
 impl GroupSpillMerge {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         spills: Vec<SpillFile>,
         output_schema: Schema,

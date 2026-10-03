@@ -501,15 +501,19 @@ pub(super) fn decode_unique_index_delta_records(
         let len = match read_u32(&mut cursor) {
             Ok(len) => len as usize,
             Err(_) => {
-                tracing::warn!("unique index delta ends in a torn record; ignoring the trailing bytes");
+                tracing::warn!(
+                    "unique index delta ends in a torn record; ignoring the trailing bytes"
+                );
                 break;
             }
         };
         let start = cursor.position() as usize;
         let end = start + len;
         if end > tail.len() {
-            tracing::warn!(remaining = tail.len() - start,
-                "unique index delta ends in a torn record; ignoring the trailing bytes");
+            tracing::warn!(
+                remaining = tail.len() - start,
+                "unique index delta ends in a torn record; ignoring the trailing bytes"
+            );
             break;
         }
         let record = &tail[start..end];

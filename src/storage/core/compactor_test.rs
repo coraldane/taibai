@@ -799,7 +799,12 @@ fn external_merge_sort_drops_deleted_rows() -> Result<()> {
         let mut bitmap = vec![0u8; 3u64.div_ceil(8) as usize];
         crate::storage::segment::delete_bitmap::mark_deleted(&mut bitmap, 1);
         drop(reader);
-        SegmentReader::rewrite_footer_with_deletes(&table_dir.join("seg_00001.dat"), &bitmap, 1, crate::storage::segment::reader::FooterRewriteMode::Immediate)?;
+        SegmentReader::rewrite_footer_with_deletes(
+            &table_dir.join("seg_00001.dat"),
+            &bitmap,
+            1,
+            crate::storage::segment::reader::FooterRewriteMode::Immediate,
+        )?;
     }
 
     CLUSTERED_MERGE_BUDGET_OVERRIDE.store(
@@ -929,7 +934,10 @@ fn noncluster_compaction_keeps_ttl_segment_with_visible_rows() -> Result<()> {
     assert_eq!(stats.rows_written, 0);
     assert_eq!(stats.rows_dropped, 0);
     assert_eq!(file_mtime(&seg), seg_mtime);
-    assert_eq!(SegmentManager::discover_segments(&table_dir)?, vec![seg.clone()]);
+    assert_eq!(
+        SegmentManager::discover_segments(&table_dir)?,
+        vec![seg.clone()]
+    );
     Ok(())
 }
 
@@ -969,7 +977,10 @@ fn unsorted_budgeted_rewrite_matches_full_buffer_result() -> Result<()> {
                 .map(|&id| (id, format!("value-{id}")))
                 .collect::<Vec<_>>()
         };
-        for (seq, ids) in [&[5i64, 1, 8][..], &[3, 9, 2], &[7, 4, 6]].iter().enumerate() {
+        for (seq, ids) in [&[5i64, 1, 8][..], &[3, 9, 2], &[7, 4, 6]]
+            .iter()
+            .enumerate()
+        {
             let owned = rows_of(ids);
             let rows = owned
                 .iter()
@@ -993,7 +1004,8 @@ fn unsorted_budgeted_rewrite_matches_full_buffer_result() -> Result<()> {
             },
         )?);
         let compactor = Compactor::new(segment_mgr, tmp.path().to_path_buf());
-        let stats = compactor.optimize_table("default", "t", &test_meta_without_cluster(&schema))?;
+        let stats =
+            compactor.optimize_table("default", "t", &test_meta_without_cluster(&schema))?;
         assert_eq!(stats.rows_written, 9);
         let segments = SegmentManager::discover_segments(&table_dir)?;
         assert_eq!(segments.len(), 1);
@@ -1005,10 +1017,7 @@ fn unsorted_budgeted_rewrite_matches_full_buffer_result() -> Result<()> {
 
     // Tiny budget (3 refs < 9 live rows): the buffer must drain mid-scan in
     // whole-chunk flushes instead of collecting every ref up front.
-    CLUSTERED_MERGE_BUDGET_OVERRIDE.store(
-        ROW_REF_BYTES * 3,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    CLUSTERED_MERGE_BUDGET_OVERRIDE.store(ROW_REF_BYTES * 3, std::sync::atomic::Ordering::Relaxed);
     let budgeted = build(tempfile::tempdir()?)?;
     CLUSTERED_MERGE_BUDGET_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
 
@@ -1016,10 +1025,7 @@ fn unsorted_budgeted_rewrite_matches_full_buffer_result() -> Result<()> {
     // single-pass rewrite.
     assert_eq!(
         single_pass,
-        (
-            vec![5, 1, 8, 3, 9, 2, 7, 4, 6],
-            vec![2, 2, 2, 2, 1]
-        )
+        (vec![5, 1, 8, 3, 9, 2, 7, 4, 6], vec![2, 2, 2, 2, 1])
     );
     assert_eq!(budgeted, single_pass);
     Ok(())

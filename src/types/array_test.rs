@@ -153,7 +153,7 @@ fn run_form_matches_flat_form_across_numeric_kernels() {
                 .collect(),
             "with nulls",
         ),
-        ((0..130).map(|i| Some(i)).collect(), "distinct values"),
+        ((0..130).map(Some).collect(), "distinct values"),
     ];
 
     for (values, label) in cases {

@@ -777,10 +777,7 @@ mod audit_tests {
     /// always had.
     #[test]
     fn resident_hot_scan_declines_ttl_tables() {
-        use std::sync::Arc;
-
-use crate::common::error::Result;
-use crate::storage::catalog::schema::TableMeta;
+        use crate::storage::catalog::schema::TableMeta;
 
         let schema = Schema::new(vec![
             ColumnDef::new("category", DataType::VarChar),
@@ -860,10 +857,7 @@ use crate::storage::catalog::schema::TableMeta;
     /// those shapes.
     #[test]
     fn resident_hot_scan_does_not_truncate_distinct_or_aggregate_shapes() {
-        use std::sync::Arc;
-
-use crate::common::error::Result;
-use crate::storage::catalog::schema::TableMeta;
+        use crate::storage::catalog::schema::TableMeta;
 
         let schema = Schema::new(vec![
             ColumnDef::new("category", DataType::VarChar),

@@ -13,7 +13,6 @@ use crate::types::batch::{RecordBatch, Schema};
 
 use super::memtable;
 use super::partition;
-use super::row_group::RowGroupPruneResult;
 use super::runtime::ScanRuntime;
 
 /// Dedicated pool for the background decoder: its multi-millisecond chunk

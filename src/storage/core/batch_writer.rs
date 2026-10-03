@@ -21,6 +21,13 @@ const DEFAULT_LOW_RATE_MAX_AGE_SECS: u64 = 3600;
 const DEFAULT_SPILL_MIN_AGE_SECS: u64 = 60;
 const MAX_TAIL_FILES_PER_TABLE: usize = 256;
 
+/// Per (db, table) flush serialization lock shared by the gate's users.
+type TableKeyLocks = std::sync::Mutex<HashMap<(String, String), Arc<std::sync::Mutex<()>>>>;
+
+/// Tail-append outcome: (written row count, optional tail-commit handoff
+/// with the memtable the rows landed in).
+type TailAppendOutcome = (u64, Option<(TailCommitTicket, Arc<MemTable>)>);
+
 fn insert_profile_enabled() -> bool {
     crate::common::config::insert_profile_enabled()
 }
@@ -54,7 +61,7 @@ enum WriteCommand {
 /// clear memtable state (`clear_memtables`, `rename_memtables`) exclude
 /// in-flight flush I/O.
 pub(crate) struct PartitionFlushGate {
-    locks: std::sync::Mutex<HashMap<(String, String), Arc<std::sync::Mutex<()>>>>,
+    locks: TableKeyLocks,
 }
 
 impl PartitionFlushGate {
@@ -418,6 +425,7 @@ impl BatchWriter {
         self.write_columns_with_txn(db, table, partition_key, batch, schema, 0, hot_fed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn write_columns_with_txn(
         &self,
         db: &str,
@@ -428,20 +436,20 @@ impl BatchWriter {
         txn_id: u64,
         hot_fed: bool,
     ) -> Result<u64> {
-        let (rows, pending) =
-            self.write_columns_with_txn_tuple(
-                db,
-                table,
-                partition_key,
-                batch,
-                schema,
-                txn_id,
-                hot_fed,
-            )?;
+        let (rows, pending) = self.write_columns_with_txn_tuple(
+            db,
+            table,
+            partition_key,
+            batch,
+            schema,
+            txn_id,
+            hot_fed,
+        )?;
         self.settle_pending_tail_commit(db, table, pending)?;
         Ok(rows)
     }
 
+    #[allow(clippy::too_many_arguments)]
     /// Variant for callers that hold the constraint stripe across the write:
     /// returns the pending tail commit so the fsync wait can run AFTER the
     /// stripe is released — concurrent same-table INSERTs then join one fsync
@@ -459,14 +467,22 @@ impl BatchWriter {
         txn_id: u64,
         hot_fed: bool,
     ) -> Result<(u64, Option<PendingTailCommit>)> {
-        let (rows, pending) =
-            self.write_columns_with_txn_tuple(db, table, partition_key, batch, schema, txn_id, hot_fed)?;
+        let (rows, pending) = self.write_columns_with_txn_tuple(
+            db,
+            table,
+            partition_key,
+            batch,
+            schema,
+            txn_id,
+            hot_fed,
+        )?;
         Ok((
             rows,
             pending.map(|(ticket, memtable)| PendingTailCommit { ticket, memtable }),
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_columns_with_txn_tuple(
         &self,
         db: &str,
@@ -476,7 +492,7 @@ impl BatchWriter {
         schema: Schema,
         txn_id: u64,
         hot_fed: bool,
-    ) -> Result<(u64, Option<(TailCommitTicket, Arc<MemTable>)>)> {
+    ) -> Result<TailAppendOutcome> {
         let row_count = batch.num_rows() as u64;
         if row_count == 0 {
             return Ok((0, None));
@@ -581,12 +597,7 @@ impl BatchWriter {
         // over-count of at most one batch that only shrinks the remaining
         // budget.
         if txn_id > 0 {
-            self.charge_txn_insert_bytes(
-                txn_id,
-                db,
-                table,
-                batch.estimated_size_bytes() as u64,
-            )?;
+            self.charge_txn_insert_bytes(txn_id, db, table, batch.estimated_size_bytes() as u64)?;
         }
         let pending = if txn_id == 0 {
             // `PreparedTailAppend` already owns the durable representation of
@@ -628,6 +639,7 @@ impl BatchWriter {
         Ok((row_count, pending))
     }
 
+    #[allow(clippy::too_many_arguments)]
     /// Entry for callers that already hold the table mutation lock (REPLACE,
     /// delayed UPDATE materialization). Same protocol as
     /// [`Self::write_columns_with_txn`]: the durable-tail delta is prepared
@@ -1242,6 +1254,7 @@ impl BatchWriter {
         self.tail_committer.stop();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn worker_loop(
         rx: Arc<crossbeam_channel::Receiver<WriteCommand>>,
         stop: Arc<AtomicBool>,
@@ -1280,18 +1293,17 @@ impl BatchWriter {
                     // logged and treated as a failure — the table is
                     // requeued — instead of permanently killing the worker
                     // thread and its channel consumer.
-                    let checkpoint =
-                        run_panic_gated("taibai-bw-worker", || {
-                            Self::checkpoint_full_memtables(
-                                &segment_mgr,
-                                &memtable_mgr,
-                                &tail_committer,
-                                &flush_gate,
-                                max_rows_per_memtable,
-                                &db,
-                                &table,
-                            )
-                        });
+                    let checkpoint = run_panic_gated("taibai-bw-worker", || {
+                        Self::checkpoint_full_memtables(
+                            &segment_mgr,
+                            &memtable_mgr,
+                            &tail_committer,
+                            &flush_gate,
+                            max_rows_per_memtable,
+                            &db,
+                            &table,
+                        )
+                    });
                     if checkpoint.unwrap_or(true) {
                         pending_tables.insert((db, table));
                     }
@@ -1312,18 +1324,17 @@ impl BatchWriter {
                         continue;
                     };
                     pending_tables.remove(&(db.clone(), table.clone()));
-                    let checkpoint =
-                        run_panic_gated("taibai-bw-worker", || {
-                            Self::checkpoint_full_memtables(
-                                &segment_mgr,
-                                &memtable_mgr,
-                                &tail_committer,
-                                &flush_gate,
-                                max_rows_per_memtable,
-                                &db,
-                                &table,
-                            )
-                        });
+                    let checkpoint = run_panic_gated("taibai-bw-worker", || {
+                        Self::checkpoint_full_memtables(
+                            &segment_mgr,
+                            &memtable_mgr,
+                            &tail_committer,
+                            &flush_gate,
+                            max_rows_per_memtable,
+                            &db,
+                            &table,
+                        )
+                    });
                     if checkpoint.unwrap_or(true) {
                         pending_tables.insert((db, table));
                     }
@@ -2074,8 +2085,9 @@ impl BatchWriter {
                 "durable tail group flush cleanup deferred to recovery"
             );
         }
-        let (segment_file_name, expected_total_rows) =
-            outcome.target.expect("append outcome carries its watermark");
+        let (segment_file_name, expected_total_rows) = outcome
+            .target
+            .expect("append outcome carries its watermark");
         let group_ids: Vec<uuid::Uuid> = locked.iter().map(|(mt, _)| mt.id()).collect();
         segment_mgr.emit_segment_update(
             db,

@@ -171,7 +171,7 @@ impl SemiJoinExec {
             .query_memory_limit_mb
             .saturating_mul(1024 * 1024);
         self.materialized_bytes = self.materialized_bytes.saturating_add(bytes);
-        if limit > 0 && self.materialized_bytes > limit as u64 {
+        if limit > 0 && self.materialized_bytes > limit {
             return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
                 "semi join materialization exceeded the query memory budget                  ({} > {} bytes); raise query_memory_limit_mb",
                 self.materialized_bytes, limit

@@ -73,19 +73,16 @@ fn prepare_direct_bulk_constraint_entries(
         // state is stale the precheck is skipped instead of blocking;
         // REPLACE-style multi-location entries remain the documented
         // outcome of a client that does send duplicates.
-        match engine.index_manager().unique_keys_exist_if_current(
+        if let Some(true) = engine.index_manager().unique_keys_exist_if_current(
             db,
             table,
             PRIMARY_LOCATION_INDEX_NAME,
             &primary_keys,
         )? {
-            Some(true) => {
-                return Err(TaibaiError::Sql(format!(
-                    "duplicate primary key for table '{}'",
-                    table
-                )))
-            }
-            Some(false) | None => {}
+            return Err(TaibaiError::Sql(format!(
+                "duplicate primary key for table '{}'",
+                table
+            )))
         }
     }
 
@@ -778,10 +775,10 @@ impl Engine {
         // The request was parsed once before the write; only the batch
         // materialization for the mirror happens here.
         let hot_parse_start = std::time::Instant::now();
-        let parse_result = (|| {
+        let parse_result = {
             let schema = Schema::new(table_meta.columns.clone());
             crate::storage::segment_manager::direct_bulk_request_to_batch(req, &schema)
-        })();
+        };
         log_direct_bulk_profile("hot_feed_parse", 0, hot_parse_start.elapsed());
         let mut parsed_batch: Option<RecordBatch> = None;
         let feed = self.begin_hot_feed(db, table);

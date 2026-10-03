@@ -175,7 +175,7 @@ impl SubscriptionHandle {
         }
         let next = self.sub.next_delivered.load(Ordering::SeqCst);
         let log = self.channel.log.lock().unwrap();
-        log.entries.back().map_or(false, |e| e.seq >= next)
+        log.entries.back().is_some_and(|e| e.seq >= next)
     }
 
     pub fn drain(&self, max_entries: usize) -> DrainResult {
@@ -404,6 +404,7 @@ impl TableChannel {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_sub(
         &self,
         id: u64,

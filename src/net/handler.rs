@@ -1903,7 +1903,7 @@ impl Handler {
         {
             return Ok(vec![build_error("REPL_SEGMENT_FETCH: unsafe path")]);
         }
-        let path = self.engine.data_dir().join(&db).join(&table).join(&segment);
+        let path = self.engine.data_dir().join(db).join(table).join(segment);
         let file = match std::fs::File::open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1914,7 +1914,7 @@ impl Handler {
                 if self
                     .engine
                     .rep_log()
-                    .is_some_and(|log| log.segment_retired(&db, &table, &segment))
+                    .is_some_and(|log| log.segment_retired(db, table, segment))
                 {
                     return Ok(vec![Message::empty(MSG_TYPE_REPL_SEGMENT_GONE)]);
                 }
@@ -2054,9 +2054,7 @@ mod query_error_tests {
 
     #[test]
     fn resource_busy_maps_to_retryable_marker() {
-        let msg = build_query_error(&TaibaiError::ResourceBusy(
-            "hot store over limit".into(),
-        ));
+        let msg = build_query_error(&TaibaiError::ResourceBusy("hot store over limit".into()));
         assert_eq!(msg.msg_type, MSG_TYPE_ERROR);
         let text = String::from_utf8_lossy(&msg.payload);
         assert!(

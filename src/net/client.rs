@@ -80,7 +80,7 @@ pub fn is_retryable_error_message(message: &str) -> bool {
 /// (see [`Client::query`]); the application decides whether and how to
 /// retry.
 pub fn statement_is_read_only(sql: &str) -> bool {
-    let first_word = sql.trim_start().split_whitespace().next().unwrap_or("");
+    let first_word = sql.split_whitespace().next().unwrap_or("");
     matches!(
         first_word.to_ascii_uppercase().as_str(),
         "SELECT" | "SHOW" | "EXPLAIN"

@@ -380,7 +380,7 @@ fn eval_in_column_literal_hashed(
         | ColumnArray::Rle { .. }
         | ColumnArray::Dictionary { .. } => {
             flattened = col.flattened();
-            &flattened
+            flattened
         }
         other => other,
     };

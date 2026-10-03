@@ -150,8 +150,7 @@ pub(crate) fn plan_replace_memtable_conflicts(
 /// The walk-and-view they used to re-derive per caller is
 /// `TxnMutationRegistry::memtable_batch_visible_to_txn`; new memtable-side
 /// consumers must iterate through here so the visibility rules stay in one
-/// place.
-
+/// place.///
 /// One segment's DELETE match result (auto-commit and deferred transactional
 /// paths share the walk).
 pub(crate) struct SegmentDeleteMatch {
@@ -165,6 +164,7 @@ pub(crate) struct SegmentDeleteMatch {
     pub matched_ids: Vec<u64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 /// The shared per-segment DELETE match walk: seed the working bitmap from
 /// the segment's footer tombstones plus `seed_tombstones` (tombstones
 /// recorded by earlier statements of the same transaction), then walk row
@@ -206,8 +206,11 @@ pub(crate) fn match_segment_for_delete(
     // the silent "no match" used here dropped rows a DELETE had to remove.
     let aligned_predicate = match predicate {
         Some(pred) => {
-            let clause_columns: Vec<usize> =
-                pred.clauses.iter().map(|clause| clause.column_index).collect();
+            let clause_columns: Vec<usize> = pred
+                .clauses
+                .iter()
+                .map(|clause| clause.column_index)
+                .collect();
             if crate::storage::segment::reader::any_column_absent_in_schema(
                 table_schema,
                 reader.schema(),
@@ -241,7 +244,7 @@ pub(crate) fn match_segment_for_delete(
                 continue;
             }
         }
-        if !where_clause.is_some() && !need_batches {
+        if where_clause.is_none() && !need_batches {
             // Delete-everything-in-the-group fast path: no batch is read, so
             // there is nothing for batch-granularity consumers to observe.
             for i in 0..rg_rows {
@@ -328,7 +331,8 @@ pub(crate) fn for_each_visible_memtable(
             view
         } else {
             Arc::new(crate::storage::core::memtable::align_batch_to_schema(
-                &view, table_schema,
+                &view,
+                table_schema,
             )?)
         };
         consume(memtable, original, view, live_positions)?;
@@ -462,10 +466,7 @@ pub(crate) fn apply_replace_memtable_conflicts(
                     // guarding. Persist the filtered snapshot (or clear an
                     // emptied one) as before.
                     if plan.filtered.num_rows() == 0 {
-                        crate::storage::core::durable_tail::clear(
-                            &table_dir,
-                            plan.memtable.id(),
-                        )
+                        crate::storage::core::durable_tail::clear(&table_dir, plan.memtable.id())
                     } else {
                         crate::storage::core::durable_tail::persist(
                             &table_dir,
@@ -553,10 +554,7 @@ fn restore_replace_memtable_undo(engine: &Engine, undo: &ReplaceDeleteUndo) -> R
             // The restored snapshot supersedes the guarded sidecar: the
             // rollback has decided the delete undone, so its guard must not
             // gate this memtable's flush any longer.
-            crate::storage::core::durable_tail::clear_statement_guards(
-                &table_dir,
-                memtable.id(),
-            );
+            crate::storage::core::durable_tail::clear_statement_guards(&table_dir, memtable.id());
         }
     }
     match first_error {
@@ -751,8 +749,7 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
                 if candidates.is_empty() {
                     continue;
                 }
-                let batch =
-                    reader.read_row_group_columns(rg_idx, &schema, &verify_indices)?;
+                let batch = reader.read_row_group_columns(rg_idx, &schema, &verify_indices)?;
                 for row_id in candidates {
                     let row_idx = (row_id - rg_start) as usize;
                     if !replace_row_conflicts(&batch, row_idx, positions) {
@@ -783,8 +780,7 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
             {
                 continue;
             }
-            let batch =
-                reader.read_row_group_columns(rg_idx, &schema, &projected_indices)?;
+            let batch = reader.read_row_group_columns(rg_idx, &schema, &projected_indices)?;
             for row_idx in 0..batch.num_rows() {
                 let absolute_row = rg_start + row_idx as u64;
                 if delete_bitmap::is_deleted(&new_bitmap, absolute_row) {
@@ -1081,7 +1077,11 @@ impl DeleteIndexMaintenance {
     /// Return the id of `path` in the statement's segment table, interning it
     /// on first sight.
     pub(crate) fn intern_segment(&mut self, path: &str) -> u32 {
-        if let Some(pos) = self.segment_paths.iter().position(|existing| existing == path) {
+        if let Some(pos) = self
+            .segment_paths
+            .iter()
+            .position(|existing| existing == path)
+        {
             return pos as u32;
         }
         self.segment_paths.push(path.to_string());
@@ -1336,7 +1336,7 @@ pub fn exec_delete(
     // is no longer safely abortable, so cancellation checks stop firing.
     crate::common::query_cancel::enter_committing_phase();
 
-    let mut index_maintenance = DeleteIndexMaintenance::plan(&table_meta, &table_schema);
+    let mut index_maintenance = DeleteIndexMaintenance::plan(table_meta, table_schema);
 
     let mut delete_body = || -> Result<bool> {
         // In-lock re-check: the fn-top gate races a transaction registering
@@ -1352,11 +1352,9 @@ pub fn exec_delete(
             engine,
             db,
             table,
-            &resolved_where_clause,
-            &table_schema,
-            target_partition_key
-                .as_deref()
-                .filter(|key| !key.is_empty()),
+            resolved_where_clause,
+            table_schema,
+            target_partition_key.filter(|key| !key.is_empty()),
             reader_txn_id,
         )?;
         if !memtable_plans.is_empty() {
@@ -1371,29 +1369,23 @@ pub fn exec_delete(
             // Auto-commit DELETE is a single-leg statement: no replacement
             // images exist, so the memtable sidecar needs no guard (an empty
             // watermark writes none).
-            let undo =
-                apply_replace_memtable_conflicts(engine, db, table, memtable_plans, &[])?;
+            let undo = apply_replace_memtable_conflicts(engine, db, table, memtable_plans, &[])?;
             total_deleted += undo.deleted_rows();
         }
 
         let mut segment_files = if table_dir.exists() {
             prune_segments_by_partition(
                 SegmentManager::discover_segments(&table_dir)?,
-                &resolved_where_clause,
-                &table_schema,
-                &table_meta,
+                resolved_where_clause,
+                table_schema,
+                table_meta,
             )
         } else {
             Vec::new()
         };
-        if let Some(ref pred) = predicate {
-            segment_files = prune_segments_by_cluster_key(
-                segment_files,
-                mgr,
-                &table_schema,
-                &table_meta,
-                pred,
-            )?;
+        if let Some(pred) = predicate {
+            segment_files =
+                prune_segments_by_cluster_key(segment_files, mgr, table_schema, table_meta, pred)?;
         }
         // Point-DELETE fast path: a WHERE that is exactly a full PK/unique
         // equality resolves the affected segments through the location
@@ -1405,8 +1397,8 @@ pub fn exec_delete(
             engine,
             db,
             table,
-            &resolved_where_clause,
-            &table_schema,
+            resolved_where_clause,
+            table_schema,
             table_meta,
         )? {
             segment_files = located;
@@ -1419,7 +1411,7 @@ pub fn exec_delete(
         let key_projection = if publish_deletes {
             Vec::new()
         } else {
-            index_maintenance.projection(&predicate_projection)
+            index_maintenance.projection(predicate_projection)
         };
         let projected_key_positions =
             index_maintenance.projected_key_positions(&if key_projection.is_empty() {
@@ -1439,7 +1431,7 @@ pub fn exec_delete(
                 if total_rows == 0 {
                     continue;
                 }
-                if let Some(ref pred) = predicate {
+                if let Some(pred) = predicate {
                     if !super::helpers::segment_may_match(&reader, table_schema, Some(pred)) {
                         continue;
                     }
@@ -1611,10 +1603,7 @@ pub fn exec_delete(
         Ok(index_maintenance.apply(engine, db, table))
     };
 
-    let indexes_maintained = match target_partition_key
-        .as_deref()
-        .filter(|key| !key.is_empty())
-    {
+    let indexes_maintained = match target_partition_key.filter(|key| !key.is_empty()) {
         Some(partition) => {
             mgr.with_partition_set_mutation_lock(db, table, &[partition], &mut delete_body)?
         }
@@ -1839,9 +1828,7 @@ pub(crate) fn point_delete_key(
             && column_ref_name(left).is_some()
         {
             (column_ref_name(left)?, right.as_ref())
-        } else if matches!(left.as_ref(), Expr::Literal(_))
-            && column_ref_name(right).is_some()
-        {
+        } else if matches!(left.as_ref(), Expr::Literal(_)) && column_ref_name(right).is_some() {
             (column_ref_name(right)?, left.as_ref())
         } else {
             return None;
@@ -1944,10 +1931,12 @@ pub(crate) fn point_delete_segments(
     let Some((index_name, key)) = point_delete_key(where_clause, schema, table_meta) else {
         return Ok(None);
     };
-    match engine
-        .index_manager()
-        .unique_key_locations(db, table, &index_name, std::iter::once(&key))?
-    {
+    match engine.index_manager().unique_key_locations(
+        db,
+        table,
+        &index_name,
+        std::iter::once(&key),
+    )? {
         Some(locations) => {
             let mut segments = locations
                 .into_iter()

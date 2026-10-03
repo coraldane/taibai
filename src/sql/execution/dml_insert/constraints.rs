@@ -86,7 +86,10 @@ pub fn validate_unique_key_uniqueness(
                 // Pass the set directly: the lookup is generic over the key
                 // iteration, so the whole key set need not be re-cloned per
                 // INSERT.
-                match engine.index_manager().unique_keys_exist(db, table, index_name, &keys)? {
+                match engine
+                    .index_manager()
+                    .unique_keys_exist(db, table, index_name, &keys)?
+                {
                     Some(false) => return Ok(()),
                     Some(true) => {
                         for key in &keys {
@@ -200,8 +203,7 @@ pub(crate) fn collect_unique_index_entries_from(
                 continue;
             }
             for row_idx in 0..batch.num_rows() {
-                let Some(key) =
-                    unique_key_for_row(&batch, row_idx, &local_indices, &batch.schema)
+                let Some(key) = unique_key_for_row(&batch, row_idx, &local_indices, &batch.schema)
                 else {
                     continue;
                 };
@@ -245,13 +247,8 @@ fn load_existing_unique_keys(
     index_name: &str,
     new_keys: &HashSet<Vec<ScalarValue>>,
 ) -> Result<()> {
-    let entries = collect_unique_index_entries(
-        engine,
-        db,
-        table,
-        indices,
-        "unique key validation fallback",
-    )?;
+    let entries =
+        collect_unique_index_entries(engine, db, table, indices, "unique key validation fallback")?;
     if let Some(entry) = entries.iter().find(|entry| new_keys.contains(&entry.key)) {
         return Err(duplicate_unique_key_error(table, index_name, &entry.key));
     }
@@ -314,15 +311,19 @@ fn unique_key_for_row(
 /// All batches are addressed through `projected_indices[p] = batch column
 /// index of validation position p`; batches that already carry the
 /// validation projection pass the identity.
+/// Per index to validate: (`UniqueIndexMeta`, key positions inside the
+/// validation projection, materialized introduced-key set).
+type UniqueIndexProjection<'a> = (
+    &'a crate::storage::catalog::schema::UniqueIndexMeta,
+    Vec<usize>,
+    std::collections::HashSet<Vec<ScalarValue>>,
+);
+
 pub struct IntroducedKeyValidator<'a> {
     table: &'a str,
     /// Per index to validate: the positions of its key columns inside the
     /// VALIDATION projection plus its materialized introduced-key set.
-    indexes: Vec<(
-        &'a crate::storage::catalog::schema::UniqueIndexMeta,
-        Vec<usize>,
-        std::collections::HashSet<Vec<ScalarValue>>,
-    )>,
+    indexes: Vec<UniqueIndexProjection<'a>>,
 }
 
 impl<'a> IntroducedKeyValidator<'a> {

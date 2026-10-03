@@ -8,11 +8,12 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use super::cluster_prune;
+use super::fast_path::FastPathOutcome;
 use super::memtable;
 use super::partition;
 use super::row_filter;
 use super::runtime::ScanRuntime;
-use super::spec::{MetadataFoldRequest, ScanSpec};
+use super::spec::ScanSpec;
 
 pub struct ScanExecutor<'a> {
     /// Owned clone of the caller's spec: the hybrid partial-residency leg
@@ -28,6 +29,11 @@ pub struct ScanExecutor<'a> {
     /// regular aggregate pipeline over the raw scan batches instead of
     /// treating them as the answer.
     metadata_answered: bool,
+    /// The fast-path chain's query-level answer (`FinalAnswer` outcome):
+    /// `execute_scan_into` stashes it here and `execute_scan` unwraps it as
+    /// the complete result, bypassing the sink exactly as the pre-chain
+    /// routing did.
+    final_answer: Option<RecordBatch>,
 }
 
 impl<'a> ScanExecutor<'a> {
@@ -46,6 +52,7 @@ impl<'a> ScanExecutor<'a> {
             db,
             stats: None,
             metadata_answered: false,
+            final_answer: None,
         }
     }
 
@@ -64,6 +71,7 @@ impl<'a> ScanExecutor<'a> {
             db,
             stats: None,
             metadata_answered: false,
+            final_answer: None,
         }
     }
 
@@ -83,100 +91,7 @@ impl<'a> ScanExecutor<'a> {
         let segment_mgr = self.runtime.segment_mgr().clone();
         let db = self.db.to_string();
         let table = self.spec.table_name.clone();
-        segment_mgr.with_table_flush_read_lock(&db, &table, || self.execute_unlocked())
-    }
-
-    fn execute_unlocked(&mut self) -> Result<Vec<RecordBatch>> {
-        // Metadata fast paths (DISTINCT / folded aggregates) fold zone maps
-        // and footers directly and never apply the read-time TTL filter, so
-        // a table with an active TTL must take the regular scan path. The
-        // folding engine carries the same gate internally; this one stays
-        // for the DISTINCT path.
-        let ttl_active = self.table_meta.ttl.is_some();
-        if let Some(column) = self.spec.distinct_column.clone() {
-            if !ttl_active {
-                if let Some(batch) = self.execute_distinct_metadata(&column)? {
-                    self.metadata_answered = true;
-                    return Ok(vec![batch]);
-                }
-            }
-        }
-        if let Some(fold) = self.spec.metadata_fold.clone() {
-            return self.execute_folded_aggregate(&fold);
-        }
-        self.execute_scan()
-    }
-
-    /// Metadata-folded aggregate fast path: answer the fold request from
-    /// row-group zone maps / footers (per fold unit, per group) without
-    /// streaming row data. COUNT(*) is the degenerate no-GROUP-BY request.
-    /// Single-column DISTINCT answered from row-group zone maps. Returns
-    /// `None` when the fast path declines (caller falls back to the normal
-    /// scan + aggregate pipeline).
-    fn execute_distinct_metadata(&mut self, column: &str) -> Result<Option<RecordBatch>> {
-        let table_dir = self
-            .runtime
-            .data_dir()
-            .join(self.db)
-            .join(&self.spec.table_name);
-        super::aggregate_meta::compute_distinct_column(
-            &self.spec,
-            &self.table_meta,
-            &self.table_schema,
-            &table_dir,
-            self.runtime.segment_mgr(),
-            self.runtime.memtable_manager(),
-            self.runtime.hot_store_manager(),
-            self.db,
-            column,
-        )
-    }
-
-    fn execute_folded_aggregate(
-        &mut self,
-        fold: &MetadataFoldRequest,
-    ) -> Result<Vec<RecordBatch>> {
-        let table_dir = self
-            .runtime
-            .data_dir()
-            .join(self.db)
-            .join(&self.spec.table_name);
-        let batch = if table_dir.exists() {
-            super::aggregate_meta::compute_folded_aggregate(
-                &self.spec,
-                &fold.group_by,
-                &fold.aggregates,
-                &self.table_meta,
-                &self.table_schema,
-                &table_dir,
-                self.runtime.segment_mgr(),
-                self.runtime.memtable_manager(),
-                self.runtime.hot_store_manager(),
-                self.db,
-            )?
-        } else {
-            // No persisted segments; only memtable/hot store rows.
-            super::aggregate_meta::compute_folded_aggregate(
-                &self.spec,
-                &fold.group_by,
-                &fold.aggregates,
-                &self.table_meta,
-                &self.table_schema,
-                std::path::Path::new(""),
-                self.runtime.segment_mgr(),
-                self.runtime.memtable_manager(),
-                self.runtime.hot_store_manager(),
-                self.db,
-            )?
-        };
-        let Some(batch) = batch else {
-            // Sum over a column the metadata path cannot answer: return the
-            // raw scan batches and let the caller run the regular aggregate
-            // pipeline over them (`metadata_answered()` stays false).
-            return self.execute_scan();
-        };
-        self.metadata_answered = true;
-        Ok(vec![batch])
+        segment_mgr.with_table_flush_read_lock(&db, &table, || self.execute_scan())
     }
 
     fn execute_scan(&mut self) -> Result<Vec<RecordBatch>> {
@@ -187,6 +102,9 @@ impl<'a> ScanExecutor<'a> {
                 "scan input materialization exceeded the query memory budget ({} > {} bytes); raise query_memory_limit_mb",
                 output.bytes, output.byte_cap
             )));
+        }
+        if let Some(batch) = self.final_answer.take() {
+            return Ok(vec![batch]);
         }
         Ok(output.finish())
     }
@@ -203,9 +121,7 @@ impl<'a> ScanExecutor<'a> {
                 .build();
         let mut scan_limit = plan.scan_limit;
 
-        if let Some(batch) = self.try_resident_hot_scan(&plan)? {
-            output.set_limit(scan_limit);
-            output.push(batch);
+        if self.try_fast_paths(&plan, output)? {
             return Ok(());
         }
 
@@ -316,9 +232,7 @@ impl<'a> ScanExecutor<'a> {
                     // anything else must fail the query instead of silently
                     // skipping the whole segment's rows.
                     let opened = match super::candidates::open_segment_with_candidates(
-                        &mgr,
-                        seg_path,
-                        &self.spec,
+                        &mgr, seg_path, &self.spec,
                     ) {
                         Ok(Some(opened)) => opened,
                         Ok(None) => continue,
@@ -527,28 +441,105 @@ impl<'a> ScanExecutor<'a> {
         Ok(())
     }
 
-    fn try_resident_hot_scan(
-        &self,
+    /// The unified fast-path chain. Order mirrors the historic routing:
+    /// DISTINCT zone-map answer, metadata-folded aggregate, resident
+    /// hot-store shortcut; anything declined reaches the hybrid mirror leg
+    /// and the general scan below.
+    ///
+    /// The universal TTL gate runs here once, before any node: every chain
+    /// node declines TTL tables (truncation-style gathers would collect at
+    /// the pushed LIMIT before TTL filtering runs and return fewer live rows
+    /// than exist), so a new node cannot forget the gate. The nodes keep
+    /// their internal gates as defense in depth for direct callers.
+    ///
+    /// Returns `true` when the chain answered and the general legs must not
+    /// run. Stats recording uses direct field access on purpose: the context
+    /// borrows `spec`/`table_meta`/`table_schema`/`runtime` immutably, so a
+    /// `&mut self` helper would fight the borrow checker.
+    fn try_fast_paths<S: BatchSink>(
+        &mut self,
         plan: &super::strategy::ScanPlan,
-    ) -> Result<Option<RecordBatch>> {
-        let mut hot_spec = self.spec.clone();
-        hot_spec.projection = Some(plan.projection_cols.clone());
-        let Some(batch) = memtable::scan_resident_hot_store(
-            self.runtime.hot_store_manager(),
-            self.runtime.memtable_manager(),
+        output: &mut S,
+    ) -> Result<bool> {
+        if super::fast_path::ttl_blocks(&self.spec, &self.table_meta) {
+            self.record_fast_path_decline(super::fast_path::TTL_GATE_NODE);
+            return Ok(false);
+        }
+        let ctx = super::fast_path::FastPathContext::from_runtime(
+            &self.spec,
+            &self.table_meta,
+            &self.table_schema,
             self.db,
-            &self.table_meta,
-            &hot_spec,
-        ) else {
-            return Ok(None);
+            &self.runtime,
+        );
+        let distinct = super::fast_path::DistinctMetadataFastPath;
+        let folded = self
+            .spec
+            .metadata_fold
+            .as_ref()
+            .map(super::fast_path::FoldedAggregateFastPath::from_fold);
+        let resident = super::fast_path::ResidentHotFastPath {
+            projection_cols: &plan.projection_cols,
+            strip_ttl_column: plan.strip_ttl_column,
         };
-        let batch = super::strategy::apply_ttl_filter_and_projection(
-            batch,
-            &self.table_meta,
-            &plan.projection_cols,
-            plan.strip_ttl_column,
-        )?;
-        Ok(Some(batch))
+        let mut nodes: Vec<&dyn super::fast_path::ScanFastPath> = vec![&distinct];
+        if let Some(node) = folded.as_ref() {
+            nodes.push(node);
+        }
+        nodes.push(&resident);
+
+        let mut declined_nodes: Vec<&'static str> = Vec::new();
+        for node in nodes {
+            match node.try_answer(&ctx)? {
+                FastPathOutcome::FinalAnswer(batch) => {
+                    self.final_answer = Some(batch);
+                    self.metadata_answered = true;
+                    if let Some(s) = self.stats.as_deref_mut() {
+                        s.entry(self.spec.table_name.clone())
+                            .or_default()
+                            .fast_path_answered = Some(node.name());
+                    }
+                    return Ok(true);
+                }
+                FastPathOutcome::ScanRows(batch) => {
+                    output.set_limit(plan.scan_limit);
+                    output.push(batch);
+                    if let Some(s) = self.stats.as_deref_mut() {
+                        s.entry(self.spec.table_name.clone())
+                            .or_default()
+                            .fast_path_answered = Some(node.name());
+                    }
+                    return Ok(true);
+                }
+                FastPathOutcome::Declined(decline) => {
+                    // A shape the node does not apply to was never a
+                    // fast-path attempt; only record real declines.
+                    if decline.reason != super::fast_path::DeclineReason::NotApplicable {
+                        declined_nodes.push(decline.node);
+                    }
+                }
+            }
+        }
+        // Recorded after the loop: the chain context borrows several fields
+        // of self immutably, so stats writes wait until the borrows end.
+        if !declined_nodes.is_empty() {
+            if let Some(s) = self.stats.as_deref_mut() {
+                s.entry(self.spec.table_name.clone())
+                    .or_default()
+                    .fast_path_declined
+                    .extend(declined_nodes);
+            }
+        }
+        Ok(false)
+    }
+
+    fn record_fast_path_decline(&mut self, node: &'static str) {
+        if let Some(s) = self.stats.as_deref_mut() {
+            s.entry(self.spec.table_name.clone())
+                .or_default()
+                .fast_path_declined
+                .push(node);
+        }
     }
 
     fn scan_segments_parallel(
@@ -569,7 +560,7 @@ impl<'a> ScanExecutor<'a> {
         // been decoded into memory.
         let byte_cap = {
             let mb = crate::common::config::query_limits().query_memory_limit_mb;
-            (mb as u64).saturating_mul(1024 * 1024)
+            mb.saturating_mul(1024 * 1024)
         };
         let mut output_bytes = 0u64;
         let mut output = Vec::new();
@@ -684,8 +675,7 @@ impl<'a> ScanExecutor<'a> {
             for outcome in scanned {
                 let (_, mut batches) = outcome?;
                 for batch in batches.drain(..) {
-                    output_bytes =
-                        output_bytes.saturating_add(batch.estimated_size_bytes() as u64);
+                    output_bytes = output_bytes.saturating_add(batch.estimated_size_bytes() as u64);
                     if output_bytes > byte_cap {
                         return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
                             "parallel scan materialization exceeded the query memory budget ({} > {} bytes); raise query_memory_limit_mb",
@@ -726,8 +716,7 @@ impl<'a> ScanExecutor<'a> {
             self.runtime.segment_mgr(),
             &self.spec.table_schema,
             bounds,
-        )
-        else {
+        ) else {
             return segments;
         };
         if start > end {
@@ -819,7 +808,7 @@ impl LimitedBatchSink {
             if mb == 0 {
                 u64::MAX
             } else {
-                mb.saturating_mul(1024 * 1024) as u64
+                mb.saturating_mul(1024 * 1024)
             }
         };
         Self {
@@ -902,7 +891,7 @@ fn reverse_column(col: &ColumnArray) -> Result<ColumnArray> {
     let col = match col {
         ColumnArray::Selected { .. } | ColumnArray::Rle { .. } | ColumnArray::Dictionary { .. } => {
             flattened = col.flattened();
-            &flattened
+            flattened
         }
         other => other,
     };

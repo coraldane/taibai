@@ -152,13 +152,9 @@ pub fn compute_folded_aggregate(
     if !needed_columns.is_empty() {
         hot_spec.projection = Some(needed_columns);
     }
-    if let Some(batch) = scan_memtable::scan_resident_hot_store(
-        hot_mgr,
-        memtable_mgr,
-        db,
-        table_meta,
-        &hot_spec,
-    ) {
+    if let Some(batch) =
+        scan_memtable::scan_resident_hot_store(hot_mgr, memtable_mgr, db, table_meta, &hot_spec)
+    {
         if fold_named_batch(
             &mut groups,
             &key_columns,
@@ -179,13 +175,9 @@ pub fn compute_folded_aggregate(
     }
     let mut hybrid_mirror_batch = None;
     if spec.hot_mirror_bound.is_none() {
-        if let Some((batch, pk_idx, covers)) = scan_memtable::hybrid_hot_mirror_scan(
-            hot_mgr,
-            memtable_mgr,
-            db,
-            table_meta,
-            &hot_spec,
-        ) {
+        if let Some((batch, pk_idx, covers)) =
+            scan_memtable::hybrid_hot_mirror_scan(hot_mgr, memtable_mgr, db, table_meta, &hot_spec)
+        {
             spec.range_predicates
                 .push(crate::storage::partition::pruning::RangeClause {
                     column_index: pk_idx,
@@ -255,14 +247,20 @@ pub fn compute_folded_aggregate(
                     .iter()
                     .map(|clause| clause.column_index)
                     .collect();
-                if row_filter::any_predicate_column_absent(table_schema, m.footer_schema(), &clause_columns)
-                {
+                if row_filter::any_predicate_column_absent(
+                    table_schema,
+                    m.footer_schema(),
+                    &clause_columns,
+                ) {
                     false
                 } else {
                     // Sidecar zone maps follow the segment's footer column
                     // order; re-index the predicate onto it before comparing.
-                    let aligned_predicate =
-                        row_filter::align_predicate_to_footer(table_schema, m.footer_schema(), &predicate)?;
+                    let aligned_predicate = row_filter::align_predicate_to_footer(
+                        table_schema,
+                        m.footer_schema(),
+                        &predicate,
+                    )?;
                     !row_group::prune_segment_by_zone_map(&aligned_predicate, m.footer_zone_maps())
                 }
             }
@@ -397,9 +395,9 @@ pub fn compute_folded_aggregate(
             .iter()
             .filter(|a| matches!(a.func, AggFunc::Sum | AggFunc::Avg))
             .all(|a| {
-                a.column.is_some_and(|column| defaults.contains_key(&column))
-                    || (footer_sums
-                        && crate::storage::segment::column_sum_supported(a.col_type))
+                a.column
+                    .is_some_and(|column| defaults.contains_key(&column))
+                    || (footer_sums && crate::storage::segment::column_sum_supported(a.col_type))
             });
         // SUM has no zone-map representation: either the per-segment
         // partial-sum cache answers (COUNT/MIN/MAX fold from the zone maps
@@ -517,11 +515,7 @@ pub fn compute_folded_aggregate(
         };
 
         let sum_before: Vec<(Option<i64>, Option<f64>)> = if has_sum && !grouped {
-            groups
-                .single()
-                .iter()
-                .map(|a| (a.sum_i, a.sum_f))
-                .collect()
+            groups.single().iter().map(|a| (a.sum_i, a.sum_f)).collect()
         } else {
             Vec::new()
         };
@@ -580,12 +574,14 @@ pub fn compute_folded_aggregate(
             /// every clause is zone-map vacuous for this row group).
             apply_mask: bool,
         }
-        let mut meta_folds: Vec<(
+        /// Per fold unit: (key values, zone maps, row count, column sums).
+        type MetaFold<'a> = (
             Vec<ScalarValue>,
-            &[crate::storage::partition::pruning::ZoneMap],
+            &'a [crate::storage::partition::pruning::ZoneMap],
             u64,
-            &[i64],
-        )> = Vec::new();
+            &'a [i64],
+        );
+        let mut meta_folds: Vec<MetaFold<'_>> = Vec::new();
         let mut data_folds: Vec<DataFold> = Vec::new();
 
         // Per-clause zone-map classification is only sound without IN /
@@ -627,10 +623,10 @@ pub fn compute_folded_aggregate(
                     .iter()
                     .filter(|a| matches!(a.func, AggFunc::Sum | AggFunc::Avg))
                     .all(|a| {
-                        a.column.is_some_and(|column| defaults.contains_key(&column))
+                        a.column
+                            .is_some_and(|column| defaults.contains_key(&column))
                             || (!row_group_meta.zone_maps.is_empty()
-                                && row_group_meta.col_sums.len()
-                                    == row_group_meta.zone_maps.len())
+                                && row_group_meta.col_sums.len() == row_group_meta.zone_maps.len())
                     });
             // A grouped metadata fold additionally needs the unit to collapse
             // into one group: every key column single-valued (or constant
@@ -645,7 +641,6 @@ pub fn compute_folded_aggregate(
             if predicate_match == crate::storage::partition::pruning::PredicateMatch::All
                 && reader.delete_bitmap().is_empty()
                 && !streaming_sum
-                && rg_unit_key.is_some()
                 && aggregates_foldable_from_metadata(
                     &groups.template,
                     &aggregate_columns,
@@ -655,15 +650,16 @@ pub fn compute_folded_aggregate(
                 )
                 && (!has_sum && !has_avg || rg_sums_available)
             {
-                meta_folds.push((
-                    rg_unit_key
-                        .expect("unit key checked above"),
-                    &row_group_meta.zone_maps,
-                    row_group_meta.row_count,
-                    &row_group_meta.col_sums,
-                ));
-                row_start += row_group_meta.row_count;
-                continue;
+                if let Some(unit_key) = rg_unit_key {
+                    meta_folds.push((
+                        unit_key,
+                        &row_group_meta.zone_maps,
+                        row_group_meta.row_count,
+                        &row_group_meta.col_sums,
+                    ));
+                    row_start += row_group_meta.row_count;
+                    continue;
+                }
             }
 
             // Classify each clause against this row group's zone maps: All
@@ -765,13 +761,13 @@ pub fn compute_folded_aggregate(
                 let live_rows = if reader.delete_bitmap().is_empty() {
                     row_group_meta.row_count
                 } else {
-                    row_group_meta.row_count.saturating_sub(
-                        delete_bitmap::row_range_deleted_count(
+                    row_group_meta
+                        .row_count
+                        .saturating_sub(delete_bitmap::row_range_deleted_count(
                             reader.delete_bitmap(),
                             row_start,
                             row_group_meta.row_count,
-                        ),
-                    )
+                        ))
                 };
                 meta_folds.push((
                     Vec::new(),
@@ -1034,7 +1030,10 @@ fn finalize_folded(
         Vec::with_capacity(key_columns.len() + aggregates.len());
     for &key in key_columns {
         let def = &table_schema.columns[key];
-        columns.push(crate::types::batch::ColumnDef::new(def.name.as_str(), def.data_type));
+        columns.push(crate::types::batch::ColumnDef::new(
+            def.name.as_str(),
+            def.data_type,
+        ));
     }
     for aggregate in aggregates {
         columns.push(aggregate_result_column_def(aggregate, table_schema));
@@ -1295,7 +1294,12 @@ fn fold_grouped_data_batch(
     for row in 0..rows {
         let key: Vec<ScalarValue> = key_positions
             .iter()
-            .map(|&position| batch.column(position).expect("key position checked").scalar(row))
+            .map(|&position| {
+                batch
+                    .column(position)
+                    .expect("key position checked")
+                    .scalar(row)
+            })
             .collect();
         let accumulators = groups.group(key);
         for (accumulator, position) in accumulators.iter_mut().zip(aggregate_positions) {
@@ -1344,7 +1348,10 @@ fn footer_column_drift(
     let mut names = Vec::with_capacity(col_def.previous_names.len() + 1);
     names.push(col_def.name.clone());
     names.extend(col_def.previous_names.iter().cloned());
-    if names.iter().any(|name| footer_schema.index_of(name).is_some()) {
+    if names
+        .iter()
+        .any(|name| footer_schema.index_of(name).is_some())
+    {
         return FooterColumnDrift::Present;
     }
     match &col_def.default_value {
@@ -1354,9 +1361,7 @@ fn footer_column_drift(
         Some(crate::types::batch::ColumnDefaultValue::CurrentTimestamp) => {
             FooterColumnDrift::NonConstantDefault
         }
-        None => FooterColumnDrift::ConstantDefault(ScalarValue::null_for_type(
-            col_def.data_type,
-        )),
+        None => FooterColumnDrift::ConstantDefault(ScalarValue::null_for_type(col_def.data_type)),
     }
 }
 
@@ -1384,10 +1389,7 @@ fn read_data_fold_batch(
     } else {
         let aligned_read_columns =
             row_filter::align_indices_to_footer(table_schema, reader.schema(), &present)?;
-        Some(reader.read_row_group_with_projection(
-            row_group_index,
-            &aligned_read_columns,
-        )?)
+        Some(reader.read_row_group_with_projection(row_group_index, &aligned_read_columns)?)
     };
     let rows = projected
         .as_ref()
@@ -1404,9 +1406,7 @@ fn read_data_fold_batch(
             .columns
             .get(column)
             .ok_or_else(|| {
-                TaibaiError::Internal(format!(
-                    "aggregate column index {column} out of range"
-                ))
+                TaibaiError::Internal(format!("aggregate column index {column} out of range"))
             })?
             .clone();
         if let Some(default) = defaults.get(&column) {
@@ -1550,7 +1550,9 @@ fn plan_vacuous_run_fold(
     // runs and no zone map. Resolve by name before the zone-map lookup so
     // the identity fallback of `mapped_column` can never index an unrelated
     // footer slot.
-    reader.schema().index_of(&table_schema.columns.get(column)?.name)?;
+    reader
+        .schema()
+        .index_of(&table_schema.columns.get(column)?.name)?;
     let footer_column = row_filter::mapped_column(column_map, column);
     if has_count_star && zone_maps.get(footer_column)?.null_count != 0 {
         return None;
@@ -1818,8 +1820,7 @@ impl AggAccum {
             },
             AggFunc::Avg => {
                 if let Some(value) = default.numeric_f64() {
-                    self.avg_sum_f =
-                        Some(self.avg_sum_f.unwrap_or(0.0) + value * row_count as f64);
+                    self.avg_sum_f = Some(self.avg_sum_f.unwrap_or(0.0) + value * row_count as f64);
                     self.avg_count += row_count;
                 }
             }
@@ -2031,15 +2032,12 @@ pub(crate) fn invalidate_segment_sum_cache_under(table_dir: &Path) {
     cache.retain(|(path, _, _, _, _), _| !Path::new(path).starts_with(table_dir));
 }
 
-fn segment_sum_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<(String, String, u64, u64, bool), SumCacheValue>,
-> {
+type SegmentSumCacheMap =
+    std::collections::HashMap<(String, String, u64, u64, bool), SumCacheValue>;
+
+fn segment_sum_cache() -> &'static std::sync::Mutex<SegmentSumCacheMap> {
     use std::sync::OnceLock;
-    static CACHE: OnceLock<
-        std::sync::Mutex<
-            std::collections::HashMap<(String, String, u64, u64, bool), SumCacheValue>,
-        >,
-    > = OnceLock::new();
+    static CACHE: OnceLock<std::sync::Mutex<SegmentSumCacheMap>> = OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -2197,7 +2195,7 @@ pub fn compute_distinct_column(
     else {
         return Ok(None);
     };
-    let col_type = table_schema.columns[col_def_idx].data_type.clone();
+    let col_type = table_schema.columns[col_def_idx].data_type;
     let null_value = ScalarValue::null_for_type(col_type);
 
     let mut seen: std::collections::HashSet<ScalarValue> = std::collections::HashSet::new();
@@ -2456,8 +2454,8 @@ mod tests {
     #[test]
     fn compute_simple_aggregate_keeps_fast_path_across_add_and_rename_drift() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let engine = crate::sql::execution::engine::Engine::new(dir.path(), "main")
-            .expect("engine");
+        let engine =
+            crate::sql::execution::engine::Engine::new(dir.path(), "main").expect("engine");
         let mut session = crate::net::session::Session::new("root".to_string(), "main".to_string());
         engine
             .execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")
@@ -2472,7 +2470,10 @@ mod tests {
         engine.execute(&mut session, &sql).expect("insert");
         engine.flush_table_buffers("main", "t").expect("flush");
         engine
-            .execute(&mut session, "ALTER TABLE t ADD COLUMN score INT64 DEFAULT 7")
+            .execute(
+                &mut session,
+                "ALTER TABLE t ADD COLUMN score INT64 DEFAULT 7",
+            )
             .expect("add column");
         engine
             .execute(&mut session, "ALTER TABLE t RENAME COLUMN v TO value")
@@ -2539,14 +2540,17 @@ mod tests {
     #[test]
     fn compute_simple_aggregate_declines_current_timestamp_default() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let engine = crate::sql::execution::engine::Engine::new(dir.path(), "main")
-            .expect("engine");
+        let engine =
+            crate::sql::execution::engine::Engine::new(dir.path(), "main").expect("engine");
         let mut session = crate::net::session::Session::new("root".to_string(), "main".to_string());
         engine
             .execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")
             .expect("create");
         engine
-            .execute(&mut session, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)")
+            .execute(
+                &mut session,
+                "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)",
+            )
             .expect("insert");
         engine.flush_table_buffers("main", "t").expect("flush");
         engine
@@ -2592,8 +2596,8 @@ mod tests {
     #[test]
     fn compute_folded_aggregate_answers_group_by_partition_key_from_metadata() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let engine = crate::sql::execution::engine::Engine::new(dir.path(), "main")
-            .expect("engine");
+        let engine =
+            crate::sql::execution::engine::Engine::new(dir.path(), "main").expect("engine");
         let mut session = crate::net::session::Session::new("root".to_string(), "main".to_string());
         engine
             .execute(
@@ -2657,8 +2661,8 @@ mod tests {
     #[test]
     fn compute_folded_aggregate_declines_active_ttl() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let engine = crate::sql::execution::engine::Engine::new(dir.path(), "main")
-            .expect("engine");
+        let engine =
+            crate::sql::execution::engine::Engine::new(dir.path(), "main").expect("engine");
         let mut session = crate::net::session::Session::new("root".to_string(), "main".to_string());
         engine
             .execute(
@@ -2698,7 +2702,10 @@ mod tests {
             "main",
         )
         .expect("compute");
-        assert!(batch.is_none(), "active TTL must decline the folding engine");
+        assert!(
+            batch.is_none(),
+            "active TTL must decline the folding engine"
+        );
         engine.segment_mgr().shutdown();
     }
 
@@ -2707,14 +2714,17 @@ mod tests {
     #[test]
     fn compute_folded_aggregate_declines_expression_group_key() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let engine = crate::sql::execution::engine::Engine::new(dir.path(), "main")
-            .expect("engine");
+        let engine =
+            crate::sql::execution::engine::Engine::new(dir.path(), "main").expect("engine");
         let mut session = crate::net::session::Session::new("root".to_string(), "main".to_string());
         engine
             .execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")
             .expect("create");
         engine
-            .execute(&mut session, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)")
+            .execute(
+                &mut session,
+                "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)",
+            )
             .expect("insert");
         engine.flush_table_buffers("main", "t").expect("flush");
 

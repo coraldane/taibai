@@ -264,6 +264,7 @@ async fn connect_and_stream(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply(
     engine: &Arc<crate::sql::execution::Engine>,
     applied: &AppliedSeqState,

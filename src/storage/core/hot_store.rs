@@ -413,14 +413,12 @@ impl<'a> KeySource<'a> {
             Self::UInt16 { data, bm } => key_or_null(bm, i, || ValueKey::Int(data[i] as i64)),
             Self::UInt32 { data, bm } => key_or_null(bm, i, || ValueKey::Int(data[i] as i64)),
             Self::UInt64 { data, bm } => key_or_null(bm, i, || ValueKey::UInt(data[i])),
-            Self::Float32 { data, bm } => {
-                key_or_null(bm, i, || {
-                    ValueKey::Float(crate::types::scalar::float_key_bits(data[i] as f64))
-                })
-            }
-            Self::Float64 { data, bm } => {
-                key_or_null(bm, i, || ValueKey::Float(crate::types::scalar::float_key_bits(data[i])))
-            }
+            Self::Float32 { data, bm } => key_or_null(bm, i, || {
+                ValueKey::Float(crate::types::scalar::float_key_bits(data[i] as f64))
+            }),
+            Self::Float64 { data, bm } => key_or_null(bm, i, || {
+                ValueKey::Float(crate::types::scalar::float_key_bits(data[i]))
+            }),
             Self::Decimal { data, bm } => key_or_null(bm, i, || ValueKey::Int(data[i])),
             Self::Date { data, bm } => key_or_null(bm, i, || ValueKey::Int(data[i] as i64)),
             Self::Time { data, bm } => key_or_null(bm, i, || ValueKey::Int(data[i])),
@@ -1693,9 +1691,9 @@ impl HotStore {
                 for col in acc.iter_mut() {
                     match sources.next() {
                         Some(SelectionSource::Shared(source)) => {
-                            if source.gather_into(&rows, col).is_err() {
-                                return None;
-                            }
+                            // A gather failure abandons the whole answer:
+                            // partial rows would under-count the group.
+                            source.gather_into(&rows, col).ok()?;
                         }
                         Some(SelectionSource::Owned(owned)) => {
                             // Rows were already gathered from the open chunk;
@@ -1748,11 +1746,7 @@ impl HotStore {
         Self::key_in_open(&open, key, partition_key)
     }
 
-    fn key_in_sealed(
-        st: &StoreState,
-        key: &ValueKey,
-        partition_key: Option<&ValueKey>,
-    ) -> bool {
+    fn key_in_sealed(st: &StoreState, key: &ValueKey, partition_key: Option<&ValueKey>) -> bool {
         st.sealed.iter().any(|c| match partition_key {
             Some(pk) => c.key_partition_postings(key, pk).is_some(),
             None => c.key_postings(key).is_some(),

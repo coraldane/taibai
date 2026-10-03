@@ -23,6 +23,11 @@ pub use self::types::{
 };
 pub const PRIMARY_LOCATION_INDEX_NAME: &str = "__taibai_primary_location";
 
+/// Unique/PK keys published per explicit transaction, per (db, table), per
+/// index name — the statement-time visibility record ROLLBACK retracts.
+type TxnPublishedUniqueKeys =
+    std::sync::Mutex<HashMap<u64, HashMap<(String, String), Vec<(String, Vec<Vec<ScalarValue>>)>>>>;
+
 pub struct IndexManager {
     unique_indexes: Arc<RwLock<HashMap<String, Arc<UniqueIndexState>>>>,
     primary_key_indexes: RwLock<HashMap<String, HashSet<Vec<u8>>>>,
@@ -34,8 +39,7 @@ pub struct IndexManager {
     /// COMMIT, so ROLLBACK must retract exactly these keys — otherwise the
     /// next INSERT of the same key sees a phantom duplicate until the next
     /// snapshot refresh. COMMIT only drops the record.
-    txn_published:
-        Mutex<HashMap<u64, HashMap<(String, String), Vec<(String, Vec<Vec<ScalarValue>>)>>>>,
+    txn_published: TxnPublishedUniqueKeys,
 }
 
 #[derive(Default)]
@@ -987,10 +991,9 @@ impl IndexManager {
                         .push(addition.entry.location.clone());
                     delta.entry_count += 1;
                 }
-                let delta_count =
-                    delta
-                        .entry_count
-                        .saturating_add(delta.tombstones.len() as u64);
+                let delta_count = delta
+                    .entry_count
+                    .saturating_add(delta.tombstones.len() as u64);
                 unique_index_delta_needs_compaction(delta_count, state.base.entry_count)
             };
             if needs_compaction {

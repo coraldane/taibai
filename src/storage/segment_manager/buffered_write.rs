@@ -1,3 +1,6 @@
+/// Optional caller hook invoked while the table lock is held.
+type UnderTableLockHook<'a> = Option<&'a mut dyn FnMut(&str, u64) -> Result<()>>;
+
 /// Result of [`SegmentManager::flush_memtable_batch_with_intents_under_table_lock`].
 pub(crate) struct FlushIntentAppendOutcome {
     pub wrote: bool,
@@ -199,6 +202,7 @@ impl SegmentManager {
             .ok_or_else(|| TaibaiError::Storage("active segment path has no file name".into()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     /// Memtable flush whose durable flush intents are written by
     /// `write_intents` INSIDE the append's active_segments critical section,
     /// stamped with the authoritative pre-append watermark of the very
@@ -312,6 +316,7 @@ impl SegmentManager {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     /// [`Self::append_batch_with_partition_locked`] plus a hook that runs
     /// under the SAME active_segments lock, after the target segment is
     /// resolved and before the append: the hook receives the segment file
@@ -330,7 +335,7 @@ impl SegmentManager {
         batch: &RecordBatch,
         flush_immediately: bool,
         pubsub_deferred: bool,
-        mut under_lock_hook: Option<&mut dyn FnMut(&str, u64) -> Result<()>>,
+        under_lock_hook: UnderTableLockHook<'_>,
     ) -> Result<()> {
         let mut pending_seal = None;
         {
@@ -344,7 +349,7 @@ impl SegmentManager {
             )?;
 
             let seg = active_guard.get_mut(partition_key).unwrap();
-            if let Some(hook) = under_lock_hook.as_deref_mut() {
+            if let Some(hook) = under_lock_hook {
                 let file_name = Self::active_segment_file_name(&seg.path)?;
                 let base_rows = seg.total_rows + seg.buffered_rows as u64;
                 hook(&file_name, base_rows)?;

@@ -435,11 +435,7 @@ impl SegmentReader {
             }
         };
 
-        if let Err(error) = Self::apply_footer_bytes_with_retry(path, source.data_end, &new_footer) {
-            // The journal stays behind: the next open of this segment
-            // repairs from it instead of losing the data block.
-            return Err(error);
-        }
+        Self::apply_footer_bytes_with_retry(path, source.data_end, &new_footer)?;
         if deferred.is_none() {
             let _ = fs::remove_file(&journal);
         }
