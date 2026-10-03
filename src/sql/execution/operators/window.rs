@@ -118,8 +118,7 @@ fn concat_batches(mut batches: Vec<RecordBatch>, num_rows: usize) -> Result<Reco
     let schema = batches[0].schema.clone();
     let mut columns: Vec<ColumnArray> = Vec::with_capacity(ncols);
     for col_idx in 0..ncols {
-        let mut column =
-            ColumnArray::with_capacity(schema.columns[col_idx].data_type, num_rows);
+        let mut column = ColumnArray::with_capacity(schema.columns[col_idx].data_type, num_rows);
         for batch in batches.iter_mut() {
             let taken = std::mem::replace(
                 &mut batch.columns[col_idx],
@@ -576,7 +575,8 @@ fn is_running_prefix_frame(plan: &WindowFuncPlan) -> bool {
                 && matches!(
                     frame.start,
                     crate::sql::parser::ast::FrameBound::UnboundedPreceding
-                ) && matches!(frame.end, crate::sql::parser::ast::FrameBound::CurrentRow)
+                )
+                && matches!(frame.end, crate::sql::parser::ast::FrameBound::CurrentRow)
         }
     }
 }
@@ -741,8 +741,7 @@ fn running_value(
                 // Decimal sums accumulate in the raw scaled domain; divide
                 // the scale back out (missing step made AVG 10^scale too
                 // large, diverging from HashAggregateExec).
-                let scale_divisor =
-                    decimal_scale.map_or(1.0, |sc| 10f64.powi(sc));
+                let scale_divisor = decimal_scale.map_or(1.0, |sc| 10f64.powi(sc));
                 ScalarValue::Float64(Some(total / count as f64 / scale_divisor))
             }
         }

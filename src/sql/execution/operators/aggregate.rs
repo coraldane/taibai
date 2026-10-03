@@ -714,16 +714,18 @@ impl ExecutionOp for HashAggregateExec {
             // and accumulate through pre-resolved typed column views across
             // per-lane tables merged at the end. Falls back to the generic
             // per-row loop for any unsupported shape.
-            if !fast_unsupported && fast_tables.is_empty()
+            if !fast_unsupported
+                && fast_tables.is_empty()
                 && !fast_group_supported(
                     &group_by,
                     &gb_indices,
                     &aggregates,
                     &agg_col_indices,
                     &batch,
-                ) {
-                    fast_unsupported = true;
-                }
+                )
+            {
+                fast_unsupported = true;
+            }
             if !fast_unsupported {
                 let phys = physical_schema.as_ref().unwrap_or(&self.input_schema);
                 fast_group_update(

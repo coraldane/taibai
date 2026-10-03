@@ -638,7 +638,10 @@ fn delete_in_large_literal_list_semantics() {
 
     // >4 literal candidates via a subquery (resolver expands to literals).
     engine
-        .execute(&mut session, "DELETE FROM in_t WHERE id IN (SELECT id FROM in_t WHERE id < 5)")
+        .execute(
+            &mut session,
+            "DELETE FROM in_t WHERE id IN (SELECT id FROM in_t WHERE id < 5)",
+        )
         .expect("delete via large IN");
     let count = |engine: &Engine, session: &mut Session, sql: &str| -> i64 {
         match engine.execute(session, sql).expect("count") {
@@ -653,19 +656,34 @@ fn delete_in_large_literal_list_semantics() {
             other => panic!("expected query, got {other:?}"),
         }
     };
-    assert_eq!(count(&engine, &mut session, "SELECT COUNT(*) FROM in_t"), 35);
+    assert_eq!(
+        count(&engine, &mut session, "SELECT COUNT(*) FROM in_t"),
+        35
+    );
 
     // NOT IN over a list containing NULL: matches nothing.
     engine
-        .execute(&mut session, "DELETE FROM in_t WHERE id NOT IN (1, 2, 3, 4, 5, NULL)")
+        .execute(
+            &mut session,
+            "DELETE FROM in_t WHERE id NOT IN (1, 2, 3, 4, 5, NULL)",
+        )
         .expect("not-in null delete");
-    assert_eq!(count(&engine, &mut session, "SELECT COUNT(*) FROM in_t"), 35);
+    assert_eq!(
+        count(&engine, &mut session, "SELECT COUNT(*) FROM in_t"),
+        35
+    );
 
     // IN over a list containing NULL still matches the non-null hits.
     engine
-        .execute(&mut session, "DELETE FROM in_t WHERE id IN (5, 6, 7, 8, 9, NULL)")
+        .execute(
+            &mut session,
+            "DELETE FROM in_t WHERE id IN (5, 6, 7, 8, 9, NULL)",
+        )
         .expect("in null delete");
-    assert_eq!(count(&engine, &mut session, "SELECT COUNT(*) FROM in_t"), 30);
+    assert_eq!(
+        count(&engine, &mut session, "SELECT COUNT(*) FROM in_t"),
+        30
+    );
 
     // Cross-width numeric equality: Int32 column vs Int64 literals.
     engine
@@ -674,5 +692,8 @@ fn delete_in_large_literal_list_semantics() {
             "DELETE FROM in_t WHERE id IN (10, 11, 12, 13, 14, 15, 16)",
         )
         .expect("cross-width delete");
-    assert_eq!(count(&engine, &mut session, "SELECT COUNT(*) FROM in_t"), 23);
+    assert_eq!(
+        count(&engine, &mut session, "SELECT COUNT(*) FROM in_t"),
+        23
+    );
 }

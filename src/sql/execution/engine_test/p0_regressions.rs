@@ -5,7 +5,6 @@
 
 use super::*;
 
-
 fn decimal_at(result: &ExecResult, row: usize, col: usize) -> i64 {
     let ExecResult::Query { batches, .. } = result else {
         panic!("expected query result");
@@ -42,8 +41,10 @@ fn txn_insert_over_budget_failure_leaves_no_ghost_rows() -> Result<()> {
             .map(|id| format!("({}, 'batch-two')", id))
             .collect::<Vec<_>>()
             .join(", ");
-        let over_budget =
-            engine.execute(&mut session, &format!("INSERT INTO t (id, name) VALUES {}", big_values));
+        let over_budget = engine.execute(
+            &mut session,
+            &format!("INSERT INTO t (id, name) VALUES {}", big_values),
+        );
         assert!(
             over_budget.is_err(),
             "second statement must fail against the 1 KiB budget"
@@ -51,7 +52,11 @@ fn txn_insert_over_budget_failure_leaves_no_ghost_rows() -> Result<()> {
 
         engine.execute(&mut session, "COMMIT")?;
 
-        let count = first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0);
+        let count = first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0,
+        );
         assert_eq!(count, 1, "failed statement's rows must not be committed");
 
         // The surviving row's unique key must be enforced.
@@ -82,7 +87,12 @@ fn rle_columns_aggregate_correctly_on_generic_paths() -> Result<()> {
     // encoding path): 4 (symbol, day) groups of 500 rows each, px constant
     // per group, so the px column wins the RLE size contest and the no-
     // predicate scan hands it downstream in run form.
-    let groups = [("A", "d1", 10i64), ("A", "d2", 20), ("B", "d1", 30), ("B", "d2", 40)];
+    let groups = [
+        ("A", "d1", 10i64),
+        ("A", "d2", 20),
+        ("B", "d1", 30),
+        ("B", "d2", 40),
+    ];
     let table_meta = engine.get_table_meta("main", "ticks").unwrap();
     let schema = crate::types::batch::Schema::new(table_meta.columns.clone());
     let mut batch = crate::types::batch::RecordBatch::with_capacity(schema.clone(), 2000);
@@ -102,7 +112,11 @@ fn rle_columns_aggregate_correctly_on_generic_paths() -> Result<()> {
                 .push(&ScalarValue::Int64(Some(px)))?;
         }
     }
-    let segment_path = engine.data_dir().join("main").join("ticks").join("seg_00001.dat");
+    let segment_path = engine
+        .data_dir()
+        .join("main")
+        .join("ticks")
+        .join("seg_00001.dat");
     engine
         .segment_mgr()
         .write_new_segment(&segment_path, schema, 8192, &batch, 3)?;
@@ -148,10 +162,7 @@ fn rle_columns_aggregate_correctly_on_generic_paths() -> Result<()> {
     // HAVING forces the no-GROUP-BY streaming pipeline off the metadata fast
     // path; its column-wide sum kernel must see the run column too.
     let total = first_i64(
-        engine.execute(
-            &mut session,
-            "SELECT SUM(px) FROM ticks HAVING SUM(px) > 0",
-        )?,
+        engine.execute(&mut session, "SELECT SUM(px) FROM ticks HAVING SUM(px) > 0")?,
         0,
         0,
     );
@@ -191,7 +202,11 @@ fn update_unique_check_sees_keys_in_pruned_row_groups() -> Result<()> {
             .unwrap()
             .push(&ScalarValue::VarChar(Some(uk.to_string())))?;
     }
-    let segment_path = engine.data_dir().join("main").join("t").join("seg_00001.dat");
+    let segment_path = engine
+        .data_dir()
+        .join("main")
+        .join("t")
+        .join("seg_00001.dat");
     engine
         .segment_mgr()
         .write_new_segment(&segment_path, schema, 2, &batch, 3)?;
@@ -256,14 +271,18 @@ fn update_unique_check_sees_keys_in_other_partitions() -> Result<()> {
                 .push(&ScalarValue::VarChar(Some(part.to_string())))?;
         }
         let path = table_dir.join(format!("p{}_{:04}.dat", part, 1));
-        engine.segment_mgr().write_new_segment(&path, schema.clone(), 8192, &batch, 3)?;
+        engine
+            .segment_mgr()
+            .write_new_segment(&path, schema.clone(), 8192, &batch, 3)?;
         Ok(())
     };
     seed_partition("A", &[(1, "a"), (2, "b")])?;
     seed_partition("B", &[(3, "x")])?;
 
-    let collided =
-        engine.execute(&mut session, "UPDATE tp SET uk = 'x' WHERE region = 'A' AND id = 1");
+    let collided = engine.execute(
+        &mut session,
+        "UPDATE tp SET uk = 'x' WHERE region = 'A' AND id = 1",
+    );
     assert!(
         collided.is_err(),
         "assigning a key that exists in another partition must be rejected"
@@ -314,7 +333,11 @@ fn update_image_append_failure_rolls_back_completely() -> Result<()> {
             .unwrap()
             .push(&ScalarValue::Int64(Some(id * 10)))?;
     }
-    let segment_path = engine.data_dir().join("main").join("t").join("seg_00001.dat");
+    let segment_path = engine
+        .data_dir()
+        .join("main")
+        .join("t")
+        .join("seg_00001.dat");
     // Row-group size 2: two row groups -> two image batches, so the injected
     // failure at the second append leaves one batch staged.
     engine
@@ -323,7 +346,10 @@ fn update_image_append_failure_rolls_back_completely() -> Result<()> {
 
     arm(FaultPoint::UpdateImageAppend);
     let failed = engine.execute(&mut session, "UPDATE t SET v = 99 WHERE id >= 1");
-    assert!(failed.is_err(), "injected append failure must surface as an error");
+    assert!(
+        failed.is_err(),
+        "injected append failure must surface as an error"
+    );
 
     // Exact rollback: every row keeps its original value, none lost.
     for id in 1..=4i64 {
@@ -334,7 +360,11 @@ fn update_image_append_failure_rolls_back_completely() -> Result<()> {
         );
         assert_eq!(value, id * 10, "row {} must keep its pre-update value", id);
     }
-    let count = first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0);
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
     assert_eq!(count, 4);
 
     // The table is fully usable afterwards: the same UPDATE succeeds.
@@ -385,15 +415,17 @@ fn txn_update_over_budget_commit_keeps_rows() -> Result<()> {
         // Two segments: the old code registered the FIRST segment's
         // tombstones before the budget charge failed on the second — the
         // later COMMIT then deleted those rows.
-        engine
-            .segment_mgr()
-            .write_new_segment(
-                &engine.data_dir().join("main").join("t").join("seg_00001.dat"),
-                schema.clone(),
-                4,
-                &batch,
-                3,
-            )?;
+        engine.segment_mgr().write_new_segment(
+            &engine
+                .data_dir()
+                .join("main")
+                .join("t")
+                .join("seg_00001.dat"),
+            schema.clone(),
+            4,
+            &batch,
+            3,
+        )?;
         let mut second = crate::types::batch::RecordBatch::with_capacity(schema.clone(), 4);
         for id in 9..=12i64 {
             second
@@ -405,31 +437,48 @@ fn txn_update_over_budget_commit_keeps_rows() -> Result<()> {
                 .unwrap()
                 .push(&ScalarValue::Int64(Some(id * 10)))?;
         }
-        engine
-            .segment_mgr()
-            .write_new_segment(
-                &engine.data_dir().join("main").join("t").join("seg_00002.dat"),
-                schema,
-                4,
-                &second,
-                3,
-            )?;
+        engine.segment_mgr().write_new_segment(
+            &engine
+                .data_dir()
+                .join("main")
+                .join("t")
+                .join("seg_00002.dat"),
+            schema,
+            4,
+            &second,
+            3,
+        )?;
 
         engine.execute(&mut session, "BEGIN")?;
         let over_budget = engine.execute(&mut session, "UPDATE t SET v = 99 WHERE id >= 1");
-        assert!(over_budget.is_err(), "statement must fail against the 1 KiB budget");
+        assert!(
+            over_budget.is_err(),
+            "statement must fail against the 1 KiB budget"
+        );
         engine.execute(&mut session, "COMMIT")?;
 
         // Every row must still exist with its original value.
-        let count = first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0);
-        assert_eq!(count, 12, "no row may disappear through the failed statement");
+        let count = first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0,
+        );
+        assert_eq!(
+            count, 12,
+            "no row may disappear through the failed statement"
+        );
         for id in 1..=12i64 {
             let value = first_i64(
                 engine.execute(&mut session, &format!("SELECT v FROM t WHERE id = {}", id))?,
                 0,
                 0,
             );
-            assert_eq!(value, id * 10, "row {} must keep its pre-statement value", id);
+            assert_eq!(
+                value,
+                id * 10,
+                "row {} must keep its pre-statement value",
+                id
+            );
         }
         Ok(())
     })();
@@ -461,7 +510,11 @@ fn txn_update_image_append_failure_discards_staging() -> Result<()> {
             .unwrap()
             .push(&ScalarValue::Int64(Some(id * 10)))?;
     }
-    let segment_path = engine.data_dir().join("main").join("t").join("seg_00001.dat");
+    let segment_path = engine
+        .data_dir()
+        .join("main")
+        .join("t")
+        .join("seg_00001.dat");
     engine
         .segment_mgr()
         .write_new_segment(&segment_path, schema, 2, &batch, 3)?;
@@ -469,18 +522,33 @@ fn txn_update_image_append_failure_discards_staging() -> Result<()> {
     engine.execute(&mut session, "BEGIN")?;
     arm(FaultPoint::TxnImageAppend);
     let failed = engine.execute(&mut session, "UPDATE t SET v = 99 WHERE id >= 1");
-    assert!(failed.is_err(), "injected append failure must surface as an error");
+    assert!(
+        failed.is_err(),
+        "injected append failure must surface as an error"
+    );
     engine.execute(&mut session, "COMMIT")?;
 
-    let count = first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0);
-    assert_eq!(count, 4, "no row may disappear through the failed statement");
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(
+        count, 4,
+        "no row may disappear through the failed statement"
+    );
     for id in 1..=4i64 {
         let value = first_i64(
             engine.execute(&mut session, &format!("SELECT v FROM t WHERE id = {}", id))?,
             0,
             0,
         );
-        assert_eq!(value, id * 10, "row {} must keep its pre-statement value", id);
+        assert_eq!(
+            value,
+            id * 10,
+            "row {} must keep its pre-statement value",
+            id
+        );
     }
     Ok(())
 }
@@ -499,7 +567,10 @@ fn fast_insert_falls_back_for_quoted_table_names() -> Result<()> {
         &mut session,
         "CREATE TABLE \"order\" (id INT64, name VARCHAR)",
     )?;
-    engine.execute(&mut session, "INSERT INTO \"order\" (id, name) VALUES (1, 'a')")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO \"order\" (id, name) VALUES (1, 'a')",
+    )?;
     let count = first_i64(
         engine.execute(&mut session, "SELECT COUNT(*) FROM \"order\"")?,
         0,
@@ -542,7 +613,11 @@ fn update_clears_statement_journals_after_durable_commit() -> Result<()> {
             .push(&ScalarValue::Int64(Some(id * 10)))?;
     }
     engine.segment_mgr().write_new_segment(
-        &engine.data_dir().join("main").join("t").join("seg_00001.dat"),
+        &engine
+            .data_dir()
+            .join("main")
+            .join("t")
+            .join("seg_00001.dat"),
         schema,
         2,
         &batch,
@@ -568,7 +643,10 @@ fn update_clears_statement_journals_after_durable_commit() -> Result<()> {
                 .is_some_and(|name| name.ends_with(".del"))
         })
         .collect();
-    assert!(leftover.is_empty(), "no statement journal may outlive the UPDATE");
+    assert!(
+        leftover.is_empty(),
+        "no statement journal may outlive the UPDATE"
+    );
     Ok(())
 }
 
@@ -596,7 +674,11 @@ fn update_crash_between_footers_and_commit_rolls_back_on_restart() -> Result<()>
             .unwrap()
             .push(&ScalarValue::Int64(Some(id * 10)))?;
     }
-    let segment_path = engine.data_dir().join("main").join("t").join("seg_00001.dat");
+    let segment_path = engine
+        .data_dir()
+        .join("main")
+        .join("t")
+        .join("seg_00001.dat");
     engine
         .segment_mgr()
         .write_new_segment(&segment_path, schema, 2, &batch, 3)?;
@@ -632,7 +714,11 @@ fn update_crash_between_footers_and_commit_rolls_back_on_restart() -> Result<()>
     // Restart: startup recovery must restore the pre-statement footer.
     let engine = Engine::new(dir.path(), "main")?;
     let mut session2 = session();
-    let count = first_i64(engine.execute(&mut session2, "SELECT COUNT(*) FROM t")?, 0, 0);
+    let count = first_i64(
+        engine.execute(&mut session2, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
     assert_eq!(count, 4, "rows restored by journal rollback");
     for id in 1..=4i64 {
         let value = first_i64(
@@ -668,14 +754,22 @@ fn update_journal_rolls_forward_when_images_durable() -> Result<()> {
             .unwrap()
             .push(&ScalarValue::Int64(Some(id * 10)))?;
     }
-    let segment_path = engine.data_dir().join("main").join("t").join("seg_00001.dat");
+    let segment_path = engine
+        .data_dir()
+        .join("main")
+        .join("t")
+        .join("seg_00001.dat");
     engine
         .segment_mgr()
         .write_new_segment(&segment_path, schema, 2, &batch, 3)?;
 
     // A committed UPDATE: images are durable in a real tail.
     engine.execute(&mut session1, "UPDATE t SET v = 99 WHERE id >= 1")?;
-    let count_updated = first_i64(engine.execute(&mut session1, "SELECT COUNT(*) FROM t")?, 0, 0);
+    let count_updated = first_i64(
+        engine.execute(&mut session1, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
     assert_eq!(count_updated, 4);
 
     // Simulate "crash after durable commit, before journal clear": re-apply
@@ -685,7 +779,10 @@ fn update_journal_rolls_forward_when_images_durable() -> Result<()> {
     let bitmap = reader.delete_bitmap().to_vec();
     let deleted = reader.deleted_row_count();
     drop(reader);
-    let tail_dir = engine.segment_mgr().table_dir("main", "t").join("memtable_tail");
+    let tail_dir = engine
+        .segment_mgr()
+        .table_dir("main", "t")
+        .join("memtable_tail");
     let tail_stem = std::fs::read_dir(&tail_dir)
         .unwrap()
         .flatten()
@@ -715,7 +812,11 @@ fn update_journal_rolls_forward_when_images_durable() -> Result<()> {
     // the recovered image rows stay visible.
     let engine = Engine::new(dir.path(), "main")?;
     let mut session2 = session();
-    let count = first_i64(engine.execute(&mut session2, "SELECT COUNT(*) FROM t")?, 0, 0);
+    let count = first_i64(
+        engine.execute(&mut session2, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
     assert_eq!(count, 4, "committed images survive the roll-forward");
     let value = first_i64(
         engine.execute(&mut session2, "SELECT v FROM t WHERE id = 1")?,
@@ -754,7 +855,11 @@ fn update_self_assignment_does_not_collide_with_own_key() -> Result<()> {
             .push(&ScalarValue::VarChar(Some(uk.to_string())))?;
     }
     engine.segment_mgr().write_new_segment(
-        &engine.data_dir().join("main").join("t").join("seg_00001.dat"),
+        &engine
+            .data_dir()
+            .join("main")
+            .join("t")
+            .join("seg_00001.dat"),
         schema,
         1,
         &batch,
@@ -816,14 +921,15 @@ fn decimal_literal_rounding_matches_between_paths() -> Result<()> {
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::new(dir.path(), "main")?;
         let mut session = session();
-        engine.execute(
-            &mut session,
-            "CREATE TABLE d (id INT64, amt DECIMAL(9,2))",
-        )?;
+        engine.execute(&mut session, "CREATE TABLE d (id INT64, amt DECIMAL(9,2))")?;
         for (index, (literal, _, _)) in cases.iter().enumerate() {
             engine.execute(
                 &mut session,
-                &format!("INSERT INTO d (id, amt) VALUES ({}, {} + 0)", index + 1, literal),
+                &format!(
+                    "INSERT INTO d (id, amt) VALUES ({}, {} + 0)",
+                    index + 1,
+                    literal
+                ),
             )?;
         }
         for (index, (literal, label, expected)) in cases.iter().enumerate() {
@@ -845,7 +951,11 @@ fn decimal_literal_rounding_matches_between_paths() -> Result<()> {
         for (index, (literal, _, _)) in cases.iter().enumerate() {
             engine.execute(
                 &mut session,
-                &format!("INSERT INTO d (id, amt) VALUES ({}, {})", index + 1, literal),
+                &format!(
+                    "INSERT INTO d (id, amt) VALUES ({}, {})",
+                    index + 1,
+                    literal
+                ),
             )?;
         }
         for (index, (literal, label, expected)) in cases.iter().enumerate() {

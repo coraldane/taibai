@@ -95,10 +95,7 @@ pub(crate) fn compress_prepared_batch_for_wal_with(
 /// silently wrapping — a wrapped prefix makes recovery decode a misaligned
 /// frame (data corruption at restart, not a clean error), exactly the class
 /// the header fields above already refuse.
-fn encode_column_raw_into(
-    col: &crate::types::array::ColumnArray,
-    out: &mut Vec<u8>,
-) -> Result<()> {
+fn encode_column_raw_into(col: &crate::types::array::ColumnArray, out: &mut Vec<u8>) -> Result<()> {
     use crate::types::array::ColumnArray;
     fn value_len(len: usize) -> Result<u32> {
         u32::try_from(len).map_err(|_| {
@@ -109,9 +106,7 @@ fn encode_column_raw_into(
         ColumnArray::Selected { .. } | ColumnArray::Rle { .. } => {
             encode_column_raw_into(col.flattened(), out)?
         }
-        ColumnArray::Dictionary { .. } => {
-            encode_column_raw_into(&col.materialize_varchar(), out)?
-        }
+        ColumnArray::Dictionary { .. } => encode_column_raw_into(&col.materialize_varchar(), out)?,
         ColumnArray::Bool { data, .. } => out.extend_from_slice(data),
         ColumnArray::Int8 { data, .. } => {
             let bytes =

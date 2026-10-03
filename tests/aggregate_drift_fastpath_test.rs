@@ -110,13 +110,22 @@ fn aggregates_over_added_constant_default_column_stay_exact() {
         "INSERT INTO t (id, v, score) VALUES (51, 51, 30)",
     );
 
-    assert_eq!(i64_value(&engine, &mut session, "SELECT SUM(score) FROM t"), 380);
+    assert_eq!(
+        i64_value(&engine, &mut session, "SELECT SUM(score) FROM t"),
+        380
+    );
     assert_eq!(
         i64_value(&engine, &mut session, "SELECT COUNT(score) FROM t"),
         51
     );
-    assert_eq!(i64_value(&engine, &mut session, "SELECT MIN(score) FROM t"), 7);
-    assert_eq!(i64_value(&engine, &mut session, "SELECT MAX(score) FROM t"), 30);
+    assert_eq!(
+        i64_value(&engine, &mut session, "SELECT MIN(score) FROM t"),
+        7
+    );
+    assert_eq!(
+        i64_value(&engine, &mut session, "SELECT MAX(score) FROM t"),
+        30
+    );
     match scalars(&engine, &mut session, "SELECT AVG(score) FROM t").remove(0) {
         ScalarValue::Float64(Some(value)) => {
             assert!((value - 380.0 / 51.0).abs() < 1e-9, "got {value}");
@@ -124,7 +133,10 @@ fn aggregates_over_added_constant_default_column_stay_exact() {
         other => panic!("expected Float64 AVG, got {other:?}"),
     }
     // The pre-existing column keeps folding from the drifted footer.
-    assert_eq!(i64_value(&engine, &mut session, "SELECT SUM(v) FROM t"), 1326);
+    assert_eq!(
+        i64_value(&engine, &mut session, "SELECT SUM(v) FROM t"),
+        1326
+    );
     engine.segment_mgr().shutdown();
 }
 
@@ -156,11 +168,19 @@ fn sum_of_added_column_with_predicate_on_old_column() {
 
     // Rows 26..=50 survive (v > 25): 25 default rows contribute 7 x 25.
     assert_eq!(
-        i64_value(&engine, &mut session, "SELECT SUM(score) FROM t WHERE v > 25"),
+        i64_value(
+            &engine,
+            &mut session,
+            "SELECT SUM(score) FROM t WHERE v > 25"
+        ),
         175
     );
     assert_eq!(
-        i64_value(&engine, &mut session, "SELECT COUNT(score) FROM t WHERE v > 25"),
+        i64_value(
+            &engine,
+            &mut session,
+            "SELECT COUNT(score) FROM t WHERE v > 25"
+        ),
         25
     );
     assert_eq!(
@@ -201,11 +221,19 @@ fn predicate_on_added_column_falls_back_but_stays_correct() {
     );
 
     assert_eq!(
-        i64_value(&engine, &mut session, "SELECT SUM(score) FROM t WHERE score = 7"),
+        i64_value(
+            &engine,
+            &mut session,
+            "SELECT SUM(score) FROM t WHERE score = 7"
+        ),
         350
     );
-    let empty_sum =
-        scalars(&engine, &mut session, "SELECT SUM(score) FROM t WHERE score = 99").remove(0);
+    let empty_sum = scalars(
+        &engine,
+        &mut session,
+        "SELECT SUM(score) FROM t WHERE score = 99",
+    )
+    .remove(0);
     assert!(
         is_null_integer(&empty_sum),
         "SUM over zero matching rows is NULL, got {empty_sum:?}"
@@ -263,10 +291,22 @@ fn added_column_without_default_folds_null_semantics() {
         &mut session,
         "INSERT INTO t (id, v, score) VALUES (11, 11, 5), (12, 12, 9)",
     );
-    assert_eq!(i64_value(&engine, &mut session, "SELECT SUM(score) FROM t"), 14);
-    assert_eq!(i64_value(&engine, &mut session, "SELECT COUNT(score) FROM t"), 2);
-    assert_eq!(i64_value(&engine, &mut session, "SELECT MIN(score) FROM t"), 5);
-    assert_eq!(i64_value(&engine, &mut session, "SELECT MAX(score) FROM t"), 9);
+    assert_eq!(
+        i64_value(&engine, &mut session, "SELECT SUM(score) FROM t"),
+        14
+    );
+    assert_eq!(
+        i64_value(&engine, &mut session, "SELECT COUNT(score) FROM t"),
+        2
+    );
+    assert_eq!(
+        i64_value(&engine, &mut session, "SELECT MIN(score) FROM t"),
+        5
+    );
+    assert_eq!(
+        i64_value(&engine, &mut session, "SELECT MAX(score) FROM t"),
+        9
+    );
     engine.segment_mgr().shutdown();
 }
 
@@ -327,9 +367,18 @@ fn aggregates_follow_renamed_column_on_drifted_segments() {
         "ALTER TABLE t RENAME COLUMN v TO value",
     );
 
-    assert_eq!(i64_value(&engine, &mut session, "SELECT SUM(value) FROM t"), 1275);
-    assert_eq!(i64_value(&engine, &mut session, "SELECT MIN(value) FROM t"), 1);
-    assert_eq!(i64_value(&engine, &mut session, "SELECT MAX(value) FROM t"), 50);
+    assert_eq!(
+        i64_value(&engine, &mut session, "SELECT SUM(value) FROM t"),
+        1275
+    );
+    assert_eq!(
+        i64_value(&engine, &mut session, "SELECT MIN(value) FROM t"),
+        1
+    );
+    assert_eq!(
+        i64_value(&engine, &mut session, "SELECT MAX(value) FROM t"),
+        50
+    );
     assert_eq!(
         i64_value(&engine, &mut session, "SELECT COUNT(value) FROM t"),
         50
@@ -358,8 +407,14 @@ fn aggregates_after_drop_column_ignore_extra_footer_columns() {
     exec(&engine, &mut session, "FLUSH TABLE t");
     exec(&engine, &mut session, "ALTER TABLE t DROP COLUMN a");
 
-    assert_eq!(i64_value(&engine, &mut session, "SELECT SUM(b) FROM t"), 820);
-    assert_eq!(i64_value(&engine, &mut session, "SELECT COUNT(b) FROM t"), 40);
+    assert_eq!(
+        i64_value(&engine, &mut session, "SELECT SUM(b) FROM t"),
+        820
+    );
+    assert_eq!(
+        i64_value(&engine, &mut session, "SELECT COUNT(b) FROM t"),
+        40
+    );
     assert_eq!(i64_value(&engine, &mut session, "SELECT MIN(b) FROM t"), 1);
     assert_eq!(i64_value(&engine, &mut session, "SELECT MAX(b) FROM t"), 40);
     engine.segment_mgr().shutdown();

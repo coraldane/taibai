@@ -2255,7 +2255,7 @@ impl HotStoreManager {
     }
 
     /// Open a hot-store feed: accounts the batch as in flight until the
-    /// caller's memtable staging completes (see [`HotFeedGuard`]) and returns
+    /// caller's memtable staging completes (see `HotFeedGuard`) and returns
     /// the current feed epoch for stale-mark detection.
     pub fn begin_feed(&self, db: &str, table: &str) -> u64 {
         let mut accounting = self.feed_accounting.lock().unwrap();

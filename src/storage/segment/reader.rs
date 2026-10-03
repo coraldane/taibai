@@ -278,11 +278,13 @@ impl SegmentReader {
             .clauses
             .iter()
             .zip(aligned)
-            .map(|(clause, column_index)| crate::storage::partition::pruning::RangeClause {
-                column_index,
-                op: clause.op,
-                value: clause.value.clone(),
-            })
+            .map(
+                |(clause, column_index)| crate::storage::partition::pruning::RangeClause {
+                    column_index,
+                    op: clause.op,
+                    value: clause.value.clone(),
+                },
+            )
             .collect();
         Ok(crate::storage::partition::pruning::RowGroupPredicate::new(
             clauses,
@@ -1170,9 +1172,7 @@ pub fn align_indices_against_schema(
         .iter()
         .map(|&catalog_idx| {
             let column = table_schema.columns.get(catalog_idx).ok_or_else(|| {
-                TaibaiError::Internal(format!(
-                    "catalog column index {catalog_idx} out of range"
-                ))
+                TaibaiError::Internal(format!("catalog column index {catalog_idx} out of range"))
             })?;
             let mut names = Vec::with_capacity(column.previous_names.len() + 1);
             names.push(column.name.clone());
@@ -1212,9 +1212,7 @@ fn batch_with_catalog_defs(
         .iter()
         .map(|&idx| {
             table_schema.columns.get(idx).cloned().ok_or_else(|| {
-                TaibaiError::Internal(format!(
-                    "catalog column index {idx} out of range"
-                ))
+                TaibaiError::Internal(format!("catalog column index {idx} out of range"))
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1331,54 +1329,18 @@ fn scalar_i64_view(
     value: &ScalarValue,
 ) -> Option<i64> {
     match (data_type, value) {
-        (
-            crate::protocol::types::DataType::Int8,
-            ScalarValue::Int8(Some(v)),
-        ) => Some(*v as i64),
-        (
-            crate::protocol::types::DataType::Int16,
-            ScalarValue::Int16(Some(v)),
-        ) => Some(*v as i64),
-        (
-            crate::protocol::types::DataType::Int32,
-            ScalarValue::Int32(Some(v)),
-        ) => Some(*v as i64),
-        (
-            crate::protocol::types::DataType::Int64,
-            ScalarValue::Int64(Some(v)),
-        ) => Some(*v),
-        (
-            crate::protocol::types::DataType::UInt8,
-            ScalarValue::UInt8(Some(v)),
-        ) => Some(*v as i64),
-        (
-            crate::protocol::types::DataType::UInt16,
-            ScalarValue::UInt16(Some(v)),
-        ) => Some(*v as i64),
-        (
-            crate::protocol::types::DataType::UInt32,
-            ScalarValue::UInt32(Some(v)),
-        ) => Some(*v as i64),
-        (
-            crate::protocol::types::DataType::Decimal,
-            ScalarValue::Decimal(Some(v)),
-        ) => Some(*v),
-        (
-            crate::protocol::types::DataType::Date,
-            ScalarValue::Date(Some(v)),
-        ) => Some(*v as i64),
-        (
-            crate::protocol::types::DataType::Time,
-            ScalarValue::Time(Some(v)),
-        ) => Some(*v),
-        (
-            crate::protocol::types::DataType::Timestamp,
-            ScalarValue::Timestamp(Some(v)),
-        ) => Some(*v),
-        (
-            crate::protocol::types::DataType::Interval,
-            ScalarValue::Interval(Some(v)),
-        ) => Some(*v),
+        (crate::protocol::types::DataType::Int8, ScalarValue::Int8(Some(v))) => Some(*v as i64),
+        (crate::protocol::types::DataType::Int16, ScalarValue::Int16(Some(v))) => Some(*v as i64),
+        (crate::protocol::types::DataType::Int32, ScalarValue::Int32(Some(v))) => Some(*v as i64),
+        (crate::protocol::types::DataType::Int64, ScalarValue::Int64(Some(v))) => Some(*v),
+        (crate::protocol::types::DataType::UInt8, ScalarValue::UInt8(Some(v))) => Some(*v as i64),
+        (crate::protocol::types::DataType::UInt16, ScalarValue::UInt16(Some(v))) => Some(*v as i64),
+        (crate::protocol::types::DataType::UInt32, ScalarValue::UInt32(Some(v))) => Some(*v as i64),
+        (crate::protocol::types::DataType::Decimal, ScalarValue::Decimal(Some(v))) => Some(*v),
+        (crate::protocol::types::DataType::Date, ScalarValue::Date(Some(v))) => Some(*v as i64),
+        (crate::protocol::types::DataType::Time, ScalarValue::Time(Some(v))) => Some(*v),
+        (crate::protocol::types::DataType::Timestamp, ScalarValue::Timestamp(Some(v))) => Some(*v),
+        (crate::protocol::types::DataType::Interval, ScalarValue::Interval(Some(v))) => Some(*v),
         _ => None,
     }
 }
@@ -1772,8 +1734,9 @@ fn read_delete_journal_v2(journal: &Path) -> Result<Option<DeferredDeleteJournal
             return Ok(None);
         };
         cursor += 16;
-        let memtable_id = uuid::Uuid::from_slice(&uuid_bytes)
-            .map_err(|error| TaibaiError::Storage(format!("bad memtable id in journal: {error}")))?;
+        let memtable_id = uuid::Uuid::from_slice(&uuid_bytes).map_err(|error| {
+            TaibaiError::Storage(format!("bad memtable id in journal: {error}"))
+        })?;
         let Some(part_len) = take_u32(&mut cursor).map(|len| len as usize) else {
             return Ok(None);
         };
@@ -1969,8 +1932,7 @@ pub fn drain_footer_rollback_compensations(
     };
     for line in content.lines() {
         let mut fields = line.splitn(3, '\t');
-        let (Some(db), Some(table), Some(segment)) =
-            (fields.next(), fields.next(), fields.next())
+        let (Some(db), Some(table), Some(segment)) = (fields.next(), fields.next(), fields.next())
         else {
             tracing::warn!(rollback_log = %log.display(), "skipping malformed rollback record");
             continue;

@@ -315,16 +315,11 @@ fn estimated_match_density(spec: &ScanSpec, reader: &SegmentReader, row_group: u
     // predicate columns are catalog-space. Misalignment only skews this
     // cost-based ordering (never correctness), so an unresolvable column
     // just falls back to the generic 0.1 estimate.
-    let footer =
-        |column: usize| -> Option<usize> {
-            super::row_filter::align_indices_to_footer(
-                &spec.table_schema,
-                reader.schema(),
-                &[column],
-            )
+    let footer = |column: usize| -> Option<usize> {
+        super::row_filter::align_indices_to_footer(&spec.table_schema, reader.schema(), &[column])
             .ok()
             .and_then(|aligned| aligned.first().copied())
-        };
+    };
     for (column, value) in &spec.eq_predicates {
         let Some(footer_column) = footer(*column) else {
             selectivity *= 0.1;

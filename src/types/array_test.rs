@@ -98,12 +98,7 @@ fn test_extend_from_run_form_source() {
 
     // append_owned routes variable-width moves separately but falls back to
     // extend for everything else — same contract for run-form sources.
-    let runs_col2 = ColumnArray::rle(
-        vec![(4, 2)],
-        DataType::Int64,
-        NullBitmap::new_valid(2),
-        2,
-    );
+    let runs_col2 = ColumnArray::rle(vec![(4, 2)], DataType::Int64, NullBitmap::new_valid(2), 2);
     let mut dst2 = ColumnArray::empty(DataType::Int64);
     dst2.append_owned(runs_col2).unwrap();
     assert_eq!(dst2.len(), 2);
@@ -149,7 +144,13 @@ fn run_form_matches_flat_form_across_numeric_kernels() {
         ),
         (
             (0..200)
-                .map(|i| if i % 5 == 0 { None } else { Some(1000 + i / 10) })
+                .map(|i| {
+                    if i % 5 == 0 {
+                        None
+                    } else {
+                        Some(1000 + i / 10)
+                    }
+                })
                 .collect(),
             "with nulls",
         ),
@@ -179,7 +180,11 @@ fn run_form_matches_flat_form_across_numeric_kernels() {
         let rle = ColumnArray::rle(runs, DataType::Int64, bitmap, len);
 
         // Column-wide sum: the aggregate kernels' entry point.
-        assert_eq!(flat.col_sum_i64(), rle.col_sum_i64(), "col_sum_i64 [{label}]");
+        assert_eq!(
+            flat.col_sum_i64(),
+            rle.col_sum_i64(),
+            "col_sum_i64 [{label}]"
+        );
         assert_eq!(
             flat.col_count_non_null(),
             rle.col_count_non_null(),

@@ -482,7 +482,12 @@ impl ScanCursor {
                             // deadlock-freedom argument; on cancellation the
                             // thread simply stops producing (the consumer's
                             // own cancel checks abort the query).
-                            if !wait_for_byte_budget(&producer_inflight, byte_cap, &cancel_flag, &consumer_done) {
+                            if !wait_for_byte_budget(
+                                &producer_inflight,
+                                byte_cap,
+                                &cancel_flag,
+                                &consumer_done,
+                            ) {
                                 return;
                             }
                             let decoded: Vec<_> = background_decode_pool().install(|| {

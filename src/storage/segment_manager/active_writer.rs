@@ -298,7 +298,11 @@ impl ActiveSegmentWriter {
         let group_end = start + rows_to_flush;
 
         let compression_level = self.compression_level;
-        let num_cols = self.buffered_batch.as_ref().expect("checked above").num_columns();
+        let num_cols = self
+            .buffered_batch
+            .as_ref()
+            .expect("checked above")
+            .num_columns();
         let col_types: Vec<crate::protocol::types::DataType> = self
             .schema
             .columns

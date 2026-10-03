@@ -673,9 +673,7 @@ pub(crate) fn batch_matches_schema(batch: &RecordBatch, schema: &Schema) -> bool
             .columns
             .iter()
             .zip(schema.columns.iter())
-            .all(|(batch_col, target_col)| {
-                batch_col.name.eq_ignore_ascii_case(&target_col.name)
-            })
+            .all(|(batch_col, target_col)| batch_col.name.eq_ignore_ascii_case(&target_col.name))
 }
 
 /// Align a batch to the target schema: map every target column into the
@@ -687,10 +685,7 @@ pub(crate) fn batch_matches_schema(batch: &RecordBatch, schema: &Schema) -> bool
 /// position maps stay valid. This is the ONE reconciliation for in-memory
 /// batches; segment batches are reconciled at read time by
 /// `SegmentReader::read_row_group_columns_aligned`.
-pub(crate) fn align_batch_to_schema(
-    batch: &RecordBatch,
-    schema: &Schema,
-) -> Result<RecordBatch> {
+pub(crate) fn align_batch_to_schema(batch: &RecordBatch, schema: &Schema) -> Result<RecordBatch> {
     let mut columns = Vec::with_capacity(schema.num_columns());
     for col_def in &schema.columns {
         let mapped = std::iter::once(&col_def.name)
@@ -771,10 +766,10 @@ impl MemTableManager {
     /// flip: statements queued on the lock read it before their first
     /// append, so no memtable can outlive the ALTER with a stale layout.
     pub fn set_table_schema(&self, db: &str, table: &str, schema: Schema) {
-        self.table_schemas
-            .lock()
-            .unwrap()
-            .insert((db.to_string(), table.to_string()), std::sync::Arc::new(schema));
+        self.table_schemas.lock().unwrap().insert(
+            (db.to_string(), table.to_string()),
+            std::sync::Arc::new(schema),
+        );
     }
 
     /// The layout new memtables of this table must use, if a width-changing

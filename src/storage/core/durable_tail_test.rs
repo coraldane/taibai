@@ -1006,11 +1006,21 @@ fn update_sidecar_covers_multi_column_null_and_variable_width_values() -> Result
         ColumnDef::new("flag", DataType::Bool),
     ]);
     let mut batch = RecordBatch::new(schema.clone());
-    let rows: [(i32, &str, bool); 3] = [(1, "alpha", false), (2, "beta", false), (3, "gamma", true)];
+    let rows: [(i32, &str, bool); 3] =
+        [(1, "alpha", false), (2, "beta", false), (3, "gamma", true)];
     for (id, name, flag) in rows {
-        batch.column_mut(0).unwrap().push(&ScalarValue::Int32(Some(id)))?;
-        batch.column_mut(1).unwrap().push(&ScalarValue::VarChar(Some(name.into())))?;
-        batch.column_mut(2).unwrap().push(&ScalarValue::Bool(Some(flag)))?;
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int32(Some(id)))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(name.into())))?;
+        batch
+            .column_mut(2)
+            .unwrap()
+            .push(&ScalarValue::Bool(Some(flag)))?;
     }
     let id = Uuid::new_v4();
     persist(temp.path(), id, "2026", &batch)?;
@@ -1032,7 +1042,10 @@ fn update_sidecar_covers_multi_column_null_and_variable_width_values() -> Result
         Some(ScalarValue::Int32(Some(2))),
         "unassigned column keeps its value"
     );
-    assert_eq!(recovered[0].batch.scalar(1, 1), Some(ScalarValue::VarChar(None)));
+    assert_eq!(
+        recovered[0].batch.scalar(1, 1),
+        Some(ScalarValue::VarChar(None))
+    );
     assert_eq!(
         recovered[0].batch.scalar(1, 2),
         Some(ScalarValue::Bool(Some(true)))
@@ -1205,8 +1218,9 @@ fn tail_last_lsn_tracks_frames_and_tolerates_torn_tail() {
     )
     .unwrap();
     let path = tail_path(&table_dir, id);
-    let lsn_after_first =
-        crate::storage::core::durable_tail::tail_last_lsn(&path).unwrap().expect("v3 lsn");
+    let lsn_after_first = crate::storage::core::durable_tail::tail_last_lsn(&path)
+        .unwrap()
+        .expect("v3 lsn");
     assert!(lsn_after_first > 0);
 
     append_raw_frames(
@@ -1216,14 +1230,16 @@ fn tail_last_lsn_tracks_frames_and_tolerates_torn_tail() {
         &encode_tail_frame(&make_batch(&[3])).unwrap(),
     )
     .unwrap();
-    let lsn_after_second =
-        crate::storage::core::durable_tail::tail_last_lsn(&path).unwrap().expect("v3 lsn");
+    let lsn_after_second = crate::storage::core::durable_tail::tail_last_lsn(&path)
+        .unwrap()
+        .expect("v3 lsn");
     assert!(
         lsn_after_second > lsn_after_first,
         "lsn is append-ordered: {lsn_after_second} > {lsn_after_first}"
     );
-    let rows =
-        crate::storage::core::durable_tail::tail_log_rows(&path).unwrap().unwrap();
+    let rows = crate::storage::core::durable_tail::tail_log_rows(&path)
+        .unwrap()
+        .unwrap();
     assert_eq!(rows, 3);
 
     // A torn final frame (truncated mid-frame) must not crash the scan or
@@ -1379,7 +1395,11 @@ fn guarded_delete_sidecar_rolls_back_when_images_not_durable() -> Result<()> {
 
     let recovered = recover(temp.path(), &schema)?;
     assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0].batch.num_rows(), 3, "the guarded delete rolls back");
+    assert_eq!(
+        recovered[0].batch.num_rows(),
+        3,
+        "the guarded delete rolls back"
+    );
     assert!(
         !memtable_has_statement_guard(temp.path(), id),
         "the decided guard is removed by recovery"
@@ -1412,11 +1432,7 @@ fn guarded_delete_sidecar_applies_when_images_durable() -> Result<()> {
         .iter()
         .find(|entry| entry.id == id)
         .expect("target memtable recovered");
-    assert_eq!(
-        target.batch.num_rows(),
-        1,
-        "the satisfied delete applies"
-    );
+    assert_eq!(target.batch.num_rows(), 1, "the satisfied delete applies");
     assert!(!memtable_has_statement_guard(temp.path(), id));
     Ok(())
 }
@@ -1562,8 +1578,14 @@ fn replicated_delete_sidecar_applies_identically_on_standby() -> Result<()> {
         .expect("standby memtable recovered")
         .batch
         .num_rows();
-    assert_eq!(primary_rows, standby_rows, "standby converges to the primary");
-    assert_eq!(standby_rows, 1, "the replicated delete removed the same rows");
+    assert_eq!(
+        primary_rows, standby_rows,
+        "standby converges to the primary"
+    );
+    assert_eq!(
+        standby_rows, 1,
+        "the replicated delete removed the same rows"
+    );
 
     // Idempotent replay (standby crash before the seq watermark persists):
     // the same primary sequence replaces the same generation instead of

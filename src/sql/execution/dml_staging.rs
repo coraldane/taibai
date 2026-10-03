@@ -7,7 +7,7 @@
 //! it before once shipped an always-empty watermark that silently defeated
 //! crash recovery (committed images resurrected their pre-statement rows as
 //! duplicates). Statement code therefore cannot construct an
-//! [`ImageWatermark`] by hand: the only producers are this module's entry
+//! `ImageWatermark` by hand: the only producers are this module's entry
 //! points, whose collection point is structurally tied to the staging act.
 
 use crate::common::error::{Result, TaibaiError};
@@ -89,12 +89,5 @@ pub(crate) fn collect_txn_watermark(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn watermark_is_opaque_and_defaults_empty() {
-        let watermark = ImageWatermark::default();
-        assert!(watermark.as_slice().is_empty());
-    }
-}
+#[path = "dml_staging_test.rs"]
+mod tests;

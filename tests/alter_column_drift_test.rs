@@ -143,10 +143,22 @@ fn rename_column_dml_and_select_follow_the_new_name() {
 #[test]
 fn resident_memtable_predating_add_column_reads_default_fill() {
     let (_temp_dir, engine, mut session) = create_engine();
-    exec(&engine, &mut session, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&engine, &mut session, "INSERT INTO t VALUES (1, 10), (2, 20)");
+    exec(
+        &engine,
+        &mut session,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+    );
+    exec(
+        &engine,
+        &mut session,
+        "INSERT INTO t VALUES (1, 10), (2, 20)",
+    );
     // Rows stay resident: no flush before the ALTER.
-    exec(&engine, &mut session, "ALTER TABLE t ADD COLUMN score INT DEFAULT 7");
+    exec(
+        &engine,
+        &mut session,
+        "ALTER TABLE t ADD COLUMN score INT DEFAULT 7",
+    );
 
     // SELECT *: the added column materializes with its DEFAULT.
     let mut rows = query_all(&engine, &mut session, "SELECT * FROM t");
@@ -164,7 +176,11 @@ fn resident_memtable_predating_add_column_reads_default_fill() {
     );
     // COUNT(*) fast path over the resident rows.
     assert_eq!(
-        query_all(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE score = 7"),
+        query_all(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE score = 7"
+        ),
         vec![vec!["2"]]
     );
 
@@ -193,11 +209,23 @@ fn add_column_converges_hot_state_before_catalog_flip() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
     let mut session = Session::new("root".to_string(), "main".to_string());
-    exec(&engine, &mut session, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&engine, &mut session, "INSERT INTO t VALUES (1, 10), (2, 20)");
+    exec(
+        &engine,
+        &mut session,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+    );
+    exec(
+        &engine,
+        &mut session,
+        "INSERT INTO t VALUES (1, 10), (2, 20)",
+    );
     let table_dir = temp_dir.path().join("main").join("t");
 
-    exec(&engine, &mut session, "ALTER TABLE t ADD COLUMN score INT DEFAULT 7");
+    exec(
+        &engine,
+        &mut session,
+        "ALTER TABLE t ADD COLUMN score INT DEFAULT 7",
+    );
 
     // Hot state converged: the memtable's rows are durable in a segment and
     // no stale tail generation remains.
@@ -212,7 +240,11 @@ fn add_column_converges_hot_state_before_catalog_flip() {
 
     // Reads span the flushed rows and the new default.
     assert_eq!(
-        query_all(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE score = 7"),
+        query_all(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE score = 7"
+        ),
         vec![vec!["2"]]
     );
     // Post-ALTER inserts land in a fresh catalog-width memtable.
@@ -230,7 +262,11 @@ fn add_column_converges_hot_state_before_catalog_flip() {
 #[test]
 fn add_column_refuses_open_transaction_with_writes() {
     let (_temp_dir, engine, mut session) = create_engine();
-    exec(&engine, &mut session, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    exec(
+        &engine,
+        &mut session,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+    );
 
     // Another session's open transaction with writes: the flush skips its
     // transactional memtable, so the layout flip would strand it stale-width.
@@ -247,7 +283,11 @@ fn add_column_refuses_open_transaction_with_writes() {
     );
 
     exec(&engine, &mut txn_session, "ROLLBACK");
-    exec(&engine, &mut session, "ALTER TABLE t ADD COLUMN score INT DEFAULT 7");
+    exec(
+        &engine,
+        &mut session,
+        "ALTER TABLE t ADD COLUMN score INT DEFAULT 7",
+    );
     exec(&engine, &mut session, "INSERT INTO t VALUES (2, 20, 7)");
     assert_eq!(
         query_all(&engine, &mut session, "SELECT COUNT(*) FROM t"),
@@ -293,7 +333,11 @@ fn resident_memtable_predating_drop_column_reads_surviving_columns() {
         &mut session,
         "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)",
     );
-    exec(&engine, &mut session, "INSERT INTO t VALUES (1, 10, 20), (2, 11, 21)");
+    exec(
+        &engine,
+        &mut session,
+        "INSERT INTO t VALUES (1, 10, 20), (2, 11, 21)",
+    );
     // Rows stay resident: no flush before the ALTER.
     exec(&engine, &mut session, "ALTER TABLE t DROP COLUMN a");
 
@@ -313,10 +357,22 @@ fn resident_memtable_predating_drop_column_reads_surviving_columns() {
 #[test]
 fn delete_where_added_column_matches_default_rows_on_old_segments() {
     let (_temp_dir, engine, mut session) = create_engine();
-    exec(&engine, &mut session, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&engine, &mut session, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
+    exec(
+        &engine,
+        &mut session,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+    );
+    exec(
+        &engine,
+        &mut session,
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+    );
     exec(&engine, &mut session, "FLUSH TABLE t");
-    exec(&engine, &mut session, "ALTER TABLE t ADD COLUMN score INT DEFAULT 7");
+    exec(
+        &engine,
+        &mut session,
+        "ALTER TABLE t ADD COLUMN score INT DEFAULT 7",
+    );
     // A post-ALTER row with a non-default value keeps the statement honest.
     exec(&engine, &mut session, "INSERT INTO t VALUES (4, 40, 8)");
 

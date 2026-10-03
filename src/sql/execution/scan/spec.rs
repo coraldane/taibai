@@ -94,10 +94,7 @@ pub struct MetadataFoldRequest {
 /// WHERE clauses the optimizer pushed into `ScanPlan::pushed_filter` are
 /// covered (they land in the compiled spec); residual `Filter` nodes carry
 /// predicates the spec never sees, so those decline too.
-pub fn extract_metadata_fold(
-    plan: &LogicalPlan,
-    table_name: &str,
-) -> Option<MetadataFoldRequest> {
+pub fn extract_metadata_fold(plan: &LogicalPlan, table_name: &str) -> Option<MetadataFoldRequest> {
     let inner = match plan {
         LogicalPlan::Project(project) => &*project.input,
         other => other,
@@ -108,7 +105,8 @@ pub fn extract_metadata_fold(
     if agg.having.is_some() || agg.distinct {
         return None;
     }
-    if agg.group_by
+    if agg
+        .group_by
         .iter()
         .any(|expr| !matches!(expr, LogicalExpr::Column(_)))
     {
@@ -134,11 +132,9 @@ pub fn extract_metadata_fold(
     // position-for-position, otherwise the rows this path returns would have
     // the wrong column order (or drop computed select items).
     if let LogicalPlan::Project(project) = plan {
-        let identity = project
-            .expressions
-            .iter()
-            .enumerate()
-            .all(|(position, expr)| matches!(expr, LogicalExpr::Column(index) if *index == position));
+        let identity = project.expressions.iter().enumerate().all(
+            |(position, expr)| matches!(expr, LogicalExpr::Column(index) if *index == position),
+        );
         if !identity {
             return None;
         }
@@ -447,7 +443,9 @@ fn collect_from_plan_ctx(
                 }
             }
         }
-        LogicalPlan::Filter(f) => collect_from_plan_ctx(&f.input, table_name, schema, spec, join_side_cols),
+        LogicalPlan::Filter(f) => {
+            collect_from_plan_ctx(&f.input, table_name, schema, spec, join_side_cols)
+        }
         LogicalPlan::Project(p) => {
             collect_from_plan_ctx(&p.input, table_name, schema, spec, join_side_cols);
             // Above an Aggregate, projection expressions index the aggregate
@@ -944,104 +942,5 @@ pub(crate) fn pushdown_safe_limit(spec: &ScanSpec, ordered_lookup: bool) -> Opti
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::protocol::types::DataType;
-    use crate::sql::parser::ast::BinOp;
-    use crate::types::batch::ColumnDef;
-
-    fn int32_schema() -> Schema {
-        Schema::new(vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("deal_date", DataType::Int32),
-        ])
-    }
-
-    /// Regression: IN literals must be coerced to the column type. Bloom and
-    /// set index pruning hash/compare the stored type exactly, so Int64
-    /// literals against an Int32 column used to prune every matching row.
-    #[test]
-    fn in_predicate_values_are_coerced_to_column_type() {
-        let schema = int32_schema();
-        let expr = LogicalExpr::In {
-            expr: Box::new(LogicalExpr::Column(1)),
-            values: vec![
-                ScalarValue::Int64(Some(20260916)),
-                ScalarValue::Int64(Some(20260917)),
-            ],
-            negated: false,
-        };
-        let mut spec = ScanSpec::new("t");
-        extract_predicates(&expr, &schema, &mut spec);
-
-        assert!(spec.remaining_predicate.is_none());
-        assert_eq!(spec.in_predicates.len(), 1);
-        assert_eq!(
-            spec.in_predicates[0].values,
-            vec![
-                ScalarValue::Int32(Some(20260916)),
-                ScalarValue::Int32(Some(20260917))
-            ]
-        );
-    }
-
-    /// Between bounds feed the same index checks as range clauses; coerce them
-    /// too so DECIMAL scale and integer widths match the stored column.
-    #[test]
-    fn between_bounds_are_coerced_to_column_type() {
-        let schema = int32_schema();
-        let expr = LogicalExpr::Between {
-            expr: Box::new(LogicalExpr::Column(1)),
-            low: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(20260901)))),
-            high: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(20260930)))),
-            negated: false,
-        };
-        let mut spec = ScanSpec::new("t");
-        extract_predicates(&expr, &schema, &mut spec);
-
-        assert!(spec.remaining_predicate.is_none());
-        assert_eq!(spec.range_predicates.len(), 2);
-        assert!(spec.range_predicates.iter().all(|clause| {
-            clause.value == ScalarValue::Int32(Some(20260901))
-                || clause.value == ScalarValue::Int32(Some(20260930))
-        }));
-    }
-
-    /// A literal that cannot be represented in the column type keeps the
-    /// predicate out of the pushed-down sets entirely (generic evaluation).
-    #[test]
-    fn in_predicate_with_uncoercible_value_stays_generic() {
-        let schema = int32_schema();
-        let expr = LogicalExpr::In {
-            expr: Box::new(LogicalExpr::Column(1)),
-            values: vec![
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Int64(Some(i64::from(i32::MAX) + 1)),
-            ],
-            negated: false,
-        };
-        let mut spec = ScanSpec::new("t");
-        extract_predicates(&expr, &schema, &mut spec);
-
-        assert!(spec.in_predicates.is_empty());
-        assert!(spec.remaining_predicate.is_some());
-    }
-
-    /// Sanity: eq literals were already coerced before the IN fix.
-    #[test]
-    fn eq_predicate_values_are_coerced_to_column_type() {
-        let schema = int32_schema();
-        let expr = LogicalExpr::BinaryOp {
-            left: Box::new(LogicalExpr::Column(1)),
-            op: BinOp::Eq,
-            right: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(20260916)))),
-        };
-        let mut spec = ScanSpec::new("t");
-        extract_predicates(&expr, &schema, &mut spec);
-
-        assert_eq!(
-            spec.eq_predicates,
-            vec![(1usize, ScalarValue::Int32(Some(20260916)))]
-        );
-    }
-}
+#[path = "spec_test.rs"]
+mod tests;

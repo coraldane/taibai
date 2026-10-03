@@ -50,12 +50,7 @@ fn spawn_test_connection_with_limiter_and_config(
 ) -> (Framed<DuplexStream, MessageCodec>, JoinHandle<Result<()>>) {
     let (server_stream, client_stream) = tokio::io::duplex(1024 * 1024);
     let limiters = RequestLimiters::from_shared(request_limiter);
-    let server = tokio::spawn(handle_framed(
-        server_stream,
-        config,
-        engine,
-        limiters,
-    ));
+    let server = tokio::spawn(handle_framed(server_stream, config, engine, limiters));
     let client = Framed::new(client_stream, MessageCodec::new(MAX_MESSAGE_SIZE));
     (client, server)
 }

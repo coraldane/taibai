@@ -231,7 +231,7 @@ impl Compactor {
         }
     }
 
-    /// See [`COMPACTION_HEAVY_DELAY_MS`].
+    /// See `COMPACTION_HEAVY_DELAY_MS`.
     pub fn set_heavy_phase_delay_for_tests(ms: u64) {
         COMPACTION_HEAVY_DELAY_MS.store(ms, AtomicOrdering::Release);
     }

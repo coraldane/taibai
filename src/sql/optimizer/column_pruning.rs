@@ -1,7 +1,7 @@
 use crate::sql::planner::*;
 
-use super::Rule;
 use super::join_projection::prune_join_under_filters;
+use super::Rule;
 
 pub struct ColumnPruningRule;
 

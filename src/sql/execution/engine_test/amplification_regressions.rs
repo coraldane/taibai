@@ -67,9 +67,15 @@ fn point_delete_narrows_via_location_index() -> Result<()> {
     engine.execute(&mut writer, "CREATE TABLE t (id INT64, v INT64)")?;
     // Two segments with interleaved id ranges: zone maps overlap, so a scan
     // cannot prune by range — exactly the case the location index decides.
-    engine.execute(&mut writer, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")?;
+    engine.execute(
+        &mut writer,
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+    )?;
     engine.execute(&mut writer, "FLUSH TABLE t")?;
-    engine.execute(&mut writer, "INSERT INTO t VALUES (4, 40), (5, 50), (6, 60)")?;
+    engine.execute(
+        &mut writer,
+        "INSERT INTO t VALUES (4, 40), (5, 50), (6, 60)",
+    )?;
     engine.execute(&mut writer, "FLUSH TABLE t")?;
 
     // Delete a row living in the SECOND segment.
@@ -113,7 +119,10 @@ fn txn_point_delete_narrows_and_rolls_back() -> Result<()> {
     let mut writer = session();
 
     engine.execute(&mut writer, "CREATE TABLE t (id INT64, v INT64)")?;
-    engine.execute(&mut writer, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")?;
+    engine.execute(
+        &mut writer,
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+    )?;
     engine.execute(&mut writer, "FLUSH TABLE t")?;
     engine.execute(&mut writer, "INSERT INTO t VALUES (4, 40)")?;
     engine.execute(&mut writer, "FLUSH TABLE t")?;
@@ -142,21 +151,33 @@ fn update_unique_validation_probes_across_segments() -> Result<()> {
         &mut writer,
         "CREATE TABLE t (id INT64, uk INT64, v INT64, UNIQUE KEY uk_val (uk))",
     )?;
-    engine.execute(&mut writer, "INSERT INTO t VALUES (1, 100, 10), (2, 200, 20)")?;
+    engine.execute(
+        &mut writer,
+        "INSERT INTO t VALUES (1, 100, 10), (2, 200, 20)",
+    )?;
     engine.execute(&mut writer, "FLUSH TABLE t")?;
-    engine.execute(&mut writer, "INSERT INTO t VALUES (3, 300, 30), (4, 400, 40)")?;
+    engine.execute(
+        &mut writer,
+        "INSERT INTO t VALUES (3, 300, 30), (4, 400, 40)",
+    )?;
     engine.execute(&mut writer, "FLUSH TABLE t")?;
 
     // Collision with a row in the FIRST segment while updating a row of the
     // second: only a global check (probe or sweep) can see it.
     let collision = engine.execute(&mut writer, "UPDATE t SET uk = 100 WHERE id = 4");
-    assert!(collision.is_err(), "cross-segment key collision must be rejected");
+    assert!(
+        collision.is_err(),
+        "cross-segment key collision must be rejected"
+    );
     let intact = first_i64(
         engine.execute(&mut writer, "SELECT v FROM t WHERE id = 4")?,
         0,
         0,
     );
-    assert_eq!(intact, 40, "the aborted UPDATE must leave the row untouched");
+    assert_eq!(
+        intact, 40,
+        "the aborted UPDATE must leave the row untouched"
+    );
 
     // A fresh key passes.
     engine.execute(&mut writer, "UPDATE t SET uk = 900 WHERE id = 4")?;
@@ -225,7 +246,10 @@ fn hot_store_rebuilds_from_live_state_after_invalidation() -> Result<()> {
     // Point lookups answer for pre- and post-rebuild rows alike.
     for id in [1i64, 2, 3] {
         let found = first_i64(
-            engine.execute(&mut writer, &format!("SELECT COUNT(*) FROM h WHERE id = {id}"))?,
+            engine.execute(
+                &mut writer,
+                &format!("SELECT COUNT(*) FROM h WHERE id = {id}"),
+            )?,
             0,
             0,
         );
@@ -272,9 +296,7 @@ fn join_projection_pruning_keeps_results_identical() -> Result<()> {
     for k in 1..=8i64 {
         engine.execute(
             &mut writer,
-            &format!(
-                "INSERT INTO b VALUES ({k}, {k}10, {k}11, {k}12, {k}13, {k}14)"
-            ),
+            &format!("INSERT INTO b VALUES ({k}, {k}10, {k}11, {k}12, {k}13, {k}14)"),
         )?;
     }
     engine.execute(&mut writer, "FLUSH TABLE a")?;
@@ -300,7 +322,10 @@ fn join_projection_pruning_keeps_results_identical() -> Result<()> {
         0,
         0,
     );
-    assert_eq!(sample, 414, "projected right-side column resolves correctly");
+    assert_eq!(
+        sample, 414,
+        "projected right-side column resolves correctly"
+    );
 
     // Outer join: the layout guard may decline pruning; results must be
     // correct either way.
@@ -317,7 +342,10 @@ fn join_projection_pruning_keeps_results_identical() -> Result<()> {
     // Nested join across three tables.
     engine.execute(&mut writer, "CREATE TABLE c (k INT64, c1 INT64, c2 INT64)")?;
     for k in 1..=4i64 {
-        engine.execute(&mut writer, &format!("INSERT INTO c VALUES ({k}, {k}00, {k}99)"))?;
+        engine.execute(
+            &mut writer,
+            &format!("INSERT INTO c VALUES ({k}, {k}00, {k}99)"),
+        )?;
     }
     engine.execute(&mut writer, "FLUSH TABLE c")?;
     let nested = first_i64(

@@ -759,7 +759,11 @@ pub fn eval_expr_column_with(
 /// filter path and the DML row-wise evaluator (helpers::eval_expr_for_row) —
 /// a previous private copy in helpers silently returned the left operand for
 /// every uncovered arithmetic shape, mis-filtering UPDATE/DELETE rows.
-pub(crate) fn eval_binary_scalar(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> ScalarValue {
+pub(crate) fn eval_binary_scalar(
+    left: &ScalarValue,
+    op: &BinOp,
+    right: &ScalarValue,
+) -> ScalarValue {
     use BinOp::*;
     if left.is_null() || right.is_null() {
         return match op {

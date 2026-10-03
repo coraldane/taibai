@@ -20,14 +20,14 @@ fn timed_count(engine: &Engine, session: &mut Session, sql: &str) -> (u64, u128)
     let rows: u64 = batches.iter().map(|batch| batch.num_rows() as u64).sum();
     let total: i64 = batches
         .iter()
-        .flat_map(|batch| (0..batch.num_rows()).filter_map(|row| match batch.scalar(row, 1) {
-            Some(taibai::types::scalar::ScalarValue::Int64(Some(v))) => Some(v),
-            _ => None,
-        }))
+        .flat_map(|batch| {
+            (0..batch.num_rows()).filter_map(|row| match batch.scalar(row, 1) {
+                Some(taibai::types::scalar::ScalarValue::Int64(Some(v))) => Some(v),
+                _ => None,
+            })
+        })
         .sum();
-    println!(
-        "  {sql:<62} rows={rows:<4} sum(count)={total:<8} {elapsed:>9} µs"
-    );
+    println!("  {sql:<62} rows={rows:<4} sum(count)={total:<8} {elapsed:>9} µs");
     (rows, elapsed)
 }
 

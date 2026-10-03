@@ -753,7 +753,7 @@ impl IndexManager {
         Ok(Some(locations))
     }
 
-    /// Generic for the same reason as [`unique_key_locations`].
+    /// Generic for the same reason as `unique_key_locations`.
     pub fn unique_keys_exist<I>(
         &self,
         db: &str,
@@ -898,7 +898,7 @@ impl IndexManager {
         self.append_prepared_unique_index_entries(db, table, index_name, prepared)
     }
 
-    /// Batched variant of [`append_prepared_unique_index_entries`] for one
+    /// Batched variant of `append_prepared_unique_index_entries` for one
     /// statement's entries across all of a table's location indexes (named
     /// unique indexes plus the primary-key location index). Instead of a full
     /// load-state / lock / write / fsync cycle per index, every state is

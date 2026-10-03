@@ -37,14 +37,12 @@ pub(super) fn open_segment_with_candidates(
     segment: &Path,
     spec: &ScanSpec,
 ) -> Result<Option<SegmentCandidates>> {
-    let meta_candidates = mgr
-        .segment_meta(segment)
-        .ok()
-        .flatten()
-        .and_then(|meta| match super::row_filter::meta_prune_row_groups(&meta, spec) {
+    let meta_candidates = mgr.segment_meta(segment).ok().flatten().and_then(|meta| {
+        match super::row_filter::meta_prune_row_groups(&meta, spec) {
             Ok(super::row_filter::MetaPrune::Candidates(indices)) => Some(indices),
             Ok(super::row_filter::MetaPrune::Unaligned) | Err(_) => None,
-        });
+        }
+    });
     if meta_candidates.as_ref().is_some_and(Vec::is_empty) {
         return Ok(None);
     }

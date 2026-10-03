@@ -130,7 +130,7 @@ pub struct UniqueIndexData {
 }
 
 /// Legacy in-memory block layout kept for decoding files written before the
-/// on-demand V6 format; new snapshots stream through [`UniqueIndexBaseWriter`].
+/// on-demand V6 format; new snapshots stream through `UniqueIndexBaseWriter`.
 #[derive(Debug, Clone)]
 pub struct UniqueIndexBlock {
     pub first_key: Vec<u8>,

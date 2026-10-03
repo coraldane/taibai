@@ -16,8 +16,8 @@ use crate::sql::execution::wal_helper::{
     compress_prepared_batch_for_wal_with, deserialize_batch_from_wal, prepare_batch_for_wal,
     serialize_batch_for_wal,
 };
-use crate::storage::segment::SegmentReader;
 use crate::storage::segment::reader::ImageDurabilityCheck;
+use crate::storage::segment::SegmentReader;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
@@ -1349,10 +1349,10 @@ fn decode_scalar_cell(body: &[u8], offset: &mut usize) -> Result<ScalarValue> {
         DataType::Interval => ScalarValue::Interval(Some(i64::from_le_bytes(
             read_raw(body, offset, 8)?.try_into().unwrap(),
         ))),
-        DataType::VarChar => ScalarValue::VarChar(Some(String::from_utf8(
-            read_len_prefixed(body, offset)?.to_vec(),
-        )
-        .map_err(|_| TaibaiError::Storage("update sidecar VarChar is not UTF-8".into()))?)),
+        DataType::VarChar => ScalarValue::VarChar(Some(
+            String::from_utf8(read_len_prefixed(body, offset)?.to_vec())
+                .map_err(|_| TaibaiError::Storage("update sidecar VarChar is not UTF-8".into()))?,
+        )),
         DataType::Blob => ScalarValue::Blob(Some(read_len_prefixed(body, offset)?.to_vec())),
         DataType::Vector => {
             let count = read_le_u32(body, offset)? as usize;
@@ -1428,7 +1428,10 @@ fn decode_update_set(raw: &[u8]) -> Result<TailUpdateSet> {
         .chunks_exact(4)
         .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
         .collect();
-    Ok(TailUpdateSet { assigned, positions })
+    Ok(TailUpdateSet {
+        assigned,
+        positions,
+    })
 }
 
 /// Why a generation walk stopped without finding a live tail.
@@ -1630,17 +1633,19 @@ fn emit_sidecar_replication(
     let (Some(db), Some(table)) = (db, table) else {
         return;
     };
-    log.enqueue(crate::storage::replication::ReplicationEvent::TailMutation {
-        db,
-        table,
-        memtable_id: id,
-        is_update,
-        sequence,
-        payload: payload.to_vec(),
-    });
+    log.enqueue(
+        crate::storage::replication::ReplicationEvent::TailMutation {
+            db,
+            table,
+            memtable_id: id,
+            is_update,
+            sequence,
+            payload: payload.to_vec(),
+        },
+    );
 }
 
-/// Standby apply of a [`ReplicationEvent::TailMutation`]: validate the
+/// Standby apply of a `ReplicationEvent::TailMutation`: validate the
 /// payload decodes (fail loudly on corruption), then write it as this
 /// node's own sidecar generation against the same tail. Replays are
 /// idempotent — a duplicate delete removes already-removed positions, a
@@ -1730,7 +1735,8 @@ fn encode_guard(watermark: &[ImageDurabilityCheck]) -> Vec<u8> {
 }
 
 fn decode_guard(bytes: &[u8]) -> Result<Vec<ImageDurabilityCheck>> {
-    let corrupt = |detail: &str| TaibaiError::Storage(format!("durable tail guard is corrupt: {detail}"));
+    let corrupt =
+        |detail: &str| TaibaiError::Storage(format!("durable tail guard is corrupt: {detail}"));
     let body = verify_crc(bytes)?;
     if body.len() < 8 || u32::from_le_bytes(body[0..4].try_into().unwrap()) != GUARD_MAGIC {
         return Err(corrupt("bad magic"));
@@ -1748,7 +1754,8 @@ fn decode_guard(bytes: &[u8]) -> Result<Vec<ImageDurabilityCheck>> {
         if offset + 4 > body.len() {
             return Err(corrupt("truncated partition length"));
         }
-        let partition_len = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap()) as usize;
+        let partition_len =
+            u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
         if offset + partition_len + 8 > body.len() {
             return Err(corrupt("truncated partition"));
@@ -1811,8 +1818,12 @@ fn sweep_orphan_guards(tail_dir: &Path) {
         let Some((guard_id, sequence)) = parse_guard_path(&path) else {
             continue;
         };
-        if !tail_dir.join(format!("{}.{}.del", guard_id.simple(), sequence)).exists()
-            && !tail_dir.join(format!("{}.{}.upd", guard_id.simple(), sequence)).exists()
+        if !tail_dir
+            .join(format!("{}.{}.del", guard_id.simple(), sequence))
+            .exists()
+            && !tail_dir
+                .join(format!("{}.{}.upd", guard_id.simple(), sequence))
+                .exists()
         {
             let _ = fs::remove_file(&path);
         }
@@ -1842,10 +1853,9 @@ pub fn memtable_has_statement_guard(table_dir: &Path, id: Uuid) -> bool {
     let Ok(entries) = fs::read_dir(table_dir.join(TAIL_DIR)) else {
         return false;
     };
-    entries.flatten().any(|entry| {
-        parse_guard_path(&entry.path())
-            .is_some_and(|(guard_id, _)| guard_id == id)
-    })
+    entries
+        .flatten()
+        .any(|entry| parse_guard_path(&entry.path()).is_some_and(|(guard_id, _)| guard_id == id))
 }
 
 /// Durably record a memtable UPDATE without rewriting its tail.
@@ -1911,7 +1921,7 @@ pub fn update_rows(
 /// not run while sidecars pend: `ensure_resident` decodes only the tail, so
 /// pending delete/update generations would be silently dropped.
 ///
-/// Not expressed through [`resolve_live_tail`]: a sidecar is terminal here
+/// Not expressed through `resolve_live_tail`: a sidecar is terminal here
 /// (answers "plain?"), not transparent as in the live-tail searches.
 pub fn tail_is_plain(table_dir: &Path, id: Uuid) -> Result<bool> {
     let tail_dir = table_dir.join(TAIL_DIR);
@@ -2192,8 +2202,8 @@ fn live_tail_with_sidecars(
                 // durable. Keep it only when the watermark is satisfied;
                 // otherwise drop sidecar and guard — the crash rolled the
                 // statement back and the deleted rows must come back.
-                if let Some(sequence) = parse_generation(&file.path)
-                    .map(|(_, generation)| generation.sequence)
+                if let Some(sequence) =
+                    parse_generation(&file.path).map(|(_, generation)| generation.sequence)
                 {
                     let guard = guard_path(tail_dir, id, sequence);
                     if guard.exists() {
@@ -2432,9 +2442,7 @@ pub fn tail_last_lsn(path: &Path) -> Result<Option<u64>> {
     };
     let format = match bytes.len() {
         len if len < 8 => return Ok(None),
-        _ => match TailFormat::from_magic(u32::from_le_bytes(
-            bytes[0..4].try_into().unwrap(),
-        )) {
+        _ => match TailFormat::from_magic(u32::from_le_bytes(bytes[0..4].try_into().unwrap())) {
             Some(format) => format,
             None => return Ok(None),
         },

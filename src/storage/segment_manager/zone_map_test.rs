@@ -61,13 +61,9 @@ fn cluster_zone_map_resolves_catalog_index_by_name_after_drop_column() {
         ColumnDef::new("v", DataType::Int64),
     ]);
     let seg_path = table_dir.join("segment_000001.seg");
-    let mut writer = crate::storage::segment::SegmentWriter::create(
-        &seg_path,
-        footer_schema.clone(),
-        8192,
-        1,
-    )
-    .unwrap();
+    let mut writer =
+        crate::storage::segment::SegmentWriter::create(&seg_path, footer_schema.clone(), 8192, 1)
+            .unwrap();
     let mut batch = RecordBatch::new(footer_schema);
     for (dropme, k, v) in [(100, 1, 10), (101, 2, 20), (102, 3, 30)] {
         batch

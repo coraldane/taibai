@@ -146,7 +146,10 @@ fn arithmetic_simplifications_preserve_results_and_nulls() -> Result<()> {
         0,
         0,
     );
-    assert_eq!(overflow, 0, "overflowed literal folds to NULL and matches nothing");
+    assert_eq!(
+        overflow, 0,
+        "overflowed literal folds to NULL and matches nothing"
+    );
     Ok(())
 }
 
@@ -179,7 +182,10 @@ fn join_matches_across_integer_widths() -> Result<()> {
     let mut session = session();
     engine.execute(&mut session, "CREATE TABLE dim (id INT64, name VARCHAR)")?;
     engine.execute(&mut session, "CREATE TABLE fact (id INT32, v INT64)")?;
-    engine.execute(&mut session, "INSERT INTO dim VALUES (1, 'one'), (2, 'two')")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO dim VALUES (1, 'one'), (2, 'two')",
+    )?;
     engine.execute(&mut session, "INSERT INTO fact VALUES (1, 100), (2, 200)")?;
     let joined = first_i64(
         engine.execute(
@@ -205,7 +211,10 @@ fn correlated_not_in_with_null_subquery_value_excludes_all_rows() -> Result<()> 
     engine.execute(&mut session, "CREATE TABLE u (k INT64, c INT64)")?;
     engine.execute(&mut session, "INSERT INTO t VALUES (1, 10), (2, 20)")?;
     // The subquery for k = 1 yields {5, NULL}; for k = 2 yields {7}.
-    engine.execute(&mut session, "INSERT INTO u VALUES (1, 5), (1, NULL), (2, 7)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO u VALUES (1, 5), (1, NULL), (2, 7)",
+    )?;
     let kept = first_i64(
         engine.execute(
             &mut session,
@@ -217,7 +226,10 @@ fn correlated_not_in_with_null_subquery_value_excludes_all_rows() -> Result<()> 
     // Correct three-valued result: the k = 1 row is UNKNOWN (set holds a
     // NULL) and excluded; the k = 2 row (20 NOT IN {7}) is TRUE and kept.
     // The pre-fix anti join output BOTH rows — no match found for either.
-    assert_eq!(kept, 1, "only the k = 2 row survives; the NULL set excludes k = 1");
+    assert_eq!(
+        kept, 1,
+        "only the k = 2 row survives; the NULL set excludes k = 1"
+    );
     Ok(())
 }
 
@@ -231,7 +243,10 @@ fn window_rows_frame_accumulates_row_by_row() -> Result<()> {
     let engine = Engine::new(dir.path(), "main")?;
     let mut session = session();
     engine.execute(&mut session, "CREATE TABLE t (k INT64, v INT64)")?;
-    engine.execute(&mut session, "INSERT INTO t VALUES (1, 10), (1, 20), (2, 30)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t VALUES (1, 10), (1, 20), (2, 30)",
+    )?;
     let r = engine.execute(
         &mut session,
         "SELECT SUM(v) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
@@ -274,9 +289,21 @@ fn dml_memtable_walk_aligns_drifted_layouts() -> Result<()> {
     let mut batch = crate::types::batch::RecordBatch::new(old_schema);
     for (a, id, v) in [(0, 1, 10), (0, 2, 20)] {
         use crate::types::scalar::ScalarValue;
-        batch.column_mut(0).unwrap().push(&ScalarValue::Int64(Some(a))).unwrap();
-        batch.column_mut(1).unwrap().push(&ScalarValue::Int64(Some(id))).unwrap();
-        batch.column_mut(2).unwrap().push(&ScalarValue::Int64(Some(v))).unwrap();
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(a)))
+            .unwrap();
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(id)))
+            .unwrap();
+        batch
+            .column_mut(2)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(v)))
+            .unwrap();
     }
     memtable.append(&batch)?;
 
@@ -290,7 +317,11 @@ fn dml_memtable_walk_aligns_drifted_layouts() -> Result<()> {
         None,
         |_memtable, _original, view, _live| {
             seen_layouts.push((
-                view.schema.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                view.schema
+                    .columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>(),
                 view.column(0).map(|c| c.len()),
             ));
             Ok(())
@@ -405,7 +436,10 @@ fn slow_path_joins_emit_all_unmatched_rows_across_chunks() -> Result<()> {
         0,
         0,
     );
-    assert_eq!(right, 10_000, "slow-path RIGHT: unmatched right side in chunks");
+    assert_eq!(
+        right, 10_000,
+        "slow-path RIGHT: unmatched right side in chunks"
+    );
     Ok(())
 }
 
@@ -491,13 +525,16 @@ fn update_unique_violations_abort_cleanly() -> Result<()> {
     // present) must be REUSABLE — dead-row keys must not falsely collide.
     engine.execute(&mut session, "DELETE FROM t WHERE id = 2")?;
     engine.execute(&mut session, "INSERT INTO t VALUES (4, 20)")?; // reuses 20
-    // Free key 10 as well: its only physical occurrence must be a tombstoned
-    // row before the reuse below is legal. (The old assertion updated to 10
-    // while row 1 still held it — that only passed because the pre-fix
-    // validation could not see keys in WHERE-pruned segments.)
+                                                                   // Free key 10 as well: its only physical occurrence must be a tombstoned
+                                                                   // row before the reuse below is legal. (The old assertion updated to 10
+                                                                   // while row 1 still held it — that only passed because the pre-fix
+                                                                   // validation could not see keys in WHERE-pruned segments.)
     engine.execute(&mut session, "DELETE FROM t WHERE id = 1")?;
     let result = engine.execute(&mut session, "UPDATE t SET code = 10 WHERE id = 4");
-    assert!(result.is_ok(), "a key freed by DELETE must be reusable: {result:?}");
+    assert!(
+        result.is_ok(),
+        "a key freed by DELETE must be reusable: {result:?}"
+    );
     let code = first_i64(
         engine.execute(&mut session, "SELECT code FROM t WHERE id = 4")?,
         0,

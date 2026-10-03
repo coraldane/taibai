@@ -111,20 +111,70 @@ fn integer_partition_values_partition_by_disjoint_domains() {
 
     // Write/read consistency for every value class: eq predicates find
     // their rows regardless of which bucket they landed in.
-    assert_eq!(count(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE deal_date = 20240101"), 2);
-    assert_eq!(count(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE deal_date = 20240131"), 1);
-    assert_eq!(count(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE deal_date = 20240132"), 2);
-    assert_eq!(count(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE deal_date = 20240230"), 1);
-    assert_eq!(count(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE deal_date = 930"), 1);
     assert_eq!(
-        count(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE deal_date = 1775040000000"),
+        count(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE deal_date = 20240101"
+        ),
         2
     );
     assert_eq!(
-        count(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE deal_date = 1672531200"),
+        count(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE deal_date = 20240131"
+        ),
         1
     );
-    assert_eq!(count(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE deal_date IS NULL"), 1);
+    assert_eq!(
+        count(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE deal_date = 20240132"
+        ),
+        2
+    );
+    assert_eq!(
+        count(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE deal_date = 20240230"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE deal_date = 930"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE deal_date = 1775040000000"
+        ),
+        2
+    );
+    assert_eq!(
+        count(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE deal_date = 1672531200"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE deal_date IS NULL"
+        ),
+        1
+    );
     assert_eq!(count(&engine, &mut session, "SELECT COUNT(*) FROM t"), 11);
 
     engine.segment_mgr().shutdown();

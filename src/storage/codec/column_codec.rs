@@ -1191,7 +1191,9 @@ pub fn decode_column_with_runs(
                         TaibaiError::Storage("vector decode: element count overflow".into())
                     })?;
                     if len_bytes > remaining_data.len().saturating_sub(dc.position() as usize) {
-                        return Err(TaibaiError::Storage("vector decode: truncated value".into()));
+                        return Err(TaibaiError::Storage(
+                            "vector decode: truncated value".into(),
+                        ));
                     }
                     let mut v = Vec::with_capacity(count);
                     for _ in 0..count {
@@ -1275,8 +1277,10 @@ pub(crate) fn decode_adaptive_column_with_runs(
             build_numeric_column_from_i64(values, row_count, col_def, bitmap)
         }
         EncodingType::BitPacked => {
-            let values =
-                decode_i64_bitpacked_payload(payload, row_count.saturating_sub(bitmap.null_count()))?;
+            let values = decode_i64_bitpacked_payload(
+                payload,
+                row_count.saturating_sub(bitmap.null_count()),
+            )?;
             build_numeric_column_from_i64(values, row_count, col_def, bitmap)
         }
         EncodingType::GorillaXor => {

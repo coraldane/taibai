@@ -99,7 +99,8 @@ async fn select_retries_retryable_error_and_succeeds() {
             "{RETRYABLE_ERROR_PREFIX} resource busy: mocked ALTER convergence window"
         )),
         ok_frame(1),
-    ]).await;
+    ])
+    .await;
     let mut client = Client::connect(&server.addr).await.expect("connect");
     let result = client.query("SELECT 1").await.expect("query");
     match result {
@@ -118,7 +119,8 @@ async fn insert_is_not_auto_retried_and_keeps_the_marker() {
     let server = spawn_mock_server(vec![
         error_frame(&format!("{RETRYABLE_ERROR_PREFIX} resource busy: mocked")),
         ok_frame(1),
-    ]).await;
+    ])
+    .await;
     let mut client = Client::connect(&server.addr).await.expect("connect");
     let result = client
         .query("INSERT INTO t VALUES (1)")
@@ -147,7 +149,8 @@ async fn select_gives_up_after_three_retries_and_surfaces_the_error() {
         error_frame(&format!("{RETRYABLE_ERROR_PREFIX} resource busy: 2")),
         error_frame(&format!("{RETRYABLE_ERROR_PREFIX} resource busy: 3")),
         error_frame(&format!("{RETRYABLE_ERROR_PREFIX} resource busy: 4")),
-    ]).await;
+    ])
+    .await;
     let mut client = Client::connect(&server.addr).await.expect("connect");
     let result = client.query("SHOW TABLES").await.expect("query transport");
     match result {

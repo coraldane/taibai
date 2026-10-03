@@ -81,7 +81,7 @@ pub fn compute_partition_key_from_scalar(func: &PartitionFunction, val: &ScalarV
 
 /// The temporal partition key of a scalar value, or `None` when the value
 /// carries no calendar meaning (NULL, a non-calendar integer — see
-/// [`date_parts_from_scalar`], a non-date string). Range-pruning callers
+/// `date_parts_from_scalar`, a non-date string). Range-pruning callers
 /// treat `None` as "no bound on this side" so an unparseable literal can
 /// never eliminate partitions; write routing and eq pruning route such rows
 /// to the unpartitioned bucket.
@@ -369,8 +369,7 @@ pub fn compute_partition_key_at(
                 PartitionFunction::Day | PartitionFunction::Month | PartitionFunction::Year => {
                     temporal_key_from_parts(
                         func,
-                        date_parts_from_date_number(v)
-                            .or_else(|| date_parts_from_epoch_number(v)),
+                        date_parts_from_date_number(v).or_else(|| date_parts_from_epoch_number(v)),
                     )
                 }
                 PartitionFunction::Hash(_) => func.apply(v).to_string(),
@@ -384,8 +383,7 @@ pub fn compute_partition_key_at(
                 PartitionFunction::Day | PartitionFunction::Month | PartitionFunction::Year => {
                     temporal_key_from_parts(
                         func,
-                        date_parts_from_date_number(v)
-                            .or_else(|| date_parts_from_epoch_number(v)),
+                        date_parts_from_date_number(v).or_else(|| date_parts_from_epoch_number(v)),
                     )
                 }
                 PartitionFunction::Hash(_) => func.apply(v).to_string(),

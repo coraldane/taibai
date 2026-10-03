@@ -347,8 +347,7 @@ impl ExecutionOp for ExpandToSchemaExec {
                         .iter()
                         .zip(self.target.columns.iter())
                         .all(|(actual, wanted)| {
-                            actual.name == wanted.name
-                                && actual.data_type == wanted.data_type
+                            actual.name == wanted.name && actual.data_type == wanted.data_type
                         })
                 {
                     return Ok(Some(batch));
@@ -365,9 +364,8 @@ impl ExecutionOp for ExpandToSchemaExec {
                         None => {
                             let mut column =
                                 crate::types::array::ColumnArray::empty(col_def.data_type);
-                            let null = crate::types::scalar::ScalarValue::null_for_type(
-                                col_def.data_type,
-                            );
+                            let null =
+                                crate::types::scalar::ScalarValue::null_for_type(col_def.data_type);
                             for _ in 0..rows {
                                 column.push(&null)?;
                             }
@@ -375,10 +373,7 @@ impl ExecutionOp for ExpandToSchemaExec {
                         }
                     }
                 }
-                Ok(Some(RecordBatch::try_new(
-                    self.target.clone(),
-                    columns,
-                )?))
+                Ok(Some(RecordBatch::try_new(self.target.clone(), columns)?))
             }
         }
     }

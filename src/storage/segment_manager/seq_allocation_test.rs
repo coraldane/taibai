@@ -30,7 +30,9 @@ fn replacement_allocation_advances_the_active_counter() {
 
     // A compaction replacement allocated by directory scan: it must see the
     // active segment and take seq 2, then fold that back into the counter.
-    let replacement = manager.next_replacement_segment_path(&table_dir, None).unwrap();
+    let replacement = manager
+        .next_replacement_segment_path(&table_dir, None)
+        .unwrap();
     assert_eq!(seq_of(&replacement), 2);
     std::fs::File::create(&replacement).unwrap();
 
@@ -60,7 +62,9 @@ fn partition_replacement_allocation_advances_the_partition_counter() {
     let replacement = manager
         .next_replacement_segment_path(&table_dir, Some("20260101"))
         .unwrap();
-    assert!(replacement.to_string_lossy().ends_with("p20260101_0002.dat"));
+    assert!(replacement
+        .to_string_lossy()
+        .ends_with("p20260101_0002.dat"));
     std::fs::File::create(&replacement).unwrap();
 
     let next = manager

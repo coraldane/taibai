@@ -394,11 +394,9 @@ fn adaptive_encoding_tag(encoded: &[u8]) -> EncodingType {
 fn bitpacked_roundtrip(values: &[i64]) {
     let payload =
         crate::storage::codec::column_codec::encode_i64_bitpacked_payload(values).unwrap();
-    let decoded = crate::storage::codec::column_codec::decode_i64_bitpacked_payload(
-        &payload,
-        values.len(),
-    )
-    .unwrap();
+    let decoded =
+        crate::storage::codec::column_codec::decode_i64_bitpacked_payload(&payload, values.len())
+            .unwrap();
     assert_eq!(decoded, values);
 }
 
@@ -876,11 +874,8 @@ fn bitpacked_decode_throughput_bench() {
             + 1;
         let payload = &adaptive[tag_pos..];
         let t2 = Instant::now();
-        let unpacked = crate::storage::codec::column_codec::decode_i64_bitpacked_payload(
-            payload,
-            n,
-        )
-        .unwrap();
+        let unpacked =
+            crate::storage::codec::column_codec::decode_i64_bitpacked_payload(payload, n).unwrap();
         let unpack_us = t2.elapsed().as_micros().max(1);
         assert_eq!(unpacked.len(), n);
 

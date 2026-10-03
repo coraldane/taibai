@@ -129,7 +129,10 @@ fn replace_memtable_leg_acks_clean_and_survives_restart() -> Result<()> {
     // Small insert: the row stays memtable-resident with a durable tail —
     // exactly the leg the guard protects.
     engine.execute(&mut writer, "INSERT INTO t (id, name) VALUES (1, 'first')")?;
-    engine.execute(&mut writer, "REPLACE INTO t (id, name) VALUES (1, 'second')")?;
+    engine.execute(
+        &mut writer,
+        "REPLACE INTO t (id, name) VALUES (1, 'second')",
+    )?;
 
     assert!(
         leftover_statement_journals(&engine, "t").is_empty(),
@@ -145,7 +148,11 @@ fn replace_memtable_leg_acks_clean_and_survives_restart() -> Result<()> {
     let mut reader = session();
     let count = first_i64(engine.execute(&mut reader, "SELECT COUNT(*) FROM t")?, 0, 0);
     assert_eq!(count, 1, "exactly one row after REPLACE and restart");
-    let name = first_text(engine.execute(&mut reader, "SELECT name FROM t WHERE id = 1")?, 0, 0);
+    let name = first_text(
+        engine.execute(&mut reader, "SELECT name FROM t WHERE id = 1")?,
+        0,
+        0,
+    );
     assert_eq!(name, "second");
     Ok(())
 }
@@ -162,7 +169,10 @@ fn txn_commit_materialization_acks_clean_and_survives_restart() -> Result<()> {
     let mut writer = session();
 
     engine.execute(&mut writer, "CREATE TABLE t (id INT64, v INT64)")?;
-    engine.execute(&mut writer, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)")?;
+    engine.execute(
+        &mut writer,
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)",
+    )?;
     engine.execute(&mut writer, "FLUSH TABLE t")?;
 
     engine.execute(&mut writer, "BEGIN")?;
@@ -183,10 +193,16 @@ fn txn_commit_materialization_acks_clean_and_survives_restart() -> Result<()> {
     let engine = Engine::new(dir.path(), "main")?;
     let mut reader = session();
     let count = first_i64(engine.execute(&mut reader, "SELECT COUNT(*) FROM t")?, 0, 0);
-    assert_eq!(count, 3, "delete + insert of a committed txn recover exactly");
+    assert_eq!(
+        count, 3,
+        "delete + insert of a committed txn recover exactly"
+    );
     for id in [3i64, 4, 5] {
         let found = first_i64(
-            engine.execute(&mut reader, &format!("SELECT COUNT(*) FROM t WHERE id = {id}"))?,
+            engine.execute(
+                &mut reader,
+                &format!("SELECT COUNT(*) FROM t WHERE id = {id}"),
+            )?,
             0,
             0,
         );
@@ -206,7 +222,10 @@ fn uncommitted_txn_deferred_delete_rolls_back_completely() -> Result<()> {
     let mut writer = session();
 
     engine.execute(&mut writer, "CREATE TABLE t (id INT64, v INT64)")?;
-    engine.execute(&mut writer, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")?;
+    engine.execute(
+        &mut writer,
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+    )?;
     engine.execute(&mut writer, "FLUSH TABLE t")?;
 
     // BEGIN + DELETE + INSERT, then simulate a crash before COMMIT's fsync:
@@ -221,7 +240,10 @@ fn uncommitted_txn_deferred_delete_rolls_back_completely() -> Result<()> {
     let engine = Engine::new(dir.path(), "main")?;
     let mut reader = session();
     let count = first_i64(engine.execute(&mut reader, "SELECT COUNT(*) FROM t")?, 0, 0);
-    assert_eq!(count, 3, "the aborted txn's delete must roll back completely");
+    assert_eq!(
+        count, 3,
+        "the aborted txn's delete must roll back completely"
+    );
     let found = first_i64(
         engine.execute(&mut reader, "SELECT COUNT(*) FROM t WHERE id = 1")?,
         0,

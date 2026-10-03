@@ -32,9 +32,9 @@ pub fn scan_resident_hot_store(
     table_meta: &TableMeta,
     spec: &ScanSpec,
 ) -> Option<RecordBatch> {
-    // TTL gate mirrors count_resident_hot_store: the hot gather truncates at
-    // the pushed LIMIT before TTL filtering runs, so with expired rows
-    // present it would return fewer live rows than exist.
+    // The hot gather truncates at the pushed LIMIT before TTL filtering
+    // runs, so with expired rows present it would return fewer live rows
+    // than exist.
     if spec.reader_txn_id != 0 || spec.ttl_active || table_meta.ttl.is_some() {
         return None;
     }
@@ -46,26 +46,6 @@ pub fn scan_resident_hot_store(
         return None;
     }
     scan_hot_store_by_key(&store, spec, 0)
-}
-
-pub fn count_resident_hot_store(
-    hot_mgr: &HotStoreManager,
-    memtable_mgr: &MemTableManager,
-    db: &str,
-    table_meta: &TableMeta,
-    spec: &ScanSpec,
-) -> Option<u64> {
-    if spec.reader_txn_id != 0 || table_meta.ttl.is_some() {
-        return None;
-    }
-    let store = hot_mgr.get(db, &spec.table_name)?;
-    if store.row_count() == 0 {
-        return None;
-    }
-    if !resident_hot_covers(&store, memtable_mgr, db, table_meta, spec) {
-        return None;
-    }
-    count_hot_store_by_key(&store, spec, 0)
 }
 
 /// Partial-residency gate. Returns `(partition_column_index, covers_value)`
@@ -165,26 +145,6 @@ pub fn hybrid_hot_mirror_scan(
     );
     let batch = scan_hot_store_by_key(&store, &mirror_spec, 0)?;
     Some((batch, pk_idx, covers))
-}
-
-/// Count counterpart of [`hybrid_hot_mirror_scan`].
-pub fn hybrid_hot_mirror_count(
-    hot_mgr: &HotStoreManager,
-    memtable_mgr: &MemTableManager,
-    db: &str,
-    table_meta: &TableMeta,
-    spec: &ScanSpec,
-) -> Option<(u64, usize, ScalarValue)> {
-    let store = hot_mgr.get(db, &spec.table_name)?;
-    let (pk_idx, covers) = hybrid_hot_mirror_bound(&store, memtable_mgr, db, table_meta, spec)?;
-    let mirror_spec = spec_with_mirror_bound(
-        spec,
-        pk_idx,
-        &covers,
-        crate::storage::partition::pruning::RangeOp::Gt,
-    );
-    let count = count_hot_store_by_key(&store, &mirror_spec, 0)?;
-    Some((count, pk_idx, covers))
 }
 
 /// The hot store may answer a partition scan alone only when it holds the
@@ -309,14 +269,13 @@ pub fn scan_memtables(
                 // alignment (the old order) evaluated predicates against the
                 // stale layout after a DROP/ADD COLUMN.
                 if memtable_batch_needs_alignment(source, &spec.table_schema) {
-                    let aligned =
-                        match crate::storage::core::memtable::align_batch_to_schema(
-                            source,
-                            &spec.table_schema,
-                        ) {
-                            Ok(batch) => batch,
-                            Err(e) => return Some(Err(e)),
-                        };
+                    let aligned = match crate::storage::core::memtable::align_batch_to_schema(
+                        source,
+                        &spec.table_schema,
+                    ) {
+                        Ok(batch) => batch,
+                        Err(e) => return Some(Err(e)),
+                    };
                     return scan_aligned_memtable_batch(aligned, spec, &txn_positions);
                 }
                 scan_memtable_snapshot(snapshot, spec, &txn_positions)
@@ -441,44 +400,6 @@ pub fn scan_hot_store_by_key(
     };
     Some(projected)
 }
-
-
-pub fn count_hot_store_by_key(store: &HotStore, spec: &ScanSpec, watermark: u64) -> Option<u64> {
-    let (key_value, partition_value) = hot_count_key_partition_values(store, spec)?;
-    let posting_list_only = spec.range_predicates.is_empty()
-        && spec.eq_predicates.iter().all(|(idx, _)| {
-            *idx == store.key_column_index() || Some(*idx) == store.partition_column_index()
-        });
-    if posting_list_only {
-        store.count_by_key_partition_from(key_value, partition_value, watermark)
-    } else {
-        store.count_filtered(
-            key_value,
-            partition_value,
-            watermark,
-            &spec.eq_predicates,
-            &spec.range_predicates,
-        )
-    }
-}
-
-fn hot_count_key_partition_values<'a>(
-    store: &HotStore,
-    spec: &'a ScanSpec,
-) -> Option<(&'a ScalarValue, Option<&'a ScalarValue>)> {
-    if spec.reader_txn_id != 0
-        || !spec.in_predicates.is_empty()
-        || spec.remaining_predicate.is_some()
-    {
-        return None;
-    }
-    let key_idx = store.key_column_index();
-    let partition_col_idx = store.partition_column_index();
-    let key_value = spec.eq_value_for_column(key_idx)?;
-    let partition_value = partition_col_idx.and_then(|idx| spec.eq_value_for_column(idx));
-    Some((key_value, partition_value))
-}
-
 
 fn apply_projection(batch: &RecordBatch, projection: &[usize]) -> RecordBatch {
     let mut col_defs = Vec::with_capacity(projection.len());
@@ -611,7 +532,7 @@ fn scan_memtable_snapshot(
         return Some(Ok(apply_projection(source, proj)));
     }
     Some(Ok(
-        Arc::try_unwrap(snapshot).unwrap_or_else(|shared| shared.as_ref().clone()),
+        Arc::try_unwrap(snapshot).unwrap_or_else(|shared| shared.as_ref().clone())
     ))
 }
 
@@ -704,232 +625,5 @@ fn reverse_batch(batch: &RecordBatch) -> Option<RecordBatch> {
 }
 
 #[cfg(test)]
-mod audit_tests {
-    use super::*;
-    use std::sync::Arc;
-    use crate::protocol::types::DataType;
-    use crate::storage::catalog::schema::TtlInfo;
-    use crate::types::batch::{ColumnDef, Schema};
-
-    fn col(name: &str) -> ColumnDef {
-        ColumnDef::new(name, DataType::Int64)
-    }
-
-    /// P0: a transactional reader's tombstone filter used to run BEFORE the
-    /// catalog alignment, so predicates evaluated against the memtable's
-    /// insert-time layout while using catalog-space column indices. Layout:
-    /// memtable keeps (a, id, v); the catalog dropped `a` and is (id, v).
-    /// The `id >= 2` clause (catalog index 0) used to hit the `a` column
-    /// and matched nothing.
-    #[test]
-    fn txn_memtable_scan_aligns_before_tombstone_predicate_eval() {
-        let old_schema = Schema::new(vec![col("a"), col("id"), col("v")]);
-        let catalog_schema = Schema::new(vec![col("id"), col("v")]);
-
-        let manager = MemTableManager::new(10_000, 60, 2, 3600);
-        let registry = Arc::new(
-            crate::storage::core::txn_mutations::TxnMutationRegistry::new(),
-        );
-        manager.set_txn_mutations(Arc::clone(&registry));
-
-        let memtable = manager.get_or_create("main", "t", "", &old_schema);
-        let mut batch = RecordBatch::new(old_schema.clone());
-        for (a, id, v) in [(0, 1, 10), (0, 2, 20), (0, 3, 30)] {
-            batch.column_mut(0).unwrap().push(&ScalarValue::Int64(Some(a))).unwrap();
-            batch.column_mut(1).unwrap().push(&ScalarValue::Int64(Some(id))).unwrap();
-            batch.column_mut(2).unwrap().push(&ScalarValue::Int64(Some(v))).unwrap();
-        }
-        memtable.append(&batch).unwrap();
-        // Deferred delete inside txn 9 (position 0 = the id = 1 row): forces
-        // the tombstone-filtered branch under test.
-        registry
-            .register_memtable_tombstones(9, "main", "t", None, Arc::clone(&memtable), [0u32])
-            .unwrap();
-
-        let mut spec = ScanSpec::new("t");
-        spec.table_schema = catalog_schema.clone();
-        spec.reader_txn_id = 9;
-        spec.range_predicates.push(crate::storage::partition::pruning::RangeClause {
-            column_index: 0, // catalog `id`
-            op: crate::storage::partition::pruning::RangeOp::Ge,
-            value: ScalarValue::Int64(Some(2)),
-        });
-
-        let hot_mgr = crate::storage::core::hot_store::HotStoreManager::new();
-        let batches = scan_memtables(&manager, &hot_mgr, "main", "t", &spec).unwrap();
-        assert_eq!(batches.len(), 1);
-        let batch = &batches[0];
-        assert_eq!(batch.num_rows(), 2, "ids 2 and 3 match id >= 2");
-        assert_eq!(batch.schema.columns.len(), 2);
-        assert_eq!(batch.schema.columns[0].name, "id");
-        match batch.column(0).unwrap() {
-            crate::types::array::ColumnArray::Int64 { data, .. } => {
-                assert_eq!(data, &vec![2i64, 3]);
-            }
-            other => panic!("expected int64 id column, got {other:?}"),
-        }
-    }
-
-    /// P0: the resident hot-store shortcut truncated its gather at the
-    /// pushed LIMIT before TTL filtering runs. With expired rows present the
-    /// query returned fewer live rows than exist, so the shortcut must be
-    /// disabled for TTL tables — the same gate count_resident_hot_store has
-    /// always had.
-    #[test]
-    fn resident_hot_scan_declines_ttl_tables() {
-        use crate::storage::catalog::schema::TableMeta;
-
-        let schema = Schema::new(vec![
-            ColumnDef::new("category", DataType::VarChar),
-            ColumnDef::new("ts", DataType::Timestamp),
-            ColumnDef::new("price", DataType::Float64),
-            ColumnDef::new("volume", DataType::Int64),
-        ]);
-        let mut meta = TableMeta::new("main", "events", schema.columns.clone());
-        meta.cluster_key = vec!["category".to_string(), "ts".to_string()];
-        meta.hot_time_column = Some("ts".to_string());
-
-        let hot_mgr = crate::storage::core::hot_store::HotStoreManager::new();
-        let memtable_mgr = MemTableManager::new(10_000, 60, 2, 3600);
-        let mut batch = RecordBatch::new(schema.clone());
-        for i in 0..3i64 {
-            batch
-                .column_mut(0)
-                .unwrap()
-                .push(&ScalarValue::VarChar(Some("alpha".into())))
-                .unwrap();
-            batch
-                .column_mut(1)
-                .unwrap()
-                .push(&ScalarValue::Timestamp(Some(1_000 + i)))
-                .unwrap();
-            batch
-                .column_mut(2)
-                .unwrap()
-                .push(&ScalarValue::Float64(Some(10.0)))
-                .unwrap();
-            batch
-                .column_mut(3)
-                .unwrap()
-                .push(&ScalarValue::Int64(Some(i)))
-                .unwrap();
-        }
-        hot_mgr.try_append("main", "events", &meta, &batch).unwrap();
-        // The resident shortcut only answers while the store claims full
-        // residency (close-of-day / restart warmup marks this in production).
-        hot_mgr
-            .get("main", "events")
-            .unwrap()
-            .mark_full_resident();
-
-        let mut spec = ScanSpec::new("events");
-        spec.table_schema = schema.clone();
-        spec.eq_predicates.push((
-            0,
-            ScalarValue::VarChar(Some("alpha".into())),
-        ));
-        spec.limit = Some(2);
-
-        // Control: without a TTL the shortcut serves the lookup.
-        assert!(
-            scan_resident_hot_store(&hot_mgr, &memtable_mgr, "main", &meta, &spec).is_some(),
-            "control: no TTL, resident shortcut must serve the lookup"
-        );
-
-        // With a TTL the shortcut must decline regardless of the spec flag.
-        meta.ttl = Some(TtlInfo {
-            column: "ts".to_string(),
-            duration_secs: 60,
-            column_idx: 1,
-        });
-        spec.ttl_active = true;
-        assert!(scan_resident_hot_store(&hot_mgr, &memtable_mgr, "main", &meta, &spec).is_none());
-        // Hand-built specs that forgot to raise the flag are still stopped
-        // by the authoritative table-meta check.
-        spec.ttl_active = false;
-        assert!(scan_resident_hot_store(&hot_mgr, &memtable_mgr, "main", &meta, &spec).is_none());
-    }
-
-    /// P0: the resident hot-store lookup consumed `spec.limit` as a row cap
-    /// even when a DISTINCT / aggregate / window wrapper above the scan needs
-    /// every row — the dedup or aggregate then ran over truncated input and
-    /// returned wrong results. The shared pushdown gate must refuse a cap for
-    /// those shapes.
-    #[test]
-    fn resident_hot_scan_does_not_truncate_distinct_or_aggregate_shapes() {
-        use crate::storage::catalog::schema::TableMeta;
-
-        let schema = Schema::new(vec![
-            ColumnDef::new("category", DataType::VarChar),
-            ColumnDef::new("ts", DataType::Timestamp),
-            ColumnDef::new("volume", DataType::Int64),
-        ]);
-        let mut meta = TableMeta::new("main", "events", schema.columns.clone());
-        meta.cluster_key = vec!["category".to_string(), "ts".to_string()];
-        meta.hot_time_column = Some("ts".to_string());
-
-        let hot_mgr = crate::storage::core::hot_store::HotStoreManager::new();
-        let memtable_mgr = MemTableManager::new(10_000, 60, 2, 3600);
-        let mut batch = RecordBatch::new(schema.clone());
-        for i in 0..6i64 {
-            batch
-                .column_mut(0)
-                .unwrap()
-                .push(&ScalarValue::VarChar(Some("alpha".into())))
-                .unwrap();
-            batch
-                .column_mut(1)
-                .unwrap()
-                .push(&ScalarValue::Timestamp(Some(1_000 + i)))
-                .unwrap();
-            batch
-                .column_mut(2)
-                .unwrap()
-                .push(&ScalarValue::Int64(Some(i / 2)))
-                .unwrap();
-        }
-        hot_mgr.try_append("main", "events", &meta, &batch).unwrap();
-        hot_mgr
-            .get("main", "events")
-            .unwrap()
-            .mark_full_resident();
-
-        let base_spec = |has_distinct: bool| {
-            let mut spec = ScanSpec::new("events");
-            spec.table_schema = schema.clone();
-            spec.eq_predicates.push((0, ScalarValue::VarChar(Some("alpha".into()))));
-            spec.limit = Some(2);
-            spec.has_distinct_or_window = has_distinct;
-            spec
-        };
-
-        // Control: a plain shape keeps the pushed cap.
-        let plain = base_spec(false);
-        let batch = scan_resident_hot_store(&hot_mgr, &memtable_mgr, "main", &meta, &plain)
-            .expect("plain shape keeps the resident shortcut");
-        assert_eq!(batch.num_rows(), 2, "plain LIMIT shape is capped at 2");
-
-        // DISTINCT wrapper: the scan must return every matching row so the
-        // dedup above sees all of them (3 distinct volumes among 6 rows).
-        let distinct = base_spec(true);
-        let batch = scan_resident_hot_store(&hot_mgr, &memtable_mgr, "main", &meta, &distinct)
-            .expect("distinct shape still uses the resident shortcut");
-        assert_eq!(
-            batch.num_rows(),
-            6,
-            "DISTINCT must not be truncated by the pushed LIMIT"
-        );
-
-        // Aggregate wrapper: same contract.
-        let mut aggregate = base_spec(false);
-        aggregate.has_distinct_or_window = false;
-        aggregate.has_aggregate = true;
-        let batch = scan_resident_hot_store(&hot_mgr, &memtable_mgr, "main", &meta, &aggregate)
-            .expect("aggregate shape still uses the resident shortcut");
-        assert_eq!(
-            batch.num_rows(),
-            6,
-            "aggregates must not be truncated by the pushed LIMIT"
-        );
-    }
-}
+#[path = "memtable_test.rs"]
+mod audit_tests;

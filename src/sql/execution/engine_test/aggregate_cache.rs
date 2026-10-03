@@ -182,20 +182,35 @@ fn count_star_with_predicate_on_added_column_matches_default_fill() -> Result<()
         "ALTER TABLE t ADD COLUMN score INT64 DEFAULT 7",
     )?;
     // Post-ADD rows stay resident for the first assertions.
-    engine.execute(&mut session, "INSERT INTO t (id, v, score) VALUES (51, 51, 7), (52, 52, 8)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t (id, v, score) VALUES (51, 51, 7), (52, 52, 8)",
+    )?;
 
     // Single-eq fast path over the default-carrying segment.
     assert_eq!(
-        count_star(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE score = 7"),
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE score = 7"
+        ),
         51,
         "50 default rows + 1 new score=7 row"
     );
     assert_eq!(
-        count_star(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE score = 8"),
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE score = 8"
+        ),
         1
     );
     assert_eq!(
-        count_star(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE score = 99"),
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE score = 99"
+        ),
         0
     );
 
@@ -213,7 +228,11 @@ fn count_star_with_predicate_on_added_column_matches_default_fill() -> Result<()
     // Aggregate pipeline: the metadata segment prune used to fail the same
     // alignment.
     assert_eq!(
-        count_star(&engine, &mut session, "SELECT COUNT(score) FROM t WHERE score = 7"),
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(score) FROM t WHERE score = 7"
+        ),
         51,
     );
 
@@ -221,24 +240,43 @@ fn count_star_with_predicate_on_added_column_matches_default_fill() -> Result<()
     // column, next to the old one that does not.
     engine.flush_table_buffers("main", "t")?;
     assert_eq!(
-        count_star(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE score = 7"),
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE score = 7"
+        ),
         51
     );
     assert_eq!(
-        count_star(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE score = 8"),
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE score = 8"
+        ),
         1
     );
     assert_eq!(
-        count_star(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE id <= 50"),
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE id <= 50"
+        ),
         50
     );
-    assert_eq!(count_star(&engine, &mut session, "SELECT COUNT(*) FROM t"), 52);
+    assert_eq!(
+        count_star(&engine, &mut session, "SELECT COUNT(*) FROM t"),
+        52
+    );
 
     // A column added without a DEFAULT carries NULL on old rows, and NULL
     // never satisfies '='.
     engine.execute(&mut session, "ALTER TABLE t ADD COLUMN note VARCHAR")?;
     assert_eq!(
-        count_star(&engine, &mut session, "SELECT COUNT(*) FROM t WHERE note = 'x'"),
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE note = 'x'"
+        ),
         0
     );
     Ok(())

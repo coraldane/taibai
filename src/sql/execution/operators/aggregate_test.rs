@@ -462,11 +462,12 @@ fn grouped_sum_overflow_errors_instead_of_wrapping() {
 
 #[test]
 fn nan_keys_share_one_canonical_encoding() {
-    use crate::types::array::ColumnArray;
     use crate::protocol::types::DataType as Dt;
+    use crate::types::array::ColumnArray;
     let mut col = ColumnArray::empty(Dt::Float64);
     for v in [f64::NAN, -f64::NAN] {
-        col.push(&crate::types::scalar::ScalarValue::Float64(Some(v))).unwrap();
+        col.push(&crate::types::scalar::ScalarValue::Float64(Some(v)))
+            .unwrap();
     }
     let mut k1 = Vec::new();
     col.encode_key_at(0, &mut k1);

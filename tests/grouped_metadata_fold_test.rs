@@ -171,7 +171,12 @@ fn group_by_partition_key_folds_deletes_and_memtable_rows() {
         "DELETE FROM ticks WHERE deal_date = 20240102 AND security_id IN ('s11', 's12', 's13', 's14', 's15')",
     );
     // Unflushed rows for a brand-new day and for an existing day.
-    insert_days(&engine, &mut session, &[(20240104, 6), (20240101, 3)], &mut id);
+    insert_days(
+        &engine,
+        &mut session,
+        &[(20240104, 6), (20240101, 3)],
+        &mut id,
+    );
 
     let folded = grouped_i64_rows(
         &engine,
@@ -184,12 +189,8 @@ fn group_by_partition_key_folds_deletes_and_memtable_rows() {
         "SELECT deal_date, COUNT(*) FROM ticks GROUP BY deal_date HAVING COUNT(*) >= 0",
     );
     assert_eq!(folded, fallback);
-    let expected: BTreeMap<i64, i64> = BTreeMap::from([
-        (20240101, 13),
-        (20240102, 5),
-        (20240103, 10),
-        (20240104, 6),
-    ]);
+    let expected: BTreeMap<i64, i64> =
+        BTreeMap::from([(20240101, 13), (20240102, 5), (20240103, 10), (20240104, 6)]);
     assert_eq!(folded, expected);
     engine.segment_mgr().shutdown();
 }
@@ -332,7 +333,12 @@ fn group_by_survives_key_column_rename() {
     let (_temp_dir, engine, mut session) = create_engine();
     create_day_table(&engine, &mut session);
     let mut id = 0i64;
-    insert_days(&engine, &mut session, &[(20240101, 6), (20240102, 9)], &mut id);
+    insert_days(
+        &engine,
+        &mut session,
+        &[(20240101, 6), (20240102, 9)],
+        &mut id,
+    );
     exec(&engine, &mut session, "FLUSH TABLE ticks");
     exec(
         &engine,
@@ -455,7 +461,12 @@ fn multi_column_group_by_stays_exact() {
     let (_temp_dir, engine, mut session) = create_engine();
     create_day_table(&engine, &mut session);
     let mut id = 0i64;
-    insert_days(&engine, &mut session, &[(20240101, 6), (20240102, 6)], &mut id);
+    insert_days(
+        &engine,
+        &mut session,
+        &[(20240101, 6), (20240102, 6)],
+        &mut id,
+    );
     exec(&engine, &mut session, "FLUSH TABLE ticks");
 
     let collect = |session: &mut Session, sql: &str| -> Vec<String> {

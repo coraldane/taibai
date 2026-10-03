@@ -1245,7 +1245,11 @@ fn fast_insert_path_matches_standard_path() -> Result<()> {
                 2 => format!("-{:.2}", (rng.next() % 50_000) as i64 as f64 / 100.0),
                 _ => format!("{}", rng.next() % 100_000),
             };
-            let active = if rng.next().is_multiple_of(2) { "true" } else { "false" };
+            let active = if rng.next().is_multiple_of(2) {
+                "true"
+            } else {
+                "false"
+            };
             let small = match rng.next() % 4 {
                 0 => "NULL".to_string(),
                 1 => i32::MIN.to_string(),

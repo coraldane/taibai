@@ -825,7 +825,11 @@ fn replace_crash_between_footer_rewrite_and_commit_rolls_back_on_restart() -> Re
     // Restart: startup recovery must restore the pre-statement footer.
     let engine = Engine::new(dir.path(), "main")?;
     let mut session2 = session();
-    let count = first_i64(engine.execute(&mut session2, "SELECT COUNT(*) FROM t")?, 0, 0);
+    let count = first_i64(
+        engine.execute(&mut session2, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
     assert_eq!(count, 4, "conflict rows restored by journal rollback");
     for id in 1..=4i64 {
         let value = first_i64(
@@ -841,13 +845,15 @@ fn replace_crash_between_footer_rewrite_and_commit_rolls_back_on_restart() -> Re
         leftover_del_journals(&engine, "main", "t").is_empty(),
         "restart consumes the rolled-back journal"
     );
-    let rollback_log =
-        crate::storage::segment::reader::footer_rollback_log_path(dir.path());
+    let rollback_log = crate::storage::segment::reader::footer_rollback_log_path(dir.path());
     let drained = match std::fs::read_to_string(&rollback_log) {
         Ok(content) => content.trim().is_empty(),
         Err(_) => true,
     };
-    assert!(drained, "rollback compensation log must be drained on startup");
+    assert!(
+        drained,
+        "rollback compensation log must be drained on startup"
+    );
     Ok(())
 }
 
@@ -886,4 +892,3 @@ fn replace_clears_statement_journals_after_durable_commit() -> Result<()> {
     );
     Ok(())
 }
-

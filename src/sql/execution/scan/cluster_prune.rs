@@ -35,23 +35,42 @@ pub(crate) fn cluster_segment_range(
     let upper_tuple = search_tuple_for_bounds(&bounds.prefix_eq, bounds.upper.as_ref());
 
     let start = match (&bounds.lower, &bounds.upper) {
-        (Some(_), _) => {
-            first_segment_with_max_tuple_at_least(segments, mgr, table_schema, &key_cols, &lower_tuple)?
-        }
+        (Some(_), _) => first_segment_with_max_tuple_at_least(
+            segments,
+            mgr,
+            table_schema,
+            &key_cols,
+            &lower_tuple,
+        )?,
         // No lower bound: only the equality prefix may narrow the start
         // (compared without the range value — every prefix row still
         // qualifies). With an empty prefix, scanning starts at 0.
         (None, Some(_)) if !bounds.prefix_eq.is_empty() => {
-            let prefix_tuple: Vec<ScalarValue> =
-                bounds.prefix_eq.iter().map(|(_, value)| value.clone()).collect();
+            let prefix_tuple: Vec<ScalarValue> = bounds
+                .prefix_eq
+                .iter()
+                .map(|(_, value)| value.clone())
+                .collect();
             let prefix_cols = &key_cols[..bounds.prefix_eq.len()];
-            first_segment_with_max_tuple_at_least(segments, mgr, table_schema, prefix_cols, &prefix_tuple)?
+            first_segment_with_max_tuple_at_least(
+                segments,
+                mgr,
+                table_schema,
+                prefix_cols,
+                &prefix_tuple,
+            )?
         }
         _ => 0,
     };
     let end = match &bounds.upper {
         Some(_) => {
-            let end = last_segment_with_min_tuple_at_most(segments, mgr, table_schema, &key_cols, &upper_tuple)?;
+            let end = last_segment_with_min_tuple_at_most(
+                segments,
+                mgr,
+                table_schema,
+                &key_cols,
+                &upper_tuple,
+            )?;
             if end < 0 {
                 return Some((1, 0));
             }
@@ -107,7 +126,8 @@ fn first_segment_with_max_tuple_at_least(
     let mut hi = segments.len();
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let cmp = compare_segment_zone_tuple(mgr, &segments[mid], table_schema, key_cols, tuple, true)?;
+        let cmp =
+            compare_segment_zone_tuple(mgr, &segments[mid], table_schema, key_cols, tuple, true)?;
         if cmp == std::cmp::Ordering::Less {
             lo = mid + 1;
         } else {
@@ -130,7 +150,8 @@ fn last_segment_with_min_tuple_at_most(
     let mut hi = segments.len();
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let cmp = compare_segment_zone_tuple(mgr, &segments[mid], table_schema, key_cols, tuple, false)?;
+        let cmp =
+            compare_segment_zone_tuple(mgr, &segments[mid], table_schema, key_cols, tuple, false)?;
         if cmp != std::cmp::Ordering::Greater {
             lo = mid + 1;
         } else {
@@ -221,10 +242,7 @@ fn search_tuple_for_bounds(
     tuple
 }
 
-fn compare_scalar_tuples(
-    left: &[ScalarValue],
-    right: &[ScalarValue],
-) -> std::cmp::Ordering {
+fn compare_scalar_tuples(left: &[ScalarValue], right: &[ScalarValue]) -> std::cmp::Ordering {
     for (l, r) in left.iter().zip(right.iter()) {
         let cmp = sort_cmp(l, r);
         if cmp != std::cmp::Ordering::Equal {
@@ -235,9 +253,6 @@ fn compare_scalar_tuples(
 }
 
 #[inline]
-fn sort_cmp(
-    a: &ScalarValue,
-    b: &ScalarValue,
-) -> std::cmp::Ordering {
+fn sort_cmp(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
     crate::storage::index::sort_key::compare_scalars_for_sort(a, b)
 }

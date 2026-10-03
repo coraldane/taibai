@@ -297,19 +297,17 @@ async fn apply(
                 &table_dir,
                 memtable_id,
             )? {
-                Some(path) => {
-                    match crate::storage::core::durable_tail::tail_last_lsn(&path)? {
-                        Some(tail_lsn) if tail_lsn >= last_lsn => true,
-                        Some(tail_lsn) if tail_lsn >= first_lsn => {
-                            return Err(TaibaiError::Storage(format!(
+                Some(path) => match crate::storage::core::durable_tail::tail_last_lsn(&path)? {
+                    Some(tail_lsn) if tail_lsn >= last_lsn => true,
+                    Some(tail_lsn) if tail_lsn >= first_lsn => {
+                        return Err(TaibaiError::Storage(format!(
                                 "replication replay for memtable {memtable_id} partially applied \
                                  (tail ends at lsn {tail_lsn}, event spans {first_lsn}..{last_lsn}); \
                                  the tail needs manual inspection"
                             )));
-                        }
-                        _ => false,
                     }
-                }
+                    _ => false,
+                },
                 None => false,
             };
             if !replayed {

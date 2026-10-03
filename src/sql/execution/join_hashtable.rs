@@ -94,9 +94,9 @@ impl ScalarValueHashable {
             ColumnArray::UInt16 { data, .. } => Self::Int64(Some(data[row] as i64)),
             ColumnArray::UInt32 { data, .. } => Self::Int64(Some(data[row] as i64)),
             ColumnArray::UInt64 { data, .. } => Self::UInt64(Some(data[row])),
-            ColumnArray::Float32 { data, .. } => {
-                Self::FloatToI64(Some(crate::types::scalar::float_key_bits(data[row] as f64) as i64))
-            }
+            ColumnArray::Float32 { data, .. } => Self::FloatToI64(Some(
+                crate::types::scalar::float_key_bits(data[row] as f64) as i64,
+            )),
             ColumnArray::Float64 { data, .. } => {
                 Self::FloatToI64(Some(crate::types::scalar::float_key_bits(data[row]) as i64))
             }
@@ -105,9 +105,7 @@ impl ScalarValueHashable {
             ColumnArray::Time { data, .. } => Self::Time(Some(data[row])),
             ColumnArray::Timestamp { data, .. } => Self::Timestamp(Some(data[row])),
             ColumnArray::Interval { data, .. } => Self::Int64(Some(data[row])),
-            ColumnArray::Blob { data, .. } => {
-                Self::Blob(Some(data.value(row).to_vec()))
-            }
+            ColumnArray::Blob { data, .. } => Self::Blob(Some(data.value(row).to_vec())),
             ColumnArray::Vector { data, .. } => Self::Vector(Some(
                 data[row]
                     .iter()
@@ -130,12 +128,12 @@ impl ScalarValueHashable {
             ScalarValue::UInt16(i) => ScalarValueHashable::Int64(i.map(|v| v as i64)),
             ScalarValue::UInt32(i) => ScalarValueHashable::Int64(i.map(|v| v as i64)),
             ScalarValue::UInt64(i) => ScalarValueHashable::UInt64(*i),
-            ScalarValue::Float32(f) => {
-                ScalarValueHashable::FloatToI64(f.map(|v| crate::types::scalar::float_key_bits(v as f64) as i64))
-            }
-            ScalarValue::Float64(f) => {
-                ScalarValueHashable::FloatToI64(f.map(|v| crate::types::scalar::float_key_bits(v) as i64))
-            }
+            ScalarValue::Float32(f) => ScalarValueHashable::FloatToI64(
+                f.map(|v| crate::types::scalar::float_key_bits(v as f64) as i64),
+            ),
+            ScalarValue::Float64(f) => ScalarValueHashable::FloatToI64(
+                f.map(|v| crate::types::scalar::float_key_bits(v) as i64),
+            ),
             ScalarValue::VarChar(s) => ScalarValueHashable::VarChar(s.clone()),
             ScalarValue::Date(d) => ScalarValueHashable::Date(*d),
             ScalarValue::Time(t) => ScalarValueHashable::Time(*t),
@@ -143,14 +141,12 @@ impl ScalarValueHashable {
             ScalarValue::Decimal(d) => ScalarValueHashable::Int64(*d),
             ScalarValue::Interval(i) => ScalarValueHashable::Int64(*i),
             ScalarValue::Blob(b) => ScalarValueHashable::Blob(b.clone()),
-            ScalarValue::Vector(v) => ScalarValueHashable::Vector(v.as_ref().map(
-                |elements| {
-                    elements
-                        .iter()
-                        .map(|v| crate::types::scalar::float_key_bits(*v as f64) as i64)
-                        .collect()
-                },
-            )),
+            ScalarValue::Vector(v) => ScalarValueHashable::Vector(v.as_ref().map(|elements| {
+                elements
+                    .iter()
+                    .map(|v| crate::types::scalar::float_key_bits(*v as f64) as i64)
+                    .collect()
+            })),
         }
     }
 

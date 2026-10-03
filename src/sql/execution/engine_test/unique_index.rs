@@ -393,23 +393,27 @@ fn update_rewrites_segments_and_auto_rebuilds_index() -> Result<()> {
     // invalidation), while the updated row itself is memtable-resident
     // until the next flush.
     engine.execute(&mut session, "UPDATE t SET code = 21 WHERE id = 1")?;
-    assert!(!invalid_file.exists(), "maintenance stays eager, no invalidation");
+    assert!(
+        !invalid_file.exists(),
+        "maintenance stays eager, no invalidation"
+    );
     assert_eq!(
-        engine
-            .index_manager()
-            .unique_key_exists("main", "t", "uk_code", &[ScalarValue::Int64(Some(21))])?,
+        engine.index_manager().unique_key_exists(
+            "main",
+            "t",
+            "uk_code",
+            &[ScalarValue::Int64(Some(21))]
+        )?,
         Some(true),
         "the new key is visible immediately"
     );
     assert_eq!(
-        engine
-            .index_manager()
-            .unique_key_exists(
-                "main",
-                "t",
-                "uk_code",
-                &[ScalarValue::Int64(Some(10))],
-            )?,
+        engine.index_manager().unique_key_exists(
+            "main",
+            "t",
+            "uk_code",
+            &[ScalarValue::Int64(Some(10))],
+        )?,
         Some(false),
         "the old key is retired incrementally"
     );

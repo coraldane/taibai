@@ -162,7 +162,10 @@ fn startup_recovery_restores_torn_footer_from_undo() {
     // Tear the embedded footer the way a crash between set_len and the write
     // would: truncate the file into the middle of the data block.
     let torn_len = segment.metadata().unwrap().len() / 2;
-    let file = std::fs::OpenOptions::new().write(true).open(&segment).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&segment)
+        .unwrap();
     file.set_len(torn_len).unwrap();
     drop(file);
     assert!(SegmentReader::open(&segment).is_err());
@@ -335,7 +338,10 @@ fn drain_handles_missing_log_and_missing_segments() {
     let rollback_log = footer_rollback_log_path(dir.path());
     std::fs::write(
         &rollback_log,
-        format!("main\tt\t{}\n", dir.path().join("main").join("t").join("gone.dat").display()),
+        format!(
+            "main\tt\t{}\n",
+            dir.path().join("main").join("t").join("gone.dat").display()
+        ),
     )
     .unwrap();
     drain_footer_rollback_compensations(dir.path(), |_, _, _| panic!("segment is gone"));

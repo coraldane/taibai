@@ -350,7 +350,10 @@ fn eval_in_column_literal_hashed(
     let col_idx = schema.index_of(col_name.as_str())?;
     let col = batch.column(col_idx)?;
     let dtype = schema.columns[col_idx].data_type;
-    if matches!(dtype, DataType::Blob | DataType::Vector | DataType::Interval) {
+    if matches!(
+        dtype,
+        DataType::Blob | DataType::Vector | DataType::Interval
+    ) {
         return None;
     }
 
@@ -376,9 +379,7 @@ fn eval_in_column_literal_hashed(
     // from_column flattens view forms per row; flatten once up front.
     let flattened;
     let col = match col {
-        ColumnArray::Selected { .. }
-        | ColumnArray::Rle { .. }
-        | ColumnArray::Dictionary { .. } => {
+        ColumnArray::Selected { .. } | ColumnArray::Rle { .. } | ColumnArray::Dictionary { .. } => {
             flattened = col.flattened();
             flattened
         }
@@ -655,9 +656,7 @@ pub fn eval_expr_for_row(
             // LEFT operand for every other shape (Mul/Div/Mod, floats, Int32
             // columns), silently mis-filtering DML WHERE rows.
             Ok(super::operators::filter::eval_binary_scalar(
-                &left_val,
-                op,
-                &right_val,
+                &left_val, op, &right_val,
             ))
         }
         Expr::IsNull(inner) => Ok(ScalarValue::Bool(Some(

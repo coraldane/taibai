@@ -331,7 +331,9 @@ fn count_eq_fixed_le8(
             continue;
         }
         if offset + 8 > data.len() {
-            return Err(TaibaiError::Storage("fixed column scan exceeds data".into()));
+            return Err(TaibaiError::Storage(
+                "fixed column scan exceeds data".into(),
+            ));
         }
         let val = i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
         if val == target {
@@ -355,7 +357,9 @@ fn count_eq_fixed_le4(
             continue;
         }
         if offset + 4 > data.len() {
-            return Err(TaibaiError::Storage("fixed column scan exceeds data".into()));
+            return Err(TaibaiError::Storage(
+                "fixed column scan exceeds data".into(),
+            ));
         }
         let val = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
         if val == target {
@@ -379,7 +383,9 @@ fn count_eq_fixed_le2(
             continue;
         }
         if offset + 2 > data.len() {
-            return Err(TaibaiError::Storage("fixed column scan exceeds data".into()));
+            return Err(TaibaiError::Storage(
+                "fixed column scan exceeds data".into(),
+            ));
         }
         let val = i16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
         if val == target {
@@ -403,7 +409,9 @@ fn count_eq_fixed_le1(
             continue;
         }
         if offset + 1 > data.len() {
-            return Err(TaibaiError::Storage("fixed column scan exceeds data".into()));
+            return Err(TaibaiError::Storage(
+                "fixed column scan exceeds data".into(),
+            ));
         }
         if data[offset] as i8 == target {
             count += 1;
@@ -426,7 +434,9 @@ fn count_eq_fixed_le8f(
             continue;
         }
         if offset + 8 > data.len() {
-            return Err(TaibaiError::Storage("fixed column scan exceeds data".into()));
+            return Err(TaibaiError::Storage(
+                "fixed column scan exceeds data".into(),
+            ));
         }
         let val = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
         if val == target {
@@ -450,7 +460,9 @@ fn count_eq_fixed_le4f(
             continue;
         }
         if offset + 4 > data.len() {
-            return Err(TaibaiError::Storage("fixed column scan exceeds data".into()));
+            return Err(TaibaiError::Storage(
+                "fixed column scan exceeds data".into(),
+            ));
         }
         let val = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
         if val == target {
@@ -482,7 +494,9 @@ fn count_eq_varchar(
         let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
         if pos + len > data.len() {
-            return Err(TaibaiError::Storage("variable column value truncated".into()));
+            return Err(TaibaiError::Storage(
+                "variable column value truncated".into(),
+            ));
         }
         if &data[pos..pos + len] == target_bytes {
             count += 1;
@@ -953,9 +967,9 @@ fn fold_plain_rle_runs(
         let len = read_u32_le(&mut cursor)? as u64;
         // The runs must cover the block's non-null rows: reject a payload
         // whose run lengths outrun the bitmap's row capacity (or overflow).
-        covered = covered.checked_add(len).ok_or_else(|| {
-            TaibaiError::Storage("RLE run lengths overflow row coverage".into())
-        })?;
+        covered = covered
+            .checked_add(len)
+            .ok_or_else(|| TaibaiError::Storage("RLE run lengths overflow row coverage".into()))?;
         if covered > max_rows as u64 {
             return Err(TaibaiError::Storage(format!(
                 "run lengths cover {} rows, exceeding the block's bitmap capacity of {}",
@@ -1001,196 +1015,8 @@ fn fold_delta_rle_runs(
 }
 
 #[cfg(test)]
-mod run_fold_tests {
-    use super::*;
-    use crate::storage::codec::column_codec::{
-        decode_i64_delta_rle_payload, decode_i64_rle_payload, encode_i64_delta_rle_payload,
-    };
-
-    /// Reference fold: expand the payload, filter per value, aggregate.
-    fn reference_fold(values: &[i64], predicates: &[RunPredicate]) -> RunFold {
-        let mut out = RunFold::default();
-        for &value in values {
-            if predicates.iter().all(|p| p.matches(value)) {
-                if !out.any {
-                    out.min = value;
-                    out.max = value;
-                    out.any = true;
-                } else {
-                    out.min = out.min.min(value);
-                    out.max = out.max.max(value);
-                }
-                out.matched_rows += 1;
-                out.sum_i = out.sum_i.wrapping_add(value);
-            }
-        }
-        out
-    }
-
-    fn raw_column(payload: &[u8], tag: u8, null_rows: usize, non_null: usize) -> Vec<u8> {
-        // bitmap_len = 0 + [magic][tag][payload] — a null-free column (the
-        // fold never consults the bitmap; runs cover only non-null values).
-        let bitmap = crate::types::bitmap::NullBitmap::new_valid(non_null + null_rows);
-        let bitmap_bytes = bitmap.to_bytes();
-        let mut raw = Vec::with_capacity(4 + bitmap_bytes.len() + 6 + payload.len());
-        raw.extend_from_slice(&(bitmap_bytes.len() as u32).to_le_bytes());
-        raw.extend_from_slice(&bitmap_bytes);
-        raw.extend_from_slice(COLUMN_ENCODING_MAGIC);
-        raw.push(tag);
-        raw.extend_from_slice(payload);
-        raw
-    }
-
-    fn sample_values() -> Vec<i64> {
-        // Long runs, negatives, zeros, repeated extremes.
-        let mut values = Vec::new();
-        for &(value, len) in &[
-            (10i64, 40usize),
-            (-5, 30),
-            (0, 25),
-            (100, 20),
-            (7, 35),
-            (-100, 10),
-            (10, 20),
-        ] {
-            values.extend(std::iter::repeat_n(value, len));
-        }
-        values
-    }
-
-    fn int_pred(op: RangeOp, value: i128) -> RunPredicate {
-        RunPredicate::Int { op, value }
-    }
-
-    #[test]
-    fn delta_rle_run_fold_matches_reference_across_predicates() {
-        let values = sample_values();
-        let payload = encode_i64_delta_rle_payload(&values);
-        assert_eq!(
-            decode_i64_delta_rle_payload(&payload, values.len()).unwrap(),
-            values,
-            "fixture must round-trip"
-        );
-        let raw = raw_column(
-            &payload,
-            crate::storage::codec::encoding::EncodingType::DeltaRle.to_u8(),
-            0,
-            values.len(),
-        );
-
-        let cases: Vec<Vec<RunPredicate>> = vec![
-            vec![],
-            vec![int_pred(RangeOp::Gt, 7)],
-            vec![int_pred(RangeOp::Ge, 0)],
-            vec![int_pred(RangeOp::Lt, 50)],
-            vec![int_pred(RangeOp::Le, 10)],
-            vec![int_pred(RangeOp::Eq, 10)],
-            vec![int_pred(RangeOp::Gt, -100), int_pred(RangeOp::Lt, 100)],
-            vec![int_pred(RangeOp::Gt, 1000)],
-        ];
-        for predicates in cases {
-            let folded = fold_runs_from_raw(&raw, &predicates)
-                .expect("adaptive column")
-                .expect("fold ok");
-            let reference = reference_fold(&values, &predicates);
-            assert_eq!(
-                folded, reference,
-                "mismatch for predicates {:?}",
-                predicates
-            );
-        }
-    }
-
-    #[test]
-    fn plain_rle_run_fold_matches_reference() {
-        let values = sample_values();
-        // Re-encode as plain Rle (value + u32 len per run).
-        let mut runs: Vec<(i64, u32)> = Vec::new();
-        for &value in &values {
-            match runs.last_mut() {
-                Some((last, len)) if *last == value => *len += 1,
-                _ => runs.push((value, 1)),
-            }
-        }
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&(runs.len() as u32).to_le_bytes());
-        for (value, len) in runs {
-            payload.extend_from_slice(&value.to_le_bytes());
-            payload.extend_from_slice(&len.to_le_bytes());
-        }
-        assert_eq!(
-            decode_i64_rle_payload(&payload, values.len()).unwrap(),
-            values
-        );
-        let raw = raw_column(
-            &payload,
-            crate::storage::codec::encoding::EncodingType::Rle.to_u8(),
-            0,
-            values.len(),
-        );
-
-        let predicates = vec![int_pred(RangeOp::Ge, 7)];
-        let folded = fold_runs_from_raw(&raw, &predicates)
-            .expect("adaptive column")
-            .expect("fold ok");
-        assert_eq!(folded, reference_fold(&values, &predicates));
-    }
-
-    #[test]
-    fn non_run_encodings_decline_and_never_predicates_fold_nothing() {
-        // BitPacked tag: fold must decline (None).
-        let raw = raw_column(
-            &[],
-            crate::storage::codec::encoding::EncodingType::BitPacked.to_u8(),
-            0,
-            0,
-        );
-        assert!(fold_runs_from_raw(&raw, &[]).is_none());
-        // No magic at all (plain column): decline.
-        assert!(fold_runs_from_raw(&[0, 0, 0, 0, 1, 2, 3], &[]).is_none());
-
-        // A NULL / varchar threshold never matches, mirroring the row
-        // kernels' all-false fallback.
-        let values = vec![1i64, 2, 3];
-        let payload = encode_i64_delta_rle_payload(&values);
-        let raw = raw_column(
-            &payload,
-            crate::storage::codec::encoding::EncodingType::DeltaRle.to_u8(),
-            0,
-            values.len(),
-        );
-        let never = RunPredicate::new(RangeOp::Gt, &ScalarValue::VarChar(Some("x".into())));
-        assert_eq!(never, RunPredicate::Never);
-        let folded = fold_runs_from_raw(&raw, &[never])
-            .expect("adaptive column")
-            .expect("fold ok");
-        assert_eq!(folded.matched_rows, 0);
-        assert!(!folded.any);
-    }
-
-    #[test]
-    fn run_predicate_float_threshold_uses_f64_domain() {
-        // Float thresholds compare in the raw f64 domain (numeric_cmp
-        // semantics), so 10.5 excludes the run of 10 and includes 100.
-        let values = sample_values();
-        let payload = encode_i64_delta_rle_payload(&values);
-        let raw = raw_column(
-            &payload,
-            crate::storage::codec::encoding::EncodingType::DeltaRle.to_u8(),
-            0,
-            values.len(),
-        );
-        let pred = RunPredicate::Float {
-            op: RangeOp::Gt,
-            value: 10.5,
-        };
-        let folded = fold_runs_from_raw(&raw, &[pred])
-            .expect("adaptive column")
-            .expect("fold ok");
-        let reference = reference_fold(&values, &[pred]);
-        assert_eq!(folded, reference);
-    }
-}
+#[path = "predicate_scan_run_fold_test.rs"]
+mod run_fold_tests;
 
 /// Diagnostic: `(runs, rows_covered)` of an Rle/DeltaRle column block, for
 /// run-length viability probes. `None` for any other encoding.
@@ -1238,91 +1064,5 @@ pub fn debug_run_stats_from_raw(data: &[u8]) -> Option<(u64, u64)> {
 }
 
 #[cfg(test)]
-mod count_eq_tests {
-    use super::*;
-
-    fn col_def(data_type: DataType) -> ColumnDef {
-        ColumnDef::new("c", data_type)
-    }
-
-    /// Full column block (`[bitmap_len][bitmap][values]`) for the plain,
-    /// non-adaptive decode paths.
-    fn raw_block(bitmap: &NullBitmap, values: &[u8]) -> Vec<u8> {
-        let bitmap_bytes = bitmap.to_bytes();
-        let mut raw = Vec::with_capacity(4 + bitmap_bytes.len() + values.len());
-        raw.extend_from_slice(&(bitmap_bytes.len() as u32).to_le_bytes());
-        raw.extend_from_slice(&bitmap_bytes);
-        raw.extend_from_slice(values);
-        raw
-    }
-
-    #[test]
-    fn count_eq_fixed_truncated_payload_is_error_not_partial_count() {
-        // Regression: the fixed-width count kernels used to stop at the
-        // truncation ("break") and return a partial count instead of
-        // surfacing the corruption like the selected_eq_rows_* family.
-        let rows = 4usize;
-        let mut payload = Vec::new();
-        for v in [7i64, 7, 9, 7] {
-            payload.extend_from_slice(&v.to_le_bytes());
-        }
-        let bitmap = NullBitmap::new_valid(rows);
-        let def = col_def(DataType::Int64);
-        let target = ScalarValue::Int64(Some(7));
-
-        let counted =
-            count_eq_from_raw(&raw_block(&bitmap, &payload), rows, &def, &target).unwrap();
-        assert_eq!(counted, 3);
-
-        // Drop the last row's final bytes: the count must fail, not report 2.
-        let truncated = &payload[..payload.len() - 4];
-        assert!(count_eq_from_raw(&raw_block(&bitmap, truncated), rows, &def, &target).is_err());
-    }
-
-    #[test]
-    fn count_eq_varchar_truncated_payload_is_error_not_partial_count() {
-        let rows = 3usize;
-        let mut payload = Vec::new();
-        for s in ["ab", "ab", "cd"] {
-            payload.extend_from_slice(&(s.len() as u32).to_le_bytes());
-            payload.extend_from_slice(s.as_bytes());
-        }
-        let bitmap = NullBitmap::new_valid(rows);
-        let def = col_def(DataType::VarChar);
-        let target = ScalarValue::VarChar(Some("ab".into()));
-
-        let counted =
-            count_eq_from_raw(&raw_block(&bitmap, &payload), rows, &def, &target).unwrap();
-        assert_eq!(counted, 2);
-
-        // Cut into the last value: must fail, not return a partial count.
-        let truncated = &payload[..payload.len() - 1];
-        assert!(count_eq_from_raw(&raw_block(&bitmap, truncated), rows, &def, &target).is_err());
-    }
-
-    #[test]
-    fn count_eq_varchar_dictionary_truncated_index_is_error_not_mismatch() {
-        // Regression: a truncated dictionary index stream used to read as
-        // u32::MAX and silently mismatch instead of surfacing the corruption.
-        let rows = 2usize;
-        let mut values = Vec::new();
-        values.extend_from_slice(COLUMN_ENCODING_MAGIC);
-        values.push(crate::storage::codec::encoding::EncodingType::Dictionary.to_u8());
-        values.extend_from_slice(&1u32.to_le_bytes()); // dict_count
-        values.extend_from_slice(&2u32.to_le_bytes()); // "ab"
-        values.extend_from_slice(b"ab");
-        values.extend_from_slice(&2u32.to_le_bytes()); // index_count
-        values.extend_from_slice(&0u32.to_le_bytes()); // row 0's index
-        // Row 1's index bytes are missing.
-
-        let bitmap = NullBitmap::new_valid(rows);
-        let def = col_def(DataType::VarChar);
-        assert!(count_eq_from_raw(
-            &raw_block(&bitmap, &values),
-            rows,
-            &def,
-            &ScalarValue::VarChar(Some("ab".into()))
-        )
-        .is_err());
-    }
-}
+#[path = "predicate_scan_count_eq_test.rs"]
+mod count_eq_tests;

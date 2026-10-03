@@ -1,8 +1,8 @@
 pub mod ddl;
 pub mod decorrelate;
 pub mod dml_delete;
-pub mod dml_staging;
 pub mod dml_insert;
+pub mod dml_staging;
 pub mod dml_update;
 pub mod engine;
 pub mod explain;

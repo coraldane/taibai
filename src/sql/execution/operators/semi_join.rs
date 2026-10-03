@@ -18,7 +18,7 @@ use super::ExecutionOp;
 /// comparison rules of `eval_filter`.
 pub struct SemiJoinExec {
     /// Row-boxed bytes accumulated by collect_right/collect_left. The whole
-    /// operator materializes both sides as Vec<Vec<ScalarValue>> with no
+    /// operator materializes both sides as `Vec<Vec<ScalarValue>>` with no
     /// spill support; charging the shared query budget turns an
     /// over-memory EXISTS/IN into a clean budget error instead of an OOM.
     materialized_bytes: u64,

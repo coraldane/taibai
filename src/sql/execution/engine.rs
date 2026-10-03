@@ -472,9 +472,7 @@ fn start_auto_compaction_thread(
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .get(&(db.clone(), table.clone()))
-                            .is_none_or(|last| {
-                                last.elapsed() >= config.fragmentation_cooldown
-                            }) =>
+                            .is_none_or(|last| last.elapsed() >= config.fragmentation_cooldown) =>
                 {
                     match compactor.compact_table_for_fragmentation(&db, &table, &table_meta) {
                         Ok(stats) => {
@@ -496,10 +494,10 @@ fn start_auto_compaction_thread(
                                     &table_meta,
                                 );
                                 compacted += 1;
-                                    fragmentation_last_run
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                        .insert((db.clone(), table.clone()), Instant::now());
+                                fragmentation_last_run
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .insert((db.clone(), table.clone()), Instant::now());
                                 tracing::info!(
                                     db,
                                     table,
@@ -599,93 +597,92 @@ pub fn start_close_of_day_scheduler(engine: Arc<Engine>) {
     let last_ttl_purge = Mutex::new(std::time::Instant::now());
     let body_engine = Arc::clone(&engine);
     let body_stop = Arc::clone(&stop);
-    let handle = spawn_supervised_with_stop(
-        "taibai-close-of-day",
-        stop,
-        move || {
-            // One scheduler round = one iteration of the original loop.
-            sleep_interruptibly(&body_stop, Duration::from_secs(30));
-            if body_stop.load(Ordering::Acquire) {
-                return;
-            }
-            let now = Local::now();
-            let today = now.date_naive();
-            let today_str = today.to_string();
-            {
-                let mut last_fired = last_fired.lock().unwrap_or_else(|p| p.into_inner());
-                last_fired.retain(|(_, _, d)| *d == today);
-            }
-            let hot_tables = {
-                let catalogs = body_engine.catalogs.read().unwrap();
-                let mut tables = Vec::new();
-                for (db, catalog) in catalogs.iter() {
-                    for (table, meta) in catalog.tables.iter() {
-                        if let (Some(_), Some(close_time)) =
-                            (&meta.hot_time_column, &meta.hot_close_time)
-                        {
-                            tables.push((
-                                db.clone(),
-                                table.clone(),
-                                close_time.clone(),
-                                meta.hot_last_close_date.clone(),
-                            ));
-                        }
-                    }
-                }
-                tables
-            };
-            // Partition-level TTL purge, at most once per minute: drop
-            // fully-expired temporal partitions instead of leaving them
-            // to the read-time row filter forever.
-            {
-                let mut last_ttl_purge = last_ttl_purge.lock().unwrap_or_else(|p| p.into_inner());
-                if last_ttl_purge.elapsed() >= Duration::from_secs(60) {
-                    *last_ttl_purge = std::time::Instant::now();
-                    drop(last_ttl_purge);
-                    if let Err(error) = body_engine.run_ttl_partition_purge() {
-                        tracing::warn!(error = %error, "ttl purge: run failed");
+    let handle = spawn_supervised_with_stop("taibai-close-of-day", stop, move || {
+        // One scheduler round = one iteration of the original loop.
+        sleep_interruptibly(&body_stop, Duration::from_secs(30));
+        if body_stop.load(Ordering::Acquire) {
+            return;
+        }
+        let now = Local::now();
+        let today = now.date_naive();
+        let today_str = today.to_string();
+        {
+            let mut last_fired = last_fired.lock().unwrap_or_else(|p| p.into_inner());
+            last_fired.retain(|(_, _, d)| *d == today);
+        }
+        let hot_tables = {
+            let catalogs = body_engine.catalogs.read().unwrap();
+            let mut tables = Vec::new();
+            for (db, catalog) in catalogs.iter() {
+                for (table, meta) in catalog.tables.iter() {
+                    if let (Some(_), Some(close_time)) =
+                        (&meta.hot_time_column, &meta.hot_close_time)
+                    {
+                        tables.push((
+                            db.clone(),
+                            table.clone(),
+                            close_time.clone(),
+                            meta.hot_last_close_date.clone(),
+                        ));
                     }
                 }
             }
+            tables
+        };
+        // Partition-level TTL purge, at most once per minute: drop
+        // fully-expired temporal partitions instead of leaving them
+        // to the read-time row filter forever.
+        {
+            let mut last_ttl_purge = last_ttl_purge.lock().unwrap_or_else(|p| p.into_inner());
+            if last_ttl_purge.elapsed() >= Duration::from_secs(60) {
+                *last_ttl_purge = std::time::Instant::now();
+                drop(last_ttl_purge);
+                if let Err(error) = body_engine.run_ttl_partition_purge() {
+                    tracing::warn!(error = %error, "ttl purge: run failed");
+                }
+            }
+        }
 
-            for (db, table, close_time, last_close_date) in hot_tables {
-                // CLOSE AT is validated at DDL time; an unparseable value
-                // here means corrupt or legacy catalog state — skip the
-                // table rather than guessing a default firing time.
-                let Some((target_h, target_m)) = parse_hh_mm(&close_time) else {
-                    tracing::warn!(
-                        db,
-                        table,
-                        close_time,
-                        "close-of-day scheduler: unparseable HOT CLOSE AT, skipping table"
-                    );
-                    continue;
-                };
-                let key = (db.clone(), table.clone(), today);
-                let already_fired_today = last_fired
+        for (db, table, close_time, last_close_date) in hot_tables {
+            // CLOSE AT is validated at DDL time; an unparseable value
+            // here means corrupt or legacy catalog state — skip the
+            // table rather than guessing a default firing time.
+            let Some((target_h, target_m)) = parse_hh_mm(&close_time) else {
+                tracing::warn!(
+                    db,
+                    table,
+                    close_time,
+                    "close-of-day scheduler: unparseable HOT CLOSE AT, skipping table"
+                );
+                continue;
+            };
+            let key = (db.clone(), table.clone(), today);
+            let already_fired_today = last_fired
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(&key);
+            if already_fired_today || last_close_date.as_deref() == Some(today_str.as_str()) {
+                continue;
+            }
+            let reached =
+                now.hour() > target_h || (now.hour() == target_h && now.minute() >= target_m);
+            if reached {
+                tracing::info!(
+                    db,
+                    table,
+                    close_time,
+                    "close-of-day scheduler: firing table archival flush"
+                );
+                if let Err(e) = body_engine.close_of_day_flush_table(&db, &table) {
+                    tracing::warn!(db, table, error = %e, "close-of-day scheduler: table flush failed");
+                }
+                last_fired
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .contains(&key);
-                if already_fired_today
-                    || last_close_date.as_deref() == Some(today_str.as_str())
-                {
-                    continue;
-                }
-                let reached = now.hour() > target_h
-                    || (now.hour() == target_h && now.minute() >= target_m);
-                if reached {
-                    tracing::info!(db, table, close_time, "close-of-day scheduler: firing table archival flush");
-                    if let Err(e) = body_engine.close_of_day_flush_table(&db, &table) {
-                        tracing::warn!(db, table, error = %e, "close-of-day scheduler: table flush failed");
-                    }
-                    last_fired
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .insert(key);
-                }
+                    .insert(key);
             }
-        },
-    );
+        }
+    });
     engine.set_close_of_day_scheduler(handle);
 }
 

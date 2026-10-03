@@ -60,8 +60,7 @@ pub fn cast(args: &[ScalarValue]) -> Result<ScalarValue> {
         DataType::Date => match value {
             ScalarValue::Date(_) => Ok(value),
             ScalarValue::VarChar(Some(s)) => {
-                let days =
-                    crate::sql::execution::functions::date::datetime_string_to_days(&s, 0);
+                let days = crate::sql::execution::functions::date::datetime_string_to_days(&s, 0);
                 Ok(ScalarValue::Date(days))
             }
             ScalarValue::Int64(Some(n)) => Ok(ScalarValue::Date(Some(n as i32))),

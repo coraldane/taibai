@@ -1562,10 +1562,7 @@ pub(super) fn meta_prune_row_groups(
             return Ok(MetaPrune::Unaligned);
         }
     };
-    if !super::row_group::prune_segment_by_zone_map(
-        &aligned.predicate,
-        meta.footer_zone_maps(),
-    ) {
+    if !super::row_group::prune_segment_by_zone_map(&aligned.predicate, meta.footer_zone_maps()) {
         return Ok(MetaPrune::Candidates(Vec::new()));
     }
     let in_refs = aligned.in_check_refs();

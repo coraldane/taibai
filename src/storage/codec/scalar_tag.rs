@@ -201,8 +201,15 @@ pub fn decode_scalar_with_tag(cursor: &mut std::io::Cursor<&[u8]>) -> Result<Sca
             let len = read_u32_le(cursor)? as usize;
             // Validate before allocating: a corrupt length prefix must not
             // zero-fill up to 4GB from a truncated stream.
-            if len > cursor.get_ref().len().saturating_sub(cursor.position() as usize) {
-                return Err(TaibaiError::Storage("scalar varchar: truncated value".into()));
+            if len
+                > cursor
+                    .get_ref()
+                    .len()
+                    .saturating_sub(cursor.position() as usize)
+            {
+                return Err(TaibaiError::Storage(
+                    "scalar varchar: truncated value".into(),
+                ));
             }
             let mut b = vec![0u8; len];
             cursor.read_exact(&mut b)?;
@@ -210,7 +217,12 @@ pub fn decode_scalar_with_tag(cursor: &mut std::io::Cursor<&[u8]>) -> Result<Sca
         }
         DataType::Blob => {
             let len = read_u32_le(cursor)? as usize;
-            if len > cursor.get_ref().len().saturating_sub(cursor.position() as usize) {
+            if len
+                > cursor
+                    .get_ref()
+                    .len()
+                    .saturating_sub(cursor.position() as usize)
+            {
                 return Err(TaibaiError::Storage("scalar blob: truncated value".into()));
             }
             let mut b = vec![0u8; len];
@@ -224,8 +236,15 @@ pub fn decode_scalar_with_tag(cursor: &mut std::io::Cursor<&[u8]>) -> Result<Sca
             let len_bytes = len.checked_mul(4).ok_or_else(|| {
                 TaibaiError::Storage("scalar vector: element count overflow".into())
             })?;
-            if len_bytes > cursor.get_ref().len().saturating_sub(cursor.position() as usize) {
-                return Err(TaibaiError::Storage("scalar vector: truncated value".into()));
+            if len_bytes
+                > cursor
+                    .get_ref()
+                    .len()
+                    .saturating_sub(cursor.position() as usize)
+            {
+                return Err(TaibaiError::Storage(
+                    "scalar vector: truncated value".into(),
+                ));
             }
             let mut v = Vec::with_capacity(len);
             for _ in 0..len {

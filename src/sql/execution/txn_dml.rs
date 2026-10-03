@@ -2,7 +2,7 @@
 //!
 //! Statement time only *plans*: matched segment rows are recorded as
 //! tombstone row ids and matched rows of committed memtables as batch
-//! positions in the [`TxnMutationRegistry`]; UPDATE additionally appends the
+//! positions in the `TxnMutationRegistry`; UPDATE additionally appends the
 //! new row images to the transaction's own memtable (visible to this
 //! transaction only). ROLLBACK drops the registry entry — no durable state
 //! was touched, which also makes a crash equivalent to ROLLBACK. COMMIT
@@ -279,10 +279,8 @@ pub(crate) fn exec_delete_in_txn(
         let mut staged_delete_events: Vec<RecordBatch> = Vec::new();
         for plan in committed_plans {
             statement_deleted += plan.removed_positions.len() as u64;
-            staged_memtable_tombstones.push((
-                Arc::clone(&plan.memtable),
-                plan.removed_positions.to_vec(),
-            ));
+            staged_memtable_tombstones
+                .push((Arc::clone(&plan.memtable), plan.removed_positions.to_vec()));
             if engine.pubsub().has_subscribers() {
                 match plan.original.take_rows(&plan.removed_positions) {
                     Ok(deleted) => staged_delete_events.push(deleted),
@@ -310,13 +308,8 @@ pub(crate) fn exec_delete_in_txn(
             Vec::new()
         };
         if let Some(pred) = predicate {
-            segment_files = prune_segments_by_cluster_key(
-                segment_files,
-                mgr,
-                table_schema,
-                table_meta,
-                pred,
-            )?;
+            segment_files =
+                prune_segments_by_cluster_key(segment_files, mgr, table_schema, table_meta, pred)?;
         }
         // Point-DELETE fast path (same contract as the auto-commit path):
         // resolve the affected segments through the location index; the
@@ -387,11 +380,7 @@ pub(crate) fn exec_delete_in_txn(
                 continue;
             }
             statement_deleted += outcome.matched_ids.len() as u64;
-            staged_segment_tombstones.push((
-                seg_path,
-                outcome.footer_bitmap,
-                outcome.matched_ids,
-            ));
+            staged_segment_tombstones.push((seg_path, outcome.footer_bitmap, outcome.matched_ids));
         }
 
         // Apply the staged registrations. The budget pre-check makes the
@@ -430,9 +419,13 @@ pub(crate) fn exec_delete_in_txn(
                 ids.iter().copied(),
             ) {
                 for (path, applied_ids) in &applied_segments {
-                    engine
-                        .txn_mutations()
-                        .unregister_segment_tombstones(reader_txn_id, db, table, path, applied_ids);
+                    engine.txn_mutations().unregister_segment_tombstones(
+                        reader_txn_id,
+                        db,
+                        table,
+                        path,
+                        applied_ids,
+                    );
                 }
                 return Err(error);
             }
@@ -449,9 +442,13 @@ pub(crate) fn exec_delete_in_txn(
                 positions.iter().copied(),
             ) {
                 for (path, applied_ids) in &applied_segments {
-                    engine
-                        .txn_mutations()
-                        .unregister_segment_tombstones(reader_txn_id, db, table, path, applied_ids);
+                    engine.txn_mutations().unregister_segment_tombstones(
+                        reader_txn_id,
+                        db,
+                        table,
+                        path,
+                        applied_ids,
+                    );
                 }
                 for (applied_id, applied_positions) in &applied_memtables {
                     engine.txn_mutations().unregister_memtable_tombstones(
@@ -569,7 +566,10 @@ pub(crate) fn exec_update_in_txn(
         // leave already-registered tombstones behind; the transaction's
         // later COMMIT then deleted those rows without inserting their
         // replacement images — silent data loss with no IO failure needed.
-        let mut staged_memtable_tombstones: Vec<(Arc<crate::storage::core::memtable::MemTable>, Vec<u32>)> = Vec::new();
+        let mut staged_memtable_tombstones: Vec<(
+            Arc<crate::storage::core::memtable::MemTable>,
+            Vec<u32>,
+        )> = Vec::new();
         let mut staged_events: Vec<RecordBatch> = Vec::new();
         super::dml_delete::for_each_visible_memtable(
             engine,
@@ -656,24 +656,24 @@ pub(crate) fn exec_update_in_txn(
             let mut newly_deleted: Vec<u64> = Vec::new();
             let mut updated_images: Vec<RecordBatch> = Vec::new();
 
-        // Footer zone maps follow the segment's own column order: re-anchor
-        // the catalog-space predicate per segment. When a predicate column
-        // is absent from this footer, alignment fails and row-group pruning
-        // is disabled for the whole segment — the default-filled aligned
-        // read below then decides row by row (the absent-column semantics
-        // DELETE/SELECT/COUNT already use). The old code `break`ed out of
-        // the loop here, silently skipping every remaining row group of the
-        // segment and losing updates.
-        let aligned_predicate = predicate
-            .as_ref()
-            .and_then(|pred| reader.align_row_group_predicate(table_schema, pred).ok());
+            // Footer zone maps follow the segment's own column order: re-anchor
+            // the catalog-space predicate per segment. When a predicate column
+            // is absent from this footer, alignment fails and row-group pruning
+            // is disabled for the whole segment — the default-filled aligned
+            // read below then decides row by row (the absent-column semantics
+            // DELETE/SELECT/COUNT already use). The old code `break`ed out of
+            // the loop here, silently skipping every remaining row group of the
+            // segment and losing updates.
+            let aligned_predicate = predicate
+                .as_ref()
+                .and_then(|pred| reader.align_row_group_predicate(table_schema, pred).ok());
 
-        for rg_idx in 0..reader.num_row_groups() {
-            if let Some(ref pred) = aligned_predicate {
-                if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
-                    continue;
+            for rg_idx in 0..reader.num_row_groups() {
+                if let Some(ref pred) = aligned_predicate {
+                    if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
+                        continue;
+                    }
                 }
-            }
                 let mask = super::dml_update::build_update_mask(
                     &reader,
                     rg_idx,
@@ -812,9 +812,13 @@ pub(crate) fn exec_update_in_txn(
                 ids.iter().copied(),
             ) {
                 for (path, applied_ids) in &applied_segments {
-                    engine
-                        .txn_mutations()
-                        .unregister_segment_tombstones(reader_txn_id, db, table, path, applied_ids);
+                    engine.txn_mutations().unregister_segment_tombstones(
+                        reader_txn_id,
+                        db,
+                        table,
+                        path,
+                        applied_ids,
+                    );
                 }
                 return Err(error);
             }
@@ -831,9 +835,13 @@ pub(crate) fn exec_update_in_txn(
                 positions.iter().copied(),
             ) {
                 for (path, applied_ids) in &applied_segments {
-                    engine
-                        .txn_mutations()
-                        .unregister_segment_tombstones(reader_txn_id, db, table, path, applied_ids);
+                    engine.txn_mutations().unregister_segment_tombstones(
+                        reader_txn_id,
+                        db,
+                        table,
+                        path,
+                        applied_ids,
+                    );
                 }
                 for (applied_id, applied_positions) in &applied_memtables {
                     engine.txn_mutations().unregister_memtable_tombstones(
@@ -924,10 +932,7 @@ pub(crate) fn finish_materialization(engine: &Engine, done: TxnMaterialization) 
         let deleted = *deleted;
         let _ = mgr.with_table_mutation_lock(db, table, || {
             crate::storage::segment::reader::clear_deferred_delete_journal_for_statement(
-                &table_dir,
-                &seg_path,
-                &bitmap,
-                deleted,
+                &table_dir, &seg_path, &bitmap, deleted,
             );
             Ok(())
         });
@@ -961,7 +966,12 @@ fn materialize_tables(
             //    first), so crash recovery cannot resurrect removed rows —
             //    nor keep a delete whose images were lost.
             for entry in &table_mutations.memtables {
-                materialize_memtable(engine, &entry.memtable, &entry.positions, watermark.as_slice())?;
+                materialize_memtable(
+                    engine,
+                    &entry.memtable,
+                    &entry.positions,
+                    watermark.as_slice(),
+                )?;
                 done.memtables.push((
                     table_mutations.db.clone(),
                     table_mutations.table.clone(),
