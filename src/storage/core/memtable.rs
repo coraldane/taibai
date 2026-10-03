@@ -602,6 +602,13 @@ impl MemTable {
         self.schema.clone()
     }
 
+    /// Borrowed schema for the write path's per-statement layout checks —
+    /// `schema()` deep-copies every ColumnDef on each call, which sat inside
+    /// the partition mutation lock of every INSERT.
+    pub fn schema_ref(&self) -> &Schema {
+        &self.schema
+    }
+
     pub fn age_secs(&self) -> u64 {
         self.created_at.elapsed().as_secs()
     }
@@ -723,7 +730,7 @@ pub struct MemTableManager {
     /// the catalog flip (see `exec_alter_table`). New memtables are created
     /// with it, so hot state always matches the catalog even when an
     /// in-flight statement planned against the pre-ALTER schema.
-    table_schemas: Mutex<HashMap<(String, String), Schema>>,
+    table_schemas: Mutex<HashMap<(String, String), std::sync::Arc<Schema>>>,
 }
 
 /// What one hot-unfed accounting entry scopes to. `Table` marks bypasses
@@ -767,12 +774,15 @@ impl MemTableManager {
         self.table_schemas
             .lock()
             .unwrap()
-            .insert((db.to_string(), table.to_string()), schema);
+            .insert((db.to_string(), table.to_string()), std::sync::Arc::new(schema));
     }
 
     /// The layout new memtables of this table must use, if a width-changing
     /// DDL published one. Absent = the incoming statement schema governs.
-    pub fn table_schema(&self, db: &str, table: &str) -> Option<Schema> {
+    /// Returns a shared handle: this sits on the per-statement INSERT path,
+    /// where the previous owned clone deep-copied every ColumnDef (name
+    /// strings, previous_names, defaults) on every write.
+    pub fn table_schema(&self, db: &str, table: &str) -> Option<std::sync::Arc<Schema>> {
         self.table_schemas
             .lock()
             .unwrap()
@@ -1005,7 +1015,11 @@ impl MemTableManager {
         // memtables; an in-flight statement that planned against the
         // pre-ALTER schema must not create a stale-width memtable with it
         // (its batch is aligned to this schema by the append site).
-        let schema = self.table_schema(db, table).unwrap_or_else(|| schema.clone());
+        // Borrowed, not cloned: the deep copy happens only if a memtable is
+        // actually created below — the common existing-memtable path pays an
+        // Arc bump instead of a full schema clone per statement.
+        let authoritative = self.table_schema(db, table);
+        let schema: &Schema = authoritative.as_deref().unwrap_or(schema);
         let key = (
             db.to_string(),
             table.to_string(),

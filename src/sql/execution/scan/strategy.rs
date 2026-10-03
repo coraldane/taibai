@@ -757,14 +757,22 @@ pub fn apply_ttl_filter_and_projection(
     let now = now_micros();
     let ttl_micros = ttl.duration_secs.saturating_mul(1_000_000);
     let ttl_col = batch.column(ttl_pos).unwrap();
-    let mut mask = Vec::with_capacity(batch.num_rows());
-    for row_idx in 0..batch.num_rows() {
-        let keep = match ttl_col.scalar(row_idx) {
-            ScalarValue::Timestamp(Some(ts)) => ts.saturating_add(ttl_micros) > now,
-            _ => false,
-        };
-        mask.push(keep);
-    }
+    // Typed walk of the raw timestamp column: the generic `scalar()` path
+    // allocated one boxed ScalarValue per row on EVERY batch of EVERY scan
+    // of a TTL table.
+    let mask: Vec<bool> = match ttl_col {
+        crate::types::array::ColumnArray::Timestamp { data, bitmap } => (0..data.len())
+            .map(|row_idx| {
+                !bitmap.is_null(row_idx) && data[row_idx].saturating_add(ttl_micros) > now
+            })
+            .collect(),
+        other => (0..batch.num_rows())
+            .map(|row_idx| match other.scalar(row_idx) {
+                ScalarValue::Timestamp(Some(ts)) => ts.saturating_add(ttl_micros) > now,
+                _ => false,
+            })
+            .collect(),
+    };
 
     let match_count = mask.iter().filter(|keep| **keep).count();
     let filtered = if match_count == batch.num_rows() {

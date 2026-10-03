@@ -560,8 +560,8 @@ impl BatchWriter {
         // the memtable, its durable tail and crash recovery all see one
         // width. The eager tail frame is rebuilt in this rare path; the
         // encoding cost moves under the lock only for the raced statement.
-        let (batch, prepared) = if !batch_matches_schema(&batch, &mt.schema()) {
-            let aligned = align_batch_to_schema(&batch, &mt.schema())?;
+        let (batch, prepared) = if !batch_matches_schema(&batch, mt.schema_ref()) {
+            let aligned = align_batch_to_schema(&batch, mt.schema_ref())?;
             let prepared = if txn_id == 0 {
                 Some(PreparedTailAppend::new(&aligned)?)
             } else {
