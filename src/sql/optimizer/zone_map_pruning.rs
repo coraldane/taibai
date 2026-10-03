@@ -103,4 +103,3 @@ fn extract_zone_maps_recursive(
         }
     }
 }
-
