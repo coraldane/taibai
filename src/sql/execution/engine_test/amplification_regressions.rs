@@ -239,3 +239,104 @@ fn hot_store_rebuilds_from_live_state_after_invalidation() -> Result<()> {
     assert_eq!(updated, 99);
     Ok(())
 }
+
+/// Join-side projection pruning (B6): the optimizer narrows each join
+/// side's scan to the columns the join condition and its consumers
+/// reference; the physical join re-pads narrowed children to the full
+/// planned side schema. Results must be IDENTICAL to the unpruned read
+/// across plain joins, nested joins and outer joins.
+#[test]
+fn join_projection_pruning_keeps_results_identical() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut writer = session();
+
+    engine.execute(
+        &mut writer,
+        "CREATE TABLE a (k INT64, a1 INT64, a2 INT64, a3 INT64, a4 INT64, a5 INT64)",
+    )?;
+    engine.execute(
+        &mut writer,
+        "CREATE TABLE b (k INT64, b1 INT64, b2 INT64, b3 INT64, b4 INT64, b5 INT64)",
+    )?;
+    for k in 1..=8i64 {
+        engine.execute(
+            &mut writer,
+            &format!(
+                "INSERT INTO a VALUES ({k}, {k}00, {k}01, {k}02, {k}03, {k}04), 
+                           ({} , 0, 0, 0, 0, 0)",
+                k + 100
+            ),
+        )?;
+    }
+    for k in 1..=8i64 {
+        engine.execute(
+            &mut writer,
+            &format!(
+                "INSERT INTO b VALUES ({k}, {k}10, {k}11, {k}12, {k}13, {k}14)"
+            ),
+        )?;
+    }
+    engine.execute(&mut writer, "FLUSH TABLE a")?;
+    engine.execute(&mut writer, "FLUSH TABLE b")?;
+
+    // Plain join: project one column per side, filter on a THIRD side
+    // column, order by a side key — exercises requirement propagation of
+    // projection + filter + join-key columns.
+    let count = first_i64(
+        engine.execute(
+            &mut writer,
+            "SELECT COUNT(*) FROM a JOIN b ON a.k = b.k WHERE a.a2 > 300",
+        )?,
+        0,
+        0,
+    );
+    assert_eq!(count, 6, "six a2 values (301..801) clear the filter");
+    let sample = first_i64(
+        engine.execute(
+            &mut writer,
+            "SELECT b.b5 FROM a JOIN b ON a.k = b.k WHERE a.k = 4",
+        )?,
+        0,
+        0,
+    );
+    assert_eq!(sample, 414, "projected right-side column resolves correctly");
+
+    // Outer join: the layout guard may decline pruning; results must be
+    // correct either way.
+    let left_rows = first_i64(
+        engine.execute(
+            &mut writer,
+            "SELECT COUNT(*) FROM a LEFT JOIN b ON a.k = b.k WHERE b.b1 IS NULL",
+        )?,
+        0,
+        0,
+    );
+    assert_eq!(left_rows, 8, "only the k+100 rows lack a match");
+
+    // Nested join across three tables.
+    engine.execute(&mut writer, "CREATE TABLE c (k INT64, c1 INT64, c2 INT64)")?;
+    for k in 1..=4i64 {
+        engine.execute(&mut writer, &format!("INSERT INTO c VALUES ({k}, {k}00, {k}99)"))?;
+    }
+    engine.execute(&mut writer, "FLUSH TABLE c")?;
+    let nested = first_i64(
+        engine.execute(
+            &mut writer,
+            "SELECT COUNT(*) FROM a JOIN b ON a.k = b.k JOIN c ON b.k = c.k",
+        )?,
+        0,
+        0,
+    );
+    assert_eq!(nested, 4, "three-way join narrows each side independently");
+    let nested_value = first_i64(
+        engine.execute(
+            &mut writer,
+            "SELECT c.c2 FROM a JOIN b ON a.k = b.k JOIN c ON b.k = c.k WHERE a.k = 3",
+        )?,
+        0,
+        0,
+    );
+    assert_eq!(nested_value, 399);
+    Ok(())
+}

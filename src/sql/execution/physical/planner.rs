@@ -389,24 +389,35 @@ fn build_operator_with_limit(
             } else {
                 true
             };
-            let left = build_operator_with_limit(
-                *join.left,
-                ctx,
-                None,
-                table_batches,
-                scan_seeds,
-                profile,
-                depth + 1,
-            )?;
-            let right = build_operator_with_limit(
-                *join.right,
-                ctx,
-                None,
-                table_batches,
-                scan_seeds,
-                profile,
-                depth + 1,
-            )?;
+            // Each child is wrapped to its FULL planned side schema: the
+            // column-pruning rules may have narrowed the scan below to the
+            // required columns, and the join's condition evaluation and row
+            // assembly address the full-width layout. The wrapper is a zero
+            // -cost pass-through for unpruned children.
+            let left = super::planner::expand_to_schema(
+                build_operator_with_limit(
+                    *join.left,
+                    ctx,
+                    None,
+                    table_batches,
+                    scan_seeds,
+                    profile,
+                    depth + 1,
+                )?,
+                join.left_schema.clone(),
+            );
+            let right = super::planner::expand_to_schema(
+                build_operator_with_limit(
+                    *join.right,
+                    ctx,
+                    None,
+                    table_batches,
+                    scan_seeds,
+                    profile,
+                    depth + 1,
+                )?,
+                join.right_schema.clone(),
+            );
             Ok(Box::new(
                 HashJoinExec::new(
                     left,
@@ -421,24 +432,31 @@ fn build_operator_with_limit(
             ))
         }
         LogicalPlan::SemiJoin(semi) => {
-            let left = build_operator_with_limit(
-                *semi.left,
-                ctx,
-                None,
-                table_batches,
-                scan_seeds,
-                profile,
-                depth + 1,
-            )?;
-            let right = build_operator_with_limit(
-                *semi.right,
-                ctx,
-                None,
-                table_batches,
-                scan_seeds,
-                profile,
-                depth + 1,
-            )?;
+            // Same full-width contract as the Join arm (see above).
+            let left = super::planner::expand_to_schema(
+                build_operator_with_limit(
+                    *semi.left,
+                    ctx,
+                    None,
+                    table_batches,
+                    scan_seeds,
+                    profile,
+                    depth + 1,
+                )?,
+                semi.left_schema.clone(),
+            );
+            let right = super::planner::expand_to_schema(
+                build_operator_with_limit(
+                    *semi.right,
+                    ctx,
+                    None,
+                    table_batches,
+                    scan_seeds,
+                    profile,
+                    depth + 1,
+                )?,
+                semi.right_schema.clone(),
+            );
             Ok(Box::new(SemiJoinExec::new(
                 left,
                 right,
@@ -2302,3 +2320,15 @@ fn try_folded_aggregate_exec(
 #[cfg(test)]
 #[path = "join_order_test.rs"]
 mod join_order_tests;
+
+/// Wrap a join child operator so it always presents the FULL planned side
+/// schema (see the Join/SemiJoin arms). Kept tiny and `inline`-shaped: for
+/// unpruned children this is a schema-equality pass-through.
+fn expand_to_schema(
+    input: Box<dyn crate::sql::execution::operators::ExecutionOp>,
+    target: crate::types::batch::Schema,
+) -> Box<dyn crate::sql::execution::operators::ExecutionOp> {
+    Box::new(crate::sql::execution::operators::ExpandToSchemaExec::new(
+        input, target,
+    ))
+}

@@ -281,7 +281,11 @@ pub fn compile_scan_spec(
     collect_from_plan(plan, table_name, table_schema, &mut spec);
 
     if spec.has_join {
-        spec.projection = None;
+        // The projection survives: join-condition side columns are merged
+        // into it during traversal, and the physical join re-pads its
+        // narrowed children to the full planned side layout
+        // (`ExpandToSchemaExec`), so consumers keep full-width semantics.
+        // A LIMIT above a join still must not push into one side.
         spec.limit = None;
     }
 
@@ -387,6 +391,20 @@ fn collect_expr_columns(expr: &LogicalExpr, cols: &mut Vec<usize>) {
 }
 
 fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec: &mut ScanSpec) {
+    collect_from_plan_ctx(plan, table_name, schema, spec, &[]);
+}
+
+/// `join_side_cols`: side-space column indices the enclosing joins'
+/// conditions read on THIS table's side — they must survive any projection
+/// pushdown, because the join's condition and row assembly address the full
+/// side layout.
+fn collect_from_plan_ctx(
+    plan: &LogicalPlan,
+    table_name: &str,
+    schema: &Schema,
+    spec: &mut ScanSpec,
+    join_side_cols: &[usize],
+) {
     match plan {
         LogicalPlan::Scan(scan) => {
             if !scan.table_name.eq_ignore_ascii_case(table_name) {
@@ -405,6 +423,23 @@ fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec
             if let Some(proj) = &scan.projection {
                 spec.projection = Some(proj.clone());
             }
+            if !join_side_cols.is_empty() {
+                // Union the join's side columns into an EXISTING narrowing
+                // only: `None` means "every column" and already includes
+                // them — turning it into a join-columns-only projection
+                // starved the join's other consumers (a GROUP BY above lost
+                // its key column and read padded NULLs).
+                if let Some(mut cols) = spec.projection.take() {
+                    for col in join_side_cols {
+                        if !cols.contains(col) {
+                            cols.push(*col);
+                        }
+                    }
+                    cols.sort_unstable();
+                    cols.dedup();
+                    spec.projection = Some(cols);
+                }
+            }
             if scan.time_range.is_some() || scan.partition_filter.is_some() {
                 if let Some(ref mut pi) = spec.partition_info {
                     pi.time_range = scan.time_range.clone();
@@ -412,9 +447,9 @@ fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec
                 }
             }
         }
-        LogicalPlan::Filter(f) => collect_from_plan(&f.input, table_name, schema, spec),
+        LogicalPlan::Filter(f) => collect_from_plan_ctx(&f.input, table_name, schema, spec, join_side_cols),
         LogicalPlan::Project(p) => {
-            collect_from_plan(&p.input, table_name, schema, spec);
+            collect_from_plan_ctx(&p.input, table_name, schema, spec, join_side_cols);
             // Above an Aggregate, projection expressions index the aggregate
             // OUTPUT, not this table's columns; slicing the scan by them
             // would drop group-key columns (materialized pipeline only).
@@ -480,40 +515,68 @@ fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec
                     }
                 }
             }
-            collect_from_plan(&a.input, table_name, schema, spec);
+            collect_from_plan_ctx(&a.input, table_name, schema, spec, join_side_cols);
         }
         LogicalPlan::Sort(s) => {
             spec.has_order_by = true;
             collect_sort_keys(&s.sort_keys, schema, spec);
-            collect_from_plan(&s.input, table_name, schema, spec);
+            collect_from_plan_ctx(&s.input, table_name, schema, spec, join_side_cols);
         }
         LogicalPlan::Limit(l) => {
             set_scan_limit(spec, l.limit.saturating_add(l.offset));
-            collect_from_plan(&l.input, table_name, schema, spec);
+            collect_from_plan_ctx(&l.input, table_name, schema, spec, join_side_cols);
         }
         LogicalPlan::TopN(t) => {
             spec.has_order_by = true;
             collect_sort_keys(&t.sort_keys, schema, spec);
             set_scan_limit(spec, t.limit.saturating_add(t.offset));
-            collect_from_plan(&t.input, table_name, schema, spec);
+            collect_from_plan_ctx(&t.input, table_name, schema, spec, join_side_cols);
         }
         LogicalPlan::Distinct(d) => {
             spec.has_distinct_or_window = true;
-            collect_from_plan(&d.input, table_name, schema, spec);
+            collect_from_plan_ctx(&d.input, table_name, schema, spec, join_side_cols);
         }
         LogicalPlan::Window(w) => {
             spec.has_distinct_or_window = true;
-            collect_from_plan(&w.input, table_name, schema, spec);
+            collect_from_plan_ctx(&w.input, table_name, schema, spec, join_side_cols);
         }
         LogicalPlan::Join(j) => {
             spec.has_join = true;
-            collect_from_plan(&j.left, table_name, schema, spec);
-            collect_from_plan(&j.right, table_name, schema, spec);
+            let mut condition_cols = Vec::new();
+            crate::sql::planner::expr::collect_cols_from_expr(&j.condition, &mut condition_cols);
+            let left_width = j.left_schema.columns.len();
+            let mut own = join_side_cols.to_vec();
+            own.retain(|col| *col < schema.num_columns());
+            let mut left_cols = own.clone();
+            left_cols.extend(condition_cols.iter().filter(|c| **c < left_width).copied());
+            let mut right_cols = own;
+            right_cols.extend(
+                condition_cols
+                    .iter()
+                    .filter(|c| **c >= left_width)
+                    .map(|c| *c - left_width),
+            );
+            collect_from_plan_ctx(&j.left, table_name, schema, spec, &left_cols);
+            collect_from_plan_ctx(&j.right, table_name, schema, spec, &right_cols);
         }
         LogicalPlan::SemiJoin(s) => {
             spec.has_join = true;
-            collect_from_plan(&s.left, table_name, schema, spec);
-            collect_from_plan(&s.right, table_name, schema, spec);
+            let mut condition_cols = Vec::new();
+            crate::sql::planner::expr::collect_cols_from_expr(&s.condition, &mut condition_cols);
+            let left_width = s.left_schema.columns.len();
+            let mut own = join_side_cols.to_vec();
+            own.retain(|col| *col < schema.num_columns());
+            let mut left_cols = own.clone();
+            left_cols.extend(condition_cols.iter().filter(|c| **c < left_width).copied());
+            let mut right_cols = own;
+            right_cols.extend(
+                condition_cols
+                    .iter()
+                    .filter(|c| **c >= left_width)
+                    .map(|c| *c - left_width),
+            );
+            collect_from_plan_ctx(&s.left, table_name, schema, spec, &left_cols);
+            collect_from_plan_ctx(&s.right, table_name, schema, spec, &right_cols);
         }
         LogicalPlan::Empty => {}
     }
