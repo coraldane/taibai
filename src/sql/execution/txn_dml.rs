@@ -322,8 +322,6 @@ pub(crate) fn exec_delete_in_txn(
         }
 
         let publish_deletes = engine.pubsub().has_subscribers();
-        let mut staged_segment_tombstones: Vec<(std::path::PathBuf, Vec<u8>, Vec<u64>)> =
-            Vec::new();
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
             let total_rows = reader.row_count();
@@ -475,7 +473,6 @@ pub(crate) fn exec_update_in_txn(
         // shared walk applies the transaction-tombstone view (same contract
         // as the DELETE planner), so a second UPDATE of the same row cannot
         // append a second copy of its new image at COMMIT.
-        let txn_mutations = engine.txn_mutations();
         // Statement staging (P0): registrations and deferred events are
         // COLLECTED here and only applied after the whole planning pass and
         // a budget pre-check succeed. A statement that failed midway used to

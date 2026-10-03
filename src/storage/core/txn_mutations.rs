@@ -106,7 +106,7 @@ pub struct TxnMutations {
     mutation_bytes: u64,
 }
 
-/// Shared with [`set_txn_mutation_budget_for_tests`]; see that function.
+// Shared with set_txn_mutation_budget_for_tests; see that function.
 #[cfg(test)]
 thread_local! {
     static TEST_BUDGET_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };

@@ -532,6 +532,48 @@ enum OpenTailResult {
     Ready(OpenTail),
 }
 
+/// Create a fresh tail log generation inside `tail_dir`: mint a sequence,
+/// create the hidden tmp file (header already written) and return the open
+/// file plus its rename pair.
+///
+/// The create races components that legitimately remove the (empty) tail
+/// directory during normal operation — flush cleanup after a table's last
+/// live generation is consumed, and recovery readers tidying an empty dir.
+/// A lost race surfaces between this function's `create_dir_all` call site
+/// and the open as a transient create error (macOS reports EEXIST/EINVAL
+/// there, not ENOENT), so the directory is restored and a fresh sequence
+/// minted, bounded to three attempts before the last error is reported.
+fn create_tail_log_file(
+    tail_dir: &Path,
+    id: Uuid,
+    partition_key: &str,
+) -> Result<(fs::File, PathBuf, PathBuf)> {
+    let mut last_error: Option<std::io::Error> = None;
+    for _ in 0..3 {
+        let sequence = next_sequence();
+        let stem = format!("{}.{}", id.simple(), sequence);
+        let tmp_path = tail_dir.join(format!(".{stem}.tmp"));
+        let final_path = tail_dir.join(format!("{stem}.tail"));
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&tmp_path)
+        {
+            Ok(mut file) => {
+                file.write_all(&encode_tail_log_header(partition_key))?;
+                return Ok((file, tmp_path, final_path));
+            }
+            Err(error) => {
+                last_error = Some(error);
+                fs::create_dir_all(tail_dir)?;
+            }
+        }
+    }
+    let error =
+        last_error.unwrap_or_else(|| std::io::Error::other("tail log create attempts exhausted"));
+    Err(error.into())
+}
+
 fn open_tail_for_group_append(command: &AppendCommand) -> Result<OpenTailResult> {
     let tail_dir = command.table_dir.join(TAIL_DIR);
     fs::create_dir_all(&tail_dir)?;
@@ -554,15 +596,8 @@ fn open_tail_for_group_append(command: &AppendCommand) -> Result<OpenTailResult>
         ));
     }
 
-    let sequence = next_sequence();
-    let stem = format!("{}.{}", command.id.simple(), sequence);
-    let tmp_path = tail_dir.join(format!(".{stem}.tmp"));
-    let final_path = tail_dir.join(format!("{stem}.tail"));
-    let mut file = fs::OpenOptions::new()
-        .create_new(true)
-        .append(true)
-        .open(&tmp_path)?;
-    file.write_all(&encode_tail_log_header(&command.partition_key))?;
+    let (file, tmp_path, final_path) =
+        create_tail_log_file(&tail_dir, command.id, &command.partition_key)?;
     Ok(OpenTailResult::Ready(OpenTail {
         file,
         path: tmp_path,
@@ -1950,7 +1985,12 @@ pub fn finish_flush_batch(table_dir: &Path, intents: Vec<FlushIntent>) -> Result
     for intent in intents {
         remove_file_if_exists(&intent.marker_path)?;
     }
-    remove_empty_dir(&tail_dir);
+    // The directory is left in place even when this flush consumed the last
+    // live generation: the tail committer mints fresh generations here
+    // concurrently, and removing it under them lost the create race as a
+    // transient EEXIST/EINVAL (macOS) — failing the append's durability
+    // ticket and rerouting acknowledged rows through the segment fallback.
+    // Recovery tidies an empty directory instead.
     Ok(())
 }
 
@@ -2229,15 +2269,7 @@ pub fn append_raw_frames(
         file.sync_all()?;
         return Ok(());
     }
-    let sequence = next_sequence();
-    let stem = format!("{}.{}", id.simple(), sequence);
-    let tmp_path = tail_dir.join(format!(".{stem}.tmp"));
-    let final_path = tail_dir.join(format!("{stem}.tail"));
-    let mut file = fs::OpenOptions::new()
-        .create_new(true)
-        .append(true)
-        .open(&tmp_path)?;
-    file.write_all(&encode_tail_log_header(partition_key))?;
+    let (mut file, tmp_path, final_path) = create_tail_log_file(&tail_dir, id, partition_key)?;
     file.write_all(frames)?;
     file.sync_all()?;
     drop(file);

@@ -264,7 +264,12 @@ fn finish_flush_batch_removes_tails_and_markers_in_one_pass() -> Result<()> {
     for id in ids {
         assert!(!has_tail(temp.path(), id));
     }
-    assert!(!temp.path().join(TAIL_DIR).exists());
+    // Tails and markers are gone, but the directory itself is left in place:
+    // the tail committer mints fresh generations there concurrently, and
+    // removing it under them raced their create (see create_tail_log_file).
+    // Recovery tidies an empty directory instead.
+    let tail_dir = temp.path().join(TAIL_DIR);
+    assert!(!std::fs::read_dir(&tail_dir)?.next().is_some());
     Ok(())
 }
 
