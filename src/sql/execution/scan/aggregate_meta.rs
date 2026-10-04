@@ -52,10 +52,39 @@ use crate::types::scalar::ScalarValue;
 ///
 /// `group_by` are the (already logical-schema-indexed) GROUP BY expressions;
 /// only bare column references are supported here — anything else declines.
-/// `aggregates` are the aggregate expressions from the SELECT list. The
-/// no-GROUP-BY shape returns a single-row batch; a grouped shape returns one
-/// row per group in first-seen order. `Ok(None)` declines and the caller
-/// falls back to the regular aggregate pipeline.
+/// Query-level shared state for one folded-aggregate evaluation: the
+/// post-hot-mirror scan spec plus everything the per-segment fold needs.
+/// Built once after the hot legs amend the spec; the per-segment fold and
+/// its row-group worker read it immutably (the tiny column-index vectors
+/// are cloned into the workers so their iterator patterns stay unchanged).
+struct FoldPlan<'a> {
+    spec: &'a ScanSpec,
+    table_schema: &'a Schema,
+    segment_mgr: &'a SegmentManager,
+    aggregates: &'a [AggregateExpr],
+    key_columns: Vec<usize>,
+    key_null_values: Vec<ScalarValue>,
+    aggregate_columns: Vec<Option<usize>>,
+    grouped: bool,
+    has_sum: bool,
+    has_avg: bool,
+    needs_data_fold: bool,
+    run_folds_enabled: bool,
+    source_columns: Vec<usize>,
+    predicate: crate::storage::partition::pruning::RowGroupPredicate,
+    bloom_checks: Vec<(usize, ScalarValue)>,
+    in_checks: Vec<&'a crate::sql::execution::scan::spec::InPredicate>,
+    set_checks: Vec<(usize, ScalarValue)>,
+    set_in_checks: Vec<&'a crate::sql::execution::scan::spec::InPredicate>,
+}
+
+/// Fold aggregates straight from segment metadata (zone maps, footer row
+/// counts, cached partial sums) instead of decoding row batches; the caller
+/// falls back to the regular aggregate pipeline on `Ok(None)`: the
+/// no-GROUP-BY shape returns a single-row batch, a grouped shape one row per
+/// group in first-seen order. Split into
+/// [`fold_one_segment`] (per-segment gates + metadata/cache folds) and
+/// [`fold_row_groups`] (row-group work planning and execution).
 #[allow(clippy::too_many_arguments)]
 pub fn compute_folded_aggregate(
     spec: &ScanSpec,
@@ -70,7 +99,6 @@ pub fn compute_folded_aggregate(
     db: &str,
 ) -> Result<Option<RecordBatch>> {
     // Read-time TTL filtering is row-dependent and metadata folds cannot see
-    // it; a table with an active TTL keeps the regular scan pipeline (which
     // filters the TTL column then aggregates). This gate used to live in the
     // scan executor's routing; it belongs to the engine itself now that the
     // folded operator calls the engine directly.
@@ -220,7 +248,107 @@ pub fn compute_folded_aggregate(
     // cannot emit per-run groups, so grouped queries decode+fold instead.
     let run_folds_enabled = !grouped;
 
+    let plan = FoldPlan {
+        spec: &spec,
+        table_schema,
+        segment_mgr,
+        aggregates,
+        key_columns: key_columns.clone(),
+        key_null_values: key_null_values.clone(),
+        aggregate_columns: aggregate_columns.clone(),
+        grouped,
+        has_sum,
+        has_avg,
+        needs_data_fold,
+        run_folds_enabled,
+        source_columns: source_columns.clone(),
+        predicate: predicate.clone(),
+        bloom_checks: bloom_checks.clone(),
+        in_checks: in_checks.clone(),
+        set_checks: set_checks.clone(),
+        set_in_checks: set_in_checks.clone(),
+    };
     for segment_path in &segment_files {
+        if fold_one_segment(&plan, &mut groups, segment_path)?.is_none() {
+            return Ok(None);
+        }
+    }
+
+    let memtable_batches =
+        scan_memtable::scan_memtables(memtable_mgr, hot_mgr, db, &spec.table_name, &spec)?;
+    for memtable_batch in &memtable_batches {
+        if fold_named_batch(
+            &mut groups,
+            &key_columns,
+            &aggregate_columns,
+            table_schema,
+            memtable_batch,
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
+    }
+    if let Some(mirror_batch) = &hybrid_mirror_batch {
+        if fold_named_batch(
+            &mut groups,
+            &key_columns,
+            &aggregate_columns,
+            table_schema,
+            mirror_batch,
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(finalize_folded(
+        groups,
+        &key_columns,
+        aggregates,
+        table_schema,
+    )?))
+}
+
+/// Segment-scoped alignment state handed from the per-segment gates to the
+/// row-group worker: the opened reader plus the drift-resolved column map,
+/// footer-aligned prune checks, and constant defaults.
+struct SegmentFoldEnv<'a> {
+    reader: &'a SegmentReader,
+    aligned_checks: &'a row_filter::FooterPruneChecks,
+    column_map: &'a std::collections::HashMap<usize, usize>,
+    defaults: &'a std::collections::HashMap<usize, ScalarValue>,
+}
+
+/// Fold one segment into `groups` (or answer it entirely from metadata /
+/// the partial-sum cache). `Ok(None)` declines the whole query (schema-drift
+/// shapes the fast path cannot serve); `Ok(Some(()))` means the segment is
+/// done and the caller continues with the next one.
+fn fold_one_segment(
+    plan: &FoldPlan<'_>,
+    groups: &mut GroupFold,
+    segment_path: &Path,
+) -> Result<Option<()>> {
+    let spec = plan.spec;
+    let table_schema = plan.table_schema;
+    let segment_mgr = plan.segment_mgr;
+    let aggregates = plan.aggregates;
+    // Column-index collections are tiny (a handful of entries); cloning them
+    // keeps the moved body's `&x` iterator patterns byte-identical.
+    let key_columns = plan.key_columns.clone();
+    let key_null_values = plan.key_null_values.clone();
+    let aggregate_columns = plan.aggregate_columns.clone();
+    let grouped = plan.grouped;
+    let has_sum = plan.has_sum;
+    let has_avg = plan.has_avg;
+    let needs_data_fold = plan.needs_data_fold;
+    let predicate = plan.predicate.clone();
+    let bloom_checks = plan.bloom_checks.clone();
+    let in_checks = plan.in_checks.clone();
+    let set_checks = plan.set_checks.clone();
+    let set_in_checks = plan.set_in_checks.clone();
+
         // Footer sums/counts cannot see this transaction's deferred
         // tombstones; treating the metadata as absent routes the segment
         // through the overlay-aware reader below.
@@ -267,7 +395,7 @@ pub fn compute_folded_aggregate(
             None => false,
         };
         if pruned {
-            continue;
+            return Ok(Some(()));
         }
 
         // The sidecar meta snapshot answers everything up to and including
@@ -460,7 +588,7 @@ pub fn compute_folded_aggregate(
                 }
                 sum_idx += 1;
             }
-            continue;
+            return Ok(Some(()));
         }
 
         // Cache miss: stream candidate row groups and fold every function
@@ -506,7 +634,7 @@ pub fn compute_folded_aggregate(
                     seg_row_count,
                     &[],
                 )?;
-                continue;
+                return Ok(Some(()));
             }
         }
         let reader = match overlay_reader {
@@ -541,10 +669,62 @@ pub fn compute_folded_aggregate(
                 reader.segment_zone_maps(),
             )
             .candidate_indices
+        };        let env = SegmentFoldEnv {
+            reader: &reader,
+            aligned_checks: &aligned_checks,
+            column_map: &column_map,
+            defaults: &defaults,
         };
+        fold_row_groups(
+            plan,
+            groups,
+            &env,
+            sums_answerable_from_footer,
+            streaming_sum,
+            &candidate_indices,
+        )?;
+        store_segment_sum_delta(
+            plan,
+            groups,
+            sum_before,
+            segment_path,
+            meta_rows,
+            &reader,
+            sums_answerable_from_footer,
+        )?;
+        Ok(Some(()))
+
+}
+
+/// Plan and run the per-row-group work for one segment: metadata-only folds
+/// collected first, data folds (run-level or decode+mask batches) read in
+/// parallel chunks of 32 and folded sequentially in candidate order. The
+fn fold_row_groups(
+    plan: &FoldPlan<'_>,
+    groups: &mut GroupFold,
+    env: &SegmentFoldEnv<'_>,
+    sums_answerable_from_footer: bool,
+    streaming_sum: bool,
+    candidate_indices: &[usize],
+) -> Result<()> {
+    let reader = env.reader;
+    let aligned_checks = env.aligned_checks;
+    let column_map = env.column_map;
+    let defaults = env.defaults;
+    let spec = plan.spec;
+    let table_schema = plan.table_schema;
+    let key_columns = plan.key_columns.clone();
+    let key_null_values = plan.key_null_values.clone();
+    let aggregate_columns = plan.aggregate_columns.clone();
+    let run_folds_enabled = plan.run_folds_enabled;
+    let source_columns = plan.source_columns.clone();
+    let predicate = plan.predicate.clone();
+    let has_sum = plan.has_sum;
+    let has_avg = plan.has_avg;
+
         let row_groups = reader.footer_row_groups();
         let mut candidates = vec![false; row_groups.len()];
-        for index in candidate_indices {
+        for &index in candidate_indices {
             if let Some(candidate) = candidates.get_mut(index) {
                 *candidate = true;
             }
@@ -634,8 +814,8 @@ pub fn compute_folded_aggregate(
             let rg_unit_key = unit_group_key(
                 &key_columns,
                 &key_null_values,
-                &defaults,
-                &column_map,
+                defaults,
+                column_map,
                 &row_group_meta.zone_maps,
             );
             if predicate_match == crate::storage::partition::pruning::PredicateMatch::All
@@ -644,8 +824,8 @@ pub fn compute_folded_aggregate(
                 && aggregates_foldable_from_metadata(
                     &groups.template,
                     &aggregate_columns,
-                    &column_map,
-                    &defaults,
+                    column_map,
+                    defaults,
                     &row_group_meta.zone_maps,
                 )
                 && (!has_sum && !has_avg || rg_sums_available)
@@ -710,7 +890,7 @@ pub fn compute_folded_aggregate(
                     run_predicates,
                     &groups.template,
                     table_schema,
-                    &reader,
+                    reader,
                 );
             } else if run_folds_enabled && classifiable && !predicate.clauses.is_empty() {
                 // Every clause is vacuous. When the aggregates share one
@@ -721,9 +901,9 @@ pub fn compute_folded_aggregate(
                     &aggregate_columns,
                     &groups.template,
                     table_schema,
-                    &column_map,
+                    column_map,
                     &row_group_meta.zone_maps,
-                    &reader,
+                    reader,
                 );
             }
 
@@ -809,8 +989,8 @@ pub fn compute_folded_aggregate(
         for (key, zone_maps, row_count, col_sums) in meta_folds {
             fold_metadata(
                 groups.group(key),
-                &column_map,
-                &defaults,
+                column_map,
+                defaults,
                 zone_maps,
                 row_count,
                 col_sums,
@@ -849,11 +1029,11 @@ pub fn compute_folded_aggregate(
                     // Columns the footer predates splice in as their
                     // constant DEFAULT instead of decoding.
                     let mut batch = read_data_fold_batch(
-                        &reader,
+                        reader,
                         table_schema,
                         fold.row_group_index,
                         &fold.read_columns,
-                        &defaults,
+                        defaults,
                     )?;
                     if !delete_bitmap_is_empty {
                         batch = delete_bitmap::filter_batch(
@@ -887,7 +1067,7 @@ pub fn compute_folded_aggregate(
                     }
                     RgOutcome::Batch(batch) => {
                         fold_grouped_data_batch(
-                            &mut groups,
+                            groups,
                             &fold.key_positions,
                             &fold.positions,
                             &batch,
@@ -896,86 +1076,71 @@ pub fn compute_folded_aggregate(
                 }
             }
         }
-
-        if has_sum
-            && !grouped
-            && !sums_answerable_from_footer
-            && !spec.has_predicates()
-            && reader.deleted_row_count() == 0
-        {
-            let needed = sum_needed_columns(aggregates, &aggregate_columns, table_schema);
-            // Only SUM accumulators: `needed` (and the cache key order)
-            // covers SUM aggregates exclusively, so zipping all accumulators
-            // would pair the cache entry with COUNT's empty delta and store
-            // a zero sum.
-            let deltas: Vec<SumCacheValue> = groups
-                .single()
-                .iter()
-                .zip(sum_before.iter())
-                .filter(|(a, _)| a.func == crate::sql::planner::AggFunc::Sum)
-                .map(|(a, (i0, f0))| SumCacheValue {
-                    i: match (a.sum_i, *i0) {
-                        // Delta of two exact i64 partials; the difference can
-                        // only exceed i64 when one side already wrapped inside
-                        // the documented vectorized col_sum_i64 fold, in which
-                        // case the cache entry is garbage either way.
-                        (Some(v), Some(base)) => Some(v.wrapping_sub(base)),
-                        (v, None) => v,
-                        (None, Some(_)) => None,
-                    },
-                    f: match (a.sum_f, *f0) {
-                        (Some(v), Some(base)) => Some(v - base),
-                        (v, None) => v,
-                        (None, Some(_)) => None,
-                    },
-                })
-                .collect();
-            segment_sum_cache_store(
-                segment_path.to_string_lossy().as_ref(),
-                meta_rows,
-                reader.deleted_row_count(),
-                &needed,
-                &deltas,
-            );
-        }
-    }
-
-    let memtable_batches =
-        scan_memtable::scan_memtables(memtable_mgr, hot_mgr, db, &spec.table_name, &spec)?;
-    for memtable_batch in &memtable_batches {
-        if fold_named_batch(
-            &mut groups,
-            &key_columns,
-            &aggregate_columns,
-            table_schema,
-            memtable_batch,
-        )?
-        .is_none()
-        {
-            return Ok(None);
-        }
-    }
-    if let Some(mirror_batch) = &hybrid_mirror_batch {
-        if fold_named_batch(
-            &mut groups,
-            &key_columns,
-            &aggregate_columns,
-            table_schema,
-            mirror_batch,
-        )?
-        .is_none()
-        {
-            return Ok(None);
-        }
-    }
-
-    Ok(Some(finalize_folded(
-        groups,
-        &key_columns,
-        aggregates,
-        table_schema,
-    )?))
+    Ok(())
 }
+
+/// After a data fold, store the segment's SUM deltas into the partial-sum
+/// cache (whole-segment shape only: no predicates, no deletes, no GROUP BY).
+fn store_segment_sum_delta(
+    plan: &FoldPlan<'_>,
+    groups: &mut GroupFold,
+    sum_before: Vec<(Option<i64>, Option<f64>)>,
+    segment_path: &Path,
+    meta_rows: u64,
+    reader: &SegmentReader,
+    sums_answerable_from_footer: bool,
+) -> Result<()> {
+    let spec = plan.spec;
+    let aggregates = plan.aggregates;
+    let aggregate_columns = plan.aggregate_columns.clone();
+    let table_schema = plan.table_schema;
+    let grouped = plan.grouped;
+    let has_sum = plan.has_sum;
+
+    if has_sum
+        && !grouped
+        && !sums_answerable_from_footer
+        && !spec.has_predicates()
+        && reader.deleted_row_count() == 0
+    {
+        let needed = sum_needed_columns(aggregates, &aggregate_columns, table_schema);
+        // Only SUM accumulators: `needed` (and the cache key order)
+        // covers SUM aggregates exclusively, so zipping all accumulators
+        // would pair the cache entry with COUNT's empty delta and store
+        // a zero sum.
+        let deltas: Vec<SumCacheValue> = groups
+            .single()
+            .iter()
+            .zip(sum_before.iter())
+            .filter(|(a, _)| a.func == crate::sql::planner::AggFunc::Sum)
+            .map(|(a, (i0, f0))| SumCacheValue {
+                i: match (a.sum_i, *i0) {
+                    // Delta of two exact i64 partials; the difference can
+                    // only exceed i64 when one side already wrapped inside
+                    // the documented vectorized col_sum_i64 fold, in which
+                    // case the cache entry is garbage either way.
+                    (Some(v), Some(base)) => Some(v.wrapping_sub(base)),
+                    (v, None) => v,
+                    (None, Some(_)) => None,
+                },
+                f: match (a.sum_f, *f0) {
+                    (Some(v), Some(base)) => Some(v - base),
+                    (v, None) => v,
+                    (None, Some(_)) => None,
+                },
+            })
+            .collect();
+        segment_sum_cache_store(
+            segment_path.to_string_lossy().as_ref(),
+            meta_rows,
+            reader.deleted_row_count(),
+            &needed,
+            &deltas,
+        );
+    }
+    Ok(())
+}
+
 
 /// Fold a hot-store / memtable batch (catalog-schema-aligned, columns
 /// resolved by name) into the group table. Returns `None` when a GROUP BY
