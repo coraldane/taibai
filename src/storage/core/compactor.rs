@@ -1283,6 +1283,49 @@ impl Compactor {
     /// inputs or atomically swap the replacement segment in. Both steps are
     /// metadata-only, so the lock is held for milliseconds, not for the
     /// length of the rewrite I/O.
+    /// Commit-time guards shared by both commit arms: the rewrite's input
+    /// identity must still hold, and no transaction may have pinned the table
+    /// after the heavy phase (a pin that never touched segment files is
+    /// invisible to the identity check, and committing under one would strand
+    /// the transaction's later COMMIT on a vanished path). Both checks run
+    /// under the same partition mutation lock the pin registration uses, so
+    /// they cannot race. Returns true when the arm must abort: the caller
+    /// runs its own cleanup and reports a partial stats value instead of
+    /// committing.
+    fn commit_guards_block(
+        &self,
+        db: &str,
+        table: &str,
+        partition_label: &str,
+        segment_files: &[PathBuf],
+        identities: &[SegmentFileIdentity],
+        abort_label: &str,
+    ) -> bool {
+        if !compaction_inputs_unchanged(&self.segment_mgr, segment_files, identities) {
+            tracing::info!(
+                db,
+                table,
+                partition_key = partition_label,
+                "compact inputs changed while rewriting; {abort_label}"
+            );
+            return true;
+        }
+        if self
+            .segment_mgr
+            .txn_mutations()
+            .is_some_and(|registry| registry.table_has_pins(db, table))
+        {
+            tracing::info!(
+                db,
+                table,
+                partition_key = partition_label,
+                "transaction pinned the table during compaction; {abort_label}"
+            );
+            return true;
+        }
+        false
+    }
+
     fn commit_prepared_compaction(
         &self,
         db: &str,
@@ -1301,37 +1344,14 @@ impl Compactor {
                 rows_dropped,
                 rows_dropped_ttl,
             } => {
-                if !compaction_inputs_unchanged(&self.segment_mgr, &segment_files, &identities) {
-                    tracing::info!(
-                        db,
-                        table,
-                        partition_key = partition_label,
-                        "compact inputs changed while rewriting; deferring empty-input cleanup"
-                    );
-                    return Ok(CompactStats {
-                        segments_read,
-                        ..CompactStats::default()
-                    });
-                }
-                // Re-check transaction pins at commit time. A BEGIN...DELETE/
-                // UPDATE that started after the heavy phase registered pins
-                // without touching segment files, so the identity validation
-                // above cannot see it. Committing under a pin makes the
-                // transaction's later COMMIT fail on a vanished path and the
-                // retry fail forever on the same stale plan; this check runs
-                // under the same partition mutation lock the registration
-                // uses, so it cannot race.
-                if self
-                    .segment_mgr
-                    .txn_mutations()
-                    .is_some_and(|registry| registry.table_has_pins(db, table))
-                {
-                    tracing::info!(
-                        db,
-                        table,
-                        partition_key = partition_label,
-                        "transaction pinned the table during compaction; deferring empty-input cleanup"
-                    );
+                if self.commit_guards_block(
+                    db,
+                    table,
+                    partition_label,
+                    &segment_files,
+                    &identities,
+                    "deferring empty-input cleanup",
+                ) {
                     return Ok(CompactStats {
                         segments_read,
                         ..CompactStats::default()
@@ -1373,37 +1393,16 @@ impl Compactor {
                 rows_dropped,
                 rows_dropped_ttl,
             } => {
-                if !compaction_inputs_unchanged(&self.segment_mgr, &segment_files, &identities) {
+                if self.commit_guards_block(
+                    db,
+                    table,
+                    partition_label,
+                    &segment_files,
+                    &identities,
+                    "discarding prepared replacement",
+                ) {
                     let _ = std::fs::remove_file(&tmp_path);
                     let _ = crate::storage::segment::meta::remove_sidecar_meta(&tmp_path);
-                    tracing::info!(
-                        db,
-                        table,
-                        partition_key = partition_label,
-                        "compact inputs changed while rewriting; discarding prepared replacement"
-                    );
-                    return Ok(CompactStats {
-                        segments_read,
-                        ..CompactStats::default()
-                    });
-                }
-                // Same commit-time pin re-check as the AllDropped arm: a pin
-                // registered after the heavy phase references the segments
-                // this replacement is about to remove, and committing would
-                // deadlock the transaction's COMMIT on a missing file.
-                if self
-                    .segment_mgr
-                    .txn_mutations()
-                    .is_some_and(|registry| registry.table_has_pins(db, table))
-                {
-                    let _ = std::fs::remove_file(&tmp_path);
-                    let _ = crate::storage::segment::meta::remove_sidecar_meta(&tmp_path);
-                    tracing::info!(
-                        db,
-                        table,
-                        partition_key = partition_label,
-                        "transaction pinned the table during compaction; discarding prepared replacement"
-                    );
                     return Ok(CompactStats {
                         segments_read,
                         ..CompactStats::default()

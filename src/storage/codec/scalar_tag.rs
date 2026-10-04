@@ -5,28 +5,10 @@ use crate::protocol::types::DataType;
 use crate::storage::codec::io_util::{read_u32_le, read_u8};
 use crate::types::scalar::ScalarValue;
 
+/// Single source of truth for "NULL of a given type" lives on `ScalarValue`;
+/// this wrapper keeps the codec-local name that the write paths use.
 pub fn null_for_dtype(dtype: DataType) -> ScalarValue {
-    match dtype {
-        DataType::Bool => ScalarValue::Bool(None),
-        DataType::Int8 => ScalarValue::Int8(None),
-        DataType::Int16 => ScalarValue::Int16(None),
-        DataType::Int32 => ScalarValue::Int32(None),
-        DataType::Int64 => ScalarValue::Int64(None),
-        DataType::UInt8 => ScalarValue::UInt8(None),
-        DataType::UInt16 => ScalarValue::UInt16(None),
-        DataType::UInt32 => ScalarValue::UInt32(None),
-        DataType::UInt64 => ScalarValue::UInt64(None),
-        DataType::Float32 => ScalarValue::Float32(None),
-        DataType::Float64 => ScalarValue::Float64(None),
-        DataType::Decimal => ScalarValue::Decimal(None),
-        DataType::Date => ScalarValue::Date(None),
-        DataType::Time => ScalarValue::Time(None),
-        DataType::Timestamp => ScalarValue::Timestamp(None),
-        DataType::Interval => ScalarValue::Interval(None),
-        DataType::VarChar => ScalarValue::VarChar(None),
-        DataType::Blob => ScalarValue::Blob(None),
-        DataType::Vector => ScalarValue::Vector(None),
-    }
+    ScalarValue::null_for_type(dtype)
 }
 
 pub fn encode_scalar_with_tag(buf: &mut Vec<u8>, v: &ScalarValue) {

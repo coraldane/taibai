@@ -61,7 +61,7 @@ fn main() {
         process::exit(2);
     }
 
-    let targets = collect_table_dirs(data_dir, args.db.as_deref(), args.table.as_deref());
+    let targets = segment::collect_table_dirs(data_dir, args.db.as_deref(), args.table.as_deref());
     if targets.is_empty() {
         eprintln!("no tables found under {}", data_dir.display());
         process::exit(2);
@@ -141,51 +141,6 @@ fn main() {
     if !args.write && skipped > 0 {
         println!("re-run with --write to apply the migration");
     }
-}
-
-fn collect_table_dirs(
-    data_dir: &Path,
-    only_db: Option<&str>,
-    only_table: Option<&str>,
-) -> Vec<(String, String, PathBuf)> {
-    let mut out = Vec::new();
-    let Ok(dbs) = std::fs::read_dir(data_dir) else {
-        return out;
-    };
-    for db_entry in dbs.flatten() {
-        if !db_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let db_name = db_entry.file_name().to_string_lossy().to_string();
-        if db_name.starts_with('.') || db_name == "meta" || db_name == "wal" {
-            continue;
-        }
-        if let Some(only_db) = only_db {
-            if db_name != only_db {
-                continue;
-            }
-        }
-        let Ok(tables) = std::fs::read_dir(db_entry.path()) else {
-            continue;
-        };
-        for table_entry in tables.flatten() {
-            if !table_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            let table_name = table_entry.file_name().to_string_lossy().to_string();
-            if table_name.starts_with(".taibai-") {
-                continue;
-            }
-            if let Some(only_table) = only_table {
-                if table_name != only_table {
-                    continue;
-                }
-            }
-            out.push((db_name.clone(), table_name.clone(), table_entry.path()));
-        }
-    }
-    out.sort();
-    out
 }
 
 /// Full structural verification (header, sidecar/embedded footer, checksum,

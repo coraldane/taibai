@@ -889,23 +889,35 @@ trait ChunkView: Sync {
     fn key_partition_postings(&self, key: &ValueKey, partition: &ValueKey) -> Option<&Vec<u32>>;
 }
 
-impl ChunkView for Chunk {
-    fn base(&self) -> u64 {
-        self.base
-    }
-    fn num_rows(&self) -> u64 {
-        self.rows as u64
-    }
-    fn columns(&self) -> &[std::sync::Arc<ColumnArray>] {
-        &self.columns
-    }
-    fn key_postings(&self, key: &ValueKey) -> Option<&Vec<u32>> {
-        self.index.key.get(key)
-    }
-    fn key_partition_postings(&self, key: &ValueKey, partition: &ValueKey) -> Option<&Vec<u32>> {
-        self.index.key_partition.as_ref()?.get(&(*key, *partition))
-    }
+/// Both chunk kinds carry the same field names, so one macro serves the two
+/// views; `rows` differs (u32 vs usize) and widens through `as u64`.
+macro_rules! impl_chunk_view {
+    ($t:ty) => {
+        impl ChunkView for $t {
+            fn base(&self) -> u64 {
+                self.base
+            }
+            fn num_rows(&self) -> u64 {
+                self.rows as u64
+            }
+            fn columns(&self) -> &[std::sync::Arc<ColumnArray>] {
+                &self.columns
+            }
+            fn key_postings(&self, key: &ValueKey) -> Option<&Vec<u32>> {
+                self.index.key.get(key)
+            }
+            fn key_partition_postings(
+                &self,
+                key: &ValueKey,
+                partition: &ValueKey,
+            ) -> Option<&Vec<u32>> {
+                self.index.key_partition.as_ref()?.get(&(*key, *partition))
+            }
+        }
+    };
 }
+
+impl_chunk_view!(Chunk);
 
 /// The single writable chunk. Appends bulk-copy columns and maintain the group
 /// index for the new rows only; readers take this chunk's lock briefly, so they
@@ -965,23 +977,7 @@ impl OpenChunk {
     }
 }
 
-impl ChunkView for OpenChunk {
-    fn base(&self) -> u64 {
-        self.base
-    }
-    fn num_rows(&self) -> u64 {
-        self.rows as u64
-    }
-    fn columns(&self) -> &[std::sync::Arc<ColumnArray>] {
-        &self.columns
-    }
-    fn key_postings(&self, key: &ValueKey) -> Option<&Vec<u32>> {
-        self.index.key.get(key)
-    }
-    fn key_partition_postings(&self, key: &ValueKey, partition: &ValueKey) -> Option<&Vec<u32>> {
-        self.index.key_partition.as_ref()?.get(&(*key, *partition))
-    }
-}
+impl_chunk_view!(OpenChunk);
 
 /// Reader-visible snapshot: the `front` cursor, the sealed chunk list and the
 /// open chunk handle. Lookups hold the `RwLock` read guard for their whole

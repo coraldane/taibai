@@ -1116,7 +1116,11 @@ fn spill_group_run(
     SpillFile::write_batches_from_iter(schema, batches, spill_rows)
 }
 
-struct GroupSpillCursor {
+/// Shared row cursor over a spilled, segment-encoded aggregate file: walks
+/// non-empty row groups and exposes row-level positioning. Payload decoding
+/// stays with the two merge algorithms (`current_group_payload` and
+/// `current_distinct_key`).
+struct SpillCursor {
     _spill: SpillFile,
     reader: SegmentReader,
     row_group: usize,
@@ -1124,7 +1128,7 @@ struct GroupSpillCursor {
     row: usize,
 }
 
-impl GroupSpillCursor {
+impl SpillCursor {
     fn new(spill: SpillFile) -> Result<Self> {
         let reader = spill.open_reader()?;
         let mut cursor = Self {
@@ -1155,7 +1159,7 @@ impl GroupSpillCursor {
     /// Byte key (the merge identity, identical to the in-memory group-key
     /// encoding), the scalar values for output reconstruction, and the JSON
     /// accumulator state.
-    fn current(&self) -> Result<(Vec<u8>, Vec<ScalarValue>, String)> {
+    fn current_group_payload(&self) -> Result<(Vec<u8>, Vec<ScalarValue>, String)> {
         let batch = self
             .batch
             .as_ref()
@@ -1181,6 +1185,14 @@ impl GroupSpillCursor {
             }
         };
         Ok((bytes, scalars, state))
+    }
+
+    /// Distinct-merge payload: the single Blob key column.
+    fn current_distinct_key(&self) -> Option<Vec<u8>> {
+        match self.batch.as_ref()?.scalar(self.row, 0) {
+            Some(ScalarValue::Blob(Some(value))) => Some(value),
+            _ => None,
+        }
     }
 
     fn advance(&mut self) -> Result<()> {
@@ -1224,7 +1236,7 @@ impl PartialOrd for GroupHeapItem {
 }
 
 struct GroupSpillMerge {
-    cursors: Vec<GroupSpillCursor>,
+    cursors: Vec<SpillCursor>,
     heap: BinaryHeap<GroupHeapItem>,
     output_schema: Schema,
     aggregates: Vec<AggregateExpr>,
@@ -1251,11 +1263,11 @@ impl GroupSpillMerge {
         let mut cursors = Vec::with_capacity(spills.len());
         let mut heap = BinaryHeap::new();
         for spill in spills {
-            let cursor = GroupSpillCursor::new(spill)?;
+            let cursor = SpillCursor::new(spill)?;
             let index = cursors.len();
             if cursor.has_row() {
                 heap.push(GroupHeapItem {
-                    key: cursor.current()?.0,
+                    key: cursor.current_group_payload()?.0,
                     cursor: index,
                 });
             }
@@ -1281,14 +1293,14 @@ impl GroupSpillMerge {
             .pop()
             .ok_or_else(|| TaibaiError::Internal("aggregate spill heap exhausted".into()))?;
         let cursor = &mut self.cursors[item.cursor];
-        let (key, key_scalars, encoded_state) = cursor.current()?;
+        let (key, key_scalars, encoded_state) = cursor.current_group_payload()?;
         let state = serde_json::from_str(&encoded_state).map_err(|error| {
             TaibaiError::Internal(format!("failed to decode aggregate spill state: {error}"))
         })?;
         cursor.advance()?;
         if cursor.has_row() {
             self.heap.push(GroupHeapItem {
-                key: cursor.current()?.0,
+                key: cursor.current_group_payload()?.0,
                 cursor: item.cursor,
             });
         }
@@ -1589,9 +1601,9 @@ impl DistinctSpillAccumulator {
         let mut cursors = Vec::with_capacity(self.runs.len());
         let mut heap = BinaryHeap::new();
         for run in self.runs {
-            let cursor = DistinctSpillCursor::new(run)?;
+            let cursor = SpillCursor::new(run)?;
             let index = cursors.len();
-            if let Some(value) = cursor.current() {
+            if let Some(value) = cursor.current_distinct_key() {
                 heap.push(DistinctHeapItem {
                     value,
                     cursor: index,
@@ -1609,7 +1621,7 @@ impl DistinctSpillAccumulator {
             }
             let cursor = &mut cursors[item.cursor];
             cursor.advance()?;
-            if let Some(value) = cursor.current() {
+            if let Some(value) = cursor.current_distinct_key() {
                 heap.push(DistinctHeapItem {
                     value,
                     cursor: item.cursor,
@@ -1617,62 +1629,6 @@ impl DistinctSpillAccumulator {
             }
         }
         Ok(summary.finalize(self.func, col_type))
-    }
-}
-
-struct DistinctSpillCursor {
-    _spill: SpillFile,
-    reader: SegmentReader,
-    row_group: usize,
-    batch: Option<RecordBatch>,
-    row: usize,
-}
-
-impl DistinctSpillCursor {
-    fn new(spill: SpillFile) -> Result<Self> {
-        let reader = spill.open_reader()?;
-        let mut cursor = Self {
-            _spill: spill,
-            reader,
-            row_group: 0,
-            batch: None,
-            row: 0,
-        };
-        cursor.load_next_batch()?;
-        Ok(cursor)
-    }
-
-    fn load_next_batch(&mut self) -> Result<()> {
-        while self.row_group < self.reader.num_row_groups() {
-            let batch = self.reader.read_row_group(self.row_group)?;
-            self.row_group += 1;
-            if batch.num_rows() > 0 {
-                self.batch = Some(batch);
-                self.row = 0;
-                return Ok(());
-            }
-        }
-        self.batch = None;
-        Ok(())
-    }
-
-    fn current(&self) -> Option<Vec<u8>> {
-        match self.batch.as_ref()?.scalar(self.row, 0) {
-            Some(ScalarValue::Blob(Some(value))) => Some(value),
-            _ => None,
-        }
-    }
-
-    fn advance(&mut self) -> Result<()> {
-        self.row += 1;
-        if self
-            .batch
-            .as_ref()
-            .is_some_and(|batch| self.row >= batch.num_rows())
-        {
-            self.load_next_batch()?;
-        }
-        Ok(())
     }
 }
 
@@ -1697,7 +1653,7 @@ impl PartialOrd for DistinctHeapItem {
     }
 }
 
-fn arg_column_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
+pub(super) fn arg_column_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
     match &*agg.arg {
         LogicalExpr::Column(idx) => schema
             .columns

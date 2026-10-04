@@ -695,6 +695,61 @@ impl Handler {
         }
     }
 
+    /// Take the prepared statement `stmt_id` out of the session cache, or
+    /// produce the protocol error response when the id is unknown (with a
+    /// diagnostic warn — usually a protocol/version mismatch or a stale
+    /// connection). The statement is removed up front so a failed execute
+    /// cannot double-run it; successful paths re-insert it.
+    fn take_prepared_statement(
+        session: &mut Session,
+        stmt_id: u32,
+        context: &str,
+    ) -> std::result::Result<crate::sql::execution::prepared::PreparedStatement, Vec<Message>>
+    {
+        match session.prepared_statements.remove(stmt_id) {
+            Some(stmt) => Ok(stmt),
+            None => {
+                tracing::warn!(
+                    stmt_id,
+                    live_statements = session.prepared_statements.len(),
+                    next_unissued_id = session.prepared_statements.next_id(),
+                    "prepared statement lookup failed on {context}; client may reference an unknown id (protocol/version mismatch or stale connection)"
+                );
+                Err(vec![build_error(&format!(
+                    "prepared statement {} not found (session has {} prepared statement(s); ids start at 1, next unissued id is {})",
+                    stmt_id,
+                    session.prepared_statements.len(),
+                    session.prepared_statements.next_id()
+                ))])
+            }
+        }
+    }
+
+    /// Reject a prepared statement whose target table's parameter types no
+    /// longer match the PREPARE-time signature. `Ok(stmt)` hands the
+    /// statement back unchanged; `Err(messages)` carries the rejection
+    /// response (the statement is re-inserted into the session cache).
+    fn reject_if_schema_changed(
+        engine: &Engine,
+        session: &mut Session,
+        stmt: crate::sql::execution::prepared::PreparedStatement,
+        stmt_id: u32,
+    ) -> std::result::Result<crate::sql::execution::prepared::PreparedStatement, Vec<Message>>
+    {
+        if let Some((_, current_types)) = Self::current_insert_param_types(engine, session, &stmt)
+        {
+            if !stmt.param_types.is_empty() && stmt.param_types != current_types {
+                return Err(Self::reject_stale_prepared_statement(
+                    engine,
+                    session,
+                    stmt,
+                    stmt_id,
+                ));
+            }
+        }
+        Ok(stmt)
+    }
+
     fn current_insert_param_types(
         engine: &Engine,
         session: &Session,
@@ -811,38 +866,17 @@ impl Handler {
             }
         }
 
-        let mut stmt = match session.prepared_statements.remove(stmt_id) {
-            Some(s) => s,
-            None => {
-                tracing::warn!(
-                    stmt_id,
-                    live_statements = session.prepared_statements.len(),
-                    next_unissued_id = session.prepared_statements.next_id(),
-                    "prepared statement lookup failed on execute; client may reference an unknown id (protocol/version mismatch or stale connection)"
-                );
-                return Ok(vec![build_error(&format!(
-                    "prepared statement {} not found (session has {} prepared statement(s); ids start at 1, next unissued id is {})",
-                    stmt_id,
-                    session.prepared_statements.len(),
-                    session.prepared_statements.next_id()
-                ))]);
-            }
+        let mut stmt = match Self::take_prepared_statement(session, stmt_id, "execute") {
+            Ok(stmt) => stmt,
+            Err(messages) => return Ok(messages),
         };
 
         stmt.params = params;
 
-        if let Some((_, current_types)) =
-            Self::current_insert_param_types(&self.engine, session, &stmt)
-        {
-            if !stmt.param_types.is_empty() && stmt.param_types != current_types {
-                return Ok(Self::reject_stale_prepared_statement(
-                    &self.engine,
-                    session,
-                    stmt,
-                    stmt_id,
-                ));
-            }
-        }
+        let mut stmt = match Self::reject_if_schema_changed(&self.engine, session, stmt, stmt_id) {
+            Ok(stmt) => stmt,
+            Err(messages) => return Ok(messages),
+        };
 
         let execute_start = Instant::now();
         let result = self.engine.execute_prepared(session, &mut stmt);
@@ -1073,38 +1107,17 @@ impl Handler {
 
         let mut offset = 8usize;
 
-        let mut stmt = match session.prepared_statements.remove(stmt_id) {
-            Some(s) => s,
-            None => {
-                tracing::warn!(
-                    stmt_id,
-                    live_statements = session.prepared_statements.len(),
-                    next_unissued_id = session.prepared_statements.next_id(),
-                    "prepared statement lookup failed on batch execute; client may reference an unknown id (protocol/version mismatch or stale connection)"
-                );
-                return Ok(vec![build_error(&format!(
-                    "prepared statement {} not found (session has {} prepared statement(s); ids start at 1, next unissued id is {})",
-                    stmt_id,
-                    session.prepared_statements.len(),
-                    session.prepared_statements.next_id()
-                ))]);
-            }
+        let stmt = match Self::take_prepared_statement(session, stmt_id, "batch execute") {
+            Ok(stmt) => stmt,
+            Err(messages) => return Ok(messages),
         };
 
         let param_count = stmt.param_count;
 
-        if let Some((_, current_types)) =
-            Self::current_insert_param_types(&self.engine, session, &stmt)
-        {
-            if !stmt.param_types.is_empty() && stmt.param_types != current_types {
-                return Ok(Self::reject_stale_prepared_statement(
-                    &self.engine,
-                    session,
-                    stmt,
-                    stmt_id,
-                ));
-            }
-        }
+        let mut stmt = match Self::reject_if_schema_changed(&self.engine, session, stmt, stmt_id) {
+            Ok(stmt) => stmt,
+            Err(messages) => return Ok(messages),
+        };
         let mut parameter_batch = Vec::with_capacity(batch_size);
 
         for row_idx in 0..batch_size {

@@ -1254,7 +1254,7 @@ fn parse_exact_decimal_text(text: &str, scale: i32) -> Option<i64> {
     Some(if negative { -value } else { value })
 }
 
-fn decimal_multiplier(scale: i32) -> Result<i64> {
+pub(super) fn decimal_multiplier(scale: i32) -> Result<i64> {
     if !(0..=18).contains(&scale) {
         return Err(TaibaiError::Sql(format!("invalid decimal scale {}", scale)));
     }

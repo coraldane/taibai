@@ -584,29 +584,12 @@ pub fn exec_drop_table(
 
             Ok(tombstone)
         };
-        let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
-            Some(
-                engine
-                    .segment_mgr()
-                    .with_table_mutation_lock(db, name, &mut op)?,
-            )
-        } else {
-            engine
-                .segment_mgr()
-                .try_with_table_mutation_lock(db, name, &mut op)?
-        };
+        let attempt = try_or_block_table_mutation_lock(engine, db, name, lock_attempts, &mut op)?;
         match attempt {
             Some(tombstone) => break (tombstone, table_meta),
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
-                    tracing::warn!(
-                        db,
-                        table = name,
-                        lock_attempts,
-                        "drop table: table mutation lock busy; retrying without the catalog lock"
-                    );
-                }
+                warn_table_mutation_lock_busy(db, name, lock_attempts, "drop table");
                 drop(catalogs);
                 thread::sleep(DDL_TABLE_LOCK_RETRY_INTERVAL);
                 catalogs = engine.catalogs().write().unwrap();
@@ -781,29 +764,12 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
             );
             Ok(())
         };
-        let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
-            Some(
-                engine
-                    .segment_mgr()
-                    .with_table_mutation_lock(db, name, &mut op)?,
-            )
-        } else {
-            engine
-                .segment_mgr()
-                .try_with_table_mutation_lock(db, name, &mut op)?
-        };
+        let attempt = try_or_block_table_mutation_lock(engine, db, name, lock_attempts, &mut op)?;
         match attempt {
             Some(()) => break catalog_before,
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
-                    tracing::warn!(
-                        db,
-                        table = name,
-                        lock_attempts,
-                        "rename table: table mutation lock busy; retrying without the catalog lock"
-                    );
-                }
+                warn_table_mutation_lock_busy(db, name, lock_attempts, "rename table");
                 drop(catalogs);
                 thread::sleep(DDL_TABLE_LOCK_RETRY_INTERVAL);
                 catalogs = engine.catalogs().write().unwrap();
@@ -972,29 +938,12 @@ fn exec_partition_change(
             );
             Ok(operation_dir.clone())
         };
-        let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
-            Some(
-                engine
-                    .segment_mgr()
-                    .with_table_mutation_lock(db, name, &mut op)?,
-            )
-        } else {
-            engine
-                .segment_mgr()
-                .try_with_table_mutation_lock(db, name, &mut op)?
-        };
+        let attempt = try_or_block_table_mutation_lock(engine, db, name, lock_attempts, &mut op)?;
         match attempt {
             Some(operation_dir) => break operation_dir,
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
-                    tracing::warn!(
-                        db,
-                        table = name,
-                        lock_attempts,
-                        "partition change: table mutation lock busy; retrying without the catalog lock"
-                    );
-                }
+                warn_table_mutation_lock_busy(db, name, lock_attempts, "partition change");
                 drop(catalogs);
                 thread::sleep(DDL_TABLE_LOCK_RETRY_INTERVAL);
                 catalogs = engine.catalogs().write().unwrap();
@@ -1064,29 +1013,12 @@ fn exec_set_hot(engine: &Engine, db: &str, name: &str, hot: &HotDef) -> Result<E
             engine.hot_store_manager().remove(db, name);
             Ok(())
         };
-        let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
-            Some(
-                engine
-                    .segment_mgr()
-                    .with_table_mutation_lock(db, name, &mut op)?,
-            )
-        } else {
-            engine
-                .segment_mgr()
-                .try_with_table_mutation_lock(db, name, &mut op)?
-        };
+        let attempt = try_or_block_table_mutation_lock(engine, db, name, lock_attempts, &mut op)?;
         match attempt {
             Some(()) => break,
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
-                    tracing::warn!(
-                        db,
-                        table = name,
-                        lock_attempts,
-                        "set hot: table mutation lock busy; retrying without the catalog lock"
-                    );
-                }
+                warn_table_mutation_lock_busy(db, name, lock_attempts, "set hot");
                 drop(catalogs);
                 thread::sleep(DDL_TABLE_LOCK_RETRY_INTERVAL);
                 catalogs = engine.catalogs().write().unwrap();
@@ -1697,29 +1629,12 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
             );
             Ok(operation_dir.clone())
         };
-        let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
-            Some(
-                engine
-                    .segment_mgr()
-                    .with_table_mutation_lock(db, table, &mut op)?,
-            )
-        } else {
-            engine
-                .segment_mgr()
-                .try_with_table_mutation_lock(db, table, &mut op)?
-        };
+        let attempt = try_or_block_table_mutation_lock(engine, db, table, lock_attempts, &mut op)?;
         match attempt {
             Some(operation_dir) => break operation_dir,
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
-                    tracing::warn!(
-                        db,
-                        table,
-                        lock_attempts,
-                        "truncate table: table mutation lock busy; retrying without the catalog lock"
-                    );
-                }
+                warn_table_mutation_lock_busy(db, table, lock_attempts, "truncate table");
                 drop(catalogs);
                 thread::sleep(DDL_TABLE_LOCK_RETRY_INTERVAL);
                 catalogs = engine.catalogs().write().unwrap();
@@ -1746,4 +1661,42 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
     }
 
     Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+/// One escalating attempt to run `op` under the table mutation lock: try-lock
+/// first, and once `DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS` busy rounds have
+/// passed, switch to a blocking acquire. `Some(value)` means the op ran; the
+/// caller owns the catalog write guard and drops it across the retry sleep.
+///
+/// The DDL paths that need catalog-meta + table-lock atomicity (drop, rename,
+/// partition change, set hot, truncate) share this loop tail; the guard dance
+/// stays at the call sites because each site's `op` borrows the catalog.
+fn try_or_block_table_mutation_lock<T>(
+    engine: &Engine,
+    db: &str,
+    name: &str,
+    lock_attempts: u32,
+    op: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
+    if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
+        Ok(Some(
+            engine.segment_mgr().with_table_mutation_lock(db, name, op)?,
+        ))
+    } else {
+        engine.segment_mgr().try_with_table_mutation_lock(db, name, op)
+    }
+}
+
+/// Warn cadence for a busy table mutation lock: first failure, then every
+/// 200th, so a stuck writer shows up in the log without flooding it.
+fn warn_table_mutation_lock_busy(db: &str, name: &str, lock_attempts: u32, label: &str) {
+    if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
+        tracing::warn!(
+            db,
+            table = name,
+            lock_attempts,
+            "{}: table mutation lock busy; retrying without the catalog lock",
+            label
+        );
+    }
 }

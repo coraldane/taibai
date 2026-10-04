@@ -1776,7 +1776,7 @@ fn push_literal_fast(
             // only the scientific-notation fallback.
             let scaled = crate::sql::execution::helpers::float_literal_to_decimal_i64(*v, scale)
                 .unwrap_or_else(|| {
-                    let multiplier = decimal_multiplier(scale).unwrap_or(1);
+                    let multiplier = super::helpers::decimal_multiplier(scale).unwrap_or(1);
                     (*v * multiplier as f64).round() as i64
                 });
             data.push(scaled);
@@ -1784,7 +1784,7 @@ fn push_literal_fast(
             Ok(())
         }
         (ColumnArray::Decimal { data, bitmap }, ScalarValue::Int64(Some(v))) => {
-            let multiplier = decimal_multiplier(scale)?;
+            let multiplier = super::helpers::decimal_multiplier(scale)?;
             data.push(v.checked_mul(multiplier).ok_or_else(|| {
                 TaibaiError::Sql(format!("decimal value '{}' overflows scale {}", v, scale))
             })?);
@@ -1806,15 +1806,6 @@ fn push_literal_fast(
             timezone_offset_hours,
         )?),
     }
-}
-
-fn decimal_multiplier(scale: i32) -> Result<i64> {
-    if !(0..=18).contains(&scale) {
-        return Err(TaibaiError::Sql(format!("invalid decimal scale {}", scale)));
-    }
-    10_i64
-        .checked_pow(scale as u32)
-        .ok_or_else(|| TaibaiError::Sql(format!("invalid decimal scale {}", scale)))
 }
 
 fn resolve_insert_columns(

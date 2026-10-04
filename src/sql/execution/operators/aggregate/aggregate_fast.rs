@@ -847,7 +847,7 @@ impl FastGroups {
                         .unwrap_or(0),
                     _ => 0,
                 };
-                Accumulator::new_for(agg, arg_column_type(agg, physical_schema), scale)
+                Accumulator::new_for(agg, super::arg_column_type(agg, physical_schema), scale)
             })
             .collect();
         let accs = accs?;
@@ -1250,15 +1250,4 @@ pub(super) fn merge_slot_tables(tables: &mut [Option<FastGroups>]) -> Result<Fas
         }
     }
     Ok(merged)
-}
-
-fn arg_column_type(agg: &AggregateExpr, schema: &Schema) -> crate::protocol::types::DataType {
-    match &*agg.arg {
-        LogicalExpr::Column(idx) => schema
-            .columns
-            .get(*idx)
-            .map(|c| c.data_type)
-            .unwrap_or(crate::protocol::types::DataType::Int64),
-        _ => crate::protocol::types::DataType::Int64,
-    }
 }

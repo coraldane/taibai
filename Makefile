@@ -1,4 +1,4 @@
-.PHONY: all build build-all package package-all install uninstall start stop restart status clean test help
+.PHONY: all build build-all package package-all install uninstall start stop restart status clean test help dup-check dup-baseline
 
 BINARY_NAME := taibai
 VERSION ?= $(shell grep '^version =' Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
@@ -73,6 +73,12 @@ bench:
 	@echo "Running benchmarks..."
 	@cargo bench
 
+dup-check:
+	@python3 scripts/dup_scan.py check 2>/dev/null || python scripts/dup_scan.py check
+
+dup-baseline:
+	@python3 scripts/dup_scan.py baseline 2>/dev/null || python scripts/dup_scan.py baseline
+
 help:
 	@echo "Taibai Build Tool - Build, package, and deployment utility"
 	@echo ""
@@ -100,6 +106,8 @@ help:
 	@echo "  test           Run unit tests"
 	@echo "  test-all       Run all tests including benchmarks"
 	@echo "  bench          Run benchmarks"
+	@echo "  dup-check      Fail if non-test code duplication or clippy allow budget exceeds scripts/dup_baseline.json"
+	@echo "  dup-baseline   Regenerate scripts/dup_baseline.json"
 	@echo "  clean          Remove build artifacts"
 	@echo ""
 	@echo "Options:"
