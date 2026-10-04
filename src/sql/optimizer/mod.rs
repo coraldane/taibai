@@ -5,6 +5,7 @@ pub mod expr_rules;
 pub mod filter_reorder;
 pub mod index_selection;
 pub mod join_projection;
+pub mod join_order;
 pub mod join_reorder;
 pub mod limit_pushdown;
 pub mod order_limit_pushdown;
