@@ -352,4 +352,6 @@ engine（4 文件）、segment_manager（5 文件）、ddl（4 文件）、dml_i
 | query 拆三 | 2,664 行拆 `query/{select_exec, subqueries, correlated}.rs` + mod.rs 宿主（表引用提取与合取工具留宿主）。`query::` 路径不变。**未做**"decorrelate/subquery_runtime 合一"：两者职责单一且健康，合并风险大于收益 | 4ff27b2 |
 | flaky 测试加固 | `optimize_heavy_phase_keeps_target_partition_writable` 的 1.5s 墙钟阈值放宽至 1.9s（四轮全量测试三次偶发超时；2s heavy-phase 停顿的区分度不变） | 2fe7ae3 |
 
-**剩余项**：scan/aggregate_meta 的 923 行 `compute_folded_aggregate` 拆解。
+| compute_folded_aggregate 拆解 | 919 行最大函数拆为编排(224行) + `fold_one_segment`(370) + `fold_row_groups`(379) + `store_segment_sum_delta`(59)，引入 FoldPlan/SegmentFoldEnv 上下文。语义转换点仅三处 `continue`→`return Ok(Some(()))`；allow 预算不增 | 7516865 |
+
+**Phase 4 完（七项全部落地）**。原始验收对照：≥2,000 行文件 12 → 7（compactor 2,615 / hot_store 2,487 / aggregate_meta 2,440 / batch_writer 2,216 / manager_core 2,182 / column_codec 2,052 / array.rs 2,009，均为 Phase 3 已模块化的宿主或待后续批次）；≥300 行单函数仅剩 estimate_plan_profile 等少数规划器估计函数；1,150 测试全过、clippy 零告警、非测试重复 4,157→3,595 行、allow 预算 62 不增。
