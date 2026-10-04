@@ -349,5 +349,7 @@ engine（4 文件）、segment_manager（5 文件）、ddl（4 文件）、dml_i
 | join-order 归位 | physical/planner.rs 约 1,250 行优化职责（内连接树重排 DP/greedy、基数/NDV 估计、表达式重映射家族、289 行计划画像估计）迁 `sql/optimizer/join_order.rs`；planner 经 `reorder_inner_join_trees`/`estimate_plan_rows` 两入口调用，explain.rs 改路径，join_order_test.rs 随迁（git mv）。planner 2,334 → 1,067 行 | 43bf3a3 |
 | helpers 拆四 | 1,635 行拆 `helpers/{eval, scalar_utils, scan_predicates, change_events}.rs` + glob re-export（`helpers::` 路径不变，调用方零改动）。子文件自持 use，跨文件项显式导入 | 24557cf |
 | durable_tail 拆八 | 3,326 行（全仓最大文件、13 类职责）拆 `durable_tail/{format, committer, generations, sidecar, flush_intent, recovery, replication, api}.rs` + mod.rs 宿主。~130 个顶层 item 按职责归类脚本切割；跨模块项 pub(super)，committer 的 pub(crate) 类型显式 re-export；子文件间直接兄弟 glob | e2a4e84 |
+| query 拆三 | 2,664 行拆 `query/{select_exec, subqueries, correlated}.rs` + mod.rs 宿主（表引用提取与合取工具留宿主）。`query::` 路径不变。**未做**"decorrelate/subquery_runtime 合一"：两者职责单一且健康，合并风险大于收益 | 4ff27b2 |
+| flaky 测试加固 | `optimize_heavy_phase_keeps_target_partition_writable` 的 1.5s 墙钟阈值放宽至 1.9s（四轮全量测试三次偶发超时；2s heavy-phase 停顿的区分度不变） | 2fe7ae3 |
 
-**剩余项**：query.rs 拆三（select_exec/derived/correlated，含三个子查询模块合一）、scan/aggregate_meta 的 923 行 `compute_folded_aggregate` 拆解。
+**剩余项**：scan/aggregate_meta 的 923 行 `compute_folded_aggregate` 拆解。
