@@ -346,5 +346,7 @@ engine（4 文件）、segment_manager（5 文件）、ddl（4 文件）、dml_i
 |---|---|---|
 | execute_stmt 分发瘦身 | InsertSelect(79行)/ReplaceSelect(44行)/Insert/Replace/Update/Delete/Begin/Commit/Rollback/Use 提取为 `exec_xxx_stmt` 方法；SHOW PARTITIONS 与 FLUSH TABLE 共享 `resolve_optional_table_target`。分发体 ~464 → 246 行，全部 match 臂单行化 | d761776 |
 | REPLACE 机器归位 | dml_delete.rs 中 ~470 行 REPLACE 语义机器迁 `dml_insert/replace.rs`。**边界修正**：侦察发现 exec_delete 共用 ReplaceDeleteUndo/plan/apply_replace_memtable_conflicts，这三项及其 helper 留在 dml_delete（字段提升 pub(crate)）；`replace_pruning_test` 挂载点随迁。dml_delete 1,989 → 1,518 行 | 13fe64a |
+| join-order 归位 | physical/planner.rs 约 1,250 行优化职责（内连接树重排 DP/greedy、基数/NDV 估计、表达式重映射家族、289 行计划画像估计）迁 `sql/optimizer/join_order.rs`；planner 经 `reorder_inner_join_trees`/`estimate_plan_rows` 两入口调用，explain.rs 改路径，join_order_test.rs 随迁（git mv）。planner 2,334 → 1,067 行 | 43bf3a3 |
+| helpers 拆四 | 1,635 行拆 `helpers/{eval, scalar_utils, scan_predicates, change_events}.rs` + glob re-export（`helpers::` 路径不变，调用方零改动）。子文件自持 use，跨文件项显式导入 | 24557cf |
 
-**剩余项**：query.rs 拆三（select_exec/derived/correlated，含三个子查询模块合一）、planner 的 ~900 行 join-order 优化器迁 `sql/optimizer/join_order.rs`、durable_tail 八模块拆分、helpers.rs 拆三、scan/aggregate_meta 的 923 行 `compute_folded_aggregate` 拆解。
+**剩余项**：query.rs 拆三（select_exec/derived/correlated，含三个子查询模块合一）、durable_tail 八模块拆分、scan/aggregate_meta 的 923 行 `compute_folded_aggregate` 拆解。
