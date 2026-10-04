@@ -1,3 +1,9 @@
+use crate::common::error::{Result, TaibaiError};
+use crate::protocol::types::DataType;
+use crate::sql::parser::ast::Expr;
+use crate::types::batch::Schema;
+use crate::types::scalar::ScalarValue;
+
 use super::*;
 
 #[test]
