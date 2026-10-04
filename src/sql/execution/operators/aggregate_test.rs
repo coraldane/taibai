@@ -475,3 +475,59 @@ fn nan_keys_share_one_canonical_encoding() {
     col.encode_key_at(1, &mut k2);
     assert_eq!(k1, k2, "all NaN payloads must fold to one canonical key");
 }
+
+#[test]
+fn spilled_min_max_merge_orders_bool_states() {
+    // Accumulator::merge (the spill path) used aggregate::compare_scalars,
+    // which had no Bool arm: every Bool pair compared Equal, so the merge
+    // kept the first partial state's value. Feed TRUE then FALSE as separate
+    // spilled states so the merge decides the result.
+    let schema = Schema::new(vec![
+        ColumnDef::new("group_id", DataType::Int64),
+        ColumnDef::new("flag", DataType::Bool),
+    ]);
+    let batch = |group: i64, flag: bool| {
+        let mut groups = ColumnArray::empty(DataType::Int64);
+        let mut flags = ColumnArray::empty(DataType::Bool);
+        groups.push(&ScalarValue::Int64(Some(group))).unwrap();
+        flags.push(&ScalarValue::Bool(Some(flag))).unwrap();
+        RecordBatch::try_new(schema.clone(), vec![groups, flags]).unwrap()
+    };
+    let batches = vec![batch(0, true), batch(0, false)];
+    let aggregates = vec![
+        AggregateExpr {
+            func: AggFunc::Min,
+            arg: Box::new(LogicalExpr::Column(1)),
+            distinct: false,
+        },
+        AggregateExpr {
+            func: AggFunc::Max,
+            arg: Box::new(LogicalExpr::Column(1)),
+            distinct: false,
+        },
+    ];
+    let mut exec = HashAggregateExec::new(
+        vec![LogicalExpr::Column(0)],
+        aggregates,
+        Box::new(ManyBatchExec {
+            batches: batches.into_iter(),
+        }),
+        schema,
+    )
+    .with_memory_limit_bytes(1);
+
+    let mut rows = Vec::new();
+    while let Some(batch) = exec.next_batch().unwrap() {
+        for row in 0..batch.num_rows() {
+            rows.push((
+                batch.scalar(row, 0).unwrap(),
+                batch.scalar(row, 1).unwrap(),
+                batch.scalar(row, 2).unwrap(),
+            ));
+        }
+    }
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, ScalarValue::Int64(Some(0)));
+    assert_eq!(rows[0].1, ScalarValue::Bool(Some(false)), "MIN");
+    assert_eq!(rows[0].2, ScalarValue::Bool(Some(true)), "MAX");
+}

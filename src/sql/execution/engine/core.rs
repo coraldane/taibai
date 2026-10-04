@@ -1,3 +1,5 @@
+use super::*;
+
 impl Engine {
     pub fn new(data_dir: &Path, default_database: &str) -> Result<Self> {
         Self::new_with_storage_config_and_auto_compact(
@@ -39,7 +41,7 @@ impl Engine {
         pubsub_settings: crate::common::config::PubSubSettings,
         hot_warmup_enabled: bool,
     ) -> Result<Self> {
-        super::ddl::recover_database_drop_tombstones(data_dir)?;
+        crate::sql::execution::ddl::recover_database_drop_tombstones(data_dir)?;
         let mut catalogs = HashMap::new();
         let meta_dir = data_dir.join("meta");
 
@@ -97,9 +99,9 @@ impl Engine {
             catalogs.insert(default_database.to_string(), catalog);
         }
 
-        super::ddl::recover_drop_tombstones(data_dir, &catalogs)?;
-        super::ddl::recover_table_data_tombstones(data_dir, &catalogs)?;
-        super::ddl::recover_rename_tombstones(data_dir, &catalogs)?;
+        crate::sql::execution::ddl::recover_drop_tombstones(data_dir, &catalogs)?;
+        crate::sql::execution::ddl::recover_table_data_tombstones(data_dir, &catalogs)?;
+        crate::sql::execution::ddl::recover_rename_tombstones(data_dir, &catalogs)?;
 
         let row_group_target_rows = segment_config.row_group_target_rows.max(1) as u64;
         let segment_mgr = Arc::new(SegmentManager::with_config(data_dir, segment_config)?);
@@ -271,13 +273,13 @@ impl Engine {
 
     pub fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecResult> {
         let _op_guard = self.begin_operation();
-        if self.is_read_only() && !super::read_only_gate::starts_read_keyword(sql) {
+        if self.is_read_only() && !crate::sql::execution::read_only_gate::starts_read_keyword(sql) {
             return Err(TaibaiError::Sql(
                 "server is running as a replication standby and is read-only".into(),
             ));
         }
         if sql.as_bytes().first().map(|b| b.to_ascii_uppercase()) == Some(b'I') {
-            if let Some(result) = super::dml_insert::try_exec_fast_insert_sql(
+            if let Some(result) = crate::sql::execution::dml_insert::try_exec_fast_insert_sql(
                 self,
                 &session.database,
                 sql,
@@ -362,7 +364,7 @@ impl Engine {
             return Ok(None);
         };
         self.ensure_permissions(session, stmt)?;
-        super::query::exec_select_streaming(self, &session.database, stmt, emit)
+        crate::sql::execution::query::exec_select_streaming(self, &session.database, stmt, emit)
     }
 
     pub fn execute_prepared(
@@ -405,7 +407,7 @@ impl Engine {
                     schema_unchanged,
                 )
                 {
-                    super::query::exec_select_with_plan_and_txn(
+                    crate::sql::execution::query::exec_select_with_plan_and_txn(
                         self,
                         &session.database,
                         &stmt,
@@ -413,7 +415,7 @@ impl Engine {
                         session.active_txn_id(),
                     )
                 } else {
-                    let result = super::query::exec_select_with_txn(
+                    let result = crate::sql::execution::query::exec_select_with_txn(
                         self,
                         &session.database,
                         &stmt,
@@ -431,7 +433,7 @@ impl Engine {
                         // cache-fill double execution of non-correlated
                         // subqueries.
                         if !has_placeholders
-                            && !super::query::statement_contains_subquery(&stmt)
+                            && !crate::sql::execution::query::statement_contains_subquery(&stmt)
                         {
                             let table_schemas =
                                 self.gather_table_schemas(&session.database, &stmt)?;
@@ -569,7 +571,7 @@ impl Engine {
             ..
         } = stmt
         {
-            table_refs.extend(super::query::extract_table_refs(from_clause, db));
+            table_refs.extend(crate::sql::execution::query::extract_table_refs(from_clause, db));
         }
         let mut table_schemas = std::collections::HashMap::new();
         let catalogs = self.catalogs().read().unwrap();
@@ -699,7 +701,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
 
-                super::ddl::exec_create_table(
+                crate::sql::execution::ddl::exec_create_table(
                     self,
                     &db,
                     &table,
@@ -722,7 +724,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 unique,
                 if_not_exists,
                 index_type,
-            } => super::ddl::exec_create_index(
+            } => crate::sql::execution::ddl::exec_create_index(
                 self,
                 table.effective_database(&session.database),
                 &table.name,
@@ -736,7 +738,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 name,
                 table,
                 if_exists,
-            } => super::ddl::exec_drop_index(
+            } => crate::sql::execution::ddl::exec_drop_index(
                 self,
                 table.effective_database(&session.database),
                 &table.name,
@@ -747,52 +749,52 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
                 
-                super::ddl::exec_drop_table(self, &db, &table, *if_exists)
+                crate::sql::execution::ddl::exec_drop_table(self, &db, &table, *if_exists)
             }
             Statement::AlterTable { name, operations } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
                 
-                super::ddl::exec_alter_table(self, &db, &table, operations)
+                crate::sql::execution::ddl::exec_alter_table(self, &db, &table, operations)
             }
             Statement::Truncate { table } => {
                 let db = table.effective_database(&session.database).to_string();
                 let table_name = table.name.clone();
                 
-                super::ddl::exec_truncate_table(self, &db, &table_name)
+                crate::sql::execution::ddl::exec_truncate_table(self, &db, &table_name)
             }
             Statement::CreateDatabase {
                 name,
                 if_not_exists,
-            } => super::ddl::exec_create_database(self, name, *if_not_exists),
+            } => crate::sql::execution::ddl::exec_create_database(self, name, *if_not_exists),
             Statement::DropDatabase { name, if_exists } => {
-                super::ddl::exec_drop_database(self, name, *if_exists)
+                crate::sql::execution::ddl::exec_drop_database(self, name, *if_exists)
             }
             Statement::CreateUser { name, password } => {
-                super::ddl::exec_create_user(self, name, password)
+                crate::sql::execution::ddl::exec_create_user(self, name, password)
             }
-            Statement::CreateRole { name } => super::ddl::exec_create_role(self, name),
+            Statement::CreateRole { name } => crate::sql::execution::ddl::exec_create_role(self, name),
             Statement::DropUser { name, if_exists } => {
-                super::ddl::exec_drop_user(self, name, *if_exists)
+                crate::sql::execution::ddl::exec_drop_user(self, name, *if_exists)
             }
             Statement::DropRole { name, if_exists } => {
-                super::ddl::exec_drop_role(self, name, *if_exists)
+                crate::sql::execution::ddl::exec_drop_role(self, name, *if_exists)
             }
             Statement::Grant { privileges, on, to } => {
-                super::ddl::exec_grant(self, privileges, on, to)
+                crate::sql::execution::ddl::exec_grant(self, privileges, on, to)
             }
             Statement::Revoke {
                 privileges,
                 on,
                 from,
-            } => super::ddl::exec_revoke(self, privileges, on, from),
+            } => crate::sql::execution::ddl::exec_revoke(self, privileges, on, from),
             Statement::Insert {
                 table,
                 columns,
                 values,
             } => {
                 let txn_id = session.active_txn_id();
-                let result = super::dml_insert::exec_insert(
+                let result = crate::sql::execution::dml_insert::exec_insert(
                     self,
                     table.effective_database(&session.database),
                     &table.name,
@@ -813,7 +815,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 values,
             } => {
                 let txn_id = session.active_txn_id();
-                let result = super::dml_insert::exec_replace(
+                let result = crate::sql::execution::dml_insert::exec_replace(
                     self,
                     table.effective_database(&session.database),
                     &table.name,
@@ -840,7 +842,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                     ));
                 }
                 let query_result =
-                    super::query::exec_select_with_txn(self, &session.database, query, txn_id)?;
+                    crate::sql::execution::query::exec_select_with_txn(self, &session.database, query, txn_id)?;
                 let ExecResult::Query { batches, .. } = query_result else {
                     return Err(TaibaiError::Internal(
                         "REPLACE SELECT source did not return rows".to_string(),
@@ -861,7 +863,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                         values.push(row);
                     }
                 }
-                super::dml_insert::exec_replace(
+                crate::sql::execution::dml_insert::exec_replace(
                     self,
                     table.effective_database(&session.database),
                     &table.name,
@@ -885,7 +887,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 // clauses are the knob for oversized sources.
                 let txn_id = session.active_txn_id();
                 let query_result =
-                    super::query::exec_select_with_txn(self, &session.database, query, txn_id)?;
+                    crate::sql::execution::query::exec_select_with_txn(self, &session.database, query, txn_id)?;
                 let ExecResult::Query { batches, .. } = query_result else {
                     return Err(TaibaiError::Internal(
                         "INSERT SELECT source did not return rows".to_string(),
@@ -908,7 +910,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                     if chunk.is_empty() {
                         return Ok(ExecResult::Ok { rows_affected: 0 });
                     }
-                    let result = super::dml_insert::exec_insert(
+                    let result = crate::sql::execution::dml_insert::exec_insert(
                         self,
                         db,
                         &table.name,
@@ -961,7 +963,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 // columns; both resolve by bare column name, so the alias
                 // needs no execution-time handling.
                 let db = table.effective_database(&session.database).to_string();
-                let result = super::dml_update::exec_update(
+                let result = crate::sql::execution::dml_update::exec_update(
                     self,
                     &db,
                     &table.name,
@@ -984,7 +986,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 // qualifier, so the alias needs no execution-time handling.
                 let db = table.effective_database(&session.database).to_string();
                 let result =
-                    super::dml_delete::exec_delete(
+                    crate::sql::execution::dml_delete::exec_delete(
                     self,
                     &db,
                     &table.name,
@@ -996,7 +998,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 }
                 result
             }
-            Statement::Select { .. } => super::query::exec_select_with_txn(
+            Statement::Select { .. } => crate::sql::execution::query::exec_select_with_txn(
                 self,
                 &session.database,
                 stmt,
@@ -1016,35 +1018,35 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
             }
             Statement::ShowTables { database } => {
                 let db = database.as_deref().unwrap_or(&session.database);
-                super::ddl::exec_show_tables(self, db)
+                crate::sql::execution::ddl::exec_show_tables(self, db)
             }
-            Statement::ShowDatabases => super::ddl::exec_show_databases(self),
-            Statement::ShowColumns { table } => super::ddl::exec_show_columns(
+            Statement::ShowDatabases => crate::sql::execution::ddl::exec_show_databases(self),
+            Statement::ShowColumns { table } => crate::sql::execution::ddl::exec_show_columns(
                 self,
                 table.effective_database(&session.database),
                 &table.name,
             ),
-            Statement::ShowIndexes { table } => super::ddl::exec_show_indexes(
+            Statement::ShowIndexes { table } => crate::sql::execution::ddl::exec_show_indexes(
                 self,
                 table.effective_database(&session.database),
                 &table.name,
             ),
             Statement::ShowUniqueIndexStatus { table } => {
-                super::ddl::exec_show_unique_index_status(
+                crate::sql::execution::ddl::exec_show_unique_index_status(
                     self,
                     table.effective_database(&session.database),
                     &table.name,
                 )
             }
             Statement::RebuildUniqueIndex { table, index_name } => {
-                super::ddl::exec_rebuild_unique_index(
+                crate::sql::execution::ddl::exec_rebuild_unique_index(
                     self,
                     table.effective_database(&session.database),
                     &table.name,
                     index_name.as_deref(),
                 )
             }
-            Statement::ShowCreateTable { table } => super::ddl::exec_show_create_table(
+            Statement::ShowCreateTable { table } => crate::sql::execution::ddl::exec_show_create_table(
                 self,
                 table.effective_database(&session.database),
                 &table.name,
@@ -1052,7 +1054,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
             Statement::Explain {
                 analyze,
                 stmt: inner,
-            } => super::explain::exec_explain(self, &session.database, inner, *analyze),
+            } => crate::sql::execution::explain::exec_explain(self, &session.database, inner, *analyze),
             Statement::Begin => {
                 if session.in_txn() {
                     return Err(TaibaiError::Sql("transaction already in progress".into()));
@@ -1074,31 +1076,31 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 let rows = self.rollback_session_txn(session)?;
                 Ok(ExecResult::Ok { rows_affected: rows })
             }
-            Statement::ShowStats => super::ddl::exec_show_stats(self, &session.database),
+            Statement::ShowStats => crate::sql::execution::ddl::exec_show_stats(self, &session.database),
             Statement::ShowPerformanceBaselines => {
-                super::performance::exec_show_performance_baselines(self, &session.database)
+                crate::sql::execution::performance::exec_show_performance_baselines(self, &session.database)
             }
-            Statement::ShowEngines => super::ddl::exec_show_engines(self),
-            Statement::ShowProcesslist { full } => super::ddl::exec_show_processlist(self, *full),
+            Statement::ShowEngines => crate::sql::execution::ddl::exec_show_engines(self),
+            Statement::ShowProcesslist { full } => crate::sql::execution::ddl::exec_show_processlist(self, *full),
             Statement::KillQuery { query_id } => {
-                super::ddl::exec_kill_query(self, &session.username, *query_id)
+                crate::sql::execution::ddl::exec_kill_query(self, &session.username, *query_id)
             }
             Statement::ResetPerformanceBaselines => {
-                super::performance::exec_reset_performance_baselines(self, &session.database)
+                crate::sql::execution::performance::exec_reset_performance_baselines(self, &session.database)
             }
             Statement::AlterUser { name, operations } => {
-                super::ddl::exec_alter_user(self, name, operations)
+                crate::sql::execution::ddl::exec_alter_user(self, name, operations)
             }
-            Statement::ShowUsers => super::ddl::exec_show_users(self),
-            Statement::ShowRoles => super::ddl::exec_show_roles(self),
-            Statement::ShowGrants { user } => super::ddl::exec_show_grants(self, user),
+            Statement::ShowUsers => crate::sql::execution::ddl::exec_show_users(self),
+            Statement::ShowRoles => crate::sql::execution::ddl::exec_show_roles(self),
+            Statement::ShowGrants { user } => crate::sql::execution::ddl::exec_show_grants(self, user),
             Statement::ShowPartitions { table } => {
                 let db = table
                     .as_ref()
                     .map(|t| t.effective_database(&session.database))
                     .unwrap_or(&session.database);
                 let table_name = table.as_ref().map(|t| t.name.clone());
-                super::ddl::exec_show_partitions(self, db, &table_name)
+                crate::sql::execution::ddl::exec_show_partitions(self, db, &table_name)
             }
             Statement::FlushTable { table } => {
                 let db = table
@@ -1106,21 +1108,21 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                     .map(|t| t.effective_database(&session.database))
                     .unwrap_or(&session.database);
                 let table_name = table.as_ref().map(|t| t.name.clone());
-                super::ddl::exec_flush_table(self, db, &table_name)
+                crate::sql::execution::ddl::exec_flush_table(self, db, &table_name)
             }
-            Statement::Union { .. } => super::query::exec_union_with_txn(
+            Statement::Union { .. } => crate::sql::execution::query::exec_union_with_txn(
                 self,
                 &session.database,
                 stmt,
                 session.active_txn_id(),
             ),
-            Statement::OptimizeTable { table, partition } => super::ddl::exec_optimize_table(
+            Statement::OptimizeTable { table, partition } => crate::sql::execution::ddl::exec_optimize_table(
                 self,
                 table.effective_database(&session.database),
                 &table.name,
                 partition.as_deref(),
             ),
-            Statement::AnalyzeTable { table } => super::ddl::exec_analyze_table(
+            Statement::AnalyzeTable { table } => crate::sql::execution::ddl::exec_analyze_table(
                 self,
                 table.effective_database(&session.database),
                 &table.name,
@@ -1364,7 +1366,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
     /// no read path — SELECT, DML, prepared, streaming — can bypass it.
     fn require_read_table_permissions(&self, session: &Session, stmt: &Statement) -> Result<()> {
         let mut tables = Vec::new();
-        super::query::collect_read_tables(stmt, &session.database, &mut tables);
+        crate::sql::execution::query::collect_read_tables(stmt, &session.database, &mut tables);
         for reference in tables {
             self.require_table_permission(
                 session,

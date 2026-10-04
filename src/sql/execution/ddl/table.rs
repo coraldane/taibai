@@ -1,3 +1,6 @@
+use super::*;
+use super::introspection::*;
+
 #[allow(clippy::too_many_arguments)]
 pub fn exec_create_table(
     engine: &Engine,
@@ -238,7 +241,7 @@ pub fn exec_create_index(
         )));
     }
     if unique {
-        super::dml_insert::validate_unique_key_uniqueness(
+        crate::sql::execution::dml_insert::validate_unique_key_uniqueness(
             engine, db, table, &schema, &indices, index_name, None,
         )?;
         table_meta.add_unique_index(index_name, columns.to_vec())?;
@@ -310,7 +313,7 @@ pub fn exec_show_unique_index_status(engine: &Engine, db: &str, table: &str) -> 
     for index in &table_meta.unique_indexes {
         let indices = resolve_unique_index_columns(&table_schema, &index.columns);
         let status = indices.and_then(|indices| {
-            super::dml_insert::validate_unique_key_uniqueness(
+            crate::sql::execution::dml_insert::validate_unique_key_uniqueness(
                 engine,
                 db,
                 table,
@@ -398,7 +401,7 @@ pub fn exec_rebuild_unique_index(
                     continue;
                 }
                 let indices = resolve_unique_index_columns(&table_schema, &index.columns)?;
-                let entries = super::dml_insert::collect_unique_index_entries(
+                let entries = crate::sql::execution::dml_insert::collect_unique_index_entries(
                     engine,
                     db,
                     table,
@@ -821,7 +824,7 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
 
-fn exec_partition_change(
+pub(super) fn exec_partition_change(
     engine: &Engine,
     db: &str,
     name: &str,
@@ -1226,7 +1229,7 @@ fn alter_column_catalog_only(
                     .clone()
                     .unwrap_or_else(|| format!("uk_{}", table_meta.unique_indexes.len() + 1));
                 let indices = resolve_unique_index_columns(&schema, &key.columns)?;
-                super::dml_insert::validate_unique_key_uniqueness(
+                crate::sql::execution::dml_insert::validate_unique_key_uniqueness(
                     engine,
                     db,
                     name,
@@ -1519,7 +1522,7 @@ fn normalize_default_value(
         }
         ColumnDefaultValue::Literal(value) => {
             let expr = crate::sql::parser::ast::Expr::Literal(value);
-            let scalar = super::helpers::eval_expr_to_scalar_with_scale_timezone(
+            let scalar = crate::sql::execution::helpers::eval_expr_to_scalar_with_scale_timezone(
                 &expr, &data_type, scale, 0,
             )?;
             if !scalar.is_null() && scalar.data_type() != data_type {

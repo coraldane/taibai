@@ -1,3 +1,5 @@
+use super::*;
+
 pub(crate) fn unique_constraints(
     table_meta: &crate::storage::catalog::schema::TableMeta,
     schema: &Schema,
@@ -15,7 +17,7 @@ pub(crate) fn unique_constraints(
     Ok(constraints)
 }
 
-fn validate_unique_constraints(
+pub(super) fn validate_unique_constraints(
     engine: &Engine,
     db: &str,
     table: &str,
@@ -29,7 +31,7 @@ fn validate_unique_constraints(
     Ok(())
 }
 
-fn validate_unique_constraints_in_batch(
+pub(super) fn validate_unique_constraints_in_batch(
     table: &str,
     batch: &RecordBatch,
     schema: &Schema,
@@ -279,7 +281,7 @@ fn load_existing_unique_keys(
     Ok(())
 }
 
-fn unique_key_for_row(
+pub(super) fn unique_key_for_row(
     batch: &RecordBatch,
     row_idx: usize,
     indices: &[usize],
@@ -525,7 +527,7 @@ pub(crate) fn primary_key_indices(schema: &Schema) -> Vec<usize> {
         .collect()
 }
 
-fn generated_auto_increment_key_guarantees_uniqueness(
+pub(super) fn generated_auto_increment_key_guarantees_uniqueness(
     primary_key_indices: &[usize],
     is_missing_auto_inc: &[bool],
 ) -> bool {
@@ -534,7 +536,7 @@ fn generated_auto_increment_key_guarantees_uniqueness(
         .any(|&idx| is_missing_auto_inc.get(idx).copied().unwrap_or(false))
 }
 
-fn validate_primary_key_values_present(
+pub(super) fn validate_primary_key_values_present(
     batch: &RecordBatch,
     schema: &Schema,
     primary_key_indices: &[usize],
@@ -622,7 +624,7 @@ pub fn validate_primary_key_uniqueness(
     Ok(())
 }
 
-fn validate_primary_key_uniqueness_in_batch(
+pub(super) fn validate_primary_key_uniqueness_in_batch(
     table: &str,
     batch: &RecordBatch,
     schema: &Schema,
@@ -639,7 +641,7 @@ fn validate_primary_key_uniqueness_in_batch(
     Ok(())
 }
 
-fn advance_explicit_auto_increment_counters(
+pub(super) fn advance_explicit_auto_increment_counters(
     engine: &Engine,
     db: &str,
     table: &str,

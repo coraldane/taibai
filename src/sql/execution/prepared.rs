@@ -619,6 +619,12 @@ fn count_window_func(wf: &WindowFunc, count: &mut usize) {
 }
 
 /// Check if a statement contains any placeholder expressions.
+///
+/// `Expr::Placeholder` is overloaded: user `?` parameter markers and the
+/// correlation markers `MarkerBinder` writes share the variant. This walker
+/// is therefore the single placeholder detector — the subquery binder in
+/// `query.rs` reuses it (entry: reject user `?`; after marking: classify
+/// correlated conjuncts) instead of keeping a drifting local copy.
 pub fn has_placeholders(stmt: &Statement) -> bool {
     let mut found = false;
     match stmt {
@@ -757,6 +763,13 @@ fn has_placeholders_table_ref(t: &TableRef) -> bool {
         TableRef::Subquery { query, .. } => has_placeholders(query),
         TableRef::Table { .. } => false,
     }
+}
+
+/// Shared expression-level placeholder detector behind [`has_placeholders`].
+pub(super) fn expr_contains_placeholder(expr: &Expr) -> bool {
+    let mut found = false;
+    check_expr_for_placeholders(expr, &mut found);
+    found
 }
 
 fn check_expr_for_placeholders(expr: &Expr, found: &mut bool) {

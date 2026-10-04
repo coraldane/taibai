@@ -1,3 +1,6 @@
+use super::*;
+use super::runtime::*;
+
 /// Upper bound for decompressing a bulk payload: the ratio cap mirrors the
 /// codec's message ceiling and bounds decompression-bomb amplification.
 fn max_bulk_decompressed_len(compressed_len: usize) -> usize {
@@ -38,8 +41,8 @@ fn prepare_direct_bulk_constraint_entries(
         UniqueIndexEntry, UniqueRowLocation, PRIMARY_LOCATION_INDEX_NAME,
     };
 
-    let primary_indices = super::dml_insert::primary_key_indices(schema);
-    let unique_constraints = super::dml_insert::unique_constraints(table_meta, schema)?;
+    let primary_indices = crate::sql::execution::dml_insert::primary_key_indices(schema);
+    let unique_constraints = crate::sql::execution::dml_insert::unique_constraints(table_meta, schema)?;
     let mut primary_keys = Vec::with_capacity(req.row_count);
     let mut primary_seen = HashSet::with_capacity(req.row_count);
     if !primary_indices.is_empty() {
@@ -141,7 +144,7 @@ fn prepare_direct_bulk_constraint_entries(
             None => {
                 let batch =
                     crate::storage::segment_manager::direct_bulk_request_to_batch(req, schema)?;
-                super::dml_insert::validate_unique_key_uniqueness(
+                crate::sql::execution::dml_insert::validate_unique_key_uniqueness(
                     engine,
                     db,
                     table,
@@ -309,7 +312,7 @@ impl Engine {
                     TaibaiError::Sql(format!("unique index column '{}' not found", column))
                 })?);
             }
-            super::dml_insert::validate_unique_key_uniqueness(
+            crate::sql::execution::dml_insert::validate_unique_key_uniqueness(
                 self,
                 db,
                 table,
@@ -327,7 +330,7 @@ impl Engine {
             .map(|(idx, _)| idx)
             .collect::<Vec<_>>();
         if !primary_key_indices.is_empty() {
-            super::dml_insert::validate_primary_key_uniqueness(
+            crate::sql::execution::dml_insert::validate_primary_key_uniqueness(
                 self,
                 db,
                 table,
@@ -500,7 +503,7 @@ impl Engine {
             !meta.unique_indexes.is_empty() || meta.columns.iter().any(|column| column.primary_key)
         });
         let _constraint_guard = has_unique_constraints.then(|| {
-            super::dml_insert::constraint_insert_lock(db, &table_name)
+            crate::sql::execution::dml_insert::constraint_insert_lock(db, &table_name)
                 .lock()
                 .unwrap()
         });

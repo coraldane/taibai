@@ -1,3 +1,5 @@
+use super::*;
+
 /// Generates a same-variant `Column op Literal` comparison kernel
 /// (`eq_vec`/`lt_vec`/…). `$ord_op`/`$ord_val` describe the cross-variant
 /// fallback: it routes through `compare_scalar_at` and keeps the same

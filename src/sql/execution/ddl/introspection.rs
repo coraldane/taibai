@@ -1,3 +1,5 @@
+use super::*;
+
 pub fn exec_show_tables(engine: &Engine, db: &str) -> Result<ExecResult> {
     let catalogs = engine.catalogs().read().unwrap();
     let catalog = catalogs
@@ -347,7 +349,7 @@ pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<
     })
 }
 
-fn get_existing_catalog<'a>(
+pub(super) fn get_existing_catalog<'a>(
     catalogs: &'a mut HashMap<String, DatabaseCatalog>,
     db: &str,
 ) -> Result<&'a mut DatabaseCatalog> {
@@ -709,7 +711,7 @@ pub fn exec_optimize_table(
     if stats.segments_written > 0 || stats.rows_dropped > 0 {
         let schema = Schema::new(table_meta.columns.clone());
         let rebuilt = engine.segment_mgr().with_table_mutation_lock(db, table, || {
-            super::dml_insert::rebuild_table_location_indexes(
+            crate::sql::execution::dml_insert::rebuild_table_location_indexes(
                 engine,
                 db,
                 table,
@@ -847,8 +849,8 @@ pub fn exec_analyze_table(engine: &Engine, db: &str, table: &str) -> Result<Exec
 
 const ANALYZE_HLL_PRECISION: u32 = 12;
 const ANALYZE_HLL_REGISTERS: usize = 1 << ANALYZE_HLL_PRECISION;
-const ANALYZE_HISTOGRAM_SAMPLE_SIZE: usize = 2048;
-const ANALYZE_HISTOGRAM_BUCKETS: usize = 32;
+pub(crate) const ANALYZE_HISTOGRAM_SAMPLE_SIZE: usize = 2048;
+pub(crate) const ANALYZE_HISTOGRAM_BUCKETS: usize = 32;
 const ANALYZE_HISTOGRAM_MAX_VALUE_BYTES: usize = 1024;
 const ANALYZE_COMPOSITE_GROUP_LIMIT: usize = 32;
 
@@ -917,7 +919,7 @@ struct AnalyzeCompositeCollector {
 }
 
 impl AnalyzeCompositeCollector {
-    fn new(group: AnalyzeCompositeGroup) -> Self {
+    pub(crate) fn new(group: AnalyzeCompositeGroup) -> Self {
         Self {
             group,
             null_count: 0,
@@ -945,7 +947,7 @@ impl AnalyzeCompositeCollector {
         }
     }
 
-    fn finish(self) -> crate::storage::catalog::schema::CompositeStatisticsMeta {
+    pub(crate) fn finish(self) -> crate::storage::catalog::schema::CompositeStatisticsMeta {
         crate::storage::catalog::schema::CompositeStatisticsMeta {
             columns: self.group.columns,
             distinct_count: estimate_hll(&self.registers).min(i64::MAX as u64) as i64,
@@ -955,7 +957,7 @@ impl AnalyzeCompositeCollector {
     }
 }
 
-struct AnalyzeSample {
+pub(crate) struct AnalyzeSample {
     priority: u64,
     value: ScalarValue,
 }
@@ -980,17 +982,17 @@ impl Ord for AnalyzeSample {
     }
 }
 
-struct AnalyzeColumnCollector {
-    null_count: u64,
-    non_null_count: u64,
-    min_value: Option<ScalarValue>,
-    max_value: Option<ScalarValue>,
+pub(crate) struct AnalyzeColumnCollector {
+    pub(crate) null_count: u64,
+    pub(crate) non_null_count: u64,
+    pub(crate) min_value: Option<ScalarValue>,
+    pub(crate) max_value: Option<ScalarValue>,
     registers: Vec<u8>,
-    samples: std::collections::BinaryHeap<AnalyzeSample>,
+    pub(crate) samples: std::collections::BinaryHeap<AnalyzeSample>,
 }
 
 impl AnalyzeColumnCollector {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             null_count: 0,
             non_null_count: 0,
@@ -1027,7 +1029,7 @@ impl AnalyzeColumnCollector {
         }
     }
 
-    fn sample_value(&mut self, value: ScalarValue) {
+    pub(crate) fn sample_value(&mut self, value: ScalarValue) {
         if histogram_value_size(&value) > ANALYZE_HISTOGRAM_MAX_VALUE_BYTES {
             return;
         }
@@ -1050,7 +1052,7 @@ impl AnalyzeColumnCollector {
         }
     }
 
-    fn finish(self) -> crate::storage::catalog::schema::ColumnStatisticsMeta {
+    pub(crate) fn finish(self) -> crate::storage::catalog::schema::ColumnStatisticsMeta {
         crate::storage::catalog::schema::ColumnStatisticsMeta {
             distinct_count: estimate_hll(&self.registers).min(i64::MAX as u64) as i64,
             null_count: self.null_count.min(i64::MAX as u64) as i64,

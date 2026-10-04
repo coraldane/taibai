@@ -79,6 +79,123 @@ fn charge_updated_image_bytes(total: &mut u64, image: &RecordBatch) -> Result<()
     Ok(())
 }
 
+/// Apply the staged tombstone registrations for one in-transaction DELETE or
+/// UPDATE, unwinding what already applied if a registration fails so COMMIT
+/// cannot materialize a half-statement (a statement that failed midway used
+/// to leave registered tombstones behind, silently deleting rows whose
+/// replacement images never appeared). Registrations are corruption-class
+/// failures only — the budget pre-check made their charges non-failing —
+/// but the unwind keeps even that path reversible.
+fn apply_staged_tombstones(
+    engine: &Engine,
+    reader_txn_id: u64,
+    db: &str,
+    table: &str,
+    partitions: &Option<Vec<String>>,
+    staged_segment_tombstones: &[(std::path::PathBuf, Vec<u8>, Vec<u64>)],
+    staged_memtable_tombstones: &[(
+        Arc<crate::storage::core::memtable::MemTable>,
+        Vec<u32>,
+    )],
+) -> Result<()> {
+    let mut applied_segments: Vec<(std::path::PathBuf, Vec<u64>)> = Vec::new();
+    for (seg_path, footer_bitmap, ids) in staged_segment_tombstones {
+        if let Err(error) = engine.txn_mutations().register_segment_tombstones(
+            reader_txn_id,
+            db,
+            table,
+            partitions.as_deref(),
+            seg_path,
+            footer_bitmap,
+            ids.iter().copied(),
+        ) {
+            for (path, applied_ids) in &applied_segments {
+                engine.txn_mutations().unregister_segment_tombstones(
+                    reader_txn_id,
+                    db,
+                    table,
+                    path,
+                    applied_ids,
+                );
+            }
+            return Err(error);
+        }
+        applied_segments.push((seg_path.clone(), ids.clone()));
+    }
+    let mut applied_memtables: Vec<(uuid::Uuid, Vec<u32>)> = Vec::new();
+    for (memtable, positions) in staged_memtable_tombstones {
+        if let Err(error) = engine.txn_mutations().register_memtable_tombstones(
+            reader_txn_id,
+            db,
+            table,
+            partitions.as_deref(),
+            Arc::clone(memtable),
+            positions.iter().copied(),
+        ) {
+            for (path, applied_ids) in &applied_segments {
+                engine.txn_mutations().unregister_segment_tombstones(
+                    reader_txn_id,
+                    db,
+                    table,
+                    path,
+                    applied_ids,
+                );
+            }
+            for (applied_id, applied_positions) in &applied_memtables {
+                engine.txn_mutations().unregister_memtable_tombstones(
+                    reader_txn_id,
+                    db,
+                    table,
+                    *applied_id,
+                    applied_positions,
+                );
+            }
+            return Err(error);
+        }
+        applied_memtables.push((memtable.id(), positions.clone()));
+    }
+    Ok(())
+}
+
+/// Shared UPDATE front matter: refuse partition-key assignment, then resolve
+/// subqueries in the SET values (exactly like the WHERE clause inside
+/// `DmlStatementContext::plan` — without it, a SET subquery would reach the
+/// evaluator as an opaque expression). Both auto-commit UPDATE and
+/// in-transaction UPDATE run this before touching any state.
+pub(crate) fn plan_update_assignments(
+    engine: &Engine,
+    db: &str,
+    assignments: &[Assignment],
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+) -> Result<Vec<Assignment>> {
+    if table_meta.is_partitioned()
+        && assignments.iter().any(|assignment| {
+            assignment
+                .column
+                .eq_ignore_ascii_case(&table_meta.partition_key)
+        })
+    {
+        return Err(TaibaiError::Sql(format!(
+            "updating partition key '{}' is not supported; use DELETE followed by INSERT",
+            table_meta.partition_key
+        )));
+    }
+
+    assignments
+        .iter()
+        .map(|assignment| {
+            Ok(Assignment {
+                column: assignment.column.clone(),
+                value: super::query::resolve_expr_in_subqueries_clone(
+                    engine,
+                    db,
+                    &assignment.value,
+                )?,
+            })
+        })
+        .collect()
+}
+
 /// Write-write conflict gate for auto-commit DML: an open transaction's
 /// deferred mutations pin memtable row positions and segment row ids.
 /// Auto-commit DELETE/UPDATE physically remove memtable rows and rewrite
@@ -407,62 +524,15 @@ pub(crate) fn exec_delete_in_txn(
             .txn_mutations()
             .precheck_statement_charge(reader_txn_id, staged_charges)?;
 
-        let mut applied_segments: Vec<(std::path::PathBuf, Vec<u64>)> = Vec::new();
-        for (seg_path, footer_bitmap, ids) in &staged_segment_tombstones {
-            if let Err(error) = engine.txn_mutations().register_segment_tombstones(
-                reader_txn_id,
-                db,
-                table,
-                partitions.as_deref(),
-                seg_path,
-                footer_bitmap,
-                ids.iter().copied(),
-            ) {
-                for (path, applied_ids) in &applied_segments {
-                    engine.txn_mutations().unregister_segment_tombstones(
-                        reader_txn_id,
-                        db,
-                        table,
-                        path,
-                        applied_ids,
-                    );
-                }
-                return Err(error);
-            }
-            applied_segments.push((seg_path.clone(), ids.clone()));
-        }
-        let mut applied_memtables: Vec<(uuid::Uuid, Vec<u32>)> = Vec::new();
-        for (memtable, positions) in &staged_memtable_tombstones {
-            if let Err(error) = engine.txn_mutations().register_memtable_tombstones(
-                reader_txn_id,
-                db,
-                table,
-                partitions.as_deref(),
-                Arc::clone(memtable),
-                positions.iter().copied(),
-            ) {
-                for (path, applied_ids) in &applied_segments {
-                    engine.txn_mutations().unregister_segment_tombstones(
-                        reader_txn_id,
-                        db,
-                        table,
-                        path,
-                        applied_ids,
-                    );
-                }
-                for (applied_id, applied_positions) in &applied_memtables {
-                    engine.txn_mutations().unregister_memtable_tombstones(
-                        reader_txn_id,
-                        db,
-                        table,
-                        *applied_id,
-                        applied_positions,
-                    );
-                }
-                return Err(error);
-            }
-            applied_memtables.push((memtable.id(), positions.clone()));
-        }
+        apply_staged_tombstones(
+            engine,
+            reader_txn_id,
+            db,
+            table,
+            &partitions,
+            &staged_segment_tombstones,
+            &staged_memtable_tombstones,
+        )?;
         // Events last: the pre-check above makes their charge non-failing,
         // and they have no unregister (a dropped notification is the only
         // residual risk on a corruption-class failure here).
@@ -502,32 +572,8 @@ pub(crate) fn exec_update_in_txn(
 ) -> Result<ExecResult> {
     let ctx = DmlStatementContext::plan(engine, db, table, where_clause)?;
     ensure_txn_dml_supported(&ctx.table_meta)?;
-    if ctx.table_meta.is_partitioned()
-        && assignments.iter().any(|assignment| {
-            assignment
-                .column
-                .eq_ignore_ascii_case(&ctx.table_meta.partition_key)
-        })
-    {
-        return Err(TaibaiError::Sql(format!(
-            "updating partition key '{}' is not supported; use DELETE followed by INSERT",
-            ctx.table_meta.partition_key
-        )));
-    }
-
-    let resolved_assignments: Vec<Assignment> = assignments
-        .iter()
-        .map(|assignment| {
-            Ok(Assignment {
-                column: assignment.column.clone(),
-                value: super::query::resolve_expr_in_subqueries_clone(
-                    engine,
-                    db,
-                    &assignment.value,
-                )?,
-            })
-        })
-        .collect::<Result<_>>()?;
+    let resolved_assignments =
+        plan_update_assignments(engine, db, assignments, &ctx.table_meta)?;
     let assignments = resolved_assignments.as_slice();
 
     let resolved_where_clause = &ctx.resolved_where;
@@ -800,62 +846,15 @@ pub(crate) fn exec_update_in_txn(
         // these charges non-failing; any other failure (corruption class)
         // unregisters what already applied so COMMIT cannot materialize a
         // half-statement.
-        let mut applied_segments: Vec<(std::path::PathBuf, Vec<u64>)> = Vec::new();
-        for (seg_path, footer_bitmap, ids) in &staged_segment_tombstones {
-            if let Err(error) = engine.txn_mutations().register_segment_tombstones(
-                reader_txn_id,
-                db,
-                table,
-                partitions.as_deref(),
-                seg_path,
-                footer_bitmap,
-                ids.iter().copied(),
-            ) {
-                for (path, applied_ids) in &applied_segments {
-                    engine.txn_mutations().unregister_segment_tombstones(
-                        reader_txn_id,
-                        db,
-                        table,
-                        path,
-                        applied_ids,
-                    );
-                }
-                return Err(error);
-            }
-            applied_segments.push((seg_path.clone(), ids.clone()));
-        }
-        let mut applied_memtables: Vec<(uuid::Uuid, Vec<u32>)> = Vec::new();
-        for (memtable, positions) in &staged_memtable_tombstones {
-            if let Err(error) = engine.txn_mutations().register_memtable_tombstones(
-                reader_txn_id,
-                db,
-                table,
-                partitions.as_deref(),
-                Arc::clone(memtable),
-                positions.iter().copied(),
-            ) {
-                for (path, applied_ids) in &applied_segments {
-                    engine.txn_mutations().unregister_segment_tombstones(
-                        reader_txn_id,
-                        db,
-                        table,
-                        path,
-                        applied_ids,
-                    );
-                }
-                for (applied_id, applied_positions) in &applied_memtables {
-                    engine.txn_mutations().unregister_memtable_tombstones(
-                        reader_txn_id,
-                        db,
-                        table,
-                        *applied_id,
-                        applied_positions,
-                    );
-                }
-                return Err(error);
-            }
-            applied_memtables.push((memtable.id(), positions.clone()));
-        }
+        apply_staged_tombstones(
+            engine,
+            reader_txn_id,
+            db,
+            table,
+            &partitions,
+            &staged_segment_tombstones,
+            &staged_memtable_tombstones,
+        )?;
         for event in staged_events {
             engine
                 .txn_mutations()

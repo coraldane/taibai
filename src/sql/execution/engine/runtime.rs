@@ -1,3 +1,5 @@
+use super::*;
+
 /// Held for the duration of one hot-store feed: from the append until the
 /// batch's memtable staging completes. Dropping it releases the in-flight
 /// accounting; the captured epoch lets `feed_hot_store` detect that a
@@ -332,7 +334,7 @@ impl Engine {
         }
     }
 
-    fn apply_hot_resident_mark(&self, db: &str, table: &str, mark: HotResidentMark) {
+    pub(super) fn apply_hot_resident_mark(&self, db: &str, table: &str, mark: HotResidentMark) {
         let Some(store) = self.hot_store_mgr.get(db, table) else {
             return;
         };
@@ -505,7 +507,7 @@ impl Engine {
             // crash before COMMIT's tail fsync rolls the tombstones back at
             // startup instead of deleting rows whose images were lost.
             let materialization =
-                super::txn_dml::materialize_txn_mutations_at_commit(self, txn_id)?;
+                crate::sql::execution::txn_dml::materialize_txn_mutations_at_commit(self, txn_id)?;
             if let Err(first_error) = self.batch_writer().commit_txn(txn_id) {
                 // By the time commit_txn reports an error, the visibility flip
                 // has usually already happened (the failure comes from the
@@ -538,7 +540,7 @@ impl Engine {
                 // satisfies every watermark, so fall through to finish
                 // materialization like the success path.
             }
-            super::txn_dml::finish_materialization(self, materialization);
+            crate::sql::execution::txn_dml::finish_materialization(self, materialization);
         }
 
         // The published index entries are authoritative now; drop the
@@ -583,7 +585,7 @@ impl Engine {
         // Deferred DML plans are dropped first: no durable state was
         // written at statement time, so discarding them restores the
         // pre-statement state.
-        let discarded_dml = super::txn_dml::discard_txn_mutations_at_rollback(self, txn_id);
+        let discarded_dml = crate::sql::execution::txn_dml::discard_txn_mutations_at_rollback(self, txn_id);
         let rolled_back = self.batch_writer().rollback_txn(txn_id)?;
         // Retract the unique/PK index entries INSERT statements published at
         // statement time; otherwise the next INSERT of the same key sees a
@@ -672,7 +674,7 @@ impl Engine {
         result
     }
 
-    fn begin_operation(&self) -> EngineOperationGuard<'_> {
+    pub(super) fn begin_operation(&self) -> EngineOperationGuard<'_> {
         self.in_flight_operations.fetch_add(1, Ordering::AcqRel);
         EngineOperationGuard { engine: self }
     }
@@ -850,7 +852,7 @@ impl Engine {
         if stats.segments_written > 0 || stats.rows_dropped > 0 {
             let schema = Schema::new(table_meta.columns.clone());
             let rebuilt = self.segment_mgr.with_table_mutation_lock(db, table, || {
-                super::dml_insert::rebuild_table_location_indexes(
+                crate::sql::execution::dml_insert::rebuild_table_location_indexes(
                     self,
                     db,
                     table,

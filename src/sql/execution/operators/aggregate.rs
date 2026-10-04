@@ -1760,37 +1760,12 @@ pub fn aggregate_result_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
     }
 }
 
+/// Total order for MIN/MAX folds, window frame checks and spill merges.
+/// NULLs sort first; see `ScalarValue::compare_ordered` (this used to be a
+/// drifting copy without Bool/Time/Interval/Blob arms, which made MIN/MAX
+/// on those types return the first-seen value).
 pub fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
-    if a.is_null() && b.is_null() {
-        return std::cmp::Ordering::Equal;
-    }
-    if a.is_null() {
-        return std::cmp::Ordering::Less;
-    }
-    if b.is_null() {
-        return std::cmp::Ordering::Greater;
-    }
-    match (a, b) {
-        _ if a.numeric_cmp(b).is_some() => a.numeric_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
-        (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => l.cmp(r),
-        (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => l.cmp(r),
-        (ScalarValue::Int16(Some(l)), ScalarValue::Int16(Some(r))) => l.cmp(r),
-        (ScalarValue::Int8(Some(l)), ScalarValue::Int8(Some(r))) => l.cmp(r),
-        (ScalarValue::UInt64(Some(l)), ScalarValue::UInt64(Some(r))) => l.cmp(r),
-        (ScalarValue::UInt32(Some(l)), ScalarValue::UInt32(Some(r))) => l.cmp(r),
-        (ScalarValue::UInt16(Some(l)), ScalarValue::UInt16(Some(r))) => l.cmp(r),
-        (ScalarValue::UInt8(Some(l)), ScalarValue::UInt8(Some(r))) => l.cmp(r),
-        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => {
-            l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (ScalarValue::Float32(Some(l)), ScalarValue::Float32(Some(r))) => {
-            l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) => l.cmp(r),
-        (ScalarValue::Date(Some(l)), ScalarValue::Date(Some(r))) => l.cmp(r),
-        (ScalarValue::Timestamp(Some(l)), ScalarValue::Timestamp(Some(r))) => l.cmp(r),
-        _ => std::cmp::Ordering::Equal,
-    }
+    a.compare_ordered(b, std::cmp::Ordering::Less)
 }
 
 /// Apply DISTINCT to a RecordBatch, removing duplicate rows.

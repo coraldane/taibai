@@ -1,3 +1,5 @@
+use super::*;
+
 /// Optional caller hook invoked while the table lock is held.
 type UnderTableLockHook<'a> = Option<&'a mut dyn FnMut(&str, u64) -> Result<()>>;
 
@@ -36,7 +38,7 @@ impl SegmentManager {
         )
     }
 
-    fn bulk_insert_batch_with_partition_owned_inner(
+    pub(super) fn bulk_insert_batch_with_partition_owned_inner(
         &self,
         db: &str,
         table: &str,
@@ -195,7 +197,7 @@ impl SegmentManager {
         Ok(None)
     }
 
-    fn active_segment_file_name(path: &Path) -> Result<String> {
+    pub(super) fn active_segment_file_name(path: &Path) -> Result<String> {
         path.file_name()
             .and_then(|name| name.to_str())
             .map(str::to_string)
@@ -386,7 +388,7 @@ impl SegmentManager {
         Ok(())
     }
 
-    fn get_or_create_active_segment_for_partition_locked(
+    pub(super) fn get_or_create_active_segment_for_partition_locked(
         &self,
         table_dir: &Path,
         schema: &Schema,

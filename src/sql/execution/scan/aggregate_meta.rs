@@ -1569,23 +1569,11 @@ fn plan_vacuous_run_fold(
 
 /// Run folding compares and sums the raw i64 run values, so the column must
 /// be i64-backed with an ordering the i64 view preserves (UInt64 excluded:
-/// its u64 domain can wrap the i64 view).
+/// its u64 domain can wrap the i64 view). This is the reader-side view of
+/// exactly the type set the writer stores footer sums for — delegates to
+/// `column_sum_supported` so the two sides cannot drift apart again.
 fn run_fold_type_ok(dt: DataType) -> bool {
-    matches!(
-        dt,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::Decimal
-            | DataType::Date
-            | DataType::Time
-            | DataType::Timestamp
-            | DataType::Interval
-    )
+    crate::storage::segment::column_sum_supported(dt)
 }
 
 /// Fold one row group's run-level result into the accumulators. The shape

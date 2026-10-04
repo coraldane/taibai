@@ -1,3 +1,5 @@
+use super::*;
+
 static FLUSH_TRANSITION_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Striped mutexes serializing per-table flush-epoch file persistence outside
@@ -363,15 +365,15 @@ impl SegmentManager {
                 .is_some_and(|registry| registry.segment_overlay(reader_txn_id, path).is_some())
     }
 
-    fn pubsub(&self) -> Option<std::sync::Arc<crate::pubsub::PubSubHub>> {
+    pub(super) fn pubsub(&self) -> Option<std::sync::Arc<crate::pubsub::PubSubHub>> {
         self.pubsub.get().cloned()
     }
 
-    fn min_segment_seal_size(&self) -> u64 {
+    pub(super) fn min_segment_seal_size(&self) -> u64 {
         self.config.min_segment_size
     }
 
-    fn max_segment_size(&self) -> u64 {
+    pub(super) fn max_segment_size(&self) -> u64 {
         self.config.max_segment_size
     }
 
@@ -605,7 +607,7 @@ impl SegmentManager {
         f()
     }
 
-    fn get_or_create_state(&self, key: &str) -> Arc<TableSegmentState> {
+    pub(super) fn get_or_create_state(&self, key: &str) -> Arc<TableSegmentState> {
         {
             let tables = self.tables.read().unwrap();
             if let Some(state) = tables.get(key) {
@@ -644,7 +646,7 @@ impl SegmentManager {
     /// Same resolution, keyed by any path inside the table directory (a
     /// segment file or the dir itself). Used by writers that only carry a
     /// path, e.g. recovery and standalone tail-flush segments.
-    fn table_compression_level_for_path(&self, path: &Path) -> Result<i32> {
+    pub(super) fn table_compression_level_for_path(&self, path: &Path) -> Result<i32> {
         let key = self.table_state_key_from_dir(path)?;
         let tables = self.tables.read().unwrap();
         let override_level = tables
@@ -1729,7 +1731,7 @@ impl SegmentManager {
         );
     }
 
-    fn table_states_snapshot(&self) -> Vec<Arc<TableSegmentState>> {
+    pub(super) fn table_states_snapshot(&self) -> Vec<Arc<TableSegmentState>> {
         self.tables.read().unwrap().values().cloned().collect()
     }
 
@@ -1904,7 +1906,7 @@ fn acquire_mutation_lock<'a>(
 /// wait. A long-held partition lock (slow partition-scoped mutation) must
 /// surface as an explicit timeout instead of freezing every partition
 /// writer behind the raised gate for the same duration.
-fn acquire_partition_lock_for_wide_gate<'a>(
+pub(super) fn acquire_partition_lock_for_wide_gate<'a>(
     lock: &'a std::sync::Mutex<()>,
     key: &str,
     partition_key: &str,
@@ -1939,7 +1941,7 @@ fn acquire_partition_lock_for_wide_gate<'a>(
 /// Clone (or lazily create) the partition's mutation lock. The Arc is owned
 /// by the caller's scope so the subsequent `MutexGuard` borrows a stable
 /// local instead of registry internals.
-fn partition_mutation_lock_arc(
+pub(super) fn partition_mutation_lock_arc(
     state: &TableSegmentState,
     partition_key: &str,
 ) -> Arc<std::sync::Mutex<()>> {
@@ -1960,7 +1962,7 @@ fn partition_mutation_lock_arc(
 /// mutex the writer re-checks the table's wide-gate flag: a table-wide
 /// mutation operation that has already snapshotted this partition holds the
 /// mutex, so the writer releases and retries until the gate clears.
-fn acquire_partition_mutation_lock<'a>(
+pub(super) fn acquire_partition_mutation_lock<'a>(
     state: &TableSegmentState,
     lock: &'a std::sync::Mutex<()>,
     key: &str,
@@ -2157,16 +2159,6 @@ fn read_replace_journal(journal: &Path) -> Option<Vec<PathBuf>> {
     Some(olds)
 }
 
-/// Test-only re-exports of the replacement journal internals.
-#[cfg(test)]
-pub mod manager_core_test_support {
-    pub(crate) use super::{
-        recover_replace_journals as recover_replace_journals_for_test,
-        replace_journal_path as replace_journal_path_for_test,
-        write_replace_journal as write_replace_journal_for_test,
-    };
-}
-
 /// `<data>/<db>/<table>/<segment>` path -> `(db, table)`.
 fn db_table_from_segment_path(path: &Path) -> Option<(String, String)> {
     let table = path.parent()?.file_name()?.to_string_lossy().to_string();
@@ -2179,3 +2171,12 @@ fn db_table_from_segment_path(path: &Path) -> Option<(String, String)> {
     Some((db, table))
 }use crate::storage::segment::reader::FooterRewriteMode;
 
+/// Test-only re-exports of the replacement journal internals.
+#[cfg(test)]
+pub mod manager_core_test_support {
+    pub(crate) use super::{
+        recover_replace_journals as recover_replace_journals_for_test,
+        replace_journal_path as replace_journal_path_for_test,
+        write_replace_journal as write_replace_journal_for_test,
+    };
+}

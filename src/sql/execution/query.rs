@@ -328,23 +328,11 @@ fn left_rows_count(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
+/// Set-operation row ordering: numeric promotion first, then natural
+/// same-type order, NULLs last, Display text as the total-order fallback.
+/// Delegates to `ScalarValue::compare_ordered`.
 fn union_scalar_cmp(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
-    a.numeric_cmp(b)
-        .or_else(|| match (a, b) {
-            (ScalarValue::VarChar(Some(x)), ScalarValue::VarChar(Some(y))) => Some(x.cmp(y)),
-            (ScalarValue::Date(Some(x)), ScalarValue::Date(Some(y))) => Some(x.cmp(y)),
-            (ScalarValue::Timestamp(Some(x)), ScalarValue::Timestamp(Some(y))) => Some(x.cmp(y)),
-            _ => None,
-        })
-        .unwrap_or_else(|| {
-            let (null_a, null_b) = (a.is_null(), b.is_null());
-            match (null_a, null_b) {
-                (true, true) => std::cmp::Ordering::Equal,
-                (true, false) => std::cmp::Ordering::Greater,
-                (false, true) => std::cmp::Ordering::Less,
-                (false, false) => a.to_string().cmp(&b.to_string()),
-            }
-        })
+    a.compare_ordered(b, std::cmp::Ordering::Greater)
 }
 
 pub fn exec_select_with_plan_and_txn(
@@ -2133,7 +2121,7 @@ fn bind_correlated_subquery(
         ));
     }
     let mut inner = inner_stmt.clone();
-    if stmt_contains_placeholder(&inner) {
+    if super::prepared::has_placeholders(&inner) {
         return Err(TaibaiError::Sql(
             "parameter markers (?) are not supported inside correlated subqueries".into(),
         ));
@@ -2275,7 +2263,7 @@ fn bind_correlated_subquery(
     if let Some(where_expr) = where_expr {
         for conjunct in split_and_conjuncts(where_expr) {
             let marked = binder.mark_expr(conjunct)?;
-            if expr_contains_placeholder(&marked) {
+            if super::prepared::expr_contains_placeholder(&marked) {
                 correlated_conjuncts.push(marked);
             } else {
                 local_conjuncts.push(marked);
@@ -2528,105 +2516,6 @@ fn combine_conjuncts(conjuncts: Vec<Expr>) -> Option<Expr> {
         });
     }
     combined
-}
-
-fn expr_contains_placeholder(expr: &Expr) -> bool {
-    match expr {
-        Expr::Placeholder(_) => true,
-        Expr::BinaryOp { left, right, .. } => {
-            expr_contains_placeholder(left) || expr_contains_placeholder(right)
-        }
-        Expr::UnaryNot(inner)
-        | Expr::UnaryMinus(inner)
-        | Expr::IsNull(inner)
-        | Expr::IsNotNull(inner) => expr_contains_placeholder(inner),
-        Expr::In { expr, values, .. } => {
-            expr_contains_placeholder(expr) || values.iter().any(expr_contains_placeholder)
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            expr_contains_placeholder(expr)
-                || expr_contains_placeholder(low)
-                || expr_contains_placeholder(high)
-        }
-        Expr::Case {
-            operand,
-            when_clauses,
-            else_clause,
-        } => {
-            operand
-                .as_ref()
-                .map(|e| expr_contains_placeholder(e))
-                .unwrap_or(false)
-                || when_clauses
-                    .iter()
-                    .any(|(w, t)| expr_contains_placeholder(w) || expr_contains_placeholder(t))
-                || else_clause
-                    .as_ref()
-                    .map(|e| expr_contains_placeholder(e))
-                    .unwrap_or(false)
-        }
-        Expr::Like { expr, pattern, .. } => {
-            expr_contains_placeholder(expr) || expr_contains_placeholder(pattern)
-        }
-        Expr::Function { args, .. } => args.iter().any(expr_contains_placeholder),
-        Expr::WindowFunction {
-            partition_by,
-            order_by,
-            ..
-        } => {
-            partition_by.iter().any(expr_contains_placeholder)
-                || order_by
-                    .iter()
-                    .any(|item| expr_contains_placeholder(&item.expr))
-        }
-        Expr::Exists(inner) => expr_contains_placeholder(inner),
-        _ => false,
-    }
-}
-
-fn stmt_contains_placeholder(stmt: &Statement) -> bool {
-    match stmt {
-        Statement::Select {
-            select_list,
-            where_clause,
-            group_by,
-            having,
-            order_by,
-            limit,
-            offset,
-            ..
-        } => {
-            select_list
-                .iter()
-                .any(|item| matches!(item, SelectItem::Expr(e, _) if expr_contains_placeholder(e)))
-                || where_clause
-                    .as_ref()
-                    .map(expr_contains_placeholder)
-                    .unwrap_or(false)
-                || group_by.iter().any(expr_contains_placeholder)
-                || having
-                    .as_ref()
-                    .map(expr_contains_placeholder)
-                    .unwrap_or(false)
-                || order_by
-                    .iter()
-                    .any(|item| expr_contains_placeholder(&item.expr))
-                || limit
-                    .as_ref()
-                    .map(expr_contains_placeholder)
-                    .unwrap_or(false)
-                || offset
-                    .as_ref()
-                    .map(expr_contains_placeholder)
-                    .unwrap_or(false)
-        }
-        Statement::Union { left, right, .. } => {
-            stmt_contains_placeholder(left) || stmt_contains_placeholder(right)
-        }
-        _ => false,
-    }
 }
 
 fn expr_has_subquery(expr: &Expr) -> bool {

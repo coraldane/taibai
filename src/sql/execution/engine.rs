@@ -560,9 +560,11 @@ fn start_auto_compaction_thread(
     ))
 }
 
-include!("engine/core.rs");
-include!("engine/runtime.rs");
-include!("engine/bulk.rs");
+mod bulk;
+mod core;
+mod runtime;
+
+pub use runtime::HotFeedGuard;
 
 impl Drop for Engine {
     fn drop(&mut self) {

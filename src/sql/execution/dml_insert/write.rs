@@ -1,3 +1,7 @@
+use super::*;
+use super::constraints::*;
+use super::fast::*;
+
 /// The single condition under which an INSERT's rows are mirrored into the
 /// hot store at statement time: auto-commit regular-path writes only.
 /// Transactional rows are mirrored at COMMIT (or accounted as unfed), and
@@ -93,7 +97,7 @@ pub fn exec_replace(
                 // transaction registering its pin under this same lock):
                 // REPLACE shifts memtable positions, which would make that
                 // transaction's COMMIT delete the wrong rows.
-                super::txn_dml::refuse_auto_commit_dml_while_pinned(engine, db, table)?;
+                crate::sql::execution::txn_dml::refuse_auto_commit_dml_while_pinned(engine, db, table)?;
                 ensure_replace_location_indexes(
                     engine,
                     db,
@@ -102,7 +106,7 @@ pub fn exec_replace(
                     &location_schema,
                     &key_sets,
                 )?;
-                let memtable_plans = super::dml_delete::plan_replace_memtable_conflicts(
+                let memtable_plans = crate::sql::execution::dml_delete::plan_replace_memtable_conflicts(
                     engine, db, table, &key_sets,
                 )?;
 
@@ -172,7 +176,7 @@ pub fn exec_replace(
                 // pre-statement footers (roll back).
                 let image_checks = staged_images.watermark;
 
-                let mut undo = match super::dml_delete::delete_replace_conflicts_under_table_lock(
+                let mut undo = match crate::sql::execution::dml_delete::delete_replace_conflicts_under_table_lock(
                     engine,
                     db,
                     table,
@@ -205,7 +209,7 @@ pub fn exec_replace(
                 // replaced below. Drop it before filtering so subsequent reads
                 // rebuild from the authoritative segments plus memtables.
                 engine.hot_store_manager().remove(db, table);
-                match super::dml_delete::apply_replace_memtable_conflicts(
+                match crate::sql::execution::dml_delete::apply_replace_memtable_conflicts(
                     engine,
                     db,
                     table,
@@ -383,7 +387,7 @@ pub fn exec_replace(
     // cleanup as UPDATE's image transaction).
     let _ = engine.txn_mutations().remove(internal_txn_id);
 
-    super::dml_delete::finalize_replace_delete(engine, db, table, &materialized.table_meta, &undo)?;
+    crate::sql::execution::dml_delete::finalize_replace_delete(engine, db, table, &materialized.table_meta, &undo)?;
     engine.record_inserted_rows(db, table, physical_insert_rows as i64, false, true)?;
     if materialized
         .table_meta
@@ -588,7 +592,7 @@ fn materialize_insert_values(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn exec_materialized_insert_batch(
+pub(super) fn exec_materialized_insert_batch(
     engine: &Engine,
     db: &str,
     table: &str,
@@ -1227,13 +1231,13 @@ fn rollback_replace_under_table_lock(
     table: &str,
     table_meta: &crate::storage::catalog::schema::TableMeta,
     txn_id: u64,
-    undo: &super::dml_delete::ReplaceDeleteUndo,
+    undo: &crate::sql::execution::dml_delete::ReplaceDeleteUndo,
 ) -> Result<()> {
     let mut errors = Vec::new();
     if let Err(error) = engine.batch_writer().rollback_txn(txn_id) {
         errors.push(format!("rollback staged insert: {}", error));
     }
-    if let Err(error) = super::dml_delete::restore_replace_delete_under_table_lock(engine, undo) {
+    if let Err(error) = crate::sql::execution::dml_delete::restore_replace_delete_under_table_lock(engine, undo) {
         errors.push(format!("restore deleted rows: {}", error));
     }
 
@@ -1776,7 +1780,7 @@ fn push_literal_fast(
             // only the scientific-notation fallback.
             let scaled = crate::sql::execution::helpers::float_literal_to_decimal_i64(*v, scale)
                 .unwrap_or_else(|| {
-                    let multiplier = super::helpers::decimal_multiplier(scale).unwrap_or(1);
+                    let multiplier = crate::sql::execution::helpers::decimal_multiplier(scale).unwrap_or(1);
                     (*v * multiplier as f64).round() as i64
                 });
             data.push(scaled);
@@ -1784,7 +1788,7 @@ fn push_literal_fast(
             Ok(())
         }
         (ColumnArray::Decimal { data, bitmap }, ScalarValue::Int64(Some(v))) => {
-            let multiplier = super::helpers::decimal_multiplier(scale)?;
+            let multiplier = crate::sql::execution::helpers::decimal_multiplier(scale)?;
             data.push(v.checked_mul(multiplier).ok_or_else(|| {
                 TaibaiError::Sql(format!("decimal value '{}' overflows scale {}", v, scale))
             })?);
@@ -1857,7 +1861,7 @@ fn resolve_insert_columns(
     Ok(indices)
 }
 
-fn materialize_default_value(
+pub(super) fn materialize_default_value(
     default: &ColumnDefaultValue,
     schema: &Schema,
     col_idx: usize,
@@ -1889,7 +1893,7 @@ fn materialize_default_value(
     }
 }
 
-fn validate_nullable(schema: &Schema, col_idx: usize, scalar: &ScalarValue) -> Result<()> {
+pub(super) fn validate_nullable(schema: &Schema, col_idx: usize, scalar: &ScalarValue) -> Result<()> {
     let col = &schema.columns[col_idx];
     if (col.primary_key || !col.nullable) && scalar.is_null() {
         return Err(TaibaiError::Sql(format!(

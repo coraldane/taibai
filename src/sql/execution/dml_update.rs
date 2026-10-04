@@ -78,35 +78,9 @@ pub fn exec_update(
     let table_dir = engine.data_dir().join(db).join(table);
     let mgr = engine.segment_mgr();
     mgr.set_table_compression_level(db, table, table_meta.compression_level);
-    if table_meta.is_partitioned()
-        && assignments.iter().any(|assignment| {
-            assignment
-                .column
-                .eq_ignore_ascii_case(&table_meta.partition_key)
-        })
-    {
-        return Err(TaibaiError::Sql(format!(
-            "updating partition key '{}' is not supported; use DELETE followed by INSERT",
-            table_meta.partition_key
-        )));
-    }
 
-    // Resolve subqueries in the assignment values up front, exactly like the
-    // WHERE clause inside `DmlStatementContext::plan` — without it, a SET
-    // subquery would reach the evaluator as an opaque expression.
-    let resolved_assignments: Vec<Assignment> = assignments
-        .iter()
-        .map(|assignment| {
-            Ok(Assignment {
-                column: assignment.column.clone(),
-                value: super::query::resolve_expr_in_subqueries_clone(
-                    engine,
-                    db,
-                    &assignment.value,
-                )?,
-            })
-        })
-        .collect::<Result<_>>()?;
+    let resolved_assignments =
+        super::txn_dml::plan_update_assignments(engine, db, assignments, table_meta)?;
     let assignments = resolved_assignments.as_slice();
 
     engine.batch_writer().checkpoint_before_rewrite(

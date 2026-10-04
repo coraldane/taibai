@@ -52,28 +52,10 @@ pub fn encode_scalar_with_tag(buf: &mut Vec<u8>, v: &ScalarValue) {
     }
 }
 
+/// Storage tag = the protocol `DataType` discriminant (1..=19), high bit set
+/// for NULL. The single tag-number source is `protocol::types::DataType`.
 fn scalar_tag(v: &ScalarValue) -> u8 {
-    let dtype_tag = match v.data_type() {
-        DataType::Bool => 1u8,
-        DataType::Int8 => 2,
-        DataType::Int16 => 3,
-        DataType::Int32 => 4,
-        DataType::Int64 => 5,
-        DataType::UInt8 => 6,
-        DataType::UInt16 => 7,
-        DataType::UInt32 => 8,
-        DataType::UInt64 => 9,
-        DataType::Float32 => 10,
-        DataType::Float64 => 11,
-        DataType::Decimal => 12,
-        DataType::Date => 13,
-        DataType::Time => 14,
-        DataType::Timestamp => 15,
-        DataType::Interval => 16,
-        DataType::VarChar => 17,
-        DataType::Blob => 18,
-        DataType::Vector => 19,
-    };
+    let dtype_tag = v.data_type() as u8;
     if v.is_null() {
         dtype_tag | 0x80
     } else {
@@ -85,28 +67,12 @@ pub fn decode_scalar_with_tag(cursor: &mut std::io::Cursor<&[u8]>) -> Result<Sca
     let tag = read_u8(cursor).map_err(|e| TaibaiError::Storage(format!("read tag: {}", e)))?;
     let is_null = (tag & 0x80) != 0;
     let dtype_tag = tag & 0x7F;
-    let dtype = match dtype_tag {
-        1 => DataType::Bool,
-        2 => DataType::Int8,
-        3 => DataType::Int16,
-        4 => DataType::Int32,
-        5 => DataType::Int64,
-        6 => DataType::UInt8,
-        7 => DataType::UInt16,
-        8 => DataType::UInt32,
-        9 => DataType::UInt64,
-        10 => DataType::Float32,
-        11 => DataType::Float64,
-        12 => DataType::Decimal,
-        13 => DataType::Date,
-        14 => DataType::Time,
-        15 => DataType::Timestamp,
-        16 => DataType::Interval,
-        17 => DataType::VarChar,
-        18 => DataType::Blob,
-        19 => DataType::Vector,
-        other => return Err(TaibaiError::Storage(format!("bad scalar tag: {}", other))),
-    };
+    // from_u8 also accepts wire ASCII aliases; the storage format only ever
+    // stores the raw discriminant, so reject anything that is not one.
+    let dtype = DataType::from_u8(dtype_tag)
+        .ok()
+        .filter(|dtype| *dtype as u8 == dtype_tag)
+        .ok_or_else(|| TaibaiError::Storage(format!("bad scalar tag: {}", dtype_tag)))?;
     if is_null {
         return Ok(null_for_dtype(dtype));
     }

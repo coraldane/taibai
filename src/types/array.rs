@@ -2001,4 +2001,9 @@ mod tests;
 #[path = "array/vec_kernel_test.rs"]
 mod vec_kernel_tests;
 
-include!("array/analytics.rs");
+/// Comparison/arithmetic kernels and gathers, previously stitched in with
+/// `include!` (a real module keeps the same namespace: children can see this
+/// module's items, and the `impl ColumnArray` blocks resolve identically).
+mod analytics;
+
+pub use analytics::{ArithOp, CompareOp};

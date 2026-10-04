@@ -1,3 +1,5 @@
+use super::*;
+
 impl SegmentManager {
     pub fn bulk_insert_batch_partitioned(
         &self,
@@ -365,7 +367,7 @@ impl SegmentManager {
         Ok(total)
     }
 
-    fn periodic_flush_check(&self) -> Result<u64> {
+    pub(super) fn periodic_flush_check(&self) -> Result<u64> {
         let now = Instant::now();
         let mut total = 0u64;
         let states = self.table_states_snapshot();

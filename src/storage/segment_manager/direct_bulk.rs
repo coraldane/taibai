@@ -1,3 +1,5 @@
+use super::*;
+
 fn log_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
     if crate::common::config::insert_profile_enabled() {
         println!(
@@ -37,7 +39,7 @@ fn warn_slow_seal(
 
 /// RAII finish of a seal registration; Drop is the safety net for error and
 /// panic paths so a leaked entry can never wedge the wide-gate drain.
-struct SealingToken {
+pub(super) struct SealingToken {
     state: Arc<TableSegmentState>,
     path: PathBuf,
 }
@@ -51,14 +53,14 @@ impl Drop for SealingToken {
 /// A segment removed from the active map whose seal (footer + fsync) still
 /// has to run — always executed after the partition and active-segments
 /// locks have been released.
-struct PendingSeal {
-    token: SealingToken,
-    writer: ActiveSegmentWriter,
-    partition: String,
+pub(super) struct PendingSeal {
+    pub(super) token: SealingToken,
+    pub(super) writer: ActiveSegmentWriter,
+    pub(super) partition: String,
 }
 
 impl PendingSeal {
-    fn new(state: Arc<TableSegmentState>, partition: &str, writer: ActiveSegmentWriter) -> Self {
+    pub(super) fn new(state: Arc<TableSegmentState>, partition: &str, writer: ActiveSegmentWriter) -> Self {
         Self {
             token: SealingToken {
                 state,

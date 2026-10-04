@@ -1,8 +1,11 @@
+use super::*;
+use super::write::*;
+
 fn insert_profile_enabled() -> bool {
     crate::common::config::insert_profile_enabled()
 }
 
-fn log_insert_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
+pub(super) fn log_insert_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
     if insert_profile_enabled() {
         eprintln!(
             "[insert-profile] stage={} rows={} elapsed_us={}",
@@ -754,7 +757,7 @@ fn push_fast_value_direct(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn materialize_insert_row<F>(
+pub(super) fn materialize_insert_row<F>(
     engine: &Engine,
     db: &str,
     table: &str,
@@ -812,7 +815,7 @@ fn push_missing_insert_value(
     col.push(&scalar)
 }
 
-fn materialize_missing_insert_scalar(
+pub(super) fn materialize_missing_insert_scalar(
     engine: &Engine,
     db: &str,
     table: &str,

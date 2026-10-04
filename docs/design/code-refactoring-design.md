@@ -295,4 +295,47 @@ engine（4 文件）、segment_manager（5 文件）、ddl（4 文件）、dml_i
 
 **验证结果**：`cargo test --workspace` 65 套件 **1,149 测试全部通过**；`cargo clippy --workspace --all-targets` **零告警**；重复扫描 **4,157 → 3,744 行（-413）**；allow 预算不变；diff **+345/-557（净 -212 行）**。
 
-下一阶段入口：Phase 2（漂移重复统一，标量比较 5→1 与 ScalarValue codec 3+3→1 优先，需先写行为锁定测试）。
+### Phase 2：消灭已漂移的重复（已完成，2026-10-04）
+
+| 项 | 实施 |
+|---|---|
+| 标量比较 5→1 | `ScalarValue::compare_ordered(other, null_order)` 落在 types/scalar.rs（numeric 提升 → 同类型臂全覆盖 → Display 兜底保证全序，NaN 排在任意数之后）；`aggregate::compare_scalars`（null 在前）、`sort_key::compare_scalars_for_sort` / `sort::compare_scalars_null_last` / `query::union_scalar_cmp`（null 在后）全部改为薄委托。helpers.rs 的 `Option<Ordering>` 版是 SQL 谓词语义（None → 谓词假），**契约不同，保留** |
+| 修复的潜伏 bug | aggregate 版缺 Bool/Time/Interval/Blob 臂 → spill 合并路径的 MIN/MAX 对这些类型返回 first-seen 值。新增 `spilled_min_max_merge_orders_bool_states` 单元测试**双向验证**（旧实现下 MIN 断言失败，新实现通过）；另加 `compare_ordered` 单元测试（null 位置、数值提升、u64 不回绕、NaN、非数值类型）与 SQL 级回归 |
+| ScalarValue codec 3+3→1 | 新建 `protocol/scalar_codec.rs`（`encode_scalar_param` + `decode_param_value`），client/handler 均委托。调查确认：client 的文本 Decimal 分支是死代码（唯一调用点 scale 恒为 0 且 Decimal 走定宽路径），已删；wire 语义统一为严格 UTF-8（client 结果路径从 lossy 收紧，编码端只产生合法 UTF-8，故仅影响损坏数据的报错方式）。`scalar_tag` 的 19 值 tag 表改为 `DataType as u8` 判别值 + `from_u8` 回程校验（拒绝 ASCII 别名渗入存储格式） |
+| 占位符 walker | 删除 query.rs 的残缺版（不遍历 FROM 派生表、Union 顶层子句、DML/Explain），入口检查与相关性标记分类均改用 `prepared::has_placeholders` / `expr_contains_placeholder`。入口检查变严格：派生表中的 `?` 现在会被正确拒绝 |
+| txn_dml unwind | 两段逐字相同的 staged tombstone 注册-撤销循环提取为 `apply_staged_tombstones` |
+| DML 公共前置 | partition-key 拒绝 + SET 子查询解析提取为 `txn_dml::plan_update_assignments`（auto-commit 与 in-txn UPDATE 共用） |
+| footer 类型锁步 | `run_fold_type_ok` 委托 `column_sum_supported`（读写两侧类型集合无法再漂移） |
+| 顺带 | `dml_insert::constraint_insert_lock` 调用点不变；修复 client.rs 脚本误删造成的 30 行重复后全量重验 |
+
+**未做（推迟到 Phase 4 前的独立批次）**：planner/expr.rs 三个 AST→LogicalExpr 转换器合一（~350 行，需要 Resolver 抽象设计，风险高于本批，单独成批）。
+
+**验证结果**：`cargo test --workspace` 65 套件 **1,150 测试全部通过**（+1 为新锁定测试）；`cargo clippy` **零告警**；重复扫描 **3,744 → 3,608 行（本阶段 -136，两阶段累计 -549）**，基线已收紧至 3,608；本阶段 diff **+399/-1,004（净 -605 行）**。
+
+下一阶段入口：Phase 3（include! → 真模块，五处拼接宿主：engine、segment_manager、ddl、dml_insert、array/analytics）。
+
+### Phase 3：include! → 真模块（已完成，2026-10-04）
+
+五处拼接宿主全部改为真 `mod` 声明（version.rs 的 `include!(concat!(env!("OUT_DIR")...))` 是 build 脚本生成代码的合法用法，保留）：
+
+| 宿主 | 改造 | 备注 |
+|---|---|---|
+| types/array.rs | `mod analytics;` + `pub use analytics::{ArithOp, CompareOp};` | 最简单：纯 impl 块，`use super::*` 即无缝 |
+| dml_insert.rs | `mod {fast, write, constraints};` + 显式 pub/pub(crate) re-export | 外部约 15 个 `dml_insert::X` 路径保持不变 |
+| ddl.rs | `mod {table, database_auth, introspection};` + `pub use xxx::*` glob | glob re-export 取 min(pub, 原项) 可见性，与 include! 时代完全一致；外部约 30 个 `ddl::exec_*` 路径不变 |
+| engine.rs | `mod {core, runtime, bulk};` + `pub use runtime::HotFeedGuard;` | 混缩进的 impl Engine 块原样保留；68 处 `super::X` 改为 `crate::sql::execution::X` |
+| segment_manager.rs | `mod {manager_core, buffered_write, direct_bulk, lifecycle};` + glob | 子文件全是 impl 方法 + crate 路径，最干净；测试模块挪到文件尾 |
+
+**通用手法**（后续 Phase 4 拆文件可复用）：
+- 子文件 prelude `use super::*;` 继承宿主命名空间（私有项对后代模块天然可见）；
+- 子文件间共享：直接 `use super::兄弟::*`（比经宿主 glob 中转可靠——实测 glob 链传递在某些方向上不生效）；
+- 跨文件共享的私有项提升 `pub(super)`（不泄漏到 crate 外）；
+- 宿主对子模块 glob `pub use`（原可见性保持）供外部路径兼容。
+
+**可见性提升清单**（全部 `pub(super)` 或测试需要的 `pub(crate)`）：dml_insert 17 个跨文件 fn、ddl 的 `get_existing_catalog`/`exec_partition_change`/Analyze 直方图项、engine 的 `begin_operation`/`apply_hot_resident_mark`、segment_manager 的锁辅助三件套 + `PendingSeal`/`SealingToken` 及其字段 + 11 个跨文件方法。
+
+**验证结果**：`cargo test --workspace` 65 套件 **1,150 测试全部通过**（第一次跑有一个时序敏感测试 `optimize_heavy_phase_keeps_target_partition_writable` 在高负载下超时，单独重跑与全量重跑均通过——该测试断言真实墙钟 1.5s 时限，与本次纯结构改造无关）；`cargo clippy --workspace --all-targets` **零告警**；重复扫描 3,608 → 3,595 行，基线收紧至 3,595；三阶段累计 diff **+639/-1,162**。
+
+**收益**：每个子文件从此是独立编译单元（IDE 导航、增量编译、按模块 clippy 生效）；测试可挂在真子模块上；后续 Phase 4 的文件拆分不再受"共享父模块私有项"牵制。
+
+下一阶段入口：Phase 4（巨型函数拆解 + 模块边界重划，按 git churn 排序：execute_stmt 分发 → query.rs 拆三 → dml_delete 的 REPLACE 机器归位 → planner join-order 迁 optimizer → durable_tail 八模块）。

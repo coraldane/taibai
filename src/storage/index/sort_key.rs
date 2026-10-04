@@ -45,49 +45,10 @@ impl SortKeyInserter {
 
 /// Compare two scalar values for sorting purposes.
 /// Nulls are sorted last (greater than all non-null values).
+/// Delegates to `ScalarValue::compare_ordered`; NULLs-last is the ascending
+/// ORDER BY / zone-map convention.
 pub fn compare_scalars_for_sort(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
-    if a.is_null() && b.is_null() {
-        return std::cmp::Ordering::Equal;
-    }
-    if a.is_null() {
-        return std::cmp::Ordering::Greater; // Nulls last
-    }
-    if b.is_null() {
-        return std::cmp::Ordering::Less;
-    }
-
-    match (a, b) {
-        _ if a.numeric_cmp(b).is_some() => a.numeric_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
-        (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => l.cmp(r),
-        (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => l.cmp(r),
-        (ScalarValue::Int16(Some(l)), ScalarValue::Int16(Some(r))) => l.cmp(r),
-        (ScalarValue::Int8(Some(l)), ScalarValue::Int8(Some(r))) => l.cmp(r),
-        (ScalarValue::UInt64(Some(l)), ScalarValue::UInt64(Some(r))) => l.cmp(r),
-        (ScalarValue::UInt32(Some(l)), ScalarValue::UInt32(Some(r))) => l.cmp(r),
-        (ScalarValue::UInt16(Some(l)), ScalarValue::UInt16(Some(r))) => l.cmp(r),
-        (ScalarValue::UInt8(Some(l)), ScalarValue::UInt8(Some(r))) => l.cmp(r),
-        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => {
-            l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (ScalarValue::Float32(Some(l)), ScalarValue::Float32(Some(r))) => {
-            l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) => l.cmp(r),
-        (ScalarValue::Bool(Some(l)), ScalarValue::Bool(Some(r))) => l.cmp(r),
-        // Cross-type: promote to i64
-        (ScalarValue::Int64(Some(l)), ScalarValue::Int32(Some(r))) => l.cmp(&(*r as i64)),
-        (ScalarValue::Int32(Some(l)), ScalarValue::Int64(Some(r))) => (*l as i64).cmp(r),
-        // Timestamp as i64 comparison
-        (ScalarValue::Timestamp(Some(l)), ScalarValue::Timestamp(Some(r))) => l.cmp(r),
-        (ScalarValue::Date(Some(l)), ScalarValue::Date(Some(r))) => l.cmp(r),
-        // Temporal i64 payloads: without these arms every Time/Interval
-        // pair compared Equal, silently breaking order-sensitive consumers
-        // (clustered-compaction merge heads, zone-map sorting).
-        (ScalarValue::Time(Some(l)), ScalarValue::Time(Some(r))) => l.cmp(r),
-        (ScalarValue::Interval(Some(l)), ScalarValue::Interval(Some(r))) => l.cmp(r),
-        (ScalarValue::Blob(Some(l)), ScalarValue::Blob(Some(r))) => l.cmp(r),
-        _ => std::cmp::Ordering::Equal,
-    }
+    a.compare_ordered(b, std::cmp::Ordering::Greater)
 }
 
 pub fn scalar_lt(a: &ScalarValue, b: &ScalarValue) -> bool {
