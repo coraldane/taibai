@@ -176,7 +176,7 @@ pub fn exec_replace(
                 // pre-statement footers (roll back).
                 let image_checks = staged_images.watermark;
 
-                let mut undo = match crate::sql::execution::dml_delete::delete_replace_conflicts_under_table_lock(
+                let mut undo = match super::replace::delete_replace_conflicts_under_table_lock(
                     engine,
                     db,
                     table,
@@ -387,7 +387,7 @@ pub fn exec_replace(
     // cleanup as UPDATE's image transaction).
     let _ = engine.txn_mutations().remove(internal_txn_id);
 
-    crate::sql::execution::dml_delete::finalize_replace_delete(engine, db, table, &materialized.table_meta, &undo)?;
+    super::replace::finalize_replace_delete(engine, db, table, &materialized.table_meta, &undo)?;
     engine.record_inserted_rows(db, table, physical_insert_rows as i64, false, true)?;
     if materialized
         .table_meta
@@ -1237,7 +1237,7 @@ fn rollback_replace_under_table_lock(
     if let Err(error) = engine.batch_writer().rollback_txn(txn_id) {
         errors.push(format!("rollback staged insert: {}", error));
     }
-    if let Err(error) = crate::sql::execution::dml_delete::restore_replace_delete_under_table_lock(engine, undo) {
+    if let Err(error) = super::replace::restore_replace_delete_under_table_lock(engine, undo) {
         errors.push(format!("restore deleted rows: {}", error));
     }
 
