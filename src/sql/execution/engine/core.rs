@@ -792,230 +792,40 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 table,
                 columns,
                 values,
-            } => {
-                let txn_id = session.active_txn_id();
-                let result = crate::sql::execution::dml_insert::exec_insert(
-                    self,
-                    table.effective_database(&session.database),
-                    &table.name,
-                    columns,
-                    values,
-                    session.timezone_offset_hours,
-                    txn_id,
-                    session.bulk_import_mode,
-                );
-                if result.is_ok() && txn_id > 0 {
-                    session.mark_txn_write();
-                }
-                result
-            }
+            } => self.exec_insert_stmt(session, table, columns, values),
             Statement::Replace {
                 table,
                 columns,
                 values,
-            } => {
-                let txn_id = session.active_txn_id();
-                let result = crate::sql::execution::dml_insert::exec_replace(
-                    self,
-                    table.effective_database(&session.database),
-                    &table.name,
-                    columns,
-                    values,
-                    session.timezone_offset_hours,
-                    txn_id,
-                    session.bulk_import_mode,
-                );
-                if result.is_ok() && txn_id > 0 {
-                    session.mark_txn_write();
-                }
-                result
-            }
+            } => self.exec_replace_stmt(session, table, columns, values),
             Statement::ReplaceSelect {
                 table,
                 columns,
                 query,
-            } => {
-                let txn_id = session.active_txn_id();
-                if txn_id > 0 {
-                    return Err(TaibaiError::Sql(
-                        "REPLACE is not supported inside an explicit transaction".to_string(),
-                    ));
-                }
-                let query_result =
-                    crate::sql::execution::query::exec_select_with_txn(self, &session.database, query, txn_id)?;
-                let ExecResult::Query { batches, .. } = query_result else {
-                    return Err(TaibaiError::Internal(
-                        "REPLACE SELECT source did not return rows".to_string(),
-                    ));
-                };
-                let mut values = Vec::new();
-                for batch in batches {
-                    for row_idx in 0..batch.num_rows() {
-                        let mut row = Vec::with_capacity(batch.num_columns());
-                        for col_idx in 0..batch.num_columns() {
-                            let value = batch.scalar(row_idx, col_idx).ok_or_else(|| {
-                                TaibaiError::Internal(
-                                    "REPLACE SELECT result column is missing".to_string(),
-                                )
-                            })?;
-                            row.push(crate::sql::parser::ast::Expr::Literal(value));
-                        }
-                        values.push(row);
-                    }
-                }
-                crate::sql::execution::dml_insert::exec_replace(
-                    self,
-                    table.effective_database(&session.database),
-                    &table.name,
-                    columns,
-                    &values,
-                    session.timezone_offset_hours,
-                    txn_id,
-                    session.bulk_import_mode,
-                )
-            }
+            } => self.exec_replace_select_stmt(session, table, columns, query),
             Statement::InsertSelect {
                 table,
                 columns,
                 query,
-            } => {
-                // Rows are read from the current snapshot and then routed
-                // through the regular INSERT path (constraint validation,
-                // partition routing, catalog accounting), mirroring
-                // REPLACE SELECT. Like REPLACE SELECT this materializes the
-                // whole result before writing; the SELECT's LIMIT/OFFSET
-                // clauses are the knob for oversized sources.
-                let txn_id = session.active_txn_id();
-                let query_result =
-                    crate::sql::execution::query::exec_select_with_txn(self, &session.database, query, txn_id)?;
-                let ExecResult::Query { batches, .. } = query_result else {
-                    return Err(TaibaiError::Internal(
-                        "INSERT SELECT source did not return rows".to_string(),
-                    ));
-                };
-                // Stream the source in row chunks instead of materializing
-                // the whole result as boxed Expr literals first (peak memory
-                // used to be 2-3x the source). Every chunk goes through the
-                // regular INSERT path, so constraint validation, partition
-                // routing and catalog accounting are unchanged; a failing
-                // chunk leaves earlier chunks inserted, matching the
-                // multi-partition INSERT path's existing partial-failure
-                // semantics. The SELECT's LIMIT/OFFSET remain the knob for
-                // one-shot bulk loads.
-                const INSERT_SELECT_CHUNK_ROWS: usize = 4096;
-                let db = table.effective_database(&session.database);
-                let mut chunk: Vec<Vec<crate::sql::parser::ast::Expr>> = Vec::new();
-                let mut rows_affected_total = 0u64;
-                let flush_chunk = |chunk: &mut Vec<Vec<crate::sql::parser::ast::Expr>>| {
-                    if chunk.is_empty() {
-                        return Ok(ExecResult::Ok { rows_affected: 0 });
-                    }
-                    let result = crate::sql::execution::dml_insert::exec_insert(
-                        self,
-                        db,
-                        &table.name,
-                        columns,
-                        chunk.as_slice(),
-                        session.timezone_offset_hours,
-                        txn_id,
-                        session.bulk_import_mode,
-                    );
-                    if result.is_ok() {
-                        chunk.clear();
-                    }
-                    result
-                };
-                for batch in &batches {
-                    for row_idx in 0..batch.num_rows() {
-                        let mut row = Vec::with_capacity(batch.num_columns());
-                        for col_idx in 0..batch.num_columns() {
-                            let value = batch.scalar(row_idx, col_idx).ok_or_else(|| {
-                                TaibaiError::Internal(
-                                    "INSERT SELECT result column is missing".to_string(),
-                                )
-                            })?;
-                            row.push(crate::sql::parser::ast::Expr::Literal(value));
-                        }
-                        chunk.push(row);
-                        if chunk.len() >= INSERT_SELECT_CHUNK_ROWS {
-                            let inserted = flush_chunk(&mut chunk)?;
-                            if let ExecResult::Ok { rows_affected } = inserted {
-                                rows_affected_total += rows_affected;
-                            }
-                        }
-                    }
-                }
-                let last_result = flush_chunk(&mut chunk);
-                if last_result.is_ok() && txn_id > 0 {
-                    session.mark_txn_write();
-                }
-                last_result.map(|_| ExecResult::Ok {
-                    rows_affected: rows_affected_total,
-                })
-            }
+            } => self.exec_insert_select_stmt(session, table, columns, query),
             Statement::Update {
                 table,
                 assignments,
                 where_clause,
                 ..
-            } => {
-                // The table alias only qualifies SET targets and WHERE
-                // columns; both resolve by bare column name, so the alias
-                // needs no execution-time handling.
-                let db = table.effective_database(&session.database).to_string();
-                let result = crate::sql::execution::dml_update::exec_update(
-                    self,
-                    &db,
-                    &table.name,
-                    assignments,
-                    where_clause,
-                    session.active_txn_id(),
-                );
-                if result.is_ok() && session.in_txn() {
-                    session.mark_txn_write();
-                }
-                result
-            }
+            } => self.exec_update_stmt(session, table, assignments, where_clause),
             Statement::Delete {
                 table,
                 where_clause,
                 ..
-            } => {
-                // The table alias only matters for WHERE-clause qualification;
-                // qualified columns resolve by column name regardless of the
-                // qualifier, so the alias needs no execution-time handling.
-                let db = table.effective_database(&session.database).to_string();
-                let result =
-                    crate::sql::execution::dml_delete::exec_delete(
-                    self,
-                    &db,
-                    &table.name,
-                    where_clause,
-                    session.active_txn_id(),
-                );
-                if result.is_ok() && session.in_txn() {
-                    session.mark_txn_write();
-                }
-                result
-            }
+            } => self.exec_delete_stmt(session, table, where_clause),
             Statement::Select { .. } => crate::sql::execution::query::exec_select_with_txn(
                 self,
                 &session.database,
                 stmt,
                 session.active_txn_id(),
             ),
-            Statement::UseDatabase(database) => {
-                let catalogs = self.catalogs().read().unwrap();
-                if !catalogs.contains_key(database.as_str()) {
-                    return Err(TaibaiError::Sql(format!(
-                        "database '{}' does not exist",
-                        database
-                    )));
-                }
-                drop(catalogs);
-                session.database = database.clone();
-                Ok(ExecResult::Ok { rows_affected: 0 })
-            }
+            Statement::UseDatabase(database) => self.exec_use_database_stmt(session, database),
             Statement::ShowTables { database } => {
                 let db = database.as_deref().unwrap_or(&session.database);
                 crate::sql::execution::ddl::exec_show_tables(self, db)
@@ -1055,27 +865,9 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 analyze,
                 stmt: inner,
             } => crate::sql::execution::explain::exec_explain(self, &session.database, inner, *analyze),
-            Statement::Begin => {
-                if session.in_txn() {
-                    return Err(TaibaiError::Sql("transaction already in progress".into()));
-                }
-                let txn_id = self.alloc_txn_id();
-                session.begin_txn(txn_id);
-                Ok(ExecResult::Ok {
-                    rows_affected: txn_id,
-                })
-            }
-            Statement::Commit => {
-                if !session.in_txn() {
-                    return Err(TaibaiError::Sql("no active transaction".into()));
-                }
-                self.commit_session_txn(session)?;
-                Ok(ExecResult::Ok { rows_affected: 0 })
-            }
-            Statement::Rollback => {
-                let rows = self.rollback_session_txn(session)?;
-                Ok(ExecResult::Ok { rows_affected: rows })
-            }
+            Statement::Begin => self.exec_begin_txn_stmt(session),
+            Statement::Commit => self.exec_commit_txn_stmt(session),
+            Statement::Rollback => self.exec_rollback_txn_stmt(session),
             Statement::ShowStats => crate::sql::execution::ddl::exec_show_stats(self, &session.database),
             Statement::ShowPerformanceBaselines => {
                 crate::sql::execution::performance::exec_show_performance_baselines(self, &session.database)
@@ -1095,19 +887,11 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
             Statement::ShowRoles => crate::sql::execution::ddl::exec_show_roles(self),
             Statement::ShowGrants { user } => crate::sql::execution::ddl::exec_show_grants(self, user),
             Statement::ShowPartitions { table } => {
-                let db = table
-                    .as_ref()
-                    .map(|t| t.effective_database(&session.database))
-                    .unwrap_or(&session.database);
-                let table_name = table.as_ref().map(|t| t.name.clone());
+                let (db, table_name) = Self::resolve_optional_table_target(session, table);
                 crate::sql::execution::ddl::exec_show_partitions(self, db, &table_name)
             }
             Statement::FlushTable { table } => {
-                let db = table
-                    .as_ref()
-                    .map(|t| t.effective_database(&session.database))
-                    .unwrap_or(&session.database);
-                let table_name = table.as_ref().map(|t| t.name.clone());
+                let (db, table_name) = Self::resolve_optional_table_target(session, table);
                 crate::sql::execution::ddl::exec_flush_table(self, db, &table_name)
             }
             Statement::Union { .. } => crate::sql::execution::query::exec_union_with_txn(
@@ -1135,6 +919,291 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 self.segment_mgr().resume_flush();
                 Ok(ExecResult::Ok { rows_affected: 0 })
             }
+        }
+    }
+
+    /// INSERT: run the write path and mark the session's transaction as a
+    /// write on success (auto-commit statements pass txn_id 0 and skip the
+    /// mark, matching the original inline arm).
+    fn exec_insert_stmt(
+        &self,
+        session: &mut Session,
+        table: &crate::sql::parser::ast::ObjectName,
+        columns: &[String],
+        values: &[Vec<crate::sql::parser::ast::Expr>],
+    ) -> Result<ExecResult> {
+        let txn_id = session.active_txn_id();
+        let result = crate::sql::execution::dml_insert::exec_insert(
+            self,
+            table.effective_database(&session.database),
+            &table.name,
+            columns,
+            values,
+            session.timezone_offset_hours,
+            txn_id,
+            session.bulk_import_mode,
+        );
+        if result.is_ok() && txn_id > 0 {
+            session.mark_txn_write();
+        }
+        result
+    }
+
+    /// REPLACE values-form: same transaction tracking as INSERT.
+    fn exec_replace_stmt(
+        &self,
+        session: &mut Session,
+        table: &crate::sql::parser::ast::ObjectName,
+        columns: &[String],
+        values: &[Vec<crate::sql::parser::ast::Expr>],
+    ) -> Result<ExecResult> {
+        let txn_id = session.active_txn_id();
+        let result = crate::sql::execution::dml_insert::exec_replace(
+            self,
+            table.effective_database(&session.database),
+            &table.name,
+            columns,
+            values,
+            session.timezone_offset_hours,
+            txn_id,
+            session.bulk_import_mode,
+        );
+        if result.is_ok() && txn_id > 0 {
+            session.mark_txn_write();
+        }
+        result
+    }
+
+    /// `REPLACE ... SELECT`: materializes the source rows as literals and
+    /// routes them through the values-form REPLACE path. Refused inside an
+    /// explicit transaction.
+    fn exec_replace_select_stmt(
+        &self,
+        session: &mut Session,
+        table: &crate::sql::parser::ast::ObjectName,
+        columns: &[String],
+        query: &Statement,
+    ) -> Result<ExecResult> {
+        let txn_id = session.active_txn_id();
+        if txn_id > 0 {
+            return Err(TaibaiError::Sql(
+                "REPLACE is not supported inside an explicit transaction".to_string(),
+            ));
+        }
+        let query_result =
+            crate::sql::execution::query::exec_select_with_txn(self, &session.database, query, txn_id)?;
+        let ExecResult::Query { batches, .. } = query_result else {
+            return Err(TaibaiError::Internal(
+                "REPLACE SELECT source did not return rows".to_string(),
+            ));
+        };
+        let mut values = Vec::new();
+        for batch in batches {
+            for row_idx in 0..batch.num_rows() {
+                let mut row = Vec::with_capacity(batch.num_columns());
+                for col_idx in 0..batch.num_columns() {
+                    let value = batch.scalar(row_idx, col_idx).ok_or_else(|| {
+                        TaibaiError::Internal(
+                            "REPLACE SELECT result column is missing".to_string(),
+                        )
+                    })?;
+                    row.push(crate::sql::parser::ast::Expr::Literal(value));
+                }
+                values.push(row);
+            }
+        }
+        crate::sql::execution::dml_insert::exec_replace(
+            self,
+            table.effective_database(&session.database),
+            &table.name,
+            columns,
+            &values,
+            session.timezone_offset_hours,
+            txn_id,
+            session.bulk_import_mode,
+        )
+    }
+
+    /// `INSERT INTO t [(cols)] SELECT ...`: rows are read from the current
+    /// snapshot and then routed through the regular INSERT path (constraint
+    /// validation, partition routing, catalog accounting), mirroring
+    /// REPLACE SELECT.
+    fn exec_insert_select_stmt(
+        &self,
+        session: &mut Session,
+        table: &crate::sql::parser::ast::ObjectName,
+        columns: &[String],
+        query: &Statement,
+    ) -> Result<ExecResult> {
+        // Stream the source in row chunks instead of materializing the whole
+        // result as boxed Expr literals first (peak memory used to be 2-3x
+        // the source). Every chunk goes through the regular INSERT path, so
+        // constraint validation, partition routing and catalog accounting
+        // are unchanged; a failing chunk leaves earlier chunks inserted,
+        // matching the multi-partition INSERT path's existing partial-failure
+        // semantics. The SELECT's LIMIT/OFFSET remain the knob for one-shot
+        // bulk loads.
+        let txn_id = session.active_txn_id();
+        let query_result =
+            crate::sql::execution::query::exec_select_with_txn(self, &session.database, query, txn_id)?;
+        let ExecResult::Query { batches, .. } = query_result else {
+            return Err(TaibaiError::Internal(
+                "INSERT SELECT source did not return rows".to_string(),
+            ));
+        };
+        const INSERT_SELECT_CHUNK_ROWS: usize = 4096;
+        let db = table.effective_database(&session.database);
+        let mut chunk: Vec<Vec<crate::sql::parser::ast::Expr>> = Vec::new();
+        let mut rows_affected_total = 0u64;
+        let flush_chunk = |chunk: &mut Vec<Vec<crate::sql::parser::ast::Expr>>| {
+            if chunk.is_empty() {
+                return Ok(ExecResult::Ok { rows_affected: 0 });
+            }
+            let result = crate::sql::execution::dml_insert::exec_insert(
+                self,
+                db,
+                &table.name,
+                columns,
+                chunk.as_slice(),
+                session.timezone_offset_hours,
+                txn_id,
+                session.bulk_import_mode,
+            );
+            if result.is_ok() {
+                chunk.clear();
+            }
+            result
+        };
+        for batch in &batches {
+            for row_idx in 0..batch.num_rows() {
+                let mut row = Vec::with_capacity(batch.num_columns());
+                for col_idx in 0..batch.num_columns() {
+                    let value = batch.scalar(row_idx, col_idx).ok_or_else(|| {
+                        TaibaiError::Internal(
+                            "INSERT SELECT result column is missing".to_string(),
+                        )
+                    })?;
+                    row.push(crate::sql::parser::ast::Expr::Literal(value));
+                }
+                chunk.push(row);
+                if chunk.len() >= INSERT_SELECT_CHUNK_ROWS {
+                    let inserted = flush_chunk(&mut chunk)?;
+                    if let ExecResult::Ok { rows_affected } = inserted {
+                        rows_affected_total += rows_affected;
+                    }
+                }
+            }
+        }
+        let last_result = flush_chunk(&mut chunk);
+        if last_result.is_ok() && txn_id > 0 {
+            session.mark_txn_write();
+        }
+        last_result.map(|_| ExecResult::Ok {
+            rows_affected: rows_affected_total,
+        })
+    }
+
+    /// UPDATE. The table alias only qualifies SET targets and WHERE columns;
+    /// both resolve by bare column name, so the alias needs no
+    /// execution-time handling.
+    fn exec_update_stmt(
+        &self,
+        session: &mut Session,
+        table: &crate::sql::parser::ast::ObjectName,
+        assignments: &[crate::sql::parser::ast::Assignment],
+        where_clause: &Option<crate::sql::parser::ast::Expr>,
+    ) -> Result<ExecResult> {
+        let db = table.effective_database(&session.database).to_string();
+        let result = crate::sql::execution::dml_update::exec_update(
+            self,
+            &db,
+            &table.name,
+            assignments,
+            where_clause,
+            session.active_txn_id(),
+        );
+        if result.is_ok() && session.in_txn() {
+            session.mark_txn_write();
+        }
+        result
+    }
+
+    /// DELETE. The table alias only matters for WHERE-clause qualification;
+    /// qualified columns resolve by column name regardless of the qualifier.
+    fn exec_delete_stmt(
+        &self,
+        session: &mut Session,
+        table: &crate::sql::parser::ast::ObjectName,
+        where_clause: &Option<crate::sql::parser::ast::Expr>,
+    ) -> Result<ExecResult> {
+        let db = table.effective_database(&session.database).to_string();
+        let result = crate::sql::execution::dml_delete::exec_delete(
+            self,
+            &db,
+            &table.name,
+            where_clause,
+            session.active_txn_id(),
+        );
+        if result.is_ok() && session.in_txn() {
+            session.mark_txn_write();
+        }
+        result
+    }
+
+    /// `USE <db>`: switch the session database after checking the catalog.
+    fn exec_use_database_stmt(
+        &self,
+        session: &mut Session,
+        database: &str,
+    ) -> Result<ExecResult> {
+        let catalogs = self.catalogs().read().unwrap();
+        if !catalogs.contains_key(database) {
+            return Err(TaibaiError::Sql(format!(
+                "database '{}' does not exist",
+                database
+            )));
+        }
+        drop(catalogs);
+        session.database = database.to_string();
+        Ok(ExecResult::Ok { rows_affected: 0 })
+    }
+
+    fn exec_begin_txn_stmt(&self, session: &mut Session) -> Result<ExecResult> {
+        if session.in_txn() {
+            return Err(TaibaiError::Sql("transaction already in progress".into()));
+        }
+        let txn_id = self.alloc_txn_id();
+        session.begin_txn(txn_id);
+        Ok(ExecResult::Ok {
+            rows_affected: txn_id,
+        })
+    }
+
+    fn exec_commit_txn_stmt(&self, session: &mut Session) -> Result<ExecResult> {
+        if !session.in_txn() {
+            return Err(TaibaiError::Sql("no active transaction".into()));
+        }
+        self.commit_session_txn(session)?;
+        Ok(ExecResult::Ok { rows_affected: 0 })
+    }
+
+    fn exec_rollback_txn_stmt(&self, session: &mut Session) -> Result<ExecResult> {
+        let rows = self.rollback_session_txn(session)?;
+        Ok(ExecResult::Ok { rows_affected: rows })
+    }
+
+    /// `SHOW PARTITIONS` / `FLUSH TABLE` accept an optional table target:
+    /// without one they act database-wide on the session database.
+    fn resolve_optional_table_target<'a>(
+        session: &'a Session,
+        table: &'a Option<crate::sql::parser::ast::ObjectName>,
+    ) -> (&'a str, Option<String>) {
+        match table {
+            Some(t) => (
+                t.effective_database(&session.database),
+                Some(t.name.clone()),
+            ),
+            None => (&session.database, None),
         }
     }
 
