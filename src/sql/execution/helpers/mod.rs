@@ -4,13 +4,13 @@
 
 mod change_events;
 mod eval;
-mod scan_predicates;
 mod scalar_utils;
+mod scan_predicates;
 
 pub use change_events::*;
 pub use eval::*;
-pub use scan_predicates::*;
 pub use scalar_utils::*;
+pub use scan_predicates::*;
 
 #[cfg(test)]
 #[path = "../helpers_test.rs"]

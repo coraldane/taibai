@@ -128,15 +128,14 @@ impl Engine {
         // Reliable-subscription layer. Disabled engines get an inert manager
         // so callers never need to branch; the hub mirrors committed inserts
         // into its per-table retention logs when subscriptions exist.
-        let pubsub_manager =
-            if pubsub_settings.enabled {
-                crate::storage::core::pubsub::PubSubManager::start(
-                    pubsub_settings,
-                    data_dir.join("pubsub"),
-                )
-            } else {
-                crate::storage::core::pubsub::PubSubManager::disabled()
-            };
+        let pubsub_manager = if pubsub_settings.enabled {
+            crate::storage::core::pubsub::PubSubManager::start(
+                pubsub_settings,
+                data_dir.join("pubsub"),
+            )
+        } else {
+            crate::storage::core::pubsub::PubSubManager::disabled()
+        };
         pubsub.set_mirror(Arc::clone(&pubsub_manager));
 
         let batch_writer = BatchWriter::new(
@@ -165,7 +164,9 @@ impl Engine {
         let txn_mutations =
             Arc::new(crate::storage::core::txn_mutations::TxnMutationRegistry::new());
         segment_mgr.set_txn_mutations(Arc::clone(&txn_mutations));
-        batch_writer.memtable_manager().set_txn_mutations(Arc::clone(&txn_mutations));
+        batch_writer
+            .memtable_manager()
+            .set_txn_mutations(Arc::clone(&txn_mutations));
 
         // Replication primary: create the event log and wire it into the
         // commit thread (tail appends) and the segment manager (structural
@@ -312,7 +313,9 @@ impl Engine {
         // DDL/auth statements mutate the catalog or auth store in place; a
         // replication primary ships a full snapshot so standbys reload.
         if result.is_ok() {
-            if let Some((kind, db)) = Self::replication_snapshot_target(&stmts[0], &session.database) {
+            if let Some((kind, db)) =
+                Self::replication_snapshot_target(&stmts[0], &session.database)
+            {
                 let (path, event) = match kind {
                     "catalog" => {
                         let path = self
@@ -323,10 +326,11 @@ impl Engine {
                         // A missing file means the database was dropped; the
                         // standby apply treats an empty payload as removal.
                         let json = std::fs::read(&path).unwrap_or_default();
-                        let event = crate::storage::replication::ReplicationEvent::CatalogSnapshot {
-                            db,
-                            json,
-                        };
+                        let event =
+                            crate::storage::replication::ReplicationEvent::CatalogSnapshot {
+                                db,
+                                json,
+                            };
                         (path, event)
                     }
                     _ => {
@@ -391,22 +395,19 @@ impl Engine {
                     .gather_table_schemas(&session.database, &stmt)
                     .ok()
                     .map(|schemas| schema_fingerprint(&schemas));
-                let schema_unchanged = match (
-                    prepared.planned_schema_fingerprint,
-                    current_fingerprint,
-                ) {
-                    (Some(planned), Some(current)) => planned == current,
-                    // No fingerprint recorded (or none computable): only
-                    // trust the plan when no fingerprint was needed before.
-                    (None, _) => prepared.planned_schema_fingerprint.is_none(),
-                    (Some(_), None) => false,
-                };
+                let schema_unchanged =
+                    match (prepared.planned_schema_fingerprint, current_fingerprint) {
+                        (Some(planned), Some(current)) => planned == current,
+                        // No fingerprint recorded (or none computable): only
+                        // trust the plan when no fingerprint was needed before.
+                        (None, _) => prepared.planned_schema_fingerprint.is_none(),
+                        (Some(_), None) => false,
+                    };
                 if let (Some(plan), true, true) = (
                     prepared.cached_plan.as_ref(),
                     plan_matches_database,
                     schema_unchanged,
-                )
-                {
+                ) {
                     crate::sql::execution::query::exec_select_with_plan_and_txn(
                         self,
                         &session.database,
@@ -437,11 +438,11 @@ impl Engine {
                         {
                             let table_schemas =
                                 self.gather_table_schemas(&session.database, &stmt)?;
-                            if let Ok(plan) = crate::sql::planner::plan_select(&stmt, &table_schemas) {
-                                prepared.cached_plan =
-                                    Some(crate::sql::optimizer::optimize(plan));
-                                prepared.planned_database =
-                                    Some(session.database.clone());
+                            if let Ok(plan) =
+                                crate::sql::planner::plan_select(&stmt, &table_schemas)
+                            {
+                                prepared.cached_plan = Some(crate::sql::optimizer::optimize(plan));
+                                prepared.planned_database = Some(session.database.clone());
                                 prepared.planned_schema_fingerprint = self
                                     .gather_table_schemas(&session.database, &stmt)
                                     .ok()
@@ -571,7 +572,10 @@ impl Engine {
             ..
         } = stmt
         {
-            table_refs.extend(crate::sql::execution::query::extract_table_refs(from_clause, db));
+            table_refs.extend(crate::sql::execution::query::extract_table_refs(
+                from_clause,
+                db,
+            ));
         }
         let mut table_schemas = std::collections::HashMap::new();
         let catalogs = self.catalogs().read().unwrap();
@@ -585,36 +589,35 @@ impl Engine {
         Ok(table_schemas)
     }
 
-
     /// DDL and segment-rewriting maintenance statements have no transactional
-/// undo path: the catalog is rewritten in place and segment rewrites are
-/// immediately durable. They must not run inside an explicit transaction,
-/// otherwise ROLLBACK would silently keep their effects. Returns the SQL
-/// verb to name in the error message.
-fn transaction_forbidden_verb(stmt: &Statement) -> Option<&'static str> {
-    match stmt {
-        Statement::CreateTable { .. }
-        | Statement::CreateIndex { .. }
-        | Statement::DropIndex { .. }
-        | Statement::DropTable { .. }
-        | Statement::AlterTable { .. }
-        | Statement::Truncate { .. }
-        | Statement::CreateDatabase { .. }
-        | Statement::DropDatabase { .. }
-        | Statement::CreateUser { .. }
-        | Statement::AlterUser { .. }
-        | Statement::DropUser { .. }
-        | Statement::CreateRole { .. }
-        | Statement::DropRole { .. }
-        | Statement::Grant { .. }
-        | Statement::Revoke { .. }
-        | Statement::RebuildUniqueIndex { .. }
-        | Statement::OptimizeTable { .. }
-        | Statement::FlushTable { .. }
-        | Statement::AnalyzeTable { .. } => Some(Self::stmt_name(stmt)),
-        _ => None,
+    /// undo path: the catalog is rewritten in place and segment rewrites are
+    /// immediately durable. They must not run inside an explicit transaction,
+    /// otherwise ROLLBACK would silently keep their effects. Returns the SQL
+    /// verb to name in the error message.
+    fn transaction_forbidden_verb(stmt: &Statement) -> Option<&'static str> {
+        match stmt {
+            Statement::CreateTable { .. }
+            | Statement::CreateIndex { .. }
+            | Statement::DropIndex { .. }
+            | Statement::DropTable { .. }
+            | Statement::AlterTable { .. }
+            | Statement::Truncate { .. }
+            | Statement::CreateDatabase { .. }
+            | Statement::DropDatabase { .. }
+            | Statement::CreateUser { .. }
+            | Statement::AlterUser { .. }
+            | Statement::DropUser { .. }
+            | Statement::CreateRole { .. }
+            | Statement::DropRole { .. }
+            | Statement::Grant { .. }
+            | Statement::Revoke { .. }
+            | Statement::RebuildUniqueIndex { .. }
+            | Statement::OptimizeTable { .. }
+            | Statement::FlushTable { .. }
+            | Statement::AnalyzeTable { .. } => Some(Self::stmt_name(stmt)),
+            _ => None,
+        }
     }
-}
 
     /// Which replication snapshot a successful DDL/auth statement implies:
     /// `("catalog", db)` ships the database's catalog JSON, `("auth", _)`
@@ -635,8 +638,7 @@ fn transaction_forbidden_verb(stmt: &Statement) -> Option<&'static str> {
             | Statement::DropIndex { table: name, .. }
             | Statement::RebuildUniqueIndex { table: name, .. }
             | Statement::AnalyzeTable { table: name } => table_db(name),
-            Statement::CreateDatabase { name, .. }
-            | Statement::DropDatabase { name, .. } => {
+            Statement::CreateDatabase { name, .. } | Statement::DropDatabase { name, .. } => {
                 Some(("catalog", name.clone()))
             }
             Statement::CreateUser { .. }
@@ -650,32 +652,32 @@ fn transaction_forbidden_verb(stmt: &Statement) -> Option<&'static str> {
         }
     }
 
-fn stmt_name(stmt: &Statement) -> &'static str {
-    match stmt {
-        Statement::CreateTable { .. } => "CREATE TABLE",
-        Statement::CreateIndex { .. } => "CREATE INDEX",
-        Statement::DropIndex { .. } => "DROP INDEX",
-        Statement::DropTable { .. } => "DROP TABLE",
-        Statement::AlterTable { .. } => "ALTER TABLE",
-        Statement::Truncate { .. } => "TRUNCATE",
-        Statement::CreateDatabase { .. } => "CREATE DATABASE",
-        Statement::DropDatabase { .. } => "DROP DATABASE",
-        Statement::CreateUser { .. } => "CREATE USER",
-        Statement::AlterUser { .. } => "ALTER USER",
-        Statement::DropUser { .. } => "DROP USER",
-        Statement::CreateRole { .. } => "CREATE ROLE",
-        Statement::DropRole { .. } => "DROP ROLE",
-        Statement::Grant { .. } => "GRANT",
-        Statement::Revoke { .. } => "REVOKE",
-        Statement::RebuildUniqueIndex { .. } => "REBUILD UNIQUE INDEX",
-        Statement::OptimizeTable { .. } => "OPTIMIZE",
-        Statement::FlushTable { .. } => "FLUSH",
-        Statement::AnalyzeTable { .. } => "ANALYZE",
-        _ => "this statement",
+    fn stmt_name(stmt: &Statement) -> &'static str {
+        match stmt {
+            Statement::CreateTable { .. } => "CREATE TABLE",
+            Statement::CreateIndex { .. } => "CREATE INDEX",
+            Statement::DropIndex { .. } => "DROP INDEX",
+            Statement::DropTable { .. } => "DROP TABLE",
+            Statement::AlterTable { .. } => "ALTER TABLE",
+            Statement::Truncate { .. } => "TRUNCATE",
+            Statement::CreateDatabase { .. } => "CREATE DATABASE",
+            Statement::DropDatabase { .. } => "DROP DATABASE",
+            Statement::CreateUser { .. } => "CREATE USER",
+            Statement::AlterUser { .. } => "ALTER USER",
+            Statement::DropUser { .. } => "DROP USER",
+            Statement::CreateRole { .. } => "CREATE ROLE",
+            Statement::DropRole { .. } => "DROP ROLE",
+            Statement::Grant { .. } => "GRANT",
+            Statement::Revoke { .. } => "REVOKE",
+            Statement::RebuildUniqueIndex { .. } => "REBUILD UNIQUE INDEX",
+            Statement::OptimizeTable { .. } => "OPTIMIZE",
+            Statement::FlushTable { .. } => "FLUSH",
+            Statement::AnalyzeTable { .. } => "ANALYZE",
+            _ => "this statement",
+        }
     }
-}
 
-fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecResult> {
+    fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecResult> {
         self.ensure_permissions(session, stmt)?;
         if session.in_txn() {
             if let Some(verb) = Self::transaction_forbidden_verb(stmt) {
@@ -748,19 +750,19 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
             Statement::DropTable { name, if_exists } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
-                
+
                 crate::sql::execution::ddl::exec_drop_table(self, &db, &table, *if_exists)
             }
             Statement::AlterTable { name, operations } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
-                
+
                 crate::sql::execution::ddl::exec_alter_table(self, &db, &table, operations)
             }
             Statement::Truncate { table } => {
                 let db = table.effective_database(&session.database).to_string();
                 let table_name = table.name.clone();
-                
+
                 crate::sql::execution::ddl::exec_truncate_table(self, &db, &table_name)
             }
             Statement::CreateDatabase {
@@ -773,7 +775,9 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
             Statement::CreateUser { name, password } => {
                 crate::sql::execution::ddl::exec_create_user(self, name, password)
             }
-            Statement::CreateRole { name } => crate::sql::execution::ddl::exec_create_role(self, name),
+            Statement::CreateRole { name } => {
+                crate::sql::execution::ddl::exec_create_role(self, name)
+            }
             Statement::DropUser { name, if_exists } => {
                 crate::sql::execution::ddl::exec_drop_user(self, name, *if_exists)
             }
@@ -856,36 +860,55 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                     index_name.as_deref(),
                 )
             }
-            Statement::ShowCreateTable { table } => crate::sql::execution::ddl::exec_show_create_table(
-                self,
-                table.effective_database(&session.database),
-                &table.name,
-            ),
+            Statement::ShowCreateTable { table } => {
+                crate::sql::execution::ddl::exec_show_create_table(
+                    self,
+                    table.effective_database(&session.database),
+                    &table.name,
+                )
+            }
             Statement::Explain {
                 analyze,
                 stmt: inner,
-            } => crate::sql::execution::explain::exec_explain(self, &session.database, inner, *analyze),
+            } => crate::sql::execution::explain::exec_explain(
+                self,
+                &session.database,
+                inner,
+                *analyze,
+            ),
             Statement::Begin => self.exec_begin_txn_stmt(session),
             Statement::Commit => self.exec_commit_txn_stmt(session),
             Statement::Rollback => self.exec_rollback_txn_stmt(session),
-            Statement::ShowStats => crate::sql::execution::ddl::exec_show_stats(self, &session.database),
+            Statement::ShowStats => {
+                crate::sql::execution::ddl::exec_show_stats(self, &session.database)
+            }
             Statement::ShowPerformanceBaselines => {
-                crate::sql::execution::performance::exec_show_performance_baselines(self, &session.database)
+                crate::sql::execution::performance::exec_show_performance_baselines(
+                    self,
+                    &session.database,
+                )
             }
             Statement::ShowEngines => crate::sql::execution::ddl::exec_show_engines(self),
-            Statement::ShowProcesslist { full } => crate::sql::execution::ddl::exec_show_processlist(self, *full),
+            Statement::ShowProcesslist { full } => {
+                crate::sql::execution::ddl::exec_show_processlist(self, *full)
+            }
             Statement::KillQuery { query_id } => {
                 crate::sql::execution::ddl::exec_kill_query(self, &session.username, *query_id)
             }
             Statement::ResetPerformanceBaselines => {
-                crate::sql::execution::performance::exec_reset_performance_baselines(self, &session.database)
+                crate::sql::execution::performance::exec_reset_performance_baselines(
+                    self,
+                    &session.database,
+                )
             }
             Statement::AlterUser { name, operations } => {
                 crate::sql::execution::ddl::exec_alter_user(self, name, operations)
             }
             Statement::ShowUsers => crate::sql::execution::ddl::exec_show_users(self),
             Statement::ShowRoles => crate::sql::execution::ddl::exec_show_roles(self),
-            Statement::ShowGrants { user } => crate::sql::execution::ddl::exec_show_grants(self, user),
+            Statement::ShowGrants { user } => {
+                crate::sql::execution::ddl::exec_show_grants(self, user)
+            }
             Statement::ShowPartitions { table } => {
                 let (db, table_name) = Self::resolve_optional_table_target(session, table);
                 crate::sql::execution::ddl::exec_show_partitions(self, db, &table_name)
@@ -900,12 +923,14 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 stmt,
                 session.active_txn_id(),
             ),
-            Statement::OptimizeTable { table, partition } => crate::sql::execution::ddl::exec_optimize_table(
-                self,
-                table.effective_database(&session.database),
-                &table.name,
-                partition.as_deref(),
-            ),
+            Statement::OptimizeTable { table, partition } => {
+                crate::sql::execution::ddl::exec_optimize_table(
+                    self,
+                    table.effective_database(&session.database),
+                    &table.name,
+                    partition.as_deref(),
+                )
+            }
             Statement::AnalyzeTable { table } => crate::sql::execution::ddl::exec_analyze_table(
                 self,
                 table.effective_database(&session.database),
@@ -990,8 +1015,12 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 "REPLACE is not supported inside an explicit transaction".to_string(),
             ));
         }
-        let query_result =
-            crate::sql::execution::query::exec_select_with_txn(self, &session.database, query, txn_id)?;
+        let query_result = crate::sql::execution::query::exec_select_with_txn(
+            self,
+            &session.database,
+            query,
+            txn_id,
+        )?;
         let ExecResult::Query { batches, .. } = query_result else {
             return Err(TaibaiError::Internal(
                 "REPLACE SELECT source did not return rows".to_string(),
@@ -1003,9 +1032,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 let mut row = Vec::with_capacity(batch.num_columns());
                 for col_idx in 0..batch.num_columns() {
                     let value = batch.scalar(row_idx, col_idx).ok_or_else(|| {
-                        TaibaiError::Internal(
-                            "REPLACE SELECT result column is missing".to_string(),
-                        )
+                        TaibaiError::Internal("REPLACE SELECT result column is missing".to_string())
                     })?;
                     row.push(crate::sql::parser::ast::Expr::Literal(value));
                 }
@@ -1044,8 +1071,12 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
         // semantics. The SELECT's LIMIT/OFFSET remain the knob for one-shot
         // bulk loads.
         let txn_id = session.active_txn_id();
-        let query_result =
-            crate::sql::execution::query::exec_select_with_txn(self, &session.database, query, txn_id)?;
+        let query_result = crate::sql::execution::query::exec_select_with_txn(
+            self,
+            &session.database,
+            query,
+            txn_id,
+        )?;
         let ExecResult::Query { batches, .. } = query_result else {
             return Err(TaibaiError::Internal(
                 "INSERT SELECT source did not return rows".to_string(),
@@ -1079,9 +1110,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 let mut row = Vec::with_capacity(batch.num_columns());
                 for col_idx in 0..batch.num_columns() {
                     let value = batch.scalar(row_idx, col_idx).ok_or_else(|| {
-                        TaibaiError::Internal(
-                            "INSERT SELECT result column is missing".to_string(),
-                        )
+                        TaibaiError::Internal("INSERT SELECT result column is missing".to_string())
                     })?;
                     row.push(crate::sql::parser::ast::Expr::Literal(value));
                 }
@@ -1151,11 +1180,7 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
     }
 
     /// `USE <db>`: switch the session database after checking the catalog.
-    fn exec_use_database_stmt(
-        &self,
-        session: &mut Session,
-        database: &str,
-    ) -> Result<ExecResult> {
+    fn exec_use_database_stmt(&self, session: &mut Session, database: &str) -> Result<ExecResult> {
         let catalogs = self.catalogs().read().unwrap();
         if !catalogs.contains_key(database) {
             return Err(TaibaiError::Sql(format!(
@@ -1189,7 +1214,9 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
 
     fn exec_rollback_txn_stmt(&self, session: &mut Session) -> Result<ExecResult> {
         let rows = self.rollback_session_txn(session)?;
-        Ok(ExecResult::Ok { rows_affected: rows })
+        Ok(ExecResult::Ok {
+            rows_affected: rows,
+        })
     }
 
     /// `SHOW PARTITIONS` / `FLUSH TABLE` accept an optional table target:

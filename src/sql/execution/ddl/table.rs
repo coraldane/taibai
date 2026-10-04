@@ -1,5 +1,5 @@
-use super::*;
 use super::introspection::*;
+use super::*;
 
 #[allow(clippy::too_many_arguments)]
 pub fn exec_create_table(
@@ -1683,10 +1683,14 @@ fn try_or_block_table_mutation_lock<T>(
 ) -> Result<Option<T>> {
     if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
         Ok(Some(
-            engine.segment_mgr().with_table_mutation_lock(db, name, op)?,
+            engine
+                .segment_mgr()
+                .with_table_mutation_lock(db, name, op)?,
         ))
     } else {
-        engine.segment_mgr().try_with_table_mutation_lock(db, name, op)
+        engine
+            .segment_mgr()
+            .try_with_table_mutation_lock(db, name, op)
     }
 }
 

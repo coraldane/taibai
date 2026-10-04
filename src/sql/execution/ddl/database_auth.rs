@@ -107,13 +107,12 @@ pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Resul
                     .close_table_state_handles(name, table_name);
             }
             engine.segment_mgr().invalidate_readers_under(&database_dir);
-            let tombstone =
-                stage_database_directory(engine.data_dir(), name).map_err(|error| {
-                    TaibaiError::Storage(format!(
-                        "failed to stage database '{}' for DROP: {}",
-                        name, error
-                    ))
-                })?;
+            let tombstone = stage_database_directory(engine.data_dir(), name).map_err(|error| {
+                TaibaiError::Storage(format!(
+                    "failed to stage database '{}' for DROP: {}",
+                    name, error
+                ))
+            })?;
 
             if let Err(error) = remove_file_with_retry(&catalog_file) {
                 if let Some(tombstone) = tombstone.as_deref() {

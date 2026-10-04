@@ -103,96 +103,81 @@ pub fn decode_param_value(data: &[u8], dt: DataType) -> Result<(ScalarValue, usi
             }
             fixed(ScalarValue::Int8(Some(data[0] as i8)), 1)
         }
-        DataType::Int16 => {
-            data.get(..2)
-                .map(|b| ScalarValue::Int16(Some(i16::from_le_bytes(b.try_into().unwrap()))))
-                .ok_or_else(|| too_short("Int16"))
-                .and_then(|v| fixed(v, 2))
-        }
-        DataType::Int32 => {
-            data.get(..4)
-                .map(|b| ScalarValue::Int32(Some(i32::from_le_bytes(b.try_into().unwrap()))))
-                .ok_or_else(|| too_short("Int32"))
-                .and_then(|v| fixed(v, 4))
-        }
-        DataType::Int64 => {
-            data.get(..8)
-                .map(|b| ScalarValue::Int64(Some(i64::from_le_bytes(b.try_into().unwrap()))))
-                .ok_or_else(|| too_short("Int64"))
-                .and_then(|v| fixed(v, 8))
-        }
+        DataType::Int16 => data
+            .get(..2)
+            .map(|b| ScalarValue::Int16(Some(i16::from_le_bytes(b.try_into().unwrap()))))
+            .ok_or_else(|| too_short("Int16"))
+            .and_then(|v| fixed(v, 2)),
+        DataType::Int32 => data
+            .get(..4)
+            .map(|b| ScalarValue::Int32(Some(i32::from_le_bytes(b.try_into().unwrap()))))
+            .ok_or_else(|| too_short("Int32"))
+            .and_then(|v| fixed(v, 4)),
+        DataType::Int64 => data
+            .get(..8)
+            .map(|b| ScalarValue::Int64(Some(i64::from_le_bytes(b.try_into().unwrap()))))
+            .ok_or_else(|| too_short("Int64"))
+            .and_then(|v| fixed(v, 8)),
         DataType::UInt8 => {
             if data.is_empty() {
                 return Err(too_short("UInt8"));
             }
             fixed(ScalarValue::UInt8(Some(data[0])), 1)
         }
-        DataType::UInt16 => {
-            data.get(..2)
-                .map(|b| ScalarValue::UInt16(Some(u16::from_le_bytes(b.try_into().unwrap()))))
-                .ok_or_else(|| too_short("UInt16"))
-                .and_then(|v| fixed(v, 2))
-        }
-        DataType::UInt32 => {
-            data.get(..4)
-                .map(|b| ScalarValue::UInt32(Some(u32::from_le_bytes(b.try_into().unwrap()))))
-                .ok_or_else(|| too_short("UInt32"))
-                .and_then(|v| fixed(v, 4))
-        }
-        DataType::UInt64 => {
-            data.get(..8)
-                .map(|b| ScalarValue::UInt64(Some(u64::from_le_bytes(b.try_into().unwrap()))))
-                .ok_or_else(|| too_short("UInt64"))
-                .and_then(|v| fixed(v, 8))
-        }
-        DataType::Float32 => {
-            data.get(..4)
-                .map(|b| ScalarValue::Float32(Some(f32::from_le_bytes(b.try_into().unwrap()))))
-                .ok_or_else(|| too_short("Float32"))
-                .and_then(|v| fixed(v, 4))
-        }
-        DataType::Float64 => {
-            data.get(..8)
-                .map(|b| ScalarValue::Float64(Some(f64::from_le_bytes(b.try_into().unwrap()))))
-                .ok_or_else(|| too_short("Float64"))
-                .and_then(|v| fixed(v, 8))
-        }
-        DataType::Decimal => {
-            data.get(..8)
-                .map(|b| ScalarValue::Decimal(Some(i64::from_le_bytes(b.try_into().unwrap()))))
-                .ok_or_else(|| too_short("Decimal"))
-                .and_then(|v| fixed(v, 8))
-        }
-        DataType::Date => {
-            data.get(..4)
-                .map(|b| ScalarValue::Date(Some(i32::from_le_bytes(b.try_into().unwrap()))))
-                .ok_or_else(|| too_short("Date"))
-                .and_then(|v| fixed(v, 4))
-        }
-        DataType::Time => {
-            data.get(..8)
-                .map(|b| ScalarValue::Time(Some(i64::from_le_bytes(b.try_into().unwrap()))))
-                .ok_or_else(|| too_short("Time"))
-                .and_then(|v| fixed(v, 8))
-        }
-        DataType::Timestamp => {
-            data.get(..8)
-                .map(|b| ScalarValue::Timestamp(Some(i64::from_le_bytes(b.try_into().unwrap()))))
-                .ok_or_else(|| too_short("Timestamp"))
-                .and_then(|v| fixed(v, 8))
-        }
-        DataType::Interval => {
-            data.get(..8)
-                .map(|b| ScalarValue::Interval(Some(i64::from_le_bytes(b.try_into().unwrap()))))
-                .ok_or_else(|| too_short("Interval"))
-                .and_then(|v| fixed(v, 8))
-        }
+        DataType::UInt16 => data
+            .get(..2)
+            .map(|b| ScalarValue::UInt16(Some(u16::from_le_bytes(b.try_into().unwrap()))))
+            .ok_or_else(|| too_short("UInt16"))
+            .and_then(|v| fixed(v, 2)),
+        DataType::UInt32 => data
+            .get(..4)
+            .map(|b| ScalarValue::UInt32(Some(u32::from_le_bytes(b.try_into().unwrap()))))
+            .ok_or_else(|| too_short("UInt32"))
+            .and_then(|v| fixed(v, 4)),
+        DataType::UInt64 => data
+            .get(..8)
+            .map(|b| ScalarValue::UInt64(Some(u64::from_le_bytes(b.try_into().unwrap()))))
+            .ok_or_else(|| too_short("UInt64"))
+            .and_then(|v| fixed(v, 8)),
+        DataType::Float32 => data
+            .get(..4)
+            .map(|b| ScalarValue::Float32(Some(f32::from_le_bytes(b.try_into().unwrap()))))
+            .ok_or_else(|| too_short("Float32"))
+            .and_then(|v| fixed(v, 4)),
+        DataType::Float64 => data
+            .get(..8)
+            .map(|b| ScalarValue::Float64(Some(f64::from_le_bytes(b.try_into().unwrap()))))
+            .ok_or_else(|| too_short("Float64"))
+            .and_then(|v| fixed(v, 8)),
+        DataType::Decimal => data
+            .get(..8)
+            .map(|b| ScalarValue::Decimal(Some(i64::from_le_bytes(b.try_into().unwrap()))))
+            .ok_or_else(|| too_short("Decimal"))
+            .and_then(|v| fixed(v, 8)),
+        DataType::Date => data
+            .get(..4)
+            .map(|b| ScalarValue::Date(Some(i32::from_le_bytes(b.try_into().unwrap()))))
+            .ok_or_else(|| too_short("Date"))
+            .and_then(|v| fixed(v, 4)),
+        DataType::Time => data
+            .get(..8)
+            .map(|b| ScalarValue::Time(Some(i64::from_le_bytes(b.try_into().unwrap()))))
+            .ok_or_else(|| too_short("Time"))
+            .and_then(|v| fixed(v, 8)),
+        DataType::Timestamp => data
+            .get(..8)
+            .map(|b| ScalarValue::Timestamp(Some(i64::from_le_bytes(b.try_into().unwrap()))))
+            .ok_or_else(|| too_short("Timestamp"))
+            .and_then(|v| fixed(v, 8)),
+        DataType::Interval => data
+            .get(..8)
+            .map(|b| ScalarValue::Interval(Some(i64::from_le_bytes(b.try_into().unwrap()))))
+            .ok_or_else(|| too_short("Interval"))
+            .and_then(|v| fixed(v, 8)),
         DataType::VarChar => decode_len_prefixed(data, "VarChar", |bytes| {
             std::str::from_utf8(bytes)
                 .map(|s| ScalarValue::VarChar(Some(s.to_string())))
-                .map_err(|e| {
-                    TaibaiError::Protocol(format!("invalid UTF-8 in VarChar param: {e}"))
-                })
+                .map_err(|e| TaibaiError::Protocol(format!("invalid UTF-8 in VarChar param: {e}")))
         }),
         DataType::Blob => decode_len_prefixed(data, "Blob", |bytes| {
             Ok(ScalarValue::Blob(Some(bytes.to_vec())))
@@ -204,9 +189,7 @@ pub fn decode_param_value(data: &[u8], dt: DataType) -> Result<(ScalarValue, usi
             let dim = u32::from_le_bytes(dim_bytes.try_into().unwrap()) as usize;
             let total = 4 + dim * 4;
             let Some(payload) = data.get(..total) else {
-                return Err(TaibaiError::Protocol(
-                    "Vector param data truncated".into(),
-                ));
+                return Err(TaibaiError::Protocol("Vector param data truncated".into()));
             };
             let mut floats = Vec::with_capacity(dim);
             for i in 0..dim {

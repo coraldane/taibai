@@ -10,8 +10,7 @@ use crate::types::scalar::ScalarValue;
 use crate::sql::parser::ast::{BinOp, Expr};
 
 use super::scalar_utils::{
-    coerce_scalar_for_dtype, compare_scalars, scalar_like_matches,
-    scalar_values_equal,
+    coerce_scalar_for_dtype, compare_scalars, scalar_like_matches, scalar_values_equal,
 };
 
 fn col_lit_pair<'a>(left: &'a Expr, right: &'a Expr) -> Option<(&'a str, &'a ScalarValue)> {
@@ -662,9 +661,11 @@ pub fn eval_expr_for_row(
             // this arm used to handle only Int64+Int64 Add/Sub and return the
             // LEFT operand for every other shape (Mul/Div/Mod, floats, Int32
             // columns), silently mis-filtering DML WHERE rows.
-            Ok(crate::sql::execution::operators::filter::eval_binary_scalar(
-                &left_val, op, &right_val,
-            ))
+            Ok(
+                crate::sql::execution::operators::filter::eval_binary_scalar(
+                    &left_val, op, &right_val,
+                ),
+            )
         }
         Expr::IsNull(inner) => Ok(ScalarValue::Bool(Some(
             eval_expr_for_row(inner, batch, row_idx, schema)?.is_null(),

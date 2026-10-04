@@ -17,9 +17,9 @@ use crate::sql::execution::wal_helper::{
 };
 use crate::types::batch::RecordBatch;
 
+use super::api::*;
 use super::format::*;
 use super::generations::*;
-use super::api::*;
 
 /// Monotonic high-water for tail LSNs, seeded from the wall clock at thread
 /// start and never allowed to regress within the process.

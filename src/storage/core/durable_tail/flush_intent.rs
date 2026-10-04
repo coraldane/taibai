@@ -11,11 +11,11 @@ use uuid::Uuid;
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::segment::SegmentReader;
 
-use super::format::*;
+use super::api::*;
 use super::committer::*;
+use super::format::*;
 use super::generations::*;
 use super::recovery::*;
-use super::api::*;
 
 pub struct FlushIntent {
     id: Uuid,

@@ -12,10 +12,10 @@ use uuid::Uuid;
 use crate::common::error::{Result, TaibaiError};
 use crate::types::batch::RecordBatch;
 
-use super::format::*;
 use super::committer::*;
-use super::generations::*;
 use super::flush_intent::*;
+use super::format::*;
+use super::generations::*;
 
 pub(super) const TAIL_DIR: &str = "memtable_tail";
 

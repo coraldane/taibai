@@ -9,10 +9,7 @@ use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use crate::sql::execution::engine::{Engine, ExecResult};
-use crate::sql::parser::ast::{
-    CorrelatedKind, CorrelatedSubquery, Expr, SelectItem, Statement,
-};
-
+use crate::sql::parser::ast::{CorrelatedKind, CorrelatedSubquery, Expr, SelectItem, Statement};
 
 use super::select_exec::*;
 use super::subqueries::*;
@@ -610,14 +607,13 @@ pub(super) fn bind_correlated_subquery(
         }
     };
 
-    let id = registry
-        .lock()
-        .unwrap()
-        .allocate(crate::sql::execution::subquery_runtime::CorrelatedSnapshot {
+    let id = registry.lock().unwrap().allocate(
+        crate::sql::execution::subquery_runtime::CorrelatedSnapshot {
             schemas: snapshot_schemas,
             batches: snapshot_batches,
             cache: HashMap::new(),
-        });
+        },
+    );
 
     Ok(Expr::Correlated(Box::new(CorrelatedSubquery {
         id,

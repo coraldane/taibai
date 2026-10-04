@@ -12,11 +12,11 @@ use crate::storage::segment::reader::ImageDurabilityCheck;
 use crate::types::batch::RecordBatch;
 use crate::types::scalar::ScalarValue;
 
-use super::format::*;
+use super::api::*;
 use super::committer::*;
+use super::format::*;
 use super::generations::*;
 use super::replication::*;
-use super::api::*;
 
 /// The two sidecar kinds that can sit above a live tail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -451,7 +451,10 @@ pub(super) fn decode_sidecar(file: &SidecarFile) -> Result<DecodedSidecar> {
 /// remove rows, updates overwrite values in place. Each sidecar's positions
 /// refer to the batch state produced by the generations before it, so the
 /// ordered replay reproduces exactly what the statements left in memory.
-pub(super) fn apply_sidecars(mut batch: RecordBatch, sidecars: &[DecodedSidecar]) -> Result<RecordBatch> {
+pub(super) fn apply_sidecars(
+    mut batch: RecordBatch,
+    sidecars: &[DecodedSidecar],
+) -> Result<RecordBatch> {
     for sidecar in sidecars {
         batch = match sidecar {
             DecodedSidecar::Delete(positions) => filter_out_positions(&batch, positions)?,

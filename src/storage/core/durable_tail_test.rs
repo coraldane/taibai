@@ -5,16 +5,16 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::common::error::Result;
-use crate::sql::execution::wal_helper::serialize_batch_for_wal;
 use crate::protocol::types::DataType;
+use crate::sql::execution::wal_helper::serialize_batch_for_wal;
 use crate::storage::segment::constants::DEFAULT_ROW_GROUP_SIZE;
 use crate::storage::segment::reader::ImageDurabilityCheck;
 use crate::storage::segment::SegmentWriter;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
-use super::*;
 use super::generations::*;
+use super::*;
 
 fn test_batch(schema: &Schema, values: &[i64]) -> Result<RecordBatch> {
     let mut batch = RecordBatch::new(schema.clone());
@@ -1370,7 +1370,6 @@ fn commit_thread_and_direct_writes_allocate_unique_monotonic_lsns() -> Result<()
 // ---------------------------------------------------------------------------
 // Statement guards: crash arbitration for multi-leg memtable deletes
 // ---------------------------------------------------------------------------
-
 
 fn watermark_of(id: Uuid, rows: u64) -> Vec<ImageDurabilityCheck> {
     vec![ImageDurabilityCheck {

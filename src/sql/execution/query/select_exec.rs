@@ -15,9 +15,7 @@ use crate::sql::execution::physical::{
     build_physical_pipeline, build_profiled_materialized_pipeline, can_use_physical_pipeline,
     drain_pipeline, PhysicalContext,
 };
-use crate::sql::parser::ast::{
-    Expr, FromClause, SelectItem, Statement,
-};
+use crate::sql::parser::ast::{Expr, FromClause, SelectItem, Statement};
 use crate::sql::planner::{LogicalExpr, LogicalPlan};
 
 use crate::sql::execution::scan::spec::compile_scan_spec;
@@ -197,7 +195,9 @@ pub fn exec_union_with_txn(
     // Dedup/set keys use the join hash table's compact typed key: hashing the
     // row itself cloned every cell a second time into the HashSet (a third
     // copy for INTERSECT/EXCEPT), while the key holds one boxed enum per row.
-    pub(super) fn row_key(row: &[ScalarValue]) -> Vec<crate::sql::execution::join_hashtable::ScalarValueHashable> {
+    pub(super) fn row_key(
+        row: &[ScalarValue],
+    ) -> Vec<crate::sql::execution::join_hashtable::ScalarValueHashable> {
         row.iter()
             .map(crate::sql::execution::join_hashtable::ScalarValueHashable::from_scalar)
             .collect()
@@ -751,7 +751,11 @@ pub(super) fn exec_table_select_materialized(
             profile,
         )?
     } else {
-        crate::sql::execution::operators::build_pipeline_with_subqueries(plan, &table_batches, subqueries)?
+        crate::sql::execution::operators::build_pipeline_with_subqueries(
+            plan,
+            &table_batches,
+            subqueries,
+        )?
     };
     tracing::debug!("query: materialized pipeline built, starting next_batch loop");
     let mut result_batches = Vec::new();

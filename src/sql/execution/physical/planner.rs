@@ -381,7 +381,8 @@ fn build_operator_with_limit(
         }
         LogicalPlan::Join(join) => {
             let build_left = if join.join_type == JoinType::Inner {
-                crate::sql::optimizer::join_order::estimate_plan_rows(&join.left, ctx) <= crate::sql::optimizer::join_order::estimate_plan_rows(&join.right, ctx)
+                crate::sql::optimizer::join_order::estimate_plan_rows(&join.left, ctx)
+                    <= crate::sql::optimizer::join_order::estimate_plan_rows(&join.right, ctx)
             } else {
                 true
             };
@@ -1059,7 +1060,6 @@ fn try_folded_aggregate_exec(
         table_ref.database.clone(),
     ))
 }
-
 
 /// Wrap a join child operator so it always presents the FULL planned side
 /// schema (see the Join/SemiJoin arms). Kept tiny and `inline`-shaped: for

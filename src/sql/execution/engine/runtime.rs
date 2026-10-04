@@ -198,7 +198,11 @@ impl Engine {
             // before the filesystem: the miss path is a full
             // `discover_segments` directory listing, paid by every INSERT
             // of a non-partitioned HOT table once segments exist.
-            if hot_tables_with_segments().lock().unwrap().contains(&table_dir) {
+            if hot_tables_with_segments()
+                .lock()
+                .unwrap()
+                .contains(&table_dir)
+            {
                 return HotResidentMark::None;
             }
             if Self::table_has_any_segment(&table_dir) {
@@ -369,7 +373,10 @@ impl Engine {
     /// mark, so wiring is an optimization, not a correctness requirement.
     pub fn invalidate_hot_segment_hint(&self, db: &str, table: &str) {
         let table_dir = self.segment_mgr.table_dir(db, table);
-        hot_tables_with_segments().lock().unwrap().remove(&table_dir);
+        hot_tables_with_segments()
+            .lock()
+            .unwrap()
+            .remove(&table_dir);
     }
 
     pub(crate) fn table_has_any_segment(table_dir: &std::path::Path) -> bool {
@@ -570,8 +577,7 @@ impl Engine {
         // transaction's rows stayed in the stats forever (only DELETE's
         // COMMIT path ever decremented).
         for (db, table, rows) in self.txn_mutations().take_inserted_rows_by_table(txn_id) {
-            if let Err(error) =
-                self.record_inserted_rows(&db, &table, -(rows as i64), true, false)
+            if let Err(error) = self.record_inserted_rows(&db, &table, -(rows as i64), true, false)
             {
                 tracing::warn!(
                     db,
@@ -585,7 +591,8 @@ impl Engine {
         // Deferred DML plans are dropped first: no durable state was
         // written at statement time, so discarding them restores the
         // pre-statement state.
-        let discarded_dml = crate::sql::execution::txn_dml::discard_txn_mutations_at_rollback(self, txn_id);
+        let discarded_dml =
+            crate::sql::execution::txn_dml::discard_txn_mutations_at_rollback(self, txn_id);
         let rolled_back = self.batch_writer().rollback_txn(txn_id)?;
         // Retract the unique/PK index entries INSERT statements published at
         // statement time; otherwise the next INSERT of the same key sees a
@@ -663,7 +670,10 @@ impl Engine {
             let mut total = 0u64;
             for (db, table) in tables {
                 total = total.saturating_add(self.flush_table_buffers(db, table)?);
-                self.bulk_dirty_tables.lock().unwrap().remove(&(db.clone(), table.clone()));
+                self.bulk_dirty_tables
+                    .lock()
+                    .unwrap()
+                    .remove(&(db.clone(), table.clone()));
             }
             Ok(total)
         };

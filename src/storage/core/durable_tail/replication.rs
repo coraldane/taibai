@@ -10,17 +10,18 @@ use uuid::Uuid;
 
 use crate::common::error::Result;
 
-use super::format::*;
-use super::committer::*;
-use super::sidecar::*;
 use super::api::*;
+use super::committer::*;
+use super::format::*;
+use super::sidecar::*;
 
 /// Replication log for memtable-level mutations: every sidecar this module
 /// writes (`.del` / `.upd`) ships verbatim to standbys, whose tail files
 /// hold the identical frame history. Set only on replication primaries —
 /// a standby never writes sidecars of its own (read-only), so the hook
 /// cannot loop.
-pub(super) static REPLICATION_LOG: OnceLock<Arc<crate::storage::replication::RepLog>> = OnceLock::new();
+pub(super) static REPLICATION_LOG: OnceLock<Arc<crate::storage::replication::RepLog>> =
+    OnceLock::new();
 
 /// Wire the replication log for sidecar shipping (primary only).
 pub fn set_rep_log(log: Arc<crate::storage::replication::RepLog>) {

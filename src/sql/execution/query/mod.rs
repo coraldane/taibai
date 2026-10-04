@@ -12,16 +12,11 @@ pub(crate) use correlated::*;
 pub use select_exec::*;
 pub use subqueries::*;
 
-
 use crate::common::error::{Result, TaibaiError};
 use crate::types::batch::{RecordBatch, Schema};
 
 use super::engine::{Engine, ExecResult};
-use crate::sql::parser::ast::{
-    Expr, FromClause, ObjectName, SelectItem, Statement,
-    TableRef,
-};
-
+use crate::sql::parser::ast::{Expr, FromClause, ObjectName, SelectItem, Statement, TableRef};
 
 #[derive(Debug, Clone)]
 pub struct ResolvedTableRef {

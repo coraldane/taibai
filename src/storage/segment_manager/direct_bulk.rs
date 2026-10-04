@@ -60,7 +60,11 @@ pub(super) struct PendingSeal {
 }
 
 impl PendingSeal {
-    pub(super) fn new(state: Arc<TableSegmentState>, partition: &str, writer: ActiveSegmentWriter) -> Self {
+    pub(super) fn new(
+        state: Arc<TableSegmentState>,
+        partition: &str,
+        writer: ActiveSegmentWriter,
+    ) -> Self {
         Self {
             token: SealingToken {
                 state,
@@ -154,7 +158,13 @@ impl SegmentManager {
                     "segment seal failed outside the locks"
                 );
             } else {
-                warn_slow_seal(db, req.table_name, &pending.partition, size, seal_start.elapsed());
+                warn_slow_seal(
+                    db,
+                    req.table_name,
+                    &pending.partition,
+                    size,
+                    seal_start.elapsed(),
+                );
             }
             drop(pending.token);
             result?;
@@ -278,55 +288,56 @@ impl SegmentManager {
             .map(String::as_str)
             .collect::<Vec<_>>();
 
-        let result = self.with_partition_set_mutation_lock(db, req.table_name, &partition_refs, || {
-            ensure_state_not_retired(&state, db, req.table_name)?;
+        let result =
+            self.with_partition_set_mutation_lock(db, req.table_name, &partition_refs, || {
+                ensure_state_not_retired(&state, db, req.table_name)?;
 
-            let mut written = 0u64;
-            let mut pending_seals: Vec<PendingSeal> = Vec::new();
-            let append_start = std::time::Instant::now();
-            for group in prepared_groups {
-                let mut active_guard = state.active_segments.lock().unwrap();
-                self.get_or_create_active_segment_for_partition_locked(
-                    &table_dir,
-                    schema,
-                    &group.partition_key,
-                    &mut active_guard,
-                    &state.sealing_paths(),
-                )?;
-                let seal_full = {
-                    let seg = active_guard.get_mut(&group.partition_key).unwrap();
-                    seg.append_direct_row_group(
-                        &group.columns,
-                        &group.compressed_columns,
-                        group.row_count as u64,
-                        build_value_sets,
-                        zone_map_columns.as_deref(),
+                let mut written = 0u64;
+                let mut pending_seals: Vec<PendingSeal> = Vec::new();
+                let append_start = std::time::Instant::now();
+                for group in prepared_groups {
+                    let mut active_guard = state.active_segments.lock().unwrap();
+                    self.get_or_create_active_segment_for_partition_locked(
+                        &table_dir,
+                        schema,
+                        &group.partition_key,
+                        &mut active_guard,
+                        &state.sealing_paths(),
                     )?;
-                    seg.current_size >= self.max_segment_size()
-                };
-                if seal_full {
-                    if let Some(seg) = active_guard.remove(&group.partition_key) {
-                        state.register_sealing_segment(&group.partition_key, seg.path.clone());
-                        pending_seals.push(PendingSeal::new(
-                            Arc::clone(&state),
-                            &group.partition_key,
-                            seg,
-                        ));
+                    let seal_full = {
+                        let seg = active_guard.get_mut(&group.partition_key).unwrap();
+                        seg.append_direct_row_group(
+                            &group.columns,
+                            &group.compressed_columns,
+                            group.row_count as u64,
+                            build_value_sets,
+                            zone_map_columns.as_deref(),
+                        )?;
+                        seg.current_size >= self.max_segment_size()
+                    };
+                    if seal_full {
+                        if let Some(seg) = active_guard.remove(&group.partition_key) {
+                            state.register_sealing_segment(&group.partition_key, seg.path.clone());
+                            pending_seals.push(PendingSeal::new(
+                                Arc::clone(&state),
+                                &group.partition_key,
+                                seg,
+                            ));
+                        }
+                    } else if flush_immediately {
+                        active_guard
+                            .get_mut(&group.partition_key)
+                            .unwrap()
+                            .flush_meta(&|path| self.invalidate_reader(path))?;
                     }
-                } else if flush_immediately {
-                    active_guard
-                        .get_mut(&group.partition_key)
-                        .unwrap()
-                        .flush_meta(&|path| self.invalidate_reader(path))?;
+                    written += group.row_count as u64;
                 }
-                written += group.row_count as u64;
-            }
-            if written > 0 {
-                self.note_segments_changed(db, req.table_name);
-            }
-            log_profile("append", written as usize, append_start.elapsed());
-            Ok((written, pending_seals))
-        });
+                if written > 0 {
+                    self.note_segments_changed(db, req.table_name);
+                }
+                log_profile("append", written as usize, append_start.elapsed());
+                Ok((written, pending_seals))
+            });
         let (written, pending_seals) = result?;
         let mut sealed_any = false;
         let mut first_seal_error: Option<TaibaiError> = None;

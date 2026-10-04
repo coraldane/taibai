@@ -9,10 +9,10 @@ use uuid::Uuid;
 
 use crate::common::error::Result;
 
-use super::sidecar::*;
+use super::api::*;
 use super::flush_intent::*;
 use super::recovery::*;
-use super::api::*;
+use super::sidecar::*;
 
 #[derive(Clone)]
 pub(super) enum GenerationKind {

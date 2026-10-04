@@ -9,11 +9,7 @@ use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use crate::sql::execution::engine::{Engine, ExecResult};
-use crate::sql::parser::ast::{
-    Expr, FromClause, ObjectName, SelectItem, Statement,
-    TableRef,
-};
-
+use crate::sql::parser::ast::{Expr, FromClause, ObjectName, SelectItem, Statement, TableRef};
 
 use super::select_exec::*;
 
@@ -181,7 +177,11 @@ pub(crate) fn resolve_where_in_subqueries(
         .transpose()
 }
 
-pub(super) fn resolve_stmt_in_subqueries(engine: &Engine, db: &str, stmt: &mut Statement) -> Result<()> {
+pub(super) fn resolve_stmt_in_subqueries(
+    engine: &Engine,
+    db: &str,
+    stmt: &mut Statement,
+) -> Result<()> {
     match stmt {
         Statement::Select {
             select_list,

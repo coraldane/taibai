@@ -704,8 +704,7 @@ impl Handler {
         session: &mut Session,
         stmt_id: u32,
         context: &str,
-    ) -> std::result::Result<crate::sql::execution::prepared::PreparedStatement, Vec<Message>>
-    {
+    ) -> std::result::Result<crate::sql::execution::prepared::PreparedStatement, Vec<Message>> {
         match session.prepared_statements.remove(stmt_id) {
             Some(stmt) => Ok(stmt),
             None => {
@@ -734,16 +733,11 @@ impl Handler {
         session: &mut Session,
         stmt: crate::sql::execution::prepared::PreparedStatement,
         stmt_id: u32,
-    ) -> std::result::Result<crate::sql::execution::prepared::PreparedStatement, Vec<Message>>
-    {
-        if let Some((_, current_types)) = Self::current_insert_param_types(engine, session, &stmt)
-        {
+    ) -> std::result::Result<crate::sql::execution::prepared::PreparedStatement, Vec<Message>> {
+        if let Some((_, current_types)) = Self::current_insert_param_types(engine, session, &stmt) {
             if !stmt.param_types.is_empty() && stmt.param_types != current_types {
                 return Err(Self::reject_stale_prepared_statement(
-                    engine,
-                    session,
-                    stmt,
-                    stmt_id,
+                    engine, session, stmt, stmt_id,
                 ));
             }
         }

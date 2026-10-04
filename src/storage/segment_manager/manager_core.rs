@@ -91,7 +91,9 @@ impl SegmentManager {
                             // Deferred (V02) statement journals are judged
                             // ONLY here: single writer per data dir means no
                             // statement is in flight at startup.
-                            crate::storage::segment::reader::recover_statement_footer_journals(&tbl_dir);
+                            crate::storage::segment::reader::recover_statement_footer_journals(
+                                &tbl_dir,
+                            );
                             let max_seq = discover_max_seq(&tbl_dir);
                             let partition_seq = discover_max_partition_seq(&tbl_dir);
                             let key = table_key(&db_name, &table_name);
@@ -412,8 +414,11 @@ impl SegmentManager {
         // detaches (dropped here), matching the previous discarded
         // JoinHandle. Pause/resume semantics are unchanged: the flag is
         // re-read at the top of every round.
-        let _ =
-            crate::common::thread_supervisor::spawn_supervised_with_stop("taibai-flush", stop, body);
+        let _ = crate::common::thread_supervisor::spawn_supervised_with_stop(
+            "taibai-flush",
+            stop,
+            body,
+        );
     }
 
     pub fn shutdown(&self) {
@@ -504,9 +509,9 @@ impl SegmentManager {
     /// only lost value is the in-memory maximum, and the sole consequence is
     /// one extra index-snapshot invalidation after the next write.
     fn persist_flush_epoch(&self, key: &str, path: &Path) {
-        let _stripe = flush_epoch_persist_lock(key).lock().unwrap_or_else(|p| {
-            p.into_inner()
-        });
+        let _stripe = flush_epoch_persist_lock(key)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let value = self
             .flush_epochs
             .read()
@@ -1070,15 +1075,21 @@ impl SegmentManager {
             return self.derive_cluster_zone_map(path, footer_idx);
         }
 
-        if let Some(cached) = self.cluster_meta_cache.lock().unwrap().get(path, footer_idx) {
+        if let Some(cached) = self
+            .cluster_meta_cache
+            .lock()
+            .unwrap()
+            .get(path, footer_idx)
+        {
             return cached;
         }
 
         let derived = self.derive_cluster_zone_map(path, footer_idx);
-        self.cluster_meta_cache
-            .lock()
-            .unwrap()
-            .put(path.to_path_buf(), footer_idx, derived.clone());
+        self.cluster_meta_cache.lock().unwrap().put(
+            path.to_path_buf(),
+            footer_idx,
+            derived.clone(),
+        );
         derived
     }
 
@@ -1104,9 +1115,7 @@ impl SegmentManager {
         let mut names = Vec::with_capacity(column.previous_names.len() + 1);
         names.push(column.name.as_str());
         names.extend(column.previous_names.iter().map(String::as_str));
-        names
-            .iter()
-            .find_map(|name| reader.schema().index_of(name))
+        names.iter().find_map(|name| reader.schema().index_of(name))
     }
 
     /// Positional zone-map access in FOOTER space: `footer_idx` must already
@@ -1229,7 +1238,12 @@ impl SegmentManager {
         bitmap: &[u8],
         deleted_count: u64,
     ) -> Result<()> {
-        self.rewrite_delete_footer_with_mode(path, bitmap, deleted_count, FooterRewriteMode::Immediate)
+        self.rewrite_delete_footer_with_mode(
+            path,
+            bitmap,
+            deleted_count,
+            FooterRewriteMode::Immediate,
+        )
     }
 
     /// Rewrite a segment's delete footer under the chosen journal lifecycle:
@@ -2169,7 +2183,8 @@ fn db_table_from_segment_path(path: &Path) -> Option<(String, String)> {
         .to_string_lossy()
         .to_string();
     Some((db, table))
-}use crate::storage::segment::reader::FooterRewriteMode;
+}
+use crate::storage::segment::reader::FooterRewriteMode;
 
 /// Test-only re-exports of the replacement journal internals.
 #[cfg(test)]

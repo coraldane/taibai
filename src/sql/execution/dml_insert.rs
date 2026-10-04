@@ -74,17 +74,16 @@ mod write;
 
 pub use constraints::{
     collect_unique_index_entries, validate_primary_key_uniqueness,
-    validate_unique_key_uniqueness, validate_unique_indexes_in_batches,
-    IntroducedKeyValidator,
+    validate_unique_indexes_in_batches, validate_unique_key_uniqueness, IntroducedKeyValidator,
 };
-pub use fast::{set_fast_insert_disabled_for_tests, try_exec_fast_insert_sql};
-pub use write::{exec_insert, exec_replace};
 pub(crate) use constraints::{primary_key_indices, primary_keys_for_batch, unique_constraints};
+pub use fast::{set_fast_insert_disabled_for_tests, try_exec_fast_insert_sql};
 pub(crate) use write::{
     append_unique_index_entries_after_insert, build_unique_index_entries_for_batch,
     primary_location_entries_for_batch, rebuild_table_location_indexes,
     rebuild_table_location_indexes_from, write_batch_by_partition,
 };
+pub use write::{exec_insert, exec_replace};
 
 #[cfg(test)]
 #[path = "dml_insert/lock_order_test.rs"]

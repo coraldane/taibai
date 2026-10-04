@@ -1,5 +1,5 @@
-use super::*;
 use super::runtime::*;
+use super::*;
 
 /// Upper bound for decompressing a bulk payload: the ratio cap mirrors the
 /// codec's message ceiling and bounds decompression-bomb amplification.
@@ -42,7 +42,8 @@ fn prepare_direct_bulk_constraint_entries(
     };
 
     let primary_indices = crate::sql::execution::dml_insert::primary_key_indices(schema);
-    let unique_constraints = crate::sql::execution::dml_insert::unique_constraints(table_meta, schema)?;
+    let unique_constraints =
+        crate::sql::execution::dml_insert::unique_constraints(table_meta, schema)?;
     let mut primary_keys = Vec::with_capacity(req.row_count);
     let mut primary_seen = HashSet::with_capacity(req.row_count);
     if !primary_indices.is_empty() {
@@ -85,7 +86,7 @@ fn prepare_direct_bulk_constraint_entries(
             return Err(TaibaiError::Sql(format!(
                 "duplicate primary key for table '{}'",
                 table
-            )))
+            )));
         }
     }
 

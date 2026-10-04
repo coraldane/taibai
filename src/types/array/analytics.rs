@@ -204,9 +204,9 @@ impl ColumnArray {
             }};
         }
         match self {
-            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => {
-                self.flattened().col_min()
-            }
+            ColumnArray::Selected { .. }
+            | ColumnArray::Dictionary { .. }
+            | ColumnArray::Rle { .. } => self.flattened().col_min(),
             ColumnArray::Int64 { data, .. } => numeric_min!(data, Int64),
             ColumnArray::Int32 { data, .. } => numeric_min!(data, Int32),
             ColumnArray::Int16 { data, .. } => numeric_min!(data, Int16),
@@ -299,9 +299,9 @@ impl ColumnArray {
             }};
         }
         match self {
-            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => {
-                self.flattened().col_max()
-            }
+            ColumnArray::Selected { .. }
+            | ColumnArray::Dictionary { .. }
+            | ColumnArray::Rle { .. } => self.flattened().col_max(),
             ColumnArray::Int64 { data, .. } => numeric_max!(data, Int64),
             ColumnArray::Int32 { data, .. } => numeric_max!(data, Int32),
             ColumnArray::Int16 { data, .. } => numeric_max!(data, Int16),
@@ -670,12 +670,20 @@ impl ColumnArray {
             ColumnArray::Timestamp { data, bitmap } => slice_copy_column!(Timestamp, data, bitmap),
             ColumnArray::Interval { data, bitmap } => slice_copy_column!(Interval, data, bitmap),
             ColumnArray::VarChar { data, bitmap } => {
-                let mut out = ColumnArray::with_capacity(crate::protocol::types::DataType::VarChar, end - start);
+                let mut out = ColumnArray::with_capacity(
+                    crate::protocol::types::DataType::VarChar,
+                    end - start,
+                );
                 for i in start..end {
-                    if bitmap.is_null(i) { out.push_null_value(); } else { out.push(&ScalarValue::VarChar(Some(data.value(i).to_owned()))).unwrap(); }
+                    if bitmap.is_null(i) {
+                        out.push_null_value();
+                    } else {
+                        out.push(&ScalarValue::VarChar(Some(data.value(i).to_owned())))
+                            .unwrap();
+                    }
                 }
                 out
-            },
+            }
             _ => {
                 let mut new_col = ColumnArray::empty(self.data_type());
                 for i in start..end {
@@ -733,7 +741,8 @@ impl ColumnArray {
                     while i < indices.len() {
                         let first = indices[i] as usize;
                         let mut run = 1usize;
-                        while i + run < indices.len() && indices[i + run] == indices[i + run - 1] + 1
+                        while i + run < indices.len()
+                            && indices[i + run] == indices[i + run - 1] + 1
                         {
                             run += 1;
                         }
@@ -1104,54 +1113,166 @@ impl ColumnArray {
             return None;
         }
         let out = match (self, other) {
-            (C::Int8 { data: l, bitmap: lb }, C::Int8 { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Int16 { data: l, bitmap: lb }, C::Int16 { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Int32 { data: l, bitmap: lb }, C::Int32 { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Int64 { data: l, bitmap: lb }, C::Int64 { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::UInt8 { data: l, bitmap: lb }, C::UInt8 { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::UInt16 { data: l, bitmap: lb }, C::UInt16 { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::UInt32 { data: l, bitmap: lb }, C::UInt32 { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::UInt64 { data: l, bitmap: lb }, C::UInt64 { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Decimal { data: l, bitmap: lb }, C::Decimal { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Date { data: l, bitmap: lb }, C::Date { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Time { data: l, bitmap: lb }, C::Time { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Timestamp { data: l, bitmap: lb }, C::Timestamp { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Interval { data: l, bitmap: lb }, C::Interval { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Float32 { data: l, bitmap: lb }, C::Float32 { data: r, bitmap: rb }) => {
-                cmp_mask_f32(l, lb, r, rb, op)
-            }
-            (C::Float64 { data: l, bitmap: lb }, C::Float64 { data: r, bitmap: rb }) => {
-                cmp_mask_f64(l, lb, r, rb, op)
-            }
-            (C::VarChar { data: l, bitmap: lb }, C::VarChar { data: r, bitmap: rb }) => {
-                cmp_mask_str(l, lb, r, rb, op)
-            }
+            (
+                C::Int8 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Int8 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Int16 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Int16 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Int32 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Int32 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Int64 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Int64 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::UInt8 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::UInt8 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::UInt16 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::UInt16 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::UInt32 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::UInt32 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::UInt64 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::UInt64 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Decimal {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Decimal {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Date {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Date {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Time {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Time {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Timestamp {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Timestamp {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Interval {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Interval {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Float32 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Float32 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_f32(l, lb, r, rb, op),
+            (
+                C::Float64 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Float64 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_f64(l, lb, r, rb, op),
+            (
+                C::VarChar {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::VarChar {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_str(l, lb, r, rb, op),
             _ => return None,
         };
         Some(out)
@@ -1251,9 +1372,7 @@ impl ColumnArray {
             let value = literal.integer_i128()?;
             return Some(self.arith_integer(op, |_| Some(value)));
         }
-        if (self.is_integer_class() || self.is_float_class())
-            && literal.numeric_f64().is_some()
-        {
+        if (self.is_integer_class() || self.is_float_class()) && literal.numeric_f64().is_some() {
             let value = literal.numeric_f64()?;
             return self.arith_numeric_f64(op, |_| Some(value));
         }
@@ -1368,7 +1487,6 @@ impl ColumnArray {
         }
     }
 }
-
 
 /// Word-at-a-time valid-row sum over `[offset, end)` for fixed-width data.
 fn sum_valid_range_words<T: Copy>(

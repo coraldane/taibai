@@ -46,7 +46,8 @@ fn test_compare_ordered_null_placement() {
 fn test_compare_ordered_numeric_promotion_and_types() {
     // cross-width integer via i128
     assert_eq!(
-        ScalarValue::Int32(Some(5)).compare_ordered(&ScalarValue::Int64(Some(4)), Ordering::Greater),
+        ScalarValue::Int32(Some(5))
+            .compare_ordered(&ScalarValue::Int64(Some(4)), Ordering::Greater),
         Ordering::Greater
     );
     // u64 above i64 range must not wrap through the i128 path
@@ -57,20 +58,24 @@ fn test_compare_ordered_numeric_promotion_and_types() {
     );
     // int vs float promotion
     assert_eq!(
-        ScalarValue::Int32(Some(5)).compare_ordered(&ScalarValue::Float64(Some(4.5)), Ordering::Greater),
+        ScalarValue::Int32(Some(5))
+            .compare_ordered(&ScalarValue::Float64(Some(4.5)), Ordering::Greater),
         Ordering::Greater
     );
     assert_eq!(
-        ScalarValue::Decimal(Some(150)).compare_ordered(&ScalarValue::Int64(Some(200)), Ordering::Greater),
+        ScalarValue::Decimal(Some(150))
+            .compare_ordered(&ScalarValue::Int64(Some(200)), Ordering::Greater),
         Ordering::Less
     );
     // NaN lands in the Display fallback and sorts after any number
     assert_eq!(
-        ScalarValue::Float64(Some(f64::NAN)).compare_ordered(&ScalarValue::Float64(Some(1.0)), Ordering::Greater),
+        ScalarValue::Float64(Some(f64::NAN))
+            .compare_ordered(&ScalarValue::Float64(Some(1.0)), Ordering::Greater),
         Ordering::Greater
     );
     assert_eq!(
-        ScalarValue::Float64(Some(f64::NAN)).compare_ordered(&ScalarValue::Float64(Some(f64::NAN)), Ordering::Greater),
+        ScalarValue::Float64(Some(f64::NAN))
+            .compare_ordered(&ScalarValue::Float64(Some(f64::NAN)), Ordering::Greater),
         Ordering::Equal
     );
 }

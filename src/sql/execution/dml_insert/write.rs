@@ -1,6 +1,6 @@
-use super::*;
 use super::constraints::*;
 use super::fast::*;
+use super::*;
 
 /// The single condition under which an INSERT's rows are mirrored into the
 /// hot store at statement time: auto-commit regular-path writes only.
@@ -80,9 +80,7 @@ pub fn exec_replace(
     engine.batch_writer().checkpoint_before_rewrite(
         db,
         table,
-        crate::storage::core::batch_writer::RewriteEstimate::Inserts(
-            physical_insert_rows as usize,
-        ),
+        crate::storage::core::batch_writer::RewriteEstimate::Inserts(physical_insert_rows as usize),
     )?;
 
     // No pre-flush: rows still resident in memtables are conflict-deleted in
@@ -355,21 +353,18 @@ pub fn exec_replace(
         let journal_segments: Vec<(std::path::PathBuf, Vec<u8>, u64)> = undo
             .segment_footers
             .iter()
-            .map(|(path, _, _, bitmap, deleted)| {
-                (path.clone(), bitmap.clone(), *deleted)
-            })
+            .map(|(path, _, _, bitmap, deleted)| (path.clone(), bitmap.clone(), *deleted))
             .collect();
-        let _ = engine.segment_mgr().with_table_mutation_lock(db, table, || {
-            for (path, bitmap, deleted) in &journal_segments {
-                crate::storage::segment::reader::clear_deferred_delete_journal_for_statement(
-                    &table_dir,
-                    path,
-                    bitmap,
-                    *deleted,
-                );
-            }
-            Ok(())
-        });
+        let _ = engine
+            .segment_mgr()
+            .with_table_mutation_lock(db, table, || {
+                for (path, bitmap, deleted) in &journal_segments {
+                    crate::storage::segment::reader::clear_deferred_delete_journal_for_statement(
+                        &table_dir, path, bitmap, *deleted,
+                    );
+                }
+                Ok(())
+            });
     }
     // The replacement rows are durable, so the memtable legs' guarded
     // sidecars are unconditionally correct: drop their guards (a leftover
@@ -377,10 +372,7 @@ pub fn exec_replace(
     {
         let table_dir = engine.data_dir().join(db).join(table);
         for memtable in undo.guarded_memtables() {
-            crate::storage::core::durable_tail::clear_statement_guards(
-                &table_dir,
-                memtable.id(),
-            );
+            crate::storage::core::durable_tail::clear_statement_guards(&table_dir, memtable.id());
         }
     }
     // The internal transaction is terminal — drop its registry entry (same
@@ -812,10 +804,9 @@ pub(super) fn exec_materialized_insert_batch(
             // Settle what earlier partitions of this statement submitted:
             // their fsync failures surface here exactly as the inline
             // settle would have reported them (the original error wins).
-            let _ =
-                engine
-                    .batch_writer()
-                    .settle_deferred_tail_commits(db, table, deferred_commits);
+            let _ = engine
+                .batch_writer()
+                .settle_deferred_tail_commits(db, table, deferred_commits);
             return Err(error);
         }
     }
@@ -955,9 +946,7 @@ pub(crate) fn build_unique_index_entries_for_batch(
 /// `primary_keys_for_batch` (C15): one entry per row, `row_id` = batch row
 /// index. Valid by construction — primary-key validation upstream rejects
 /// NULLs, so unlike the batch-scanning twin above no row can be skipped.
-fn primary_location_entries_from_keys(
-    primary_keys: &[Vec<ScalarValue>],
-) -> Vec<UniqueIndexEntry> {
+fn primary_location_entries_from_keys(primary_keys: &[Vec<ScalarValue>]) -> Vec<UniqueIndexEntry> {
     primary_keys
         .iter()
         .enumerate()
@@ -1009,7 +998,9 @@ pub(crate) fn append_unique_index_entries_after_insert(
     for (index_name, entries) in entries_by_index {
         prepared.push((
             index_name,
-            engine.index_manager().prepare_unique_index_entries(entries)?,
+            engine
+                .index_manager()
+                .prepare_unique_index_entries(entries)?,
         ));
     }
     match engine
@@ -1780,7 +1771,8 @@ fn push_literal_fast(
             // only the scientific-notation fallback.
             let scaled = crate::sql::execution::helpers::float_literal_to_decimal_i64(*v, scale)
                 .unwrap_or_else(|| {
-                    let multiplier = crate::sql::execution::helpers::decimal_multiplier(scale).unwrap_or(1);
+                    let multiplier =
+                        crate::sql::execution::helpers::decimal_multiplier(scale).unwrap_or(1);
                     (*v * multiplier as f64).round() as i64
                 });
             data.push(scaled);
@@ -1893,7 +1885,11 @@ pub(super) fn materialize_default_value(
     }
 }
 
-pub(super) fn validate_nullable(schema: &Schema, col_idx: usize, scalar: &ScalarValue) -> Result<()> {
+pub(super) fn validate_nullable(
+    schema: &Schema,
+    col_idx: usize,
+    scalar: &ScalarValue,
+) -> Result<()> {
     let col = &schema.columns[col_idx];
     if (col.primary_key || !col.nullable) && scalar.is_null() {
         return Err(TaibaiError::Sql(format!(

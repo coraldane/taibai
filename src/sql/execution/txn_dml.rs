@@ -93,10 +93,7 @@ fn apply_staged_tombstones(
     table: &str,
     partitions: &Option<Vec<String>>,
     staged_segment_tombstones: &[(std::path::PathBuf, Vec<u8>, Vec<u64>)],
-    staged_memtable_tombstones: &[(
-        Arc<crate::storage::core::memtable::MemTable>,
-        Vec<u32>,
-    )],
+    staged_memtable_tombstones: &[(Arc<crate::storage::core::memtable::MemTable>, Vec<u32>)],
 ) -> Result<()> {
     let mut applied_segments: Vec<(std::path::PathBuf, Vec<u64>)> = Vec::new();
     for (seg_path, footer_bitmap, ids) in staged_segment_tombstones {
@@ -572,8 +569,7 @@ pub(crate) fn exec_update_in_txn(
 ) -> Result<ExecResult> {
     let ctx = DmlStatementContext::plan(engine, db, table, where_clause)?;
     ensure_txn_dml_supported(&ctx.table_meta)?;
-    let resolved_assignments =
-        plan_update_assignments(engine, db, assignments, &ctx.table_meta)?;
+    let resolved_assignments = plan_update_assignments(engine, db, assignments, &ctx.table_meta)?;
     let assignments = resolved_assignments.as_slice();
 
     let resolved_where_clause = &ctx.resolved_where;

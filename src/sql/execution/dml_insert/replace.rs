@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use crate::sql::execution::dml_delete::{restore_replace_memtable_undo, ReplaceDeleteUndo};
 use crate::storage::catalog::schema::TableMeta;
 use crate::storage::index::sort_key::compare_scalars_for_sort;
-use crate::storage::segment::delete_bitmap;
 use crate::storage::partition::pruning::ZoneMap;
+use crate::storage::segment::delete_bitmap;
 /// Delete rows conflicting with the REPLACE key sets. Segment legs rewrite
 /// footers under the DEFERRED journal lifecycle: the caller passes the
 /// durability watermark of the REPLACE's staged replacement rows, so a crash

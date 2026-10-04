@@ -6,16 +6,19 @@
 
 use std::collections::HashMap;
 
+use crate::sql::execution::physical::context::PhysicalContext;
+use crate::sql::execution::physical::planner::get_scan_schema;
 use crate::sql::optimizer::cost::{ColumnStats, CostEstimator, TableStats};
 use crate::sql::parser::ast::JoinType;
-use crate::sql::execution::physical::planner::get_scan_schema;
 use crate::sql::planner::{
     merge_schemas, FilterPlan, JoinPlan, LogicalExpr, LogicalPlan, ProjectPlan,
 };
 use crate::types::batch::Schema;
-use crate::sql::execution::physical::context::PhysicalContext;
 
-pub(crate) fn reorder_inner_join_trees(plan: LogicalPlan, ctx: &PhysicalContext<'_>) -> LogicalPlan {
+pub(crate) fn reorder_inner_join_trees(
+    plan: LogicalPlan,
+    ctx: &PhysicalContext<'_>,
+) -> LogicalPlan {
     match plan {
         LogicalPlan::Join(mut join) if join.join_type == JoinType::Inner => {
             reorder_inner_join_tree(LogicalPlan::Join(join.clone()), ctx).unwrap_or_else(|| {

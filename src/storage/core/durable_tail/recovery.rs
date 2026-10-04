@@ -10,11 +10,11 @@ use uuid::Uuid;
 use crate::common::error::{Result, TaibaiError};
 use crate::types::batch::{RecordBatch, Schema};
 
-use super::format::*;
+use super::api::*;
 use super::committer::*;
+use super::format::*;
 use super::generations::*;
 use super::sidecar::*;
-use super::api::*;
 
 pub struct RecoveredTail {
     pub id: Uuid,
@@ -111,7 +111,9 @@ pub(super) fn live_tail_with_sidecars(
     }
 }
 
-pub(super) fn resolve_live_tail_paths(table_dir: &Path) -> Result<Vec<(Uuid, PathBuf, Vec<DecodedSidecar>)>> {
+pub(super) fn resolve_live_tail_paths(
+    table_dir: &Path,
+) -> Result<Vec<(Uuid, PathBuf, Vec<DecodedSidecar>)>> {
     let tail_dir = table_dir.join(TAIL_DIR);
     if !tail_dir.exists() {
         return Ok(Vec::new());

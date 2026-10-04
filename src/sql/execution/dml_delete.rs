@@ -64,7 +64,10 @@ impl ReplaceDeleteUndo {
     }
 }
 
-pub(crate) fn restore_replace_memtable_undo(engine: &Engine, undo: &ReplaceDeleteUndo) -> Result<()> {
+pub(crate) fn restore_replace_memtable_undo(
+    engine: &Engine,
+    undo: &ReplaceDeleteUndo,
+) -> Result<()> {
     let mut first_error = None;
     for (memtable, original) in undo.memtable_backups.iter().rev() {
         if !memtable.replace_pending_batch(original.clone()) {
@@ -1537,5 +1540,3 @@ fn expr_matches_column(expr: &Expr, column: &str) -> bool {
 #[cfg(test)]
 #[path = "dml_delete_test.rs"]
 mod tests;
-
-

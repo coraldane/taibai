@@ -127,7 +127,11 @@ impl ScalarValue {
     /// compare_scalars_null_last`, `aggregate::compare_scalars`,
     /// `query::union_scalar_cmp`); see
     /// docs/design/code-refactoring-design.md §2.4.
-    pub fn compare_ordered(&self, other: &Self, null_order: std::cmp::Ordering) -> std::cmp::Ordering {
+    pub fn compare_ordered(
+        &self,
+        other: &Self,
+        null_order: std::cmp::Ordering,
+    ) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         match (self.is_null(), other.is_null()) {
             (true, true) => return Ordering::Equal,

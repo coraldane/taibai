@@ -13,9 +13,9 @@ use crate::types::scalar::ScalarValue;
 use super::engine::{Engine, ExecResult};
 use super::operators::profile::{OperatorProfileSnapshot, QueryProfile};
 use super::physical::planner::prepare_physical_plan;
-use crate::sql::optimizer::join_order::estimate_plan_rows;
 use super::physical::PhysicalContext;
 use super::query::extract_table_refs;
+use crate::sql::optimizer::join_order::estimate_plan_rows;
 
 pub fn exec_explain(
     engine: &Engine,

@@ -1,5 +1,5 @@
-use super::*;
 use super::write::*;
+use super::*;
 
 fn insert_profile_enabled() -> bool {
     crate::common::config::insert_profile_enabled()
@@ -851,9 +851,15 @@ fn materialize_auto_increment_value(
         ))
     };
     Ok(match schema.columns[col_idx].data_type {
-        DataType::Int32 => ScalarValue::Int32(Some(i32::try_from(next_val).map_err(|_| overflow())?)),
-        DataType::Int64 => ScalarValue::Int64(Some(i64::try_from(next_val).map_err(|_| overflow())?)),
-        DataType::UInt32 => ScalarValue::UInt32(Some(u32::try_from(next_val).map_err(|_| overflow())?)),
+        DataType::Int32 => {
+            ScalarValue::Int32(Some(i32::try_from(next_val).map_err(|_| overflow())?))
+        }
+        DataType::Int64 => {
+            ScalarValue::Int64(Some(i64::try_from(next_val).map_err(|_| overflow())?))
+        }
+        DataType::UInt32 => {
+            ScalarValue::UInt32(Some(u32::try_from(next_val).map_err(|_| overflow())?))
+        }
         DataType::UInt64 => ScalarValue::UInt64(Some(next_val)),
         _ => ScalarValue::Int64(Some(i64::try_from(next_val).map_err(|_| overflow())?)),
     })

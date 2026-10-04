@@ -11,10 +11,7 @@ use crc32fast::Hasher;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
-use crate::sql::execution::wal_helper::{
-    deserialize_batch_from_wal,
-    serialize_batch_for_wal,
-};
+use crate::sql::execution::wal_helper::{deserialize_batch_from_wal, serialize_batch_for_wal};
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 

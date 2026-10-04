@@ -601,11 +601,16 @@ pub fn exec_show_processlist(engine: &Engine, full: bool) -> Result<ExecResult> 
                 crate::common::query_cancel::QueryPhase::Committing => "Committing".to_string(),
             }
         };
-        batch.column_mut(5).unwrap().push(&ScalarValue::VarChar(Some(state)))?;
+        batch
+            .column_mut(5)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(state)))?;
         batch
             .column_mut(6)
             .unwrap()
-            .push(&ScalarValue::VarChar(Some(processlist_info(&entry.sql, full))))?;
+            .push(&ScalarValue::VarChar(Some(processlist_info(
+                &entry.sql, full,
+            ))))?;
     }
     Ok(ExecResult::Query {
         schema,
@@ -710,15 +715,17 @@ pub fn exec_optimize_table(
     // lazy rebuild on the next probe. Skip when compaction was a no-op.
     if stats.segments_written > 0 || stats.rows_dropped > 0 {
         let schema = Schema::new(table_meta.columns.clone());
-        let rebuilt = engine.segment_mgr().with_table_mutation_lock(db, table, || {
-            crate::sql::execution::dml_insert::rebuild_table_location_indexes(
-                engine,
-                db,
-                table,
-                &table_meta,
-                &schema,
-            )
-        });
+        let rebuilt = engine
+            .segment_mgr()
+            .with_table_mutation_lock(db, table, || {
+                crate::sql::execution::dml_insert::rebuild_table_location_indexes(
+                    engine,
+                    db,
+                    table,
+                    &table_meta,
+                    &schema,
+                )
+            });
         if let Err(error) = rebuilt {
             tracing::warn!(
                 db,
@@ -1012,12 +1019,14 @@ impl AnalyzeColumnCollector {
             }
             self.non_null_count = self.non_null_count.saturating_add(1);
             if self.min_value.as_ref().is_none_or(|current| {
-                crate::sql::execution::operators::sort::compare_scalars_null_last(&value, current).is_lt()
+                crate::sql::execution::operators::sort::compare_scalars_null_last(&value, current)
+                    .is_lt()
             }) {
                 self.min_value = Some(value.clone());
             }
             if self.max_value.as_ref().is_none_or(|current| {
-                crate::sql::execution::operators::sort::compare_scalars_null_last(&value, current).is_gt()
+                crate::sql::execution::operators::sort::compare_scalars_null_last(&value, current)
+                    .is_gt()
             }) {
                 self.max_value = Some(value.clone());
             }
@@ -1133,5 +1142,3 @@ fn estimate_hll(registers: &[u8]) -> u64 {
     };
     corrected.round().max(0.0) as u64
 }
-
-
