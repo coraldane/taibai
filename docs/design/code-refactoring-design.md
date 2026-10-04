@@ -339,3 +339,12 @@ engine（4 文件）、segment_manager（5 文件）、ddl（4 文件）、dml_i
 **收益**：每个子文件从此是独立编译单元（IDE 导航、增量编译、按模块 clippy 生效）；测试可挂在真子模块上；后续 Phase 4 的文件拆分不再受"共享父模块私有项"牵制。
 
 下一阶段入口：Phase 4（巨型函数拆解 + 模块边界重划，按 git churn 排序：execute_stmt 分发 → query.rs 拆三 → dml_delete 的 REPLACE 机器归位 → planner join-order 迁 optimizer → durable_tail 八模块）。
+
+### Phase 4：巨型函数拆解 + 模块归位（进行中，2026-10-04）
+
+| 项 | 实施 | 提交 |
+|---|---|---|
+| execute_stmt 分发瘦身 | InsertSelect(79行)/ReplaceSelect(44行)/Insert/Replace/Update/Delete/Begin/Commit/Rollback/Use 提取为 `exec_xxx_stmt` 方法；SHOW PARTITIONS 与 FLUSH TABLE 共享 `resolve_optional_table_target`。分发体 ~464 → 246 行，全部 match 臂单行化 | d761776 |
+| REPLACE 机器归位 | dml_delete.rs 中 ~470 行 REPLACE 语义机器迁 `dml_insert/replace.rs`。**边界修正**：侦察发现 exec_delete 共用 ReplaceDeleteUndo/plan/apply_replace_memtable_conflicts，这三项及其 helper 留在 dml_delete（字段提升 pub(crate)）；`replace_pruning_test` 挂载点随迁。dml_delete 1,989 → 1,518 行 | 13fe64a |
+
+**剩余项**：query.rs 拆三（select_exec/derived/correlated，含三个子查询模块合一）、planner 的 ~900 行 join-order 优化器迁 `sql/optimizer/join_order.rs`、durable_tail 八模块拆分、helpers.rs 拆三、scan/aggregate_meta 的 923 行 `compute_folded_aggregate` 拆解。
