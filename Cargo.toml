@@ -289,3 +289,7 @@ path = "tests/partition_int_calendar_test.rs"
 [[test]]
 name = "retryable_error_test"
 path = "tests/retryable_error_test.rs"
+
+[[test]]
+name = "sql_reference_doc_test"
+path = "tests/sql_reference_doc_test.rs"

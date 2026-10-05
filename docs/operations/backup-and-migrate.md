@@ -50,7 +50,7 @@ catalog（缺列按 DEFAULT 填充），不能一律用当前 catalog schema 解
 
 | 行为 | 位置 |
 |---|---|
-| V3 tail 帧（LSN + 提交时间戳）与 V2/V3 双解码 | `src/storage/core/durable_tail.rs` |
+| V3 tail 帧（LSN + 提交时间戳）与 V2/V3 双解码 | `src/storage/core/durable_tail/format.rs` |
 | tail 归档与清理路径 | `durable_tail.rs`（`archive_or_remove` / `dispose_tail_file`） |
 | 段版本门与版本区间 | `src/storage/segment/constants.rs` |
 | footer 扩展单一维护点 | `src/storage/segment/footer_ext.rs` |

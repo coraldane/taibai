@@ -211,6 +211,7 @@ log:
 ## 更多文档
 
 - `docs/getting-started/quick-start.md`：五分钟快速开始。
+- `docs/user-guide/sql-reference.md`：SQL 语法参考（全部支持的语法与不兼容主流数据库的差异说明）。
 - `docs/overview/project-summary.md`：工程功能总览。
 - `docs/user-guide/transactions-and-concurrency.md`：事务与并发语义。
 - `docs/user-guide/query-management.md`：查询管理与语句超时。

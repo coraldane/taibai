@@ -125,8 +125,7 @@ impl ScalarValue {
     /// This is the single implementation behind the former four drifting
     /// copies (`sort_key::compare_scalars_for_sort`, `sort::
     /// compare_scalars_null_last`, `aggregate::compare_scalars`,
-    /// `query::union_scalar_cmp`); see
-    /// docs/design/code-refactoring-design.md §2.4.
+    /// `query::union_scalar_cmp`).
     pub fn compare_ordered(
         &self,
         other: &Self,

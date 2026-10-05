@@ -1,6 +1,11 @@
 # 普通 INSERT 持久化路径磁盘 I/O 优化方案
 
-> 计划文档。状态：**提案，未实施**。
+> 计划文档。状态：**提案，部分已被现实现吸收**（2026-10 注）：P2a 的
+> `DURABILITY = RELAXED` 表选项与 P3 思路的 `storage.tail_async_fsync` 配置
+> 均已落地（见[建表选项 SQL 参考](../user-guide/table-options.md)与
+> [事务与并发语义](../user-guide/transactions-and-concurrency.md)）；
+> P0/P1/P2b/P5 仍未实施。文中 `durable_tail.rs` 代码锚点现为
+> `durable_tail/` 目录（format/committer 等子模块）。
 > 背景：tail 文件堆积问题已由三道防线消除（Flush 即时 drain / 周期转储 / 每表 256
 > 文件高水位），memtable spill 与重启惰性恢复已实施（见 `../design/TAIBAI_DESIGN_ZH.md`
 > MemTable 一节）；本方案只针对**残余的磁盘 I/O 开销**。

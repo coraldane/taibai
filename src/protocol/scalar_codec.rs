@@ -3,10 +3,9 @@
 //! One encoder, one decoder, shared by the client (`net/client.rs`) and the
 //! server (`net/handler.rs`). These used to be three drifting copies: the
 //! client decoder carried a text-form Decimal branch no producer emits and a
-//! lossy UTF-8 VarChar decode, while the server was strict — see
-//! docs/design/code-refactoring-design.md §2.4. The wire format itself is
-//! unchanged: `[u8 DataType tag]` is written by the caller, then the payload
-//! produced here.
+//! lossy UTF-8 VarChar decode, while the server was strict. The wire format
+//! itself is unchanged: `[u8 DataType tag]` is written by the caller, then
+//! the payload produced here.
 
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
