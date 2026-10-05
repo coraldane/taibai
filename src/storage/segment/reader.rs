@@ -322,18 +322,30 @@ impl SegmentReader {
         row_group: usize,
         table_schema: &crate::types::batch::Schema,
     ) -> Result<crate::types::batch::RecordBatch> {
-        let rg_rows = self.row_group_rows(row_group) as usize;
-        let mut columns = Vec::with_capacity(table_schema.num_columns());
-        for col_def in &table_schema.columns {
-            let mut names = Vec::with_capacity(col_def.previous_names.len() + 1);
-            names.push(col_def.name.clone());
-            names.extend(col_def.previous_names.iter().cloned());
-            match self.footer_column_index_for_names(&names) {
-                Some(footer_idx) => columns.push(self.read_column(row_group, footer_idx)?),
-                None => columns.push(default_value_column(col_def, rg_rows)?),
-            }
-        }
+        let columns = (0..table_schema.num_columns())
+            .map(|index| self.read_catalog_column(row_group, table_schema, index))
+            .collect::<Result<Vec<_>>>()?;
         crate::types::batch::RecordBatch::try_new(table_schema.clone(), columns)
+    }
+
+    /// Read one catalog column by its current/previous names, filling a
+    /// column absent from an older segment with its DEFAULT or typed NULL.
+    pub(crate) fn read_catalog_column(
+        &self,
+        row_group: usize,
+        table_schema: &crate::types::batch::Schema,
+        index: usize,
+    ) -> Result<crate::types::array::ColumnArray> {
+        let col_def = table_schema.columns.get(index).ok_or_else(|| {
+            TaibaiError::Storage(format!("catalog column index {index} out of bounds"))
+        })?;
+        let mut names = Vec::with_capacity(col_def.previous_names.len() + 1);
+        names.push(col_def.name.clone());
+        names.extend(col_def.previous_names.iter().cloned());
+        match self.footer_column_index_for_names(&names) {
+            Some(footer_idx) => self.read_column(row_group, footer_idx),
+            None => default_value_column(col_def, self.row_group_rows(row_group) as usize),
+        }
     }
 
     /// Attach a transaction's composed delete bitmap (footer ∪ deferred
