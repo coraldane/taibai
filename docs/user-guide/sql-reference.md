@@ -227,14 +227,16 @@ GRANT   权限 [, 权限]... [ON 对象] TO 用户
 REVOKE  权限 [, 权限]... [ON 对象] FROM 用户
 ```
 
-- 权限：`ALL [PRIVILEGES]`、`SELECT`、`INSERT`、`UPDATE`、`DELETE`、`CREATE`、`DROP`、`ALTER`、`TRUNCATE`、`SUBSCRIBE`。
+- 权限：`ALL [PRIVILEGES]`、`SELECT`、`INSERT`、`UPDATE`、`DELETE`、`CREATE`、`DROP`、`ALTER`、`TRUNCATE`、`SUBSCRIBE`、`REPLICATION`。
 - 对象：`TABLE 库.表`、`DATABASE 库名`、`*`（全部表）、`库.*`、裸标识符（等价表名）。
-- 鉴权模型中还存在 `REPLICATION` 权限（备机建立 REPL_HELLO 连接时校验），但当前 SQL 语法**尚不支持 GRANT REPLICATION**；root 的 `ALL` 覆盖该检查。
+- `REPLICATION` 是**全局权限**（授权备机读取复制事件流）：授予/回收时省略 ON 子句或使用通配对象（`*` / `*.*`），带 `ON TABLE` / `ON DATABASE` 会明确报错。
 
 ```sql
 GRANT SELECT, INSERT ON TABLE main.ticks TO alice;
 GRANT SUBSCRIBE ON DATABASE main TO bob;
 GRANT ALL ON *.* TO alice;
+GRANT REPLICATION TO repl_user;
+REVOKE REPLICATION FROM repl_user;
 ```
 
 ---
@@ -653,7 +655,7 @@ STOP BULK IMPORT
 - 语句级：独立 `SET` 会话变量语句、`PREPARE`/`EXECUTE` SQL 文本、`CALL` / 存储过程、`LOAD DATA`、`COPY`、`VALUES` 语句、多语句脚本执行。
 - 查询：`t.*` 限定星号、`USING` / `NATURAL JOIN`、`JOIN ON` 中子查询、`NULLS FIRST/LAST`、`LIMIT n, m`、`FETCH FIRST`、`OFFSET n ROWS`、`GROUPING SETS`/`CUBE`/`ROLLUP`、`INTERSECT ALL` / `EXCEPT ALL`、递归 CTE、窗口函数与 `GROUP BY` 同用。
 - 表达式：`||` 连接、位运算、`XOR`、`IS TRUE/FALSE`、`ANY/ALL/SOME`、`CONVERT()`、`::` 转换、日期/间隔字面量、十六进制字面量。
-- DDL：`CHECK`、`FOREIGN KEY`/`REFERENCES`、生成列、表达式默认值、`CREATE SCHEMA`。
+- DDL：`CHECK`、`FOREIGN KEY`/`REFERENCES`、生成列、表达式默认值、`CREATE SCHEMA`、`ALTER TABLE ... ADD PARTITION`（分区由 `PARTITION BY` 随写入自动创建）。
 - DML：多表 UPDATE/DELETE、`UPDATE`/`DELETE` WHERE 中的相关子查询、`ON DUPLICATE KEY UPDATE`（用 `REPLACE` 代替）。
 - 权限：`GRANT REPLICATION`（REPLICATION 权限存在但暂不能通过 SQL 授予，root 的 ALL 覆盖）。
 

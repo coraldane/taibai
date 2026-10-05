@@ -224,51 +224,9 @@ pub fn exec_grant(
     on: &Option<GrantObject>,
     to: &str,
 ) -> Result<ExecResult> {
-    let perms: Vec<Permission> = privileges
-        .iter()
-        .map(|p| {
-            let perm_type = match p {
-                Privilege::All => PermissionType::All,
-                Privilege::Select => PermissionType::Select,
-                Privilege::Insert => PermissionType::Insert,
-                Privilege::Update => PermissionType::Update,
-                Privilege::Delete => PermissionType::Delete,
-                Privilege::Create => PermissionType::Create,
-                Privilege::Drop => PermissionType::Drop,
-                Privilege::Alter => PermissionType::Alter,
-                Privilege::Truncate => PermissionType::Truncate,
-                Privilege::Subscribe => PermissionType::Subscribe,
-            };
-            let (obj_type, obj_name) = match on {
-                Some(GrantObject::Table(t)) => (PermissionObjectType::Table, t.clone()),
-                Some(GrantObject::Database(d)) => (PermissionObjectType::Database, d.clone()),
-                Some(GrantObject::AllTables) => (PermissionObjectType::Table, "*".to_string()),
-                Some(GrantObject::AllDatabases) => {
-                    (PermissionObjectType::Database, "*".to_string())
-                }
-                None => (PermissionObjectType::Global, "*".to_string()),
-            };
-            Permission {
-                permission_type: perm_type,
-                object_type: obj_type,
-                object_name: obj_name,
-            }
-        })
-        .collect();
-    engine.auth_manager().grant(to, perms)?;
-    tracing::info!(privileges_count = privileges.len(), to, "GRANT executed");
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-pub fn exec_revoke(
-    engine: &Engine,
-    privileges: &[Privilege],
-    on: &Option<GrantObject>,
-    from: &str,
-) -> Result<ExecResult> {
-    let perm_types: Vec<PermissionType> = privileges
-        .iter()
-        .map(|p| match p {
+    let mut perms = Vec::with_capacity(privileges.len());
+    for p in privileges {
+        let perm_type = match p {
             Privilege::All => PermissionType::All,
             Privilege::Select => PermissionType::Select,
             Privilege::Insert => PermissionType::Insert,
@@ -279,14 +237,96 @@ pub fn exec_revoke(
             Privilege::Alter => PermissionType::Alter,
             Privilege::Truncate => PermissionType::Truncate,
             Privilege::Subscribe => PermissionType::Subscribe,
-        })
-        .collect();
-    let obj_name = match on {
-        Some(GrantObject::Table(t)) => Some(t.as_str()),
-        Some(GrantObject::Database(d)) => Some(d.as_str()),
-        Some(GrantObject::AllTables) => Some("*"),
-        Some(GrantObject::AllDatabases) => Some("*"),
-        None => None,
+            Privilege::Replication => PermissionType::Replication,
+        };
+        // REPLICATION authorizes reading the whole replication stream; the
+        // only check site (REPL_HELLO) asks for the Global scope, so scoped
+        // grants are rejected instead of being stored where they can never
+        // match.
+        let (obj_type, obj_name) = if *p == Privilege::Replication {
+            if !is_global_grant_object(on) {
+                return Err(TaibaiError::Sql(
+                    "REPLICATION is a global privilege: grant it without an ON object \
+                     (e.g. GRANT REPLICATION TO user)"
+                        .into(),
+                ));
+            }
+            (PermissionObjectType::Global, "*".to_string())
+        } else {
+            grant_object_scope(on)
+        };
+        perms.push(Permission {
+            permission_type: perm_type,
+            object_type: obj_type,
+            object_name: obj_name,
+        });
+    }
+    engine.auth_manager().grant(to, perms)?;
+    tracing::info!(privileges_count = privileges.len(), to, "GRANT executed");
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+fn grant_object_scope(on: &Option<GrantObject>) -> (PermissionObjectType, String) {
+    match on {
+        Some(GrantObject::Table(t)) => (PermissionObjectType::Table, t.clone()),
+        Some(GrantObject::Database(d)) => (PermissionObjectType::Database, d.clone()),
+        Some(GrantObject::AllTables) => (PermissionObjectType::Table, "*".to_string()),
+        Some(GrantObject::AllDatabases) => (PermissionObjectType::Database, "*".to_string()),
+        None => (PermissionObjectType::Global, "*".to_string()),
+    }
+}
+
+fn is_global_grant_object(on: &Option<GrantObject>) -> bool {
+    match on {
+        None | Some(GrantObject::AllTables) | Some(GrantObject::AllDatabases) => true,
+        Some(GrantObject::Table(t)) => t == "*",
+        Some(GrantObject::Database(_)) => false,
+    }
+}
+
+pub fn exec_revoke(
+    engine: &Engine,
+    privileges: &[Privilege],
+    on: &Option<GrantObject>,
+    from: &str,
+) -> Result<ExecResult> {
+    let mut perm_types = Vec::with_capacity(privileges.len());
+    let mut global_only = false;
+    for p in privileges {
+        if *p == Privilege::Replication {
+            if !is_global_grant_object(on) {
+                return Err(TaibaiError::Sql(
+                    "REPLICATION is a global privilege: revoke it without an ON object \
+                     (e.g. REVOKE REPLICATION FROM user)"
+                        .into(),
+                ));
+            }
+            global_only = true;
+        }
+        perm_types.push(match p {
+            Privilege::All => PermissionType::All,
+            Privilege::Select => PermissionType::Select,
+            Privilege::Insert => PermissionType::Insert,
+            Privilege::Update => PermissionType::Update,
+            Privilege::Delete => PermissionType::Delete,
+            Privilege::Create => PermissionType::Create,
+            Privilege::Drop => PermissionType::Drop,
+            Privilege::Alter => PermissionType::Alter,
+            Privilege::Truncate => PermissionType::Truncate,
+            Privilege::Subscribe => PermissionType::Subscribe,
+            Privilege::Replication => PermissionType::Replication,
+        });
+    }
+    let obj_name = if global_only {
+        Some("*")
+    } else {
+        match on {
+            Some(GrantObject::Table(t)) => Some(t.as_str()),
+            Some(GrantObject::Database(d)) => Some(d.as_str()),
+            Some(GrantObject::AllTables) => Some("*"),
+            Some(GrantObject::AllDatabases) => Some("*"),
+            None => None,
+        }
     };
     engine.auth_manager().revoke(from, &perm_types, obj_name)?;
     tracing::info!(privileges_count = privileges.len(), from, "REVOKE executed");

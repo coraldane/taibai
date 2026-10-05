@@ -648,6 +648,7 @@ impl Parser {
                 Token::Alter => Privilege::Alter,
                 Token::Truncate => Privilege::Truncate,
                 Token::Subscribe => Privilege::Subscribe,
+                Token::Ident(s) if s.eq_ignore_ascii_case("REPLICATION") => Privilege::Replication,
                 Token::Ident(s)
                     if s.to_uppercase() == "ALL" || s.to_uppercase() == "ALL_PRIVILEGES" =>
                 {
@@ -810,9 +811,16 @@ impl Parser {
                         key: self.parse_unique_key_def()?,
                     }
                 } else if self.peek() == &Token::Partition {
-                    self.advance();
-                    let partition_key = self.expect_ident()?;
-                    AlterOperation::DropPartition { partition_key }
+                    // Partitions come into being implicitly from PARTITION BY
+                    // when rows are written; there is no manual add. (This arm
+                    // used to fall through to DropPartition — an ADD that
+                    // deleted data.)
+                    return Err(TaibaiError::Sql(
+                        "ADD PARTITION is not supported: partitions are created implicitly by \
+                         PARTITION BY when rows are written; use DROP PARTITION or \
+                         TRUNCATE PARTITION to remove one"
+                            .into(),
+                    ));
                 } else {
                     self.expect(&Token::Column)?;
                     let column = self.parse_column_def()?;

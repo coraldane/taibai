@@ -293,3 +293,7 @@ path = "tests/retryable_error_test.rs"
 [[test]]
 name = "sql_reference_doc_test"
 path = "tests/sql_reference_doc_test.rs"
+
+[[test]]
+name = "grant_replication_test"
+path = "tests/grant_replication_test.rs"

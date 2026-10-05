@@ -97,6 +97,10 @@ pub enum Privilege {
     Alter,
     Truncate,
     Subscribe,
+    /// Server-wide right to read the replication event stream (REPL_HELLO).
+    /// Always granted globally: the only check site asks for the Global scope,
+    /// so a table- or database-scoped grant could never be satisfied.
+    Replication,
 }
 
 #[derive(Debug, Clone, PartialEq)]
