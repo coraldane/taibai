@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::engine::{Engine, ExecResult};
-use super::helpers::{eval_expr_to_scalar, eval_where_clause_batch};
+use super::helpers::{eval_expr_to_scalar_with_scale_timezone, eval_where_clause_batch};
 use crate::sql::parser::ast::{Assignment, Expr};
 
 /// One staged memtable UPDATE: (memtable, rewritten image batch, tombstoned
@@ -33,6 +33,7 @@ type MemtableUpdateOutcome = (
 /// previous bitmap bytes + previous deleted count).
 type FooterReinsertEntry = (std::path::PathBuf, Vec<u8>, u64, (Vec<u8>, u64));
 
+/// Compatibility entry point for callers using the default UTC conversion.
 pub fn exec_update(
     engine: &Engine,
     db: &str,
@@ -40,6 +41,26 @@ pub fn exec_update(
     assignments: &[Assignment],
     where_clause: &Option<Expr>,
     reader_txn_id: u64,
+) -> Result<ExecResult> {
+    exec_update_with_timezone(
+        engine,
+        db,
+        table,
+        assignments,
+        where_clause,
+        reader_txn_id,
+        0,
+    )
+}
+
+pub(crate) fn exec_update_with_timezone(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    assignments: &[Assignment],
+    where_clause: &Option<Expr>,
+    reader_txn_id: u64,
+    timezone_offset_hours: i32,
 ) -> Result<ExecResult> {
     if reader_txn_id > 0 {
         return super::txn_dml::exec_update_in_txn(
@@ -49,6 +70,7 @@ pub fn exec_update(
             assignments,
             where_clause,
             reader_txn_id,
+            timezone_offset_hours,
         );
     }
     super::txn_dml::refuse_auto_commit_dml_while_pinned(engine, db, table)?;
@@ -81,7 +103,8 @@ pub fn exec_update(
 
     let resolved_assignments =
         super::txn_dml::plan_update_assignments(engine, db, assignments, table_meta)?;
-    let assignments = resolved_assignments.as_slice();
+    let assigned =
+        precompute_assigned_values(&resolved_assignments, table_schema, timezone_offset_hours)?;
 
     engine.batch_writer().checkpoint_before_rewrite(
         db,
@@ -93,6 +116,7 @@ pub fn exec_update(
     // is no longer safely abortable, so cancellation checks stop firing.
     crate::common::query_cancel::enter_committing_phase();
 
+    let mutation_started = std::cell::Cell::new(false);
     let update_body = || -> Result<u64> {
         // In-lock re-check: the fn-top gate races a transaction registering
         // its memtable-position pin under this lock, and this statement
@@ -103,7 +127,10 @@ pub fn exec_update(
         let publish_updates = engine.pubsub().has_subscribers();
         let mut updated_events = super::helpers::ChangeEventBuffer::new("update", db, table);
         let mut updated_count = 0u64;
+        let mut budget = super::dml_staging::MutationBudget::new();
         let mut memtable_updates: Vec<StagedMemtableUpdate> = Vec::new();
+        let mut index_maintenance =
+            super::dml_delete::DeleteIndexMaintenance::plan(table_meta, table_schema);
         let narrowed_partition = target_partition_key;
         super::dml_delete::for_each_visible_memtable(
             engine,
@@ -116,8 +143,14 @@ pub fn exec_update(
                 // C9: `batch` (the Arc) is consumed — update_memtable_batch
                 // moves untouched columns out of it when it is the sole owner.
                 let (new_batch, affected, matched_rows, assigned_pairs) =
-                    update_memtable_batch(assignments, where_clause, table_schema, batch)?;
+                    update_memtable_batch(&assigned, where_clause, table_schema, batch.clone())?;
                 if let Some(new_batch) = new_batch {
+                    budget.charge(
+                        new_batch
+                            .mutation_allocation_bytes(&batch)
+                            .saturating_add(matched_rows.len() * 4),
+                    )?;
+                    index_maintenance.record_memtable_update(&batch, &matched_rows, &assigned);
                     updated_count += affected;
                     if publish_updates {
                         // Change events carry the post-update row images: take
@@ -156,7 +189,6 @@ pub fn exec_update(
         };
         // Assignments are constant per statement; resolve them once for every
         // segment/row group below.
-        let assigned = precompute_assigned_values(assignments, table_schema)?;
 
         // Validation set up front: the segment dry-run below gathers the
         // surviving rows' key columns while it scans, so no second
@@ -202,7 +234,7 @@ pub fn exec_update(
         // tombstone (with undo on IO failure) and the images insert.
         let mut segment_plan = plan_segment_rows_for_reinsert(
             mgr,
-            table_meta,
+            index_maintenance,
             table_schema,
             segment_files,
             predicate,
@@ -211,6 +243,7 @@ pub fn exec_update(
             &assigned,
             publish_updates,
             &mut updated_events,
+            &mut budget,
         )?;
         updated_count += segment_plan.updated_count;
 
@@ -233,10 +266,11 @@ pub fn exec_update(
             // previous shape collected every survivor's key columns into a
             // Vec before comparing, so a wide table's validation cost scaled
             // with the whole table, not the statement.
-            let mut validator = super::dml_insert::IntroducedKeyValidator::new(
+            let mut validator = super::dml_insert::IntroducedKeyValidator::new_with_budget(
                 table,
                 &validation_schema,
                 &indexes_to_validate,
+                &mut budget,
             );
             let projected_indices: Vec<usize> = validation_indices.to_vec();
             let identity_indices: Vec<usize> = (0..validation_indices.len()).collect();
@@ -286,7 +320,7 @@ pub fn exec_update(
                 let Some(keys) = validator.introduced_keys(&index.name) else {
                     continue;
                 };
-                for key in &keys {
+                for key in keys {
                     match engine.index_manager().unique_key_locations(
                         db,
                         table,
@@ -400,6 +434,79 @@ pub fn exec_update(
             }
         }
 
+        // Only matched resident rows with changed keys produce new entries.
+        // They use the same publish path as segment images and INSERT.
+        for (_, batch, rows, _) in &memtable_updates {
+            let touched: Vec<_> = unique_constraints
+                .iter()
+                .filter(|(_, columns)| columns.iter().any(|c| assigned.contains_key(c)))
+                .cloned()
+                .collect();
+            if touched.is_empty() && !primary_key_indices.iter().any(|c| assigned.contains_key(c)) {
+                continue;
+            }
+            let positions: std::sync::Arc<[u32]> = rows.clone().into();
+            let images = RecordBatch::try_new(
+                batch.schema.clone(),
+                batch
+                    .columns
+                    .iter()
+                    .map(|c| c.shared_take(positions.clone()))
+                    .collect(),
+            )?;
+            unique_index_entries.extend(super::dml_insert::build_unique_index_entries_for_batch(
+                table_meta,
+                table_schema,
+                &images,
+                &touched,
+            )?);
+            if primary_key_indices.iter().any(|c| assigned.contains_key(c)) {
+                unique_index_entries.push((
+                    crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME.into(),
+                    super::dml_insert::primary_location_entries_for_batch(
+                        table_schema,
+                        &images,
+                        &primary_key_indices,
+                    ),
+                ));
+                primary_keys.extend(super::dml_insert::primary_keys_for_batch(
+                    &images,
+                    table_schema,
+                    &primary_key_indices,
+                )?);
+            }
+        }
+
+        for (_, entries) in &unique_index_entries {
+            budget.charge(
+                entries
+                    .iter()
+                    .map(|entry| {
+                        std::mem::size_of_val(entry)
+                            + entry.key.capacity() * std::mem::size_of::<ScalarValue>()
+                            + entry
+                                .key
+                                .iter()
+                                .map(super::spill::scalar_heap_bytes)
+                                .sum::<usize>()
+                            + entry.location.segment_path.capacity()
+                    })
+                    .sum(),
+            )?;
+        }
+        budget.charge(
+            primary_keys
+                .iter()
+                .map(|key| {
+                    key.capacity() * std::mem::size_of::<ScalarValue>()
+                        + key
+                            .iter()
+                            .map(super::spill::scalar_heap_bytes)
+                            .sum::<usize>()
+                })
+                .sum(),
+        )?;
+
         // Phase 2a, ordered for statement atomicity:
         //   1. Stage the images into a PRIVATE transaction (invisible until
         //      its commit; nothing durable is rewritten).
@@ -481,6 +588,9 @@ pub fn exec_update(
         // images live in the private transaction's memtables; once their
         // tails are durable, recovery may keep the tombstones (roll forward),
         // otherwise it restores the pre-statement footers (roll back).
+        if !segment_plan.footers.is_empty() {
+            mutation_started.set(true);
+        }
         if let Err(error) = segment_plan.apply_footers_deferred(mgr, image_watermark.as_slice()) {
             // apply_footers undoes its own partial rewrites; discard the
             // staged images (still invisible) as above.
@@ -518,6 +628,57 @@ pub fn exec_update(
         // re-judged by startup recovery, which will find the watermark met).
         for (seg_path, ..) in &segment_plan.footers {
             crate::storage::segment::reader::clear_deferred_delete_journal(seg_path);
+        }
+
+        let mut tail_persist_failed = false;
+        for (memtable, batch, matched_rows, assigned_pairs) in memtable_updates {
+            mutation_started.set(true);
+            // Durable side BEFORE the in-memory swap: the segment rewrites
+            // above already committed the new values, so a crash between the
+            // two steps must not let recovery restore the pre-update tail
+            // next to them. This loop runs under the table/partition
+            // mutation lock, so no flush can invalidate `batch` in between.
+            // The incremental `.upd` sidecar costs O(affected rows) instead
+            // of a whole-tail rewrite (quadratic for repeated small UPDATEs
+            // on a large memtable). A tail write failure still swaps in
+            // memory and falls back to the flush below (same degradation as
+            // before).
+            if let Err(error) = engine.batch_writer().update_memtable_tail_rows(
+                &memtable,
+                &matched_rows,
+                &assigned_pairs,
+                &batch,
+            ) {
+                tail_persist_failed = true;
+                tracing::warn!(
+                    db,
+                    table,
+                    error = %error,
+                    "UPDATE durable tail write failed; flushing target table"
+                );
+            }
+            if !memtable.replace_pending_batch(batch) {
+                return Err(TaibaiError::Internal(format!(
+                    "memtable for '{}.{}' left pending state during UPDATE",
+                    db, table
+                )));
+            }
+        }
+        if tail_persist_failed {
+            // Partition-pruned UPDATEs run under the target partition's lock
+            // only; flushing the whole table with the "table lock held"
+            // freeze would race concurrent appends in OTHER partitions.
+            // Flush just the pruned partition, whose appenders this
+            // statement's partition lock already excludes.
+            if let Some(partition) = target_partition_key.filter(|key| !key.is_empty()) {
+                engine
+                    .batch_writer()
+                    .flush_partition_under_partition_lock(db, table, partition)?;
+            } else {
+                engine
+                    .batch_writer()
+                    .flush_table_under_table_lock(db, table)?;
+            }
         }
 
         // Incremental index maintenance, both halves, still under the
@@ -579,56 +740,6 @@ pub fn exec_update(
             }
         }
 
-        let mut tail_persist_failed = false;
-        for (memtable, batch, matched_rows, assigned_pairs) in memtable_updates {
-            // Durable side BEFORE the in-memory swap: the segment rewrites
-            // above already committed the new values, so a crash between the
-            // two steps must not let recovery restore the pre-update tail
-            // next to them. This loop runs under the table/partition
-            // mutation lock, so no flush can invalidate `batch` in between.
-            // The incremental `.upd` sidecar costs O(affected rows) instead
-            // of a whole-tail rewrite (quadratic for repeated small UPDATEs
-            // on a large memtable). A tail write failure still swaps in
-            // memory and falls back to the flush below (same degradation as
-            // before).
-            if let Err(error) = engine.batch_writer().update_memtable_tail_rows(
-                &memtable,
-                &matched_rows,
-                &assigned_pairs,
-                &batch,
-            ) {
-                tail_persist_failed = true;
-                tracing::warn!(
-                    db,
-                    table,
-                    error = %error,
-                    "UPDATE durable tail write failed; flushing target table"
-                );
-            }
-            if !memtable.replace_pending_batch(batch) {
-                return Err(TaibaiError::Internal(format!(
-                    "memtable for '{}.{}' left pending state during UPDATE",
-                    db, table
-                )));
-            }
-        }
-        if tail_persist_failed {
-            // Partition-pruned UPDATEs run under the target partition's lock
-            // only; flushing the whole table with the "table lock held"
-            // freeze would race concurrent appends in OTHER partitions.
-            // Flush just the pruned partition, whose appenders this
-            // statement's partition lock already excludes.
-            if let Some(partition) = target_partition_key.filter(|key| !key.is_empty()) {
-                engine
-                    .batch_writer()
-                    .flush_partition_under_partition_lock(db, table, partition)?;
-            } else {
-                engine
-                    .batch_writer()
-                    .flush_table_under_table_lock(db, table)?;
-            }
-        }
-
         // HotStore is append-only. Once rows are updated in place it is no
         // longer authoritative, and must not be lazily recreated from only
         // later INSERTs while older memtable rows are still live.
@@ -660,8 +771,19 @@ pub fn exec_update(
     // is append-only and must never serve pre-update rows after any rewrite
     // happened, so retire it on the error path too — the old early-return
     // skipped the invalidation and left stale mirror rows resident.
-    if update_outcome.is_err() {
+    if update_outcome.is_err() && mutation_started.get() {
         engine.invalidate_hot_store(db, table);
+        engine
+            .index_manager()
+            .invalidate_primary_key_index(db, table);
+        let names = table_meta
+            .unique_indexes
+            .iter()
+            .map(|index| index.name.clone())
+            .collect::<Vec<_>>();
+        engine
+            .index_manager()
+            .invalidate_table_unique_index_snapshots(db, table, &names);
     }
     let updated_count = update_outcome?;
 
@@ -726,7 +848,7 @@ fn indexes_touched_by_assignments(
 }
 
 pub(crate) fn update_memtable_batch(
-    assignments: &[Assignment],
+    assigned: &HashMap<usize, ScalarValue>,
     where_clause: &Option<Expr>,
     table_schema: &Schema,
     batch: Arc<RecordBatch>,
@@ -753,20 +875,6 @@ pub(crate) fn update_memtable_batch(
         return Ok((None, 0, Vec::new(), Vec::new()));
     }
 
-    // Assignments resolve against THIS batch's column layout: the catalog
-    // index of a column and its index inside an older memtable's batch can
-    // disagree after a DROP/RENAME COLUMN, and writing by catalog position
-    // would corrupt the neighboring physical column.
-    let mut assigned = HashMap::new();
-    for assign in assignments {
-        if let Some(local_idx) = batch.schema.index_of(&assign.column) {
-            let col_type = batch.schema.columns[local_idx].data_type;
-            if let std::collections::hash_map::Entry::Vacant(e) = assigned.entry(local_idx) {
-                let value = eval_expr_to_scalar(&assign.value, &col_type)?;
-                e.insert(value);
-            }
-        }
-    }
     // Canonical ascending column order, ready for the durable `.upd` sidecar
     // (which replays these constants by physical column index).
     let assigned_pairs: Vec<(usize, ScalarValue)> = assigned
@@ -774,42 +882,16 @@ pub(crate) fn update_memtable_batch(
         .map(|(col_idx, value)| (*col_idx, value.clone()))
         .collect();
     let affected = matched_rows.len() as u64;
-    // C9: only the ASSIGNED columns pay a rebuild. `rebuild_update_column`
-    // takes `&[u32]`, so keep the single identity-index allocation but pass
-    // it to assigned columns only; untouched columns never walk it.
-    let all_rows: Vec<u32> = if assigned.is_empty() {
-        Vec::new()
-    } else {
-        (0..batch.num_rows() as u32).collect()
-    };
-    let mut new_columns = Vec::with_capacity(batch.num_columns());
-    // C9: untouched columns move straight into the replacement batch when
-    // this statement is the snapshot Arc's sole owner (the transaction view
-    // and schema-aligned copies); when the memtable still shares the Arc a
-    // flat clone is the fallback — still cheaper than the old per-row
-    // identity gather through `rebuild_update_column`, and never taken for
-    // assigned columns (those are rebuilt either way).
-    let new_batch = match Arc::try_unwrap(batch) {
-        Ok(owned) => {
-            let schema = owned.schema;
-            for (col_idx, column) in owned.columns.into_iter().enumerate() {
-                new_columns.push(match assigned.get(&col_idx) {
-                    Some(value) => rebuild_update_column(&column, Some(value), &all_rows, &mask)?,
-                    None => column,
-                });
-            }
-            RecordBatch::try_new(schema, new_columns)?
-        }
-        Err(shared) => {
-            for (col_idx, column) in shared.columns.iter().enumerate() {
-                new_columns.push(match assigned.get(&col_idx) {
-                    Some(value) => rebuild_update_column(column, Some(value), &all_rows, &mask)?,
-                    None => column.clone(),
-                });
-            }
-            RecordBatch::try_new(shared.schema.clone(), new_columns)?
-        }
-    };
+    let new_columns = batch
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| match assigned.get(&idx) {
+            Some(value) => column.shared_update(&mask, value),
+            None => Ok(column.shared_clone()),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let new_batch = RecordBatch::try_new(batch.schema.clone(), new_columns)?;
     Ok((Some(new_batch), affected, matched_rows, assigned_pairs))
 }
 
@@ -883,17 +965,25 @@ pub(crate) fn rebuild_update_column(
 pub(crate) fn precompute_assigned_values(
     assignments: &[Assignment],
     table_schema: &Schema,
+    timezone_offset_hours: i32,
 ) -> Result<HashMap<usize, ScalarValue>> {
     let mut assigned = HashMap::new();
     for assign in assignments {
-        if let Some(col_idx) = table_schema
-            .columns
-            .iter()
-            .position(|column| column.name == assign.column)
-        {
+        if let Some(col_idx) = table_schema.index_of(&assign.column) {
             if let std::collections::hash_map::Entry::Vacant(e) = assigned.entry(col_idx) {
-                let value =
-                    eval_expr_to_scalar(&assign.value, &table_schema.columns[col_idx].data_type)?;
+                let value = eval_expr_to_scalar_with_scale_timezone(
+                    &assign.value,
+                    &table_schema.columns[col_idx].data_type,
+                    table_schema.columns[col_idx].scale,
+                    timezone_offset_hours,
+                )?;
+                let column = &table_schema.columns[col_idx];
+                if (column.primary_key || !column.nullable) && value.is_null() {
+                    return Err(TaibaiError::Sql(format!(
+                        "column '{}' cannot be NULL",
+                        column.name
+                    )));
+                }
                 e.insert(value);
             }
         } else {
@@ -1034,7 +1124,7 @@ fn for_each_surviving_key_row_group(
 #[allow(clippy::too_many_arguments)]
 fn plan_segment_rows_for_reinsert(
     mgr: &crate::storage::segment_manager::SegmentManager,
-    table_meta: &crate::storage::catalog::schema::TableMeta,
+    mut index_maintenance: super::dml_delete::DeleteIndexMaintenance,
     table_schema: &Schema,
     segment_files: Vec<std::path::PathBuf>,
     predicate: Option<&crate::storage::segment::RowGroupPredicate>,
@@ -1043,17 +1133,14 @@ fn plan_segment_rows_for_reinsert(
     assigned: &std::collections::HashMap<usize, ScalarValue>,
     publish_updates: bool,
     updated_events: &mut super::helpers::ChangeEventBuffer,
+    budget: &mut super::dml_staging::MutationBudget,
 ) -> Result<SegmentReinsertPlan> {
-    let mut index_maintenance =
-        crate::sql::execution::dml_delete::DeleteIndexMaintenance::plan(table_meta, table_schema);
     let maintaining = index_maintenance.still_maintaining();
     let key_positions: Vec<Vec<usize>> = index_maintenance.schema_key_positions().to_vec();
 
     let mut footers = Vec::new();
     let mut image_pending: Option<RecordBatch> = None;
     let mut image_batches: Vec<RecordBatch> = Vec::new();
-    let mut image_bytes = 0u64;
-    let byte_budget = crate::storage::core::txn_mutations::txn_mutation_budget_bytes();
     let mut updated_count = 0u64;
     let row_group_target = mgr.row_group_target_rows();
 
@@ -1145,14 +1232,7 @@ fn plan_segment_rows_for_reinsert(
                     updated_events.push(&images, &idxs);
                 }
                 updated_count += matched_rows.len() as u64;
-                image_bytes = image_bytes
-                    .saturating_add(images.estimated_size_bytes().saturating_mul(2) as u64);
-                if image_bytes > byte_budget {
-                    return Err(TaibaiError::ResourceBusy(format!(
-                        "UPDATE image materialization exceeded the budget ({} > {} bytes); narrow the statement or raise the transaction budget",
-                        image_bytes, byte_budget
-                    )));
-                }
+                budget.charge(images.estimated_size_bytes().saturating_mul(2))?;
                 image_pending = match image_pending.take() {
                     Some(mut accumulated) => {
                         for col_idx in 0..images.num_columns() {
@@ -1173,6 +1253,7 @@ fn plan_segment_rows_for_reinsert(
         }
         drop(reader);
         if segment_matched {
+            budget.charge(new_bitmap.len().saturating_add(footer_bitmap.len()))?;
             footers.push((
                 seg_path,
                 new_bitmap,

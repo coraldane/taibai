@@ -289,6 +289,36 @@ impl MemTable {
         Ok(added)
     }
 
+    /// Freeze columns individually for mutation planning. Move the resident
+    /// payload into immutable leaves once; subsequent plans share those
+    /// leaves, including across row selections and constant assignments.
+    pub fn read_mutation_snapshot(&self) -> Result<Option<Arc<RecordBatch>>> {
+        self.ensure_resident()?;
+        let mut guard = self.batch.write().unwrap();
+        let Some(batch) = guard.as_mut() else {
+            return Ok(None);
+        };
+        if batch.columns.iter().all(|c| c.is_selected()) {
+            return Ok(Some(batch.clone()));
+        }
+        let owned = Arc::make_mut(batch);
+        let rows: Arc<[u32]> = (0..owned.num_rows() as u32).collect::<Vec<_>>().into();
+        for column in &mut owned.columns {
+            if column.is_selected() {
+                continue;
+            }
+            let data_type = column.data_type();
+            let leaf =
+                std::mem::replace(column, crate::types::array::ColumnArray::empty(data_type));
+            *column = crate::types::array::ColumnArray::selected(
+                vec![(Arc::new(leaf), rows.clone())].into(),
+                data_type,
+                rows.len(),
+            );
+        }
+        Ok(Some(batch.clone()))
+    }
+
     pub fn read(&self) -> Option<RecordBatch> {
         if self.ensure_resident().is_err() {
             return None;
@@ -1518,6 +1548,25 @@ impl MemTableManager {
             self.prune_replace_key_indexes();
         }
         rolled_back
+    }
+
+    /// Publish privately staged statement images into an open transaction.
+    /// Caller holds the table mutation locks; no durable visibility changes.
+    pub(crate) fn adopt_staged_transaction(&self, staged: u64, owner: u64) {
+        let mut writable = self.writable.write().unwrap();
+        let memtables = self.memtables.read().unwrap();
+        for mt in memtables.iter().filter(|mt| mt.txn_id() == staged) {
+            let old = (
+                mt.db().to_string(),
+                mt.table().to_string(),
+                mt.partition_key().to_string(),
+                staged,
+            );
+            writable.remove(&old);
+            mt.txn_id.store(owner, Ordering::Release);
+            *mt.visibility.write().unwrap() = TxnVisibility::Uncommitted(owner);
+            writable.insert((old.0, old.1, old.2, owner), Arc::downgrade(mt));
+        }
     }
 
     pub fn commit_txn(&self, txn_id: u64) -> Vec<Arc<MemTable>> {

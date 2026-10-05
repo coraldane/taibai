@@ -35,6 +35,48 @@ pub struct MemoryReservation {
     bytes: usize,
 }
 
+/// Shared accounting for operators that cannot spill their retained state.
+/// Every allocation phase checks its peak, not just the final result size.
+pub(crate) struct OperatorMemory {
+    reservation: MemoryReservation,
+    limit: usize,
+    name: &'static str,
+}
+impl OperatorMemory {
+    pub(crate) fn new(name: &'static str, limit: usize) -> Self {
+        Self {
+            reservation: MemoryManager::reservation(),
+            limit: limit.max(1),
+            name,
+        }
+    }
+    pub(crate) fn reserve(&mut self, bytes: usize) -> Result<()> {
+        if bytes > self.limit || !self.reservation.try_resize(bytes) {
+            return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
+                "{} exceeded the query memory budget ({} bytes, local limit {} bytes)",
+                self.name, bytes, self.limit
+            )));
+        }
+        super::operators::profile::record_current_peak_memory(bytes);
+        Ok(())
+    }
+}
+pub(crate) fn operator_memory_limit() -> usize {
+    crate::common::config::query_limits()
+        .query_memory_limit_mb
+        .saturating_mul(1024 * 1024)
+        .min(usize::MAX as u64) as usize
+}
+pub(crate) fn scalar_heap_bytes(value: &crate::types::scalar::ScalarValue) -> usize {
+    use crate::types::scalar::ScalarValue;
+    match value {
+        ScalarValue::VarChar(Some(v)) => v.capacity(),
+        ScalarValue::Blob(Some(v)) => v.capacity(),
+        ScalarValue::Vector(Some(v)) => v.capacity() * 4,
+        _ => 0,
+    }
+}
+
 impl MemoryManager {
     fn global() -> &'static Self {
         static MANAGER: OnceLock<MemoryManager> = OnceLock::new();

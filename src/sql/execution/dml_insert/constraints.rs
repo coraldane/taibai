@@ -152,8 +152,35 @@ pub(crate) fn collect_unique_index_entries_from(
     indices: &[usize],
     reason: &str,
 ) -> Result<Vec<UniqueIndexEntry>> {
-    let started = std::time::Instant::now();
     let mut entries = Vec::new();
+    visit_unique_index_entries_from(
+        segment_mgr,
+        memtables,
+        table_dir,
+        table,
+        table_schema,
+        indices,
+        reason,
+        &mut |entry| {
+            entries.push(entry);
+            Ok(())
+        },
+    )?;
+    Ok(entries)
+}
+
+pub(crate) fn visit_unique_index_entries_from(
+    segment_mgr: &SegmentManager,
+    memtables: &[std::sync::Arc<crate::storage::core::memtable::MemTable>],
+    table_dir: &std::path::Path,
+    table: &str,
+    table_schema: &crate::types::batch::Schema,
+    indices: &[usize],
+    reason: &str,
+    visit: &mut dyn FnMut(UniqueIndexEntry) -> Result<()>,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let mut count = 0usize;
     if table_dir.exists() {
         for seg_path in SegmentManager::discover_segments(table_dir)? {
             let reader = segment_mgr.open_reader_cached(&seg_path)?;
@@ -168,6 +195,9 @@ pub(crate) fn collect_unique_index_entries_from(
                 let delete_bitmap = reader.delete_bitmap();
                 let projected_indices: Vec<usize> = (0..batch.num_columns()).collect();
                 for row_idx in 0..batch.num_rows() {
+                    if row_idx % 1024 == 0 {
+                        crate::common::query_cancel::check()?;
+                    }
                     let row_id = rg_start + row_idx as u64;
                     if crate::storage::segment::delete_bitmap::is_deleted(delete_bitmap, row_id) {
                         continue;
@@ -177,19 +207,20 @@ pub(crate) fn collect_unique_index_entries_from(
                     else {
                         continue;
                     };
-                    entries.push(UniqueIndexEntry {
+                    visit(UniqueIndexEntry {
                         key,
                         location: UniqueRowLocation {
                             segment_path: seg_path.to_string_lossy().to_string(),
                             row_id,
                         },
-                    });
+                    })?;
+                    count += 1;
                 }
             }
         }
     }
     for memtable in memtables {
-        if let Some(batch) = memtable.read() {
+        if let Some(batch) = memtable.read_snapshot_arc() {
             // Memtable batches keep their insert-time layout; resolve the key
             // columns by name against the batch's own schema.
             let local_indices: Vec<usize> = indices
@@ -205,29 +236,33 @@ pub(crate) fn collect_unique_index_entries_from(
                 continue;
             }
             for row_idx in 0..batch.num_rows() {
+                if row_idx % 1024 == 0 {
+                    crate::common::query_cancel::check()?;
+                }
                 let Some(key) = unique_key_for_row(&batch, row_idx, &local_indices, &batch.schema)
                 else {
                     continue;
                 };
-                entries.push(UniqueIndexEntry {
+                visit(UniqueIndexEntry {
                     key,
                     location: UniqueRowLocation {
                         segment_path: String::new(),
                         row_id: row_idx as u64,
                     },
-                });
+                })?;
+                count += 1;
             }
         }
     }
     tracing::warn!(
         table,
         key_columns = indices.len(),
-        entries = entries.len(),
+        entries = count,
         elapsed_ms = started.elapsed().as_millis() as u64,
         reason,
         "unique index snapshot rebuild from full-table scan"
     );
-    Ok(entries)
+    Ok(())
 }
 
 /// Historical duplicate keys among themselves do not violate the statement
@@ -235,11 +270,9 @@ pub(crate) fn collect_unique_index_entries_from(
 /// is an error. This mirrors the snapshot-based path (`unique_key_exists`),
 /// which never fails on unrelated pre-existing duplicates.
 ///
-/// The fallback collects the whole key set once and then INSTALLS it as the
-/// index snapshot, so a single lost/invalid snapshot costs one full-table
-/// scan instead of one per subsequent INSERT (the primary-key fallback in
-/// `validate_primary_key_uniqueness` already did this via
-/// `install_primary_key_index`).
+/// The fallback scans once into bounded sorted runs and publishes a file-
+/// backed snapshot. Only incoming keys are retained in memory, so losing a
+/// snapshot cannot turn a small INSERT into a table-sized key allocation.
 fn load_existing_unique_keys(
     engine: &Engine,
     db: &str,
@@ -249,36 +282,29 @@ fn load_existing_unique_keys(
     index_name: &str,
     new_keys: &HashSet<Vec<ScalarValue>>,
 ) -> Result<()> {
-    let entries =
-        collect_unique_index_entries(engine, db, table, indices, "unique key validation fallback")?;
-    if let Some(entry) = entries.iter().find(|entry| new_keys.contains(&entry.key)) {
-        return Err(duplicate_unique_key_error(table, index_name, &entry.key));
-    }
-    // Install the scanned snapshot so future statements probe it instead of
-    // rescanning the table. Failure only leaves the slow path in place — the
-    // statement itself is unaffected.
     let columns = indices
         .iter()
         .map(|&idx| schema.columns[idx].name.clone())
         .collect::<Vec<_>>();
-    if let Err(error) = engine.index_manager().persist_unique_index_entries(
-        db,
-        table,
-        index_name,
-        &columns,
-        entries,
-        Some(engine.segment_mgr().memtable_flush_epoch(db, table)),
-        None,
-    ) {
-        tracing::warn!(
-            db,
-            table,
-            index = %index_name,
-            error = %error,
-            "failed to install unique-index snapshot after fallback scan"
-        );
-    }
-    Ok(())
+    engine
+        .index_manager()
+        .persist_unique_index_stream(db, table, index_name, &columns, |emit| {
+            visit_unique_index_entries_from(
+                engine.segment_mgr(),
+                &engine.memtable_manager().get_by_table(db, table),
+                &engine.data_dir().join(db).join(table),
+                table,
+                schema,
+                indices,
+                "unique key validation fallback",
+                &mut |entry| {
+                    if new_keys.contains(&entry.key) {
+                        return Err(duplicate_unique_key_error(table, index_name, &entry.key));
+                    }
+                    emit(entry)
+                },
+            )
+        })
 }
 
 pub(super) fn unique_key_for_row(
@@ -326,6 +352,9 @@ pub struct IntroducedKeyValidator<'a> {
     /// Per index to validate: the positions of its key columns inside the
     /// VALIDATION projection plus its materialized introduced-key set.
     indexes: Vec<UniqueIndexProjection<'a>>,
+    budget: super::super::dml_staging::MutationBudget,
+    shared_budget: Option<&'a mut super::super::dml_staging::MutationBudget>,
+    charged: usize,
 }
 
 impl<'a> IntroducedKeyValidator<'a> {
@@ -351,7 +380,21 @@ impl<'a> IntroducedKeyValidator<'a> {
         Self {
             table,
             indexes: validators,
+            budget: super::super::dml_staging::MutationBudget::new(),
+            shared_budget: None,
+            charged: 0,
         }
+    }
+
+    pub(crate) fn new_with_budget(
+        table: &'a str,
+        validation_schema: &Schema,
+        indexes: &'a [crate::storage::catalog::schema::UniqueIndexMeta],
+        budget: &'a mut super::super::dml_staging::MutationBudget,
+    ) -> Self {
+        let mut validator = Self::new(table, validation_schema, indexes);
+        validator.shared_budget = Some(budget);
+        validator
     }
 
     /// Register the keys of every row of a batch. Two introduced rows
@@ -393,6 +436,17 @@ impl<'a> IntroducedKeyValidator<'a> {
                 else {
                     continue;
                 };
+                let bytes = key.capacity() * std::mem::size_of::<ScalarValue>()
+                    + key
+                        .iter()
+                        .map(super::super::spill::scalar_heap_bytes)
+                        .sum::<usize>()
+                    + 64;
+                self.shared_budget
+                    .as_deref_mut()
+                    .unwrap_or(&mut self.budget)
+                    .charge(bytes)?;
+                self.charged = self.charged.saturating_add(bytes);
                 if !keys.insert(key.clone()) {
                     return Err(duplicate_unique_key_error(self.table, &index.name, &key));
                 }
@@ -431,11 +485,11 @@ impl<'a> IntroducedKeyValidator<'a> {
     /// Introduced keys of one index, for the location-index fast path: the
     /// segment-survivor check can probe the maintained snapshot with them
     /// instead of streaming every row group of the table's key columns.
-    pub fn introduced_keys(&self, index_name: &str) -> Option<Vec<Vec<ScalarValue>>> {
+    pub fn introduced_keys(&self, index_name: &str) -> Option<&HashSet<Vec<ScalarValue>>> {
         self.indexes
             .iter()
             .find(|(index, _, _)| index.name == index_name)
-            .map(|(_, _, keys)| keys.iter().cloned().collect())
+            .map(|(_, _, keys)| keys)
     }
 
     /// Collision error for the location-index fast path: an introduced key
@@ -601,27 +655,15 @@ pub fn validate_primary_key_uniqueness(
         return Ok(());
     }
 
-    let entries = collect_unique_index_entries(
+    load_existing_unique_keys(
         engine,
         db,
         table,
+        schema,
         primary_key_indices,
-        "primary key uniqueness fallback",
-    )?;
-    let historical_keys = entries
-        .into_iter()
-        .map(|entry| entry.key)
-        .collect::<Vec<_>>();
-    if historical_keys.iter().any(|key| unique.contains(key)) {
-        return Err(TaibaiError::Sql(format!(
-            "duplicate primary key for table '{}'",
-            table
-        )));
-    }
-    engine
-        .index_manager()
-        .install_primary_key_index(db, table, historical_keys)?;
-    Ok(())
+        crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+        &unique,
+    )
 }
 
 pub(super) fn validate_primary_key_uniqueness_in_batch(
@@ -711,4 +753,12 @@ fn duplicate_primary_key_error(table: &str, key: &[ScalarValue]) -> TaibaiError 
         "duplicate primary key for table '{}': ({})",
         table, key_text
     ))
+}
+
+impl Drop for IntroducedKeyValidator<'_> {
+    fn drop(&mut self) {
+        if let Some(budget) = &mut self.shared_budget {
+            budget.release(self.charged);
+        }
+    }
 }

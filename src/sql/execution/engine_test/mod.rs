@@ -9,6 +9,7 @@ mod amplification_regressions;
 mod audit_regression;
 mod bulk_payload;
 mod cancellation;
+mod crud_root_regressions;
 mod dml;
 mod durability;
 mod lifecycle;

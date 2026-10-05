@@ -1049,3 +1049,57 @@ fn base_block_loads_survive_publish_rename_over_the_path() -> Result<()> {
     assert_eq!(state_a.entry_count, 600);
     Ok(())
 }
+
+#[test]
+fn external_index_build_merges_runs_and_keeps_previous_base_on_scan_error() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
+    let manager =
+        IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
+    manager.persist_unique_index_stream("db", "t", "uq", &["v".into()], |emit| {
+        for value in (0..40_000).rev() {
+            emit(entry(value, value as u64))?;
+        }
+        Ok(())
+    })?;
+    for value in [0, 1, 20_000, 39_999] {
+        assert_eq!(
+            manager.unique_key_exists("db", "t", "uq", &[ScalarValue::Int64(Some(value))])?,
+            Some(true)
+        );
+    }
+    assert_eq!(
+        manager.unique_key_exists("db", "t", "uq", &[ScalarValue::Int64(Some(40_000))])?,
+        Some(false)
+    );
+    let failed = manager.persist_unique_index_stream("db", "t", "uq", &["v".into()], |emit| {
+        for value in 50_000..90_000 {
+            emit(entry(value, value as u64))?;
+        }
+        Err(TaibaiError::Storage("forced producer read failure".into()))
+    });
+    assert!(failed.is_err());
+    assert_eq!(
+        manager.unique_key_exists("db", "t", "uq", &[ScalarValue::Int64(Some(39_999))])?,
+        Some(true)
+    );
+    assert_eq!(
+        manager.unique_key_exists("db", "t", "uq", &[ScalarValue::Int64(Some(50_000))])?,
+        Some(false)
+    );
+    assert!(
+        std::fs::read_dir(manager.unique_index_dir("db", "t"))?.all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".build-"))
+    );
+    drop(manager);
+    let manager =
+        IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
+    assert_eq!(
+        manager.unique_key_exists("db", "t", "uq", &[ScalarValue::Int64(Some(39_999))])?,
+        Some(true)
+    );
+    Ok(())
+}

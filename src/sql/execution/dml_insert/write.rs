@@ -1110,24 +1110,18 @@ pub(crate) fn rebuild_table_location_indexes_from(
     }
     let table_dir = data_dir.join(db).join(table);
     for (index_name, columns, indices) in indexes {
-        let entries = collect_unique_index_entries_from(
-            segment_mgr,
-            memtables,
-            &table_dir,
-            table,
-            schema,
-            &indices,
-            "segment rewrite auto rebuild",
-        )?;
-        index_manager.persist_unique_index_entries(
-            db,
-            table,
-            &index_name,
-            &columns,
-            entries,
-            Some(segment_mgr.memtable_flush_epoch(db, table)),
-            None,
-        )?;
+        index_manager.persist_unique_index_stream(db, table, &index_name, &columns, |visit| {
+            visit_unique_index_entries_from(
+                segment_mgr,
+                memtables,
+                &table_dir,
+                table,
+                schema,
+                &indices,
+                "segment rewrite auto rebuild",
+                visit,
+            )
+        })?;
     }
     index_manager.invalidate_primary_key_cache(db, table);
     Ok(())
@@ -1163,21 +1157,23 @@ fn ensure_replace_location_indexes(
         if locations.is_some() {
             continue;
         }
-        let entries = collect_unique_index_entries(
-            engine,
-            db,
-            table,
-            &indices,
-            "replace location index bootstrap",
-        )?;
-        engine.index_manager().persist_unique_index_entries(
+        engine.index_manager().persist_unique_index_stream(
             db,
             table,
             &index_name,
             &columns,
-            entries,
-            Some(engine.segment_mgr().memtable_flush_epoch(db, table)),
-            None,
+            |visit| {
+                visit_unique_index_entries_from(
+                    engine.segment_mgr(),
+                    &engine.memtable_manager().get_by_table(db, table),
+                    &engine.data_dir().join(db).join(table),
+                    table,
+                    schema,
+                    &indices,
+                    "replace location index bootstrap",
+                    visit,
+                )
+            },
         )?;
     }
     Ok(())

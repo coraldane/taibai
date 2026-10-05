@@ -1,5 +1,4 @@
-//! Diagnostic assertions demonstrating current memory-budget omissions.
-//! After fixes, invert these expectations and move them into regression tests.
+//! End-to-end checks of operator and resident/segment mutation memory budgets.
 
 use taibai::common::config::{set_query_limits, QueryLimits};
 use taibai::protocol::types::DataType;
@@ -36,13 +35,10 @@ fn main() {
         }],
         schema.clone(),
     );
-    let out = window.next_batch().unwrap().unwrap();
-    println!(
-        "Window with 1 MiB budget retained {} bytes, {} rows",
-        out.estimated_size_bytes(),
-        out.num_rows()
+    assert!(
+        window.next_batch().is_err(),
+        "window must enforce its memory budget"
     );
-    assert!(out.estimated_size_bytes() > 1024 * 1024);
     let mut top = TopNExec::new(
         vec![SortKey {
             expr: LogicalExpr::Column(0),
@@ -52,13 +48,10 @@ fn main() {
         schema,
     )
     .with_capacity(190_000);
-    let out = top.next_batch().unwrap().unwrap();
-    println!(
-        "TopN with 1 MiB budget retained {} bytes, {} rows",
-        out.estimated_size_bytes(),
-        out.num_rows()
+    assert!(
+        top.next_batch().is_err(),
+        "TopN must enforce its memory budget"
     );
-    assert!(out.estimated_size_bytes() > 1024 * 1024);
 
     std::env::set_var("TAIBAI_TXN_MUTATION_BUDGET_BYTES", "1024");
     let dir = tempfile::tempdir().unwrap();
@@ -79,7 +72,7 @@ fn main() {
         .unwrap();
     let resident = engine.execute(&mut session, "UPDATE mutations SET v = 20");
     println!("Resident UPDATE with 1 KiB mutation budget => {resident:?}");
-    assert!(resident.is_ok());
+    assert!(resident.is_err());
     engine
         .execute(&mut session, "FLUSH TABLE mutations")
         .unwrap();

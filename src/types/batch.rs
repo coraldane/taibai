@@ -145,10 +145,19 @@ impl Schema {
 }
 
 /// A record batch: a horizontal slice of rows with columns matching a schema.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RecordBatch {
     pub schema: Schema,
     pub columns: Vec<ColumnArray>,
+}
+
+impl Clone for RecordBatch {
+    fn clone(&self) -> Self {
+        Self {
+            schema: self.schema.clone(),
+            columns: self.columns.iter().map(ColumnArray::shared_clone).collect(),
+        }
+    }
 }
 
 impl RecordBatch {
@@ -219,6 +228,57 @@ impl RecordBatch {
     pub fn take_rows(&self, indices: &[u32]) -> Result<RecordBatch> {
         let columns = self.columns.iter().map(|col| col.take(indices)).collect();
         RecordBatch::try_new(self.schema.clone(), columns)
+    }
+
+    /// Zero-copy selection of mutation snapshots whose columns own shared
+    /// leaf buffers. One row-position array is shared by all identity columns.
+    pub fn take_rows_shared(&self, rows: std::sync::Arc<[u32]>) -> Result<Self> {
+        Self::try_new(
+            self.schema.clone(),
+            self.columns
+                .iter()
+                .map(|c| c.shared_take(rows.clone()).compact_sparse_selection())
+                .collect(),
+        )
+    }
+
+    /// New allocations retained by a mutation image, excluding immutable
+    /// leaves and index arrays it shares with the old resident snapshot.
+    pub fn mutation_allocation_bytes(&self, original: &Self) -> usize {
+        let mut bytes = self.columns.len() * std::mem::size_of::<ColumnArray>();
+        let mut indices_seen = std::collections::HashSet::new();
+        let mut leaves_seen = std::collections::HashSet::new();
+        for (column, old) in self.columns.iter().zip(&original.columns) {
+            match (column, old) {
+                (
+                    ColumnArray::Selected { parts, .. },
+                    ColumnArray::Selected {
+                        parts: previous, ..
+                    },
+                ) => {
+                    for (leaf, rows) in parts.iter() {
+                        let row_ptr = rows.as_ptr();
+                        if !previous
+                            .iter()
+                            .any(|(_, old_rows)| std::sync::Arc::ptr_eq(rows, old_rows))
+                            && indices_seen.insert(row_ptr)
+                        {
+                            bytes = bytes.saturating_add(rows.len() * 4);
+                        }
+                        let leaf_ptr = std::sync::Arc::as_ptr(leaf);
+                        if !previous
+                            .iter()
+                            .any(|(old_leaf, _)| std::sync::Arc::ptr_eq(leaf, old_leaf))
+                            && leaves_seen.insert(leaf_ptr)
+                        {
+                            bytes = bytes.saturating_add(leaf.estimated_size_bytes());
+                        }
+                    }
+                }
+                _ => bytes = bytes.saturating_add(column.estimated_size_bytes()),
+            }
+        }
+        bytes
     }
 
     /// Returns the number of rows (assumes all columns have the same length).

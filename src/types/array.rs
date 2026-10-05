@@ -339,6 +339,8 @@ pub enum ColumnArray {
         parts: SelectedParts,
         data_type: DataType,
         len: usize,
+        /// Null checks must not materialize wide value buffers.
+        nulls: OnceLock<NullBitmap>,
         /// Lazily materialized identical owned column (never `Selected`).
         flat: OnceLock<Box<ColumnArray>>,
     },
@@ -497,6 +499,9 @@ impl ColumnArray {
 
     /// Typed comparison against a literal, used by filter/range kernels.
     pub fn compare_scalar_at(&self, row: usize, value: &ScalarValue) -> Option<std::cmp::Ordering> {
+        if let Some((source, position)) = self.selected_source_at(row) {
+            return source.compare_scalar_at(position, value);
+        }
         // Zero-copy views / dictionary encodings compare through their
         // materialized form; row indexes are preserved by `flattened`.
         if matches!(
@@ -554,6 +559,12 @@ impl ColumnArray {
     /// Append a stable, typed row-key representation directly from column
     /// storage. Used by GROUP BY and hash join to avoid per-row boxing.
     pub fn encode_key_at(&self, row: usize, out: &mut Vec<u8>) {
+        if let Some((source, position)) = self.selected_source_at(row) {
+            return source.encode_key_at(position, out);
+        }
+        if matches!(self, Self::Rle { .. }) {
+            return self.flattened().encode_key_at(row, out);
+        }
         out.push(self.data_type() as u8);
         if self.bitmap().is_null(row) {
             out.push(0);
@@ -614,7 +625,10 @@ impl ColumnArray {
     }
 
     pub fn numeric_i64_at(&self, row: usize) -> Option<i64> {
-        // Zero-copy views read through their materialized form.
+        if let Some((source, position)) = self.selected_source_at(row) {
+            return source.numeric_i64_at(position);
+        }
+        // Encoded run values use their cached dense representation.
         if let ColumnArray::Selected { .. } | ColumnArray::Rle { .. } = self {
             return self.flattened().numeric_i64_at(row);
         }
@@ -641,7 +655,10 @@ impl ColumnArray {
     }
 
     pub fn numeric_f64_at(&self, row: usize) -> Option<f64> {
-        // Zero-copy views read through their materialized form.
+        if let Some((source, position)) = self.selected_source_at(row) {
+            return source.numeric_f64_at(position);
+        }
+        // Encoded run values use their cached dense representation.
         if let ColumnArray::Selected { .. } | ColumnArray::Rle { .. } = self {
             return self.flattened().numeric_f64_at(row);
         }
@@ -663,8 +680,206 @@ impl ColumnArray {
             parts,
             data_type,
             len,
+            nulls: OnceLock::new(),
             flat: OnceLock::new(),
         }
+    }
+
+    fn selected_source_at(&self, row: usize) -> Option<(&ColumnArray, usize)> {
+        if let Self::Selected { parts, .. } = self {
+            let mut base = 0;
+            for (source, indices) in parts.iter() {
+                if row < base + indices.len() {
+                    return Some((source, indices[row - base] as usize));
+                }
+                base += indices.len();
+            }
+        }
+        None
+    }
+
+    /// Reclaim a mostly-deleted immutable leaf at geometrically decreasing
+    /// live sizes. This bounds retained dead payload without copying every
+    /// surviving cell on each small DELETE.
+    pub fn compact_sparse_selection(&self) -> Self {
+        if let Self::Selected {
+            parts,
+            len,
+            data_type,
+            ..
+        } = self
+        {
+            let mut seen = std::collections::HashSet::new();
+            let retained_rows = parts
+                .iter()
+                .filter(|(source, _)| seen.insert(std::sync::Arc::as_ptr(source)))
+                .map(|(source, _)| source.len())
+                .sum::<usize>();
+            // Variable-width rows can be very uneven: deleting one large
+            // blob must not pin it merely because many tiny rows remain.
+            let mut seen = std::collections::HashSet::new();
+            let retained_bytes = parts
+                .iter()
+                .filter(|(source, _)| seen.insert(std::sync::Arc::as_ptr(source)))
+                .map(|(source, _)| source.estimated_size_bytes())
+                .sum::<usize>();
+            let live_variable_bytes = if matches!(
+                data_type,
+                DataType::VarChar | DataType::Blob | DataType::Vector
+            ) {
+                Some(
+                    parts
+                        .iter()
+                        .map(|(source, rows)| {
+                            rows.iter()
+                                .map(|&row| match source.as_ref() {
+                                    Self::Dictionary {
+                                        ids, dict, bitmap, ..
+                                    } => {
+                                        if bitmap.is_null(row as usize) {
+                                            8
+                                        } else {
+                                            dict.value(ids[row as usize] as usize)
+                                                .len()
+                                                .saturating_add(8)
+                                        }
+                                    }
+                                    Self::VarChar { data, .. } => {
+                                        data.value(row as usize).len().saturating_add(8)
+                                    }
+                                    Self::Blob { data, .. } => {
+                                        data.value(row as usize).len().saturating_add(8)
+                                    }
+                                    Self::Vector { data, .. } => data[row as usize]
+                                        .len()
+                                        .saturating_mul(4)
+                                        .saturating_add(32),
+                                    _ => source.estimated_size_bytes(),
+                                })
+                                .fold(0usize, usize::saturating_add)
+                        })
+                        .fold(0usize, usize::saturating_add),
+                )
+            } else {
+                None
+            };
+            if retained_rows > len.saturating_mul(2)
+                || live_variable_bytes.is_some_and(|live| retained_bytes > live.saturating_mul(2))
+            {
+                let leaf = std::sync::Arc::new(self.take(&(0..*len as u32).collect::<Vec<_>>()));
+                let indices = (0..*len as u32).collect::<Vec<_>>().into();
+                return Self::selected(vec![(leaf, indices)].into(), *data_type, *len);
+            }
+        }
+        self.shared_clone()
+    }
+
+    /// Share an immutable column without copying a lazily flattened cache.
+    pub fn shared_clone(&self) -> Self {
+        match self {
+            Self::Selected {
+                parts,
+                data_type,
+                len,
+                ..
+            } => Self::selected(parts.clone(), *data_type, *len),
+            _ => self.clone(),
+        }
+    }
+
+    /// Compose selections down to immutable leaf buffers. No parent view is
+    /// retained, so repeated DELETE/UPDATE cannot build snapshot chains.
+    pub fn shared_take(&self, rows: std::sync::Arc<[u32]>) -> Self {
+        let Self::Selected {
+            parts,
+            data_type,
+            len,
+            ..
+        } = self
+        else {
+            return self.take(&rows);
+        };
+        if rows.len() == *len && rows.iter().enumerate().all(|(i, &r)| i == r as usize) {
+            return self.shared_clone();
+        }
+        let mut out = Vec::new();
+        let mut base = 0usize;
+        let mut cursor = 0usize;
+        for (source, indices) in parts.iter() {
+            let end = base + indices.len();
+            let start = cursor;
+            while cursor < rows.len() && (rows[cursor] as usize) < end {
+                cursor += 1;
+            }
+            if cursor > start {
+                let mapped: std::sync::Arc<[u32]> = if indices.len() == source.len()
+                    && indices.iter().enumerate().all(|(i, &r)| i == r as usize)
+                    && base == 0
+                    && cursor == rows.len()
+                {
+                    rows.clone()
+                } else {
+                    rows[start..cursor]
+                        .iter()
+                        .map(|&r| indices[r as usize - base])
+                        .collect::<Vec<_>>()
+                        .into()
+                };
+                out.push((source.clone(), mapped));
+            }
+            base = end;
+        }
+        Self::selected(out.into(), *data_type, rows.len())
+    }
+
+    /// Replace constant runs through shared selections; untouched payloads
+    /// stay in their existing leaf buffers rather than being rebuilt.
+    pub fn shared_update(&self, mask: &[bool], value: &ScalarValue) -> Result<Self> {
+        let mut constant = Self::empty(self.data_type());
+        constant.push(value)?;
+        let constant = std::sync::Arc::new(constant);
+        let mut parts = Vec::new();
+        let mut start = 0usize;
+        while start < mask.len() {
+            let matched = mask[start];
+            let mut end = start + 1;
+            while end < mask.len() && mask[end] == matched {
+                end += 1;
+            }
+            if matched {
+                parts.push((constant.clone(), vec![0u32; end - start].into()));
+            } else {
+                let rows = (start as u32..end as u32).collect::<Vec<_>>().into();
+                let view = self.shared_take(rows);
+                match view {
+                    Self::Selected {
+                        parts: selected, ..
+                    } => parts.extend(selected.iter().cloned()),
+                    owned => parts.push((
+                        std::sync::Arc::new(owned),
+                        (0..end as u32 - start as u32).collect::<Vec<_>>().into(),
+                    )),
+                }
+            }
+            start = end;
+        }
+        // Bound fragmentation: flatten only after enough independent runs
+        // accumulate, amortizing payload copying across small mutations.
+        let view = Self::selected(parts.into(), self.data_type(), self.len());
+        if let Self::Selected { parts, .. } = &view {
+            if parts.len() > 64 {
+                let len = view.len();
+                let data_type = view.data_type();
+                let positions: std::sync::Arc<[u32]> = (0..len as u32).collect::<Vec<_>>().into();
+                let leaf = std::sync::Arc::new(view.take(&positions));
+                return Ok(Self::selected(
+                    vec![(leaf, positions)].into(),
+                    data_type,
+                    len,
+                ));
+            }
+        }
+        Ok(view)
     }
 
     /// The owned materialization of this column. `Selected` columns gather
@@ -1074,14 +1289,28 @@ impl ColumnArray {
     /// This deliberately favours a cheap, deterministic estimate over an
     /// allocator-specific exact value and is used for query spill decisions.
     pub fn estimated_size_bytes(&self) -> usize {
-        if let ColumnArray::Selected { parts, .. } = self {
-            return parts
-                .iter()
-                .map(|(source, indices)| {
-                    let width = source.data_type().fixed_size().unwrap_or(24);
-                    indices.len() * width + indices.len().div_ceil(8)
-                })
-                .sum();
+        if let ColumnArray::Selected {
+            parts, flat, nulls, ..
+        } = self
+        {
+            let mut leaves = std::collections::HashSet::new();
+            let mut rows_seen = std::collections::HashSet::new();
+            let mut bytes = parts.len() * std::mem::size_of::<SelectedPart>();
+            for (source, indices) in parts.iter() {
+                if leaves.insert(std::sync::Arc::as_ptr(source)) {
+                    bytes = bytes.saturating_add(source.estimated_size_bytes());
+                }
+                if rows_seen.insert(indices.as_ptr()) {
+                    bytes = bytes.saturating_add(indices.len() * 4);
+                }
+            }
+            if let Some(flat) = flat.get() {
+                bytes = bytes.saturating_add(flat.estimated_size_bytes());
+            }
+            if let Some(nulls) = nulls.get() {
+                bytes = bytes.saturating_add(nulls.estimated_size_bytes());
+            }
+            return bytes;
         }
         if let ColumnArray::Dictionary {
             ids, dict, bitmap, ..
@@ -1150,13 +1379,27 @@ impl ColumnArray {
         }
     }
 
-    /// Returns a reference to the null bitmap. Materializes a `Selected`
-    /// view on first call (the bitmap is cached with the flattened column).
+    /// Returns the null bitmap, gathering only bits for selection views.
     pub fn bitmap(&self) -> &NullBitmap {
         match self {
             ColumnArray::Dictionary { bitmap, .. } => bitmap,
             ColumnArray::Rle { bitmap, .. } => bitmap,
-            ColumnArray::Selected { .. } => self.flattened().bitmap(),
+            ColumnArray::Selected {
+                parts, len, nulls, ..
+            } => nulls.get_or_init(|| {
+                let mut bitmap = NullBitmap::with_capacity(*len);
+                for (source, rows) in parts.iter() {
+                    let source_bitmap = source.bitmap();
+                    for &row in rows.iter() {
+                        if source_bitmap.is_null(row as usize) {
+                            bitmap.push_null();
+                        } else {
+                            bitmap.push_valid();
+                        }
+                    }
+                }
+                bitmap
+            }),
             ColumnArray::Bool { bitmap, .. } => bitmap,
             ColumnArray::Int8 { bitmap, .. } => bitmap,
             ColumnArray::Int16 { bitmap, .. } => bitmap,

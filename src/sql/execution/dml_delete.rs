@@ -369,7 +369,7 @@ pub(crate) fn for_each_visible_memtable(
                 continue;
             }
         }
-        let Some(original) = memtable.read_snapshot_arc() else {
+        let Some(original) = memtable.read_mutation_snapshot()? else {
             continue;
         };
         if original.num_rows() == 0 {
@@ -414,6 +414,7 @@ pub(crate) fn plan_delete_memtable_rows(
     reader_txn_id: u64,
 ) -> Result<Vec<ReplaceMemtableConflictPlan>> {
     let mut plans = Vec::new();
+    let mut budget = super::dml_staging::MutationBudget::new();
     for_each_visible_memtable(
         engine,
         db,
@@ -450,12 +451,23 @@ pub(crate) fn plan_delete_memtable_rows(
                     .iter()
                     .map(|matches| !matches)
                     .collect::<Vec<_>>();
-                let filtered = filter_batch_keep(&original, &keep, original.num_rows() - removed)?;
+                let kept: Arc<[u32]> = keep
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &keep)| keep.then_some(i as u32))
+                    .collect::<Vec<_>>()
+                    .into();
+                let filtered = original.take_rows_shared(kept)?;
                 let removed_positions = absolute_mask
                     .iter()
                     .enumerate()
                     .filter_map(|(row_idx, matches)| matches.then_some(row_idx as u32))
                     .collect::<Vec<_>>();
+                budget.charge(
+                    filtered
+                        .mutation_allocation_bytes(&original)
+                        .saturating_add(removed_positions.len() * 4),
+                )?;
                 plans.push(ReplaceMemtableConflictPlan {
                     memtable,
                     original,
@@ -590,6 +602,8 @@ pub(crate) struct DeleteIndexMaintenance {
     locations: Vec<(u32, u64)>,
     maintained: bool,
     rows_seen: usize,
+    key_bytes: usize,
+    key_budget: usize,
 }
 
 impl DeleteIndexMaintenance {
@@ -628,6 +642,9 @@ impl DeleteIndexMaintenance {
             locations: Vec::new(),
             maintained: true,
             rows_seen: 0,
+            key_bytes: 0,
+            key_budget: (crate::storage::core::txn_mutations::txn_mutation_budget_bytes() / 8)
+                .min(8 * 1024 * 1024) as usize,
         }
     }
 
@@ -660,16 +677,39 @@ impl DeleteIndexMaintenance {
         &self.schema_key_positions
     }
 
+    fn abandon_precise_maintenance(&mut self) {
+        self.maintained = false;
+        for keys in &mut self.keys {
+            *keys = HashSet::new();
+        }
+        self.locations = Vec::new();
+        self.key_bytes = 0;
+    }
+
+    fn retain_key(&mut self, index: usize, key: Vec<ScalarValue>) {
+        if !self.maintained || self.keys[index].contains(&key) {
+            return;
+        }
+        let bytes = key.capacity() * std::mem::size_of::<ScalarValue>()
+            + key
+                .iter()
+                .map(super::spill::scalar_heap_bytes)
+                .sum::<usize>()
+            + 64;
+        if self.key_bytes.saturating_add(bytes) > self.key_budget {
+            self.abandon_precise_maintenance();
+            return;
+        }
+        self.key_bytes += bytes;
+        self.keys[index].insert(key);
+    }
+
     fn admit_row(&mut self) -> bool {
         if !self.has_indexes() || !self.maintained {
             return false;
         }
         if self.rows_seen >= MAX_PRECISELY_MAINTAINED_DELETE_ROWS {
-            self.maintained = false;
-            for key_set in &mut self.keys {
-                key_set.clear();
-            }
-            self.locations.clear();
+            self.abandon_precise_maintenance();
             return false;
         }
         self.rows_seen += 1;
@@ -722,8 +762,37 @@ impl DeleteIndexMaintenance {
         }
     }
 
+    /// Retire changed resident keys through the same maintenance plan as
+    /// segment keys. Unchanged indexes keep their existing placeholders.
+    pub(crate) fn record_memtable_update(
+        &mut self,
+        batch: &RecordBatch,
+        rows: &[u32],
+        assigned: &std::collections::HashMap<usize, ScalarValue>,
+    ) {
+        for &row in rows {
+            if !self.admit_row() {
+                return;
+            }
+            for idx in 0..self.indexes.len() {
+                let columns = &self.indexes[idx].1;
+                if !columns.iter().any(|column| assigned.contains_key(column)) {
+                    continue;
+                }
+                let key: Vec<_> = columns
+                    .iter()
+                    .map(|&c| batch.columns[c].scalar(row as usize))
+                    .collect();
+                if key.iter().all(|value| !value.is_null()) {
+                    self.retain_key(idx, key);
+                }
+            }
+        }
+    }
+
     fn record_keys_from_positions(&mut self, batch: &RecordBatch, row_idx: usize) {
-        for (index_offset, key_positions) in self.schema_key_positions.iter().enumerate() {
+        for index_offset in 0..self.schema_key_positions.len() {
+            let key_positions = &self.schema_key_positions[index_offset];
             let mut key = Vec::with_capacity(key_positions.len());
             let mut valid = true;
             for &position in key_positions {
@@ -737,7 +806,7 @@ impl DeleteIndexMaintenance {
                 key.push(value);
             }
             if valid {
-                self.keys[index_offset].insert(key);
+                self.retain_key(index_offset, key);
             }
         }
     }
@@ -768,7 +837,7 @@ impl DeleteIndexMaintenance {
                 key.push(value);
             }
             if valid {
-                self.keys[index_offset].insert(key);
+                self.retain_key(index_offset, key);
             }
         }
     }
@@ -820,6 +889,9 @@ impl DeleteIndexMaintenance {
                 }
             }
             let keys = self.keys[index_offset].iter().cloned().collect::<Vec<_>>();
+            if index_name == crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME {
+                engine.index_manager().remove_primary_keys(db, table, &keys);
+            }
             match engine
                 .index_manager()
                 .remove_unique_index_keys(db, table, index_name, &keys)
@@ -923,11 +995,6 @@ pub fn exec_delete(
                     deleted_events.push(&plan.original, &plan.removed_positions);
                 }
             }
-            // Auto-commit DELETE is a single-leg statement: no replacement
-            // images exist, so the memtable sidecar needs no guard (an empty
-            // watermark writes none).
-            let undo = apply_replace_memtable_conflicts(engine, db, table, memtable_plans, &[])?;
-            total_deleted += undo.deleted_rows();
         }
 
         let mut segment_files = if table_dir.exists() {
@@ -980,6 +1047,15 @@ pub fn exec_delete(
         // for a segment whose footer predates a projected (WHERE/key) column.
         let full_schema_key_positions = index_maintenance
             .projected_key_positions(&(0..table_schema.columns.len()).collect::<Vec<_>>());
+        let mut planned_footers = Vec::new();
+        let mut budget = super::dml_staging::MutationBudget::new();
+        for plan in &memtable_plans {
+            budget.charge(
+                plan.filtered
+                    .mutation_allocation_bytes(&plan.original)
+                    .saturating_add(plan.removed_positions.len() * 4),
+            )?;
+        }
         let mut first_rewrite_error: Option<crate::common::error::TaibaiError> = None;
         for seg_path in segment_files {
             let (new_bitmap, new_deleted_count, prev_deleted) = {
@@ -1051,7 +1127,7 @@ pub fn exec_delete(
                     },
                 )?;
                 let new_deleted_count = prev_deleted + outcome.matched_ids.len() as u64;
-                total_deleted += outcome.matched_ids.len() as u64;
+
                 (outcome.new_bitmap, new_deleted_count, prev_deleted)
             };
 
@@ -1059,22 +1135,28 @@ pub fn exec_delete(
                 continue;
             }
 
-            // A failed footer rewrite must not abort the remaining segments:
-            // rows already tombstoned elsewhere stay deleted either way, and
-            // continuing maximizes how much of the statement is applied. The
-            // error is reported after the loop.
-            if let Err(error) = mgr.rewrite_delete_footer(&seg_path, &new_bitmap, new_deleted_count)
-            {
-                tracing::warn!(
-                    file = %seg_path.display(),
-                    error = %error,
-                    "DELETE footer rewrite failed; continuing with remaining segments"
-                );
-                // This segment's rows were not tombstoned after all.
-                total_deleted -= new_deleted_count - prev_deleted;
-                first_rewrite_error = first_rewrite_error.or(Some(error));
-            } else {
-                footers_rewritten += 1;
+            budget.charge(new_bitmap.len())?;
+            planned_footers.push((seg_path, new_bitmap, new_deleted_count, prev_deleted));
+        }
+
+        // Plan every fallible read/evaluation before publishing any delete.
+        // A broken later segment cannot strand earlier memtable deletions.
+        if !memtable_plans.is_empty() {
+            // Auto-commit DELETE is a single-leg statement: no replacement
+            // images exist, so the memtable sidecar needs no guard (an empty
+            // watermark writes none).
+            let undo = apply_replace_memtable_conflicts(engine, db, table, memtable_plans, &[])?;
+            total_deleted += undo.deleted_rows();
+        }
+        for (seg_path, new_bitmap, new_deleted_count, prev_deleted) in planned_footers {
+            match mgr.rewrite_delete_footer(&seg_path, &new_bitmap, new_deleted_count) {
+                Ok(()) => {
+                    total_deleted += new_deleted_count - prev_deleted;
+                    footers_rewritten += 1;
+                }
+                Err(error) => {
+                    first_rewrite_error = first_rewrite_error.or(Some(error));
+                }
             }
         }
 

@@ -7,6 +7,9 @@ use super::*;
 macro_rules! cmp_vec_fn {
     ($fn_name:ident, $op:tt, $ord_op:tt, $ord_val:ident) => {
         pub fn $fn_name(&self, value: &ScalarValue) -> Vec<bool> {
+            if self.is_selected() {
+                return (0..self.len()).map(|row| self.compare_scalar_at(row, value).is_some_and(|ordering| ordering $ord_op std::cmp::Ordering::$ord_val)).collect();
+            }
             // Zero-copy views / dictionary encodings compare through their
             // materialized form; row indexes are preserved by `flattened`.
             if matches!(
@@ -377,6 +380,16 @@ impl ColumnArray {
 
     /// Count of non-null values in this column (vectorized).
     pub fn col_count_non_null(&self) -> u64 {
+        if let Self::Selected { parts, .. } = self {
+            return parts
+                .iter()
+                .map(|(source, rows)| {
+                    rows.iter()
+                        .filter(|&&row| !source.bitmap().is_null(row as usize))
+                        .count() as u64
+                })
+                .sum();
+        }
         (self.len() as u64).saturating_sub(self.bitmap().null_count() as u64)
     }
 
@@ -391,6 +404,16 @@ impl ColumnArray {
     /// value or the column type is not i64-viewable — the same contract as
     /// [`Self::col_sum_i64`].
     pub fn col_sum_i64_range(&self, offset: usize, count: usize) -> Option<i64> {
+        if self.is_selected() {
+            let mut sum = None;
+            for row in offset..offset.saturating_add(count).min(self.len()) {
+                let (source, position) = self.selected_source_at(row)?;
+                if let Some(value) = source.col_sum_i64_range(position, 1) {
+                    sum = Some(sum.unwrap_or(0i64).wrapping_add(value));
+                }
+            }
+            return sum;
+        }
         // Run-form columns read through their materialized expansion; the
         // lazy flatten is cached, so repeated range sums over the same column
         // expand once.
@@ -454,6 +477,18 @@ impl ColumnArray {
     /// Column-wide sum as f64 for float columns (vectorized). Returns None if
     /// all values are null or the column type is not float.
     pub fn col_sum_f64(&self) -> Option<f64> {
+        if self.is_selected() {
+            if !matches!(self.data_type(), DataType::Float32 | DataType::Float64) {
+                return None;
+            }
+            let mut sum = None;
+            for row in 0..self.len() {
+                if let Some(value) = self.numeric_f64_at(row) {
+                    sum = Some(sum.unwrap_or(0.0) + value);
+                }
+            }
+            return sum;
+        }
         if let ColumnArray::Rle { .. } = self {
             return self.flattened().col_sum_f64();
         }
@@ -722,6 +757,15 @@ impl ColumnArray {
         }
         if indices.is_empty() {
             return Ok(());
+        }
+        if self.is_selected() {
+            for &row in indices {
+                dst.push(&self.scalar(row as usize))?;
+            }
+            return Ok(());
+        }
+        if matches!(self, Self::Dictionary { .. } | Self::Rle { .. }) {
+            return self.flattened().gather_into(indices, dst);
         }
         // A source column without nulls lets the gather extend the output
         // bitmap in bulk instead of a branch per row, which is the common case

@@ -331,6 +331,75 @@ impl TxnMutationRegistry {
         txn.charge_insert(bytes)
     }
 
+    /// Transfer only buffered image charges from a private statement staging
+    /// transaction. Validate before mutation so a failed transfer is inert.
+    pub(crate) fn adopt_staged_insert_bytes(
+        &self,
+        staged: u64,
+        owner: u64,
+        db: &str,
+        table: &str,
+        view_bytes: u64,
+    ) -> crate::common::error::Result<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        let bytes = inner
+            .get(&staged)
+            .map_or(0, |txn| txn.mutation_bytes)
+            .saturating_add(view_bytes);
+        Self::table_entry(&mut inner, owner, db, table, None);
+        inner.get_mut(&owner).unwrap().charge(bytes)?;
+        inner.remove(&staged);
+        Ok(bytes)
+    }
+
+    pub(crate) fn release_insert_bytes(&self, txn_id: u64, bytes: u64) {
+        if let Some(txn) = self.inner.lock().unwrap().get_mut(&txn_id) {
+            txn.mutation_bytes = txn.mutation_bytes.saturating_sub(bytes);
+        }
+    }
+
+    /// Charge and install a statement's events together. No partial append
+    /// survives a budget failure.
+    pub(crate) fn defer_update_events(
+        &self,
+        txn_id: u64,
+        db: &str,
+        table: &str,
+        batches: Vec<RecordBatch>,
+    ) -> crate::common::error::Result<()> {
+        let bytes = batches
+            .iter()
+            .map(|b| b.estimated_size_bytes() as u64)
+            .sum();
+        let mut inner = self.inner.lock().unwrap();
+        Self::table_entry(&mut inner, txn_id, db, table, None);
+        inner.get_mut(&txn_id).unwrap().charge(bytes)?;
+        Self::table_entry(&mut inner, txn_id, db, table, None)
+            .deferred_update_batches
+            .extend(batches);
+        Ok(())
+    }
+
+    pub(crate) fn defer_delete_events(
+        &self,
+        txn_id: u64,
+        db: &str,
+        table: &str,
+        batches: Vec<RecordBatch>,
+    ) -> crate::common::error::Result<()> {
+        let bytes = batches
+            .iter()
+            .map(|b| b.estimated_size_bytes() as u64)
+            .sum();
+        let mut inner = self.inner.lock().unwrap();
+        Self::table_entry(&mut inner, txn_id, db, table, None);
+        inner.get_mut(&txn_id).unwrap().charge(bytes)?;
+        Self::table_entry(&mut inner, txn_id, db, table, None)
+            .deferred_delete_batches
+            .extend(batches);
+        Ok(())
+    }
+
     /// Bytes this transaction has already charged. Statement planners use it
     /// to pre-check that ALL of a statement's upcoming charges fit the
     /// budget before the first side effect — a mid-statement budget failure
@@ -514,10 +583,15 @@ impl TxnMutationRegistry {
     ) -> crate::common::error::Result<()> {
         let bytes = batch.estimated_size_bytes() as u64;
         let mut inner = self.inner.lock().unwrap();
-        let entry = Self::table_entry(&mut inner, txn_id, db, table, None);
-        entry.deferred_delete_batches.push(batch);
-        let txn = inner.get_mut(&txn_id).expect("entry just created");
-        txn.charge(bytes)
+        Self::table_entry(&mut inner, txn_id, db, table, None);
+        inner
+            .get_mut(&txn_id)
+            .expect("entry just created")
+            .charge(bytes)?;
+        Self::table_entry(&mut inner, txn_id, db, table, None)
+            .deferred_delete_batches
+            .push(batch);
+        Ok(())
     }
 
     pub fn defer_update_event(
@@ -529,10 +603,15 @@ impl TxnMutationRegistry {
     ) -> crate::common::error::Result<()> {
         let bytes = batch.estimated_size_bytes() as u64;
         let mut inner = self.inner.lock().unwrap();
-        let entry = Self::table_entry(&mut inner, txn_id, db, table, None);
-        entry.deferred_update_batches.push(batch);
-        let txn = inner.get_mut(&txn_id).expect("entry just created");
-        txn.charge(bytes)
+        Self::table_entry(&mut inner, txn_id, db, table, None);
+        inner
+            .get_mut(&txn_id)
+            .expect("entry just created")
+            .charge(bytes)?;
+        Self::table_entry(&mut inner, txn_id, db, table, None)
+            .deferred_update_batches
+            .push(batch);
+        Ok(())
     }
 
     /// Composed delete bitmap for one of the transaction's pinned segments.
@@ -592,7 +671,7 @@ impl TxnMutationRegistry {
                 let keep: Vec<u32> = (0..original.num_rows() as u32)
                     .filter(|row| !positions.contains(row))
                     .collect();
-                let filtered = filter_batch_excluding_positions(original, &positions)?;
+                let filtered = original.take_rows_shared(keep.clone().into())?;
                 Ok((Arc::new(filtered), Some(keep)))
             }
             _ => Ok((Arc::clone(original), None)),
@@ -677,14 +756,15 @@ impl TxnMutations {
     }
 
     fn charge(&mut self, bytes: u64) -> crate::common::error::Result<()> {
-        self.mutation_bytes = self.mutation_bytes.saturating_add(bytes);
+        let next_bytes = self.mutation_bytes.saturating_add(bytes);
         let budget = txn_mutation_budget_bytes();
-        if self.mutation_bytes > budget {
+        if next_bytes > budget {
             return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
                 "transaction in-memory mutation budget exceeded: {} bytes charged against a {} byte limit (deferred DML plans plus buffered transactional inserts); the transaction is too large to keep in memory - commit or roll back and split the work",
-                self.mutation_bytes, budget
+                next_bytes, budget
             )));
         }
+        self.mutation_bytes = next_bytes;
         Ok(())
     }
 }

@@ -1143,13 +1143,14 @@ impl Engine {
         where_clause: &Option<crate::sql::parser::ast::Expr>,
     ) -> Result<ExecResult> {
         let db = table.effective_database(&session.database).to_string();
-        let result = crate::sql::execution::dml_update::exec_update(
+        let result = crate::sql::execution::dml_update::exec_update_with_timezone(
             self,
             &db,
             &table.name,
             assignments,
             where_clause,
             session.active_txn_id(),
+            session.timezone_offset_hours,
         );
         if result.is_ok() && session.in_txn() {
             session.mark_txn_write();

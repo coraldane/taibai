@@ -76,7 +76,10 @@ pub use constraints::{
     collect_unique_index_entries, validate_primary_key_uniqueness,
     validate_unique_indexes_in_batches, validate_unique_key_uniqueness, IntroducedKeyValidator,
 };
-pub(crate) use constraints::{primary_key_indices, primary_keys_for_batch, unique_constraints};
+pub(crate) use constraints::{
+    primary_key_indices, primary_keys_for_batch, unique_constraints,
+    visit_unique_index_entries_from,
+};
 pub use fast::{set_fast_insert_disabled_for_tests, try_exec_fast_insert_sql};
 pub(crate) use write::{
     append_unique_index_entries_after_insert, build_unique_index_entries_for_batch,

@@ -10,6 +10,7 @@ use crate::types::scalar::ScalarValue;
 mod codec;
 mod compaction;
 mod state_ops;
+mod stream_build;
 mod types;
 
 use self::codec::*;

@@ -67,6 +67,7 @@ pub(super) struct UniqueIndexBaseWriter<W: Write> {
     blocks: Vec<UniqueIndexBlockRef>,
     paths: Vec<String>,
     path_ids: HashMap<String, u32>,
+    metadata_bytes: usize,
 }
 
 impl<W: Write> UniqueIndexBaseWriter<W> {
@@ -91,6 +92,7 @@ impl<W: Write> UniqueIndexBaseWriter<W> {
             blocks: Vec::new(),
             paths: Vec::new(),
             path_ids: HashMap::new(),
+            metadata_bytes: 0,
         };
         let mut header = Vec::with_capacity(64);
         header.extend_from_slice(UNIQUE_INDEX_MAGIC_V6);
@@ -105,6 +107,17 @@ impl<W: Write> UniqueIndexBaseWriter<W> {
         Ok(out)
     }
 
+    pub(super) fn resident_build_bytes(&self) -> usize {
+        self.metadata_bytes
+            .saturating_add(
+                self.blocks
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<UniqueIndexBlockRef>()),
+            )
+            .saturating_add(self.run.capacity())
+            .saturating_add(self.run_first_key.capacity())
+    }
+
     fn write_all_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         self.writer.write_all(bytes)?;
         self.bytes_written += bytes.len() as u64;
@@ -116,6 +129,9 @@ impl<W: Write> UniqueIndexBaseWriter<W> {
             return *id;
         }
         let id = self.paths.len() as u32;
+        self.metadata_bytes = self
+            .metadata_bytes
+            .saturating_add(segment_path.len().saturating_mul(2).saturating_add(128));
         self.paths.push(segment_path.to_string());
         self.path_ids.insert(segment_path.to_string(), id);
         id
@@ -160,6 +176,7 @@ impl<W: Write> UniqueIndexBaseWriter<W> {
         let run = std::mem::take(&mut self.run);
         self.write_all_bytes(&run)?;
         self.run_entries = 0;
+        self.metadata_bytes = self.metadata_bytes.saturating_add(block.first_key.len());
         self.blocks.push(block);
         Ok(())
     }

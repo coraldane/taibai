@@ -360,7 +360,7 @@ fn materialized_key_column<'a>(
             *owned = Some(col.materialize_varchar());
             owned.as_ref().expect("just inserted")
         }
-        ColumnArray::Rle { .. } => {
+        ColumnArray::Rle { .. } | ColumnArray::Selected { .. } => {
             *owned = Some(col.flattened().clone());
             owned.as_ref().expect("just inserted")
         }

@@ -15,6 +15,33 @@ use crate::storage::segment::reader::ImageDurabilityCheck;
 
 use super::engine::Engine;
 
+/// One budget for every retained statement plan: resident views, row
+/// positions, segment images, and undo bitmaps share this accounting.
+pub(crate) struct MutationBudget {
+    used: u64,
+    limit: u64,
+}
+impl MutationBudget {
+    pub(crate) fn new() -> Self {
+        Self {
+            used: 0,
+            limit: crate::storage::core::txn_mutations::txn_mutation_budget_bytes(),
+        }
+    }
+    pub(crate) fn release(&mut self, bytes: usize) {
+        self.used = self.used.saturating_sub(bytes as u64);
+    }
+    pub(crate) fn charge(&mut self, bytes: usize) -> Result<()> {
+        let next = self.used.saturating_add(bytes as u64);
+        if next > self.limit {
+            return Err(TaibaiError::ResourceBusy(format!(
+            "DML statement staging exceeded the mutation budget ({} > {} bytes); narrow the statement", next, self.limit)));
+        }
+        self.used = next;
+        Ok(())
+    }
+}
+
 /// Durability watermark of one staged image transaction: the memtables the
 /// staging created, with the row counts recovery must find durable before
 /// the statement's tombstone legs may survive a crash.
