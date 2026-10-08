@@ -33,6 +33,7 @@ fn first_owned_batch_keeps_variable_buffer_allocation() {
         deleted_row_count: 0,
         buffered_batch: None,
         buffered_rows: 0,
+        flushed_buffer_prefix: 0,
         dirty_meta: false,
         data_end: SEGMENT_HEADER_SIZE as u64,
         sidecar_row_groups_flushed: 0,

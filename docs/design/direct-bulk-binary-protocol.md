@@ -1,6 +1,6 @@
 # Direct Bulk 列式载荷协议（v1/v2）
 
-> 状态：已实现（2026-09）。描述 `MSG_TYPE_BULK_INSERT_COLUMNAR`（0x23）消息载荷的两种编码。
+> 状态（2026-10）：**v1 已实现并在用**；v2 为已定稿的设计，服务端解析（`src/storage/bulk_payload.rs`）尚未实现，实施状态见[向量化执行路线图](../plans/vectorization-parquet-timeseries-roadmap.md)。描述 `MSG_TYPE_BULK_INSERT_COLUMNAR`（0x23）消息载荷的两种编码。
 > 背景与动机见 [行情数据实时落库改造方案](../plans/realtime-market-data-ingestion-plan.md)。
 
 ## 版本识别
@@ -80,5 +80,5 @@ v2 的设计目标是消除"文本惯性"：
 | taibai-cpp `bulk_insert_columnar(table, const std::vector<Column>&, row_count)`（兼容重载） | v1 |
 | `examples/batch_import` 等存量 Rust 构造器 | v1 |
 
-服务端对两种编码的处理路径完全一致（解析后统一为 `DirectBulkRequest`），查询、压缩、
-zone map、热存喂给等行为与编码版本无关。
+v2 落地后，服务端对两种编码的处理路径将统一（解析后归一为 `DirectBulkRequest`），查询、压缩、
+zone map、热存喂给等行为与编码版本无关。当前服务端只接受 v1 载荷，发送 v2 编码会被拒绝。

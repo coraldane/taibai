@@ -20,10 +20,11 @@ use super::row_filter::ClusterKeyBounds;
 pub(crate) fn cluster_segment_range(
     segments: &[PathBuf],
     mgr: &SegmentManager,
+    table_schema: &crate::types::batch::Schema,
     bounds: &ClusterKeyBounds,
 ) -> Option<(usize, usize)> {
     let key_cols = bounds.key_column_indices();
-    if !cluster_segment_tuple_zone_maps_are_monotonic(segments, mgr, &key_cols) {
+    if !cluster_segment_tuple_zone_maps_are_monotonic(segments, mgr, table_schema, &key_cols) {
         return None;
     }
 
@@ -34,23 +35,42 @@ pub(crate) fn cluster_segment_range(
     let upper_tuple = search_tuple_for_bounds(&bounds.prefix_eq, bounds.upper.as_ref());
 
     let start = match (&bounds.lower, &bounds.upper) {
-        (Some(_), _) => {
-            first_segment_with_max_tuple_at_least(segments, mgr, &key_cols, &lower_tuple)?
-        }
+        (Some(_), _) => first_segment_with_max_tuple_at_least(
+            segments,
+            mgr,
+            table_schema,
+            &key_cols,
+            &lower_tuple,
+        )?,
         // No lower bound: only the equality prefix may narrow the start
         // (compared without the range value — every prefix row still
         // qualifies). With an empty prefix, scanning starts at 0.
         (None, Some(_)) if !bounds.prefix_eq.is_empty() => {
-            let prefix_tuple: Vec<ScalarValue> =
-                bounds.prefix_eq.iter().map(|(_, value)| value.clone()).collect();
+            let prefix_tuple: Vec<ScalarValue> = bounds
+                .prefix_eq
+                .iter()
+                .map(|(_, value)| value.clone())
+                .collect();
             let prefix_cols = &key_cols[..bounds.prefix_eq.len()];
-            first_segment_with_max_tuple_at_least(segments, mgr, prefix_cols, &prefix_tuple)?
+            first_segment_with_max_tuple_at_least(
+                segments,
+                mgr,
+                table_schema,
+                prefix_cols,
+                &prefix_tuple,
+            )?
         }
         _ => 0,
     };
     let end = match &bounds.upper {
         Some(_) => {
-            let end = last_segment_with_min_tuple_at_most(segments, mgr, &key_cols, &upper_tuple)?;
+            let end = last_segment_with_min_tuple_at_most(
+                segments,
+                mgr,
+                table_schema,
+                &key_cols,
+                &upper_tuple,
+            )?;
             if end < 0 {
                 return Some((1, 0));
             }
@@ -66,13 +86,14 @@ pub(crate) fn cluster_segment_range(
 pub(crate) fn cluster_segment_zone_maps_are_monotonic(
     segments: &[PathBuf],
     mgr: &SegmentManager,
+    table_schema: &crate::types::batch::Schema,
     col_idx: usize,
 ) -> bool {
     let mut prev_min: Option<ScalarValue> = None;
     let mut prev_max: Option<ScalarValue> = None;
 
     for segment in segments {
-        let Some(zm) = mgr.cluster_zone_map_cached(segment, col_idx) else {
+        let Some(zm) = mgr.cluster_zone_map_cached(segment, table_schema, col_idx) else {
             return false;
         };
         if let Some(prev) = &prev_min {
@@ -97,6 +118,7 @@ pub(crate) fn cluster_segment_zone_maps_are_monotonic(
 fn first_segment_with_max_tuple_at_least(
     segments: &[PathBuf],
     mgr: &SegmentManager,
+    table_schema: &crate::types::batch::Schema,
     key_cols: &[usize],
     tuple: &[ScalarValue],
 ) -> Option<usize> {
@@ -104,7 +126,8 @@ fn first_segment_with_max_tuple_at_least(
     let mut hi = segments.len();
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let cmp = compare_segment_zone_tuple(mgr, &segments[mid], key_cols, tuple, true)?;
+        let cmp =
+            compare_segment_zone_tuple(mgr, &segments[mid], table_schema, key_cols, tuple, true)?;
         if cmp == std::cmp::Ordering::Less {
             lo = mid + 1;
         } else {
@@ -119,6 +142,7 @@ fn first_segment_with_max_tuple_at_least(
 fn last_segment_with_min_tuple_at_most(
     segments: &[PathBuf],
     mgr: &SegmentManager,
+    table_schema: &crate::types::batch::Schema,
     key_cols: &[usize],
     tuple: &[ScalarValue],
 ) -> Option<isize> {
@@ -126,7 +150,8 @@ fn last_segment_with_min_tuple_at_most(
     let mut hi = segments.len();
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let cmp = compare_segment_zone_tuple(mgr, &segments[mid], key_cols, tuple, false)?;
+        let cmp =
+            compare_segment_zone_tuple(mgr, &segments[mid], table_schema, key_cols, tuple, false)?;
         if cmp != std::cmp::Ordering::Greater {
             lo = mid + 1;
         } else {
@@ -142,12 +167,13 @@ fn last_segment_with_min_tuple_at_most(
 fn compare_segment_zone_tuple(
     mgr: &SegmentManager,
     segment: &Path,
+    table_schema: &crate::types::batch::Schema,
     key_cols: &[usize],
     tuple: &[ScalarValue],
     use_max: bool,
 ) -> Option<std::cmp::Ordering> {
     for (&col_idx, value) in key_cols.iter().zip(tuple.iter()) {
-        let zm = mgr.cluster_zone_map_cached(segment, col_idx)?;
+        let zm = mgr.cluster_zone_map_cached(segment, table_schema, col_idx)?;
         let side = if use_max {
             &zm.max_value
         } else {
@@ -166,6 +192,7 @@ fn compare_segment_zone_tuple(
 fn cluster_segment_tuple_zone_maps_are_monotonic(
     segments: &[PathBuf],
     mgr: &SegmentManager,
+    table_schema: &crate::types::batch::Schema,
     key_cols: &[usize],
 ) -> bool {
     if segments.len() <= 1 {
@@ -178,7 +205,7 @@ fn cluster_segment_tuple_zone_maps_are_monotonic(
         let mut min_tuple = Vec::with_capacity(key_cols.len());
         let mut max_tuple = Vec::with_capacity(key_cols.len());
         for &col_idx in key_cols {
-            let Some(zm) = mgr.cluster_zone_map_cached(segment, col_idx) else {
+            let Some(zm) = mgr.cluster_zone_map_cached(segment, table_schema, col_idx) else {
                 return false;
             };
             min_tuple.push(zm.min_value);
@@ -215,10 +242,7 @@ fn search_tuple_for_bounds(
     tuple
 }
 
-fn compare_scalar_tuples(
-    left: &[ScalarValue],
-    right: &[ScalarValue],
-) -> std::cmp::Ordering {
+fn compare_scalar_tuples(left: &[ScalarValue], right: &[ScalarValue]) -> std::cmp::Ordering {
     for (l, r) in left.iter().zip(right.iter()) {
         let cmp = sort_cmp(l, r);
         if cmp != std::cmp::Ordering::Equal {
@@ -229,9 +253,6 @@ fn compare_scalar_tuples(
 }
 
 #[inline]
-fn sort_cmp(
-    a: &ScalarValue,
-    b: &ScalarValue,
-) -> std::cmp::Ordering {
+fn sort_cmp(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
     crate::storage::index::sort_key::compare_scalars_for_sort(a, b)
 }

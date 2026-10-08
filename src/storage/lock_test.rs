@@ -88,7 +88,7 @@ fn replace_journal_recovery_discards_when_rename_never_happened() {
         );
     crate::storage::segment_manager::manager_core_test_support::write_replace_journal_for_test(
         &journal,
-        &[old_a.clone()],
+        std::slice::from_ref(&old_a),
     )
     .unwrap();
 

@@ -1,5 +1,5 @@
 use crate::common::error::{Result, TaibaiError};
-use crate::storage::partition::partition_function::strict_temporal_partition_key;
+use crate::storage::partition::partition_function::temporal_partition_key;
 use crate::types::scalar::ScalarValue;
 
 /// Partition strategy for a table.
@@ -132,9 +132,9 @@ impl PartitionPruner {
         // `deal_time <= 2000` upper bound into month key "197001" and pruned
         // every partition.
         let lower_key =
-            lower_bound.and_then(|v| strict_temporal_partition_key(&self.partition_function(), v));
+            lower_bound.and_then(|v| temporal_partition_key(&self.partition_function(), v));
         let upper_key =
-            upper_bound.and_then(|v| strict_temporal_partition_key(&self.partition_function(), v));
+            upper_bound.and_then(|v| temporal_partition_key(&self.partition_function(), v));
         if lower_bound.is_some() && lower_key.is_none() {
             return available_partitions.to_vec();
         }

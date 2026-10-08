@@ -72,7 +72,12 @@ impl SlotKind {
             Self::Bool | Self::I8 | Self::U8 => 1,
             Self::I16 | Self::U16 | Self::F32 => 2,
             Self::I32 | Self::U32 | Self::Date => 4,
-            Self::I64 | Self::U64 | Self::F64 | Self::Decimal | Self::Time | Self::Timestamp
+            Self::I64
+            | Self::U64
+            | Self::F64
+            | Self::Decimal
+            | Self::Time
+            | Self::Timestamp
             | Self::Interval => 8,
         }
     }
@@ -452,37 +457,37 @@ pub(crate) fn direct_bulk_column_to_array(
     }
 
     if col.data_type == DataType::VarChar {
-            if let Some(ranges) = &col.variable_ranges {
-                if ranges.len() == rows {
-                    // Protocol-supplied offsets: validate before slicing so a
-                    // malformed payload reports an error instead of panicking
-                    // the decode task (parity with the scalar fallback).
-                    let max_end: usize = ranges
-                        .iter()
-                        .map(|&(offset, len)| offset.saturating_add(len))
-                        .max()
-                        .unwrap_or(0);
-                    if max_end > col.data.len() {
-                        return Err(TaibaiError::Protocol(
-                            "bulk varchar ranges exceed column payload".into(),
-                        ));
-                    }
-                    let total_bytes: usize = ranges.iter().map(|&(_, len)| len).sum();
-                    let mut buf = crate::types::array::Utf8Buffer::with_capacity(rows);
-                    buf.reserve_values(rows, total_bytes);
-                    for &(offset, len) in ranges {
-                        let value =
-                            std::str::from_utf8(&col.data[offset..offset + len]).map_err(|_| {
-                                TaibaiError::Protocol("invalid utf8 in bulk varchar".into())
-                            })?;
-                        buf.push_str(value);
-                    }
-                    return Ok(ColumnArray::VarChar {
-                        data: buf,
-                        bitmap: NullBitmap::new_valid(rows),
-                    });
+        if let Some(ranges) = &col.variable_ranges {
+            if ranges.len() == rows {
+                // Protocol-supplied offsets: validate before slicing so a
+                // malformed payload reports an error instead of panicking
+                // the decode task (parity with the scalar fallback).
+                let max_end: usize = ranges
+                    .iter()
+                    .map(|&(offset, len)| offset.saturating_add(len))
+                    .max()
+                    .unwrap_or(0);
+                if max_end > col.data.len() {
+                    return Err(TaibaiError::Protocol(
+                        "bulk varchar ranges exceed column payload".into(),
+                    ));
                 }
+                let total_bytes: usize = ranges.iter().map(|&(_, len)| len).sum();
+                let mut buf = crate::types::array::Utf8Buffer::with_capacity(rows);
+                buf.reserve_values(rows, total_bytes);
+                for &(offset, len) in ranges {
+                    let value =
+                        std::str::from_utf8(&col.data[offset..offset + len]).map_err(|_| {
+                            TaibaiError::Protocol("invalid utf8 in bulk varchar".into())
+                        })?;
+                    buf.push_str(value);
+                }
+                return Ok(ColumnArray::VarChar {
+                    data: buf,
+                    bitmap: NullBitmap::new_valid(rows),
+                });
             }
+        }
     }
 
     // Fallback for unexpected payload sizes and variable-width types without
@@ -570,10 +575,7 @@ pub(crate) fn bulk_column_scalar_at(
 /// (offset, len) of one length-prefixed variable-width value, walked from
 /// the payload start. Single-row callers only; loop callers precompute the
 /// whole range vector with [`loop_variable_ranges`].
-fn walk_variable_range_at(
-    col: &DirectBulkColumn<'_>,
-    target_row: usize,
-) -> Result<(usize, usize)> {
+fn walk_variable_range_at(col: &DirectBulkColumn<'_>, target_row: usize) -> Result<(usize, usize)> {
     if let Some(ranges) = &col.variable_ranges {
         return ranges.get(target_row).copied().ok_or_else(|| {
             TaibaiError::Protocol(format!(
@@ -894,7 +896,10 @@ fn fixed_zone_map_typed(
         SlotKind::U16 => minmax!(u16, |v: u16| v as i64),
         SlotKind::I32 | SlotKind::Date => minmax!(i32, |v: i32| v as i64),
         SlotKind::U32 => minmax!(u32, |v: u32| v as i64),
-        SlotKind::I64 | SlotKind::Decimal | SlotKind::Time | SlotKind::Timestamp
+        SlotKind::I64
+        | SlotKind::Decimal
+        | SlotKind::Time
+        | SlotKind::Timestamp
         | SlotKind::Interval => minmax!(i64, |v: i64| v),
         // Bool/UInt64/Float orders are not preserved by an i64 projection;
         // the caller's per-row ZoneMap::update path handles them.

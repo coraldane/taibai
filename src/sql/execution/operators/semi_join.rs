@@ -17,6 +17,11 @@ use super::ExecutionOp;
 /// join semantics), and residual evaluation follows the ordinary two-valued
 /// comparison rules of `eval_filter`.
 pub struct SemiJoinExec {
+    /// Row-boxed bytes accumulated by collect_right/collect_left. The whole
+    /// operator materializes both sides as `Vec<Vec<ScalarValue>>` with no
+    /// spill support; charging the shared query budget turns an
+    /// over-memory EXISTS/IN into a clean budget error instead of an OOM.
+    materialized_bytes: u64,
     pub left: Box<dyn ExecutionOp>,
     pub right: Box<dyn ExecutionOp>,
     pub condition: LogicalExpr,
@@ -77,6 +82,7 @@ impl SemiJoinExec {
             left_global_offset: 0,
             matched_left_rows: Vec::new(),
             residual_schema: Schema::new(residual_columns),
+            materialized_bytes: 0,
         }
     }
 
@@ -84,6 +90,7 @@ impl SemiJoinExec {
         let has_keys = !self.right_key_cols.is_empty();
         while let Some(batch) = self.right.next_batch()? {
             crate::common::query_cancel::check()?;
+            self.charge_budget(batch.estimated_size_bytes().saturating_mul(2) as u64)?;
             for row in 0..batch.num_rows() {
                 let values: Vec<ScalarValue> = (0..batch.num_columns())
                     .map(|c| batch.scalar(row, c).unwrap_or(ScalarValue::Int64(None)))
@@ -112,6 +119,7 @@ impl SemiJoinExec {
         let has_keys = !self.left_key_cols.is_empty();
         while let Some(batch) = self.left.next_batch()? {
             crate::common::query_cancel::check()?;
+            self.charge_budget(batch.estimated_size_bytes().saturating_mul(2) as u64)?;
             let batch_start = self.matched_left_rows.len();
             self.matched_left_rows.extend(vec![false; batch.num_rows()]);
             for row in 0..batch.num_rows() {
@@ -154,6 +162,20 @@ impl SemiJoinExec {
                 self.matched_left_rows[batch_start + row] = matched;
             }
             self.left_batches.push(batch);
+        }
+        Ok(())
+    }
+
+    fn charge_budget(&mut self, bytes: u64) -> Result<()> {
+        let limit = crate::common::config::query_limits()
+            .query_memory_limit_mb
+            .saturating_mul(1024 * 1024);
+        self.materialized_bytes = self.materialized_bytes.saturating_add(bytes);
+        if limit > 0 && self.materialized_bytes > limit {
+            return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
+                "semi join materialization exceeded the query memory budget                  ({} > {} bytes); raise query_memory_limit_mb",
+                self.materialized_bytes, limit
+            )));
         }
         Ok(())
     }

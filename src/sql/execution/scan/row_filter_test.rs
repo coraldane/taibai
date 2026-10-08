@@ -34,7 +34,7 @@ fn cluster_key_range_read_returns_only_matching_sorted_range() {
     }
 
     {
-        let mut writer = SegmentWriter::create(&path, schema, 8192, 3).unwrap();
+        let mut writer = SegmentWriter::create(&path, schema.clone(), 8192, 3).unwrap();
         writer.write_batch(&batch).unwrap();
         writer.seal().unwrap();
     }
@@ -42,6 +42,7 @@ fn cluster_key_range_read_returns_only_matching_sorted_range() {
     let reader = SegmentReader::open(&path).unwrap();
     let result = cluster_key_range_read(
         &reader,
+        &schema,
         0,
         &ClusterKeyBounds::single(
             0,
@@ -67,6 +68,7 @@ fn cluster_key_range_read_returns_only_matching_sorted_range() {
 
     let filtered = cluster_key_range_read(
         &reader,
+        &schema,
         0,
         &ClusterKeyBounds::single(
             0,
@@ -123,7 +125,7 @@ fn cluster_key_range_read_falls_back_when_key_column_is_unsorted() {
     }
 
     {
-        let mut writer = SegmentWriter::create(&path, schema, 8192, 3).unwrap();
+        let mut writer = SegmentWriter::create(&path, schema.clone(), 8192, 3).unwrap();
         writer.write_batch(&batch).unwrap();
         writer.seal().unwrap();
     }
@@ -131,6 +133,7 @@ fn cluster_key_range_read_falls_back_when_key_column_is_unsorted() {
     let reader = SegmentReader::open(&path).unwrap();
     let result = cluster_key_range_read(
         &reader,
+        &schema,
         0,
         &ClusterKeyBounds::single(
             0,
@@ -195,7 +198,7 @@ fn cluster_key_range_read_binary_searches_composite_key() {
     }
 
     {
-        let mut writer = SegmentWriter::create(&path, schema, 8192, 3).unwrap();
+        let mut writer = SegmentWriter::create(&path, schema.clone(), 8192, 3).unwrap();
         writer.write_batch(&batch).unwrap();
         writer.seal().unwrap();
     }
@@ -209,6 +212,7 @@ fn cluster_key_range_read_binary_searches_composite_key() {
     };
     let result = cluster_key_range_read(
         &reader,
+        &schema,
         0,
         &bounds,
         &[0, 1, 2],
@@ -240,6 +244,7 @@ fn cluster_key_range_read_binary_searches_composite_key() {
     };
     let result = cluster_key_range_read(
         &reader,
+        &schema,
         0,
         &bounds,
         &[0, 1, 2],
@@ -262,6 +267,7 @@ fn cluster_key_range_read_binary_searches_composite_key() {
     };
     let result = cluster_key_range_read(
         &reader,
+        &schema,
         0,
         &bounds,
         &[0, 1, 2],

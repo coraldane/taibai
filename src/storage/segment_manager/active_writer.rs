@@ -34,7 +34,16 @@ pub(super) struct ActiveSegmentWriter {
     pub(super) delete_bitmap: Vec<u8>,
     pub(super) deleted_row_count: u64,
     pub(super) buffered_batch: Option<RecordBatch>,
+    /// Rows of `buffered_batch` NOT yet written as a row group. The batch
+    /// itself is retained unchanged until every row is flushed (see
+    /// `flush_buffer`): a `flushed_buffer_prefix` prefix of it has already
+    /// been written, and the rest is still pending.
     pub(super) buffered_rows: usize,
+    /// Rows at the FRONT of `buffered_batch` already written to row groups
+    /// but retained as the slice source. Group boundaries are cut from the
+    /// original buffer, so each row leaves the buffer with one copy instead
+    /// of the old re-slice-the-remainder copy per flushed group.
+    pub(super) flushed_buffer_prefix: usize,
     pub(super) dirty_meta: bool,
     pub(super) data_end: u64,
     pub(super) sidecar_row_groups_flushed: usize,
@@ -79,7 +88,9 @@ impl ActiveSegmentWriter {
         pubsub_deferred: bool,
         invalidate_reader: &dyn Fn(&Path),
     ) -> Result<()> {
-        let defer_from = self.buffered_rows;
+        // Deferred ranges are absolute positions in the retained buffer, so
+        // the new rows' window starts after the flushed prefix.
+        let defer_from = self.flushed_buffer_prefix + self.buffered_rows;
         if let Some(ref mut buffered) = self.buffered_batch {
             for col_idx in 0..batch.num_columns() {
                 let src = batch.column(col_idx).unwrap();
@@ -91,9 +102,9 @@ impl ActiveSegmentWriter {
             self.buffered_batch = Some(batch.clone());
             self.buffered_rows = batch.num_rows();
         }
-        if pubsub_deferred && self.buffered_rows > defer_from {
-            self.pubsub_deferred_ranges
-                .push((defer_from, self.buffered_rows));
+        let defer_to = self.flushed_buffer_prefix + self.buffered_rows;
+        if pubsub_deferred && defer_to > defer_from {
+            self.pubsub_deferred_ranges.push((defer_from, defer_to));
         }
 
         while self.buffered_rows >= self.row_group_target_rows {
@@ -113,7 +124,9 @@ impl ActiveSegmentWriter {
         pubsub_deferred: bool,
         invalidate_reader: &dyn Fn(&Path),
     ) -> Result<()> {
-        let defer_from = self.buffered_rows;
+        // Deferred ranges are absolute positions in the retained buffer, so
+        // the new rows' window starts after the flushed prefix.
+        let defer_from = self.flushed_buffer_prefix + self.buffered_rows;
         let added = batch.num_rows();
         if batch.num_columns() != self.schema.num_columns() {
             return Err(TaibaiError::Internal(format!(
@@ -141,9 +154,9 @@ impl ActiveSegmentWriter {
             self.buffered_batch = Some(batch);
             self.buffered_rows = added;
         }
-        if pubsub_deferred && self.buffered_rows > defer_from {
-            self.pubsub_deferred_ranges
-                .push((defer_from, self.buffered_rows));
+        let defer_to = self.flushed_buffer_prefix + self.buffered_rows;
+        if pubsub_deferred && defer_to > defer_from {
+            self.pubsub_deferred_ranges.push((defer_from, defer_to));
         }
 
         while self.buffered_rows >= self.row_group_target_rows {
@@ -261,15 +274,35 @@ impl ActiveSegmentWriter {
     pub(super) fn flush_buffer(&mut self, invalidate_reader: &dyn Fn(&Path)) -> Result<()> {
         use rayon::prelude::*;
 
-        let buffered = match self.buffered_batch.take() {
-            Some(b) => b,
+        // Flush exactly one row group — the single-group contract every
+        // caller relies on (`append_batch`/`append_batch_owned` loop it; the
+        // drain/seal paths call it once for a sub-group remainder) — but cut
+        // the group out of the ORIGINAL retained buffer at its boundary
+        // instead of re-slicing the remainder after every group. The old
+        // flow deep-copied the surviving tail once per flushed group, an
+        // O(N²/R) cost for an N-row append with R-row groups (a 500k-row
+        // memtable flush paid ~60 redundant full-column copies on top of the
+        // per-row `slice_fast` bitmap pushes). The buffer is now only read in
+        // place and dropped once every retained row is flushed: each row
+        // leaves the buffer with zero extra copies.
+        let total_buffered = match self.buffered_batch.as_ref() {
+            Some(batch) => batch.num_rows(),
             None => return Ok(()),
         };
-        let total_buffered = self.buffered_rows;
-        self.buffered_rows = 0;
+        let start = self.flushed_buffer_prefix;
+        let unflushed = total_buffered - start;
+        if unflushed == 0 {
+            return Ok(());
+        }
+        let rows_to_flush = self.row_group_target_rows.min(unflushed);
+        let group_end = start + rows_to_flush;
 
         let compression_level = self.compression_level;
-        let num_cols = buffered.num_columns();
+        let num_cols = self
+            .buffered_batch
+            .as_ref()
+            .expect("checked above")
+            .num_columns();
         let col_types: Vec<crate::protocol::types::DataType> = self
             .schema
             .columns
@@ -277,29 +310,33 @@ impl ActiveSegmentWriter {
             .map(|column| column.data_type)
             .collect();
 
-        let rows_to_flush = self.row_group_target_rows.min(total_buffered);
-
-        // One pass per column in parallel: encode+compress, zone map and
-        // value set used to run value sets serially on the single flusher
-        // thread, where the per-row ScalarValue allocations of low-cardinality
-        // columns dominated the group write time.
-        let outputs = (0..num_cols)
-            .into_par_iter()
-            .map(|col_idx| {
-                let col = buffered.column(col_idx).unwrap();
-                let encoded = encode_column_direct_range(col, 0, rows_to_flush);
-                let orig_len = encoded.len() as u64;
-                let compressed = zstd::bulk::compress(&encoded, compression_level)
-                    .map_err(|e| TaibaiError::Storage(format!("zstd error: {}", e)))?;
-                let zone_map = compute_zone_map_from_column(col, 0, rows_to_flush);
-                let value_set = compute_value_set_from_column(col, 0, rows_to_flush);
-                let col_sum = col
-                    .col_sum_i64_range(0, rows_to_flush)
-                    .filter(|_| crate::storage::segment::column_sum_supported(col_types[col_idx]))
-                    .unwrap_or(0);
-                Ok((compressed, orig_len, zone_map, value_set, col_sum))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // One pass per column in parallel over the group's window of the
+        // original buffer: encode+compress, zone map and value set used to
+        // run value sets serially on the single flusher thread, where the
+        // per-row ScalarValue allocations of low-cardinality columns
+        // dominated the group write time.
+        let outputs = {
+            let buffered = self.buffered_batch.as_ref().expect("checked above");
+            (0..num_cols)
+                .into_par_iter()
+                .map(|col_idx| {
+                    let col = buffered.column(col_idx).unwrap();
+                    let encoded = encode_column_direct_range(col, start, rows_to_flush);
+                    let orig_len = encoded.len() as u64;
+                    let compressed = zstd::bulk::compress(&encoded, compression_level)
+                        .map_err(|e| TaibaiError::Storage(format!("zstd error: {}", e)))?;
+                    let zone_map = compute_zone_map_from_column(col, start, rows_to_flush);
+                    let value_set = compute_value_set_from_column(col, start, rows_to_flush);
+                    let col_sum = col
+                        .col_sum_i64_range(start, rows_to_flush)
+                        .filter(|_| {
+                            crate::storage::segment::column_sum_supported(col_types[col_idx])
+                        })
+                        .unwrap_or(0);
+                    Ok((compressed, orig_len, zone_map, value_set, col_sum))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
         let mut compressed_columns = Vec::with_capacity(num_cols);
         let mut zone_maps = Vec::with_capacity(num_cols);
         let mut value_sets = Vec::with_capacity(num_cols);
@@ -354,63 +391,64 @@ impl ActiveSegmentWriter {
         if rows_to_flush > 0 {
             if let Some(pubsub) = self.pubsub.as_ref() {
                 if pubsub.has_any_subscribers() && self.topic().is_some() {
+                    // Deferred ranges are absolute positions in the retained
+                    // buffer; intersect them with this group's window.
                     let mut indices: Vec<u32> = Vec::new();
-                    for (start, end) in &self.pubsub_deferred_ranges {
-                        let lo = (*start).min(rows_to_flush);
-                        let hi = (*end).min(rows_to_flush);
+                    for (range_start, range_end) in &self.pubsub_deferred_ranges {
+                        let lo = (*range_start).max(start).min(group_end);
+                        let hi = (*range_end).min(group_end);
                         for row in lo..hi {
                             indices.push(row as u32);
                         }
                     }
                     let mut cols = Vec::with_capacity(num_cols);
                     let mut ok = true;
-                    for col_idx in 0..num_cols {
-                        match buffered.column(col_idx) {
-                            Some(col) => cols.push(col.take(&indices)),
-                            None => {
-                                ok = false;
-                                break;
+                    let schema = {
+                        let buffered = self.buffered_batch.as_ref().expect("checked above");
+                        for col_idx in 0..num_cols {
+                            match buffered.column(col_idx) {
+                                Some(col) => cols.push(col.take(&indices)),
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
                             }
                         }
-                    }
+                        buffered.schema.clone()
+                    };
                     if ok && !indices.is_empty() {
-                        if let Ok(batch) = RecordBatch::try_new(buffered.schema.clone(), cols) {
+                        if let Ok(batch) = RecordBatch::try_new(schema, cols) {
                             self.pending_publish.push(batch);
                         }
                     }
                 }
             }
         }
-        // The flushed rows leave the front of the buffer; shift the ranges
-        // that (partially) survive and drop the consumed ones.
-        for (start, end) in self.pubsub_deferred_ranges.iter_mut() {
-            *start = start.saturating_sub(rows_to_flush);
-            *end = end.saturating_sub(rows_to_flush);
+        // The flushed rows stay in place at the front of the buffer; retire
+        // the deferred-range part this group consumed. (The old code shifted
+        // every range down by rows_to_flush because the buffer front moved on
+        // each flush; with a stable buffer the positions stay absolute.)
+        for (range_start, _) in self.pubsub_deferred_ranges.iter_mut() {
+            *range_start = (*range_start).max(group_end);
         }
         self.pubsub_deferred_ranges
-            .retain(|(start, end)| end > start);
+            .retain(|(range_start, range_end)| range_end > range_start);
 
         if FLUSH_META_AFTER_ROW_GROUP {
             self.flush_meta(invalidate_reader)?;
         }
 
-        let remaining = total_buffered - rows_to_flush;
-        if remaining > 0 {
-            // One slice per column instead of a scalar() + push() round-trip
-            // per cell: an append larger than the row-group target flushed
-            // this loop once per group, so the old rebuild was O(N²/R) cell
-            // copies for a single big append (a 500k-row memtable flush paid
-            // ~15M scalar clones).
-            let columns = (0..num_cols)
-                .map(|col_idx| {
-                    buffered
-                        .column(col_idx)
-                        .expect("buffered column exists")
-                        .slice_fast(rows_to_flush, total_buffered)
-                })
-                .collect();
-            self.buffered_batch = Some(RecordBatch::try_new(buffered.schema.clone(), columns)?);
-            self.buffered_rows = remaining;
+        // Advance the bookkeeping past the flushed group; drop the buffer
+        // entirely once every retained row is flushed. A failed group write
+        // (`?` above) leaves the buffer and counters untouched, so the rows
+        // stay pending instead of vanishing with the taken batch.
+        self.flushed_buffer_prefix = group_end;
+        if group_end == total_buffered {
+            self.buffered_batch = None;
+            self.flushed_buffer_prefix = 0;
+            self.buffered_rows = 0;
+        } else {
+            self.buffered_rows = total_buffered - group_end;
         }
 
         Ok(())

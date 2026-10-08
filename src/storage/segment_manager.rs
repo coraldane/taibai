@@ -112,10 +112,16 @@ pub struct SegmentManager {
     rep_log: std::sync::OnceLock<std::sync::Arc<crate::storage::replication::RepLog>>,
 }
 
-include!("segment_manager/manager_core.rs");
-include!("segment_manager/buffered_write.rs");
-include!("segment_manager/direct_bulk.rs");
-include!("segment_manager/lifecycle.rs");
+mod buffered_write;
+mod direct_bulk;
+mod lifecycle;
+mod manager_core;
+
+// Glob re-exports keep every `segment_manager::…` path (and the test-support
+// module) that the flat include! layout used to expose; visibility per item
+// is preserved (min of pub and the item's own).
+use direct_bulk::*;
+pub(crate) use manager_core::*;
 
 fn cleanup_incomplete_compaction_files(table_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(table_dir) else {
@@ -182,3 +188,7 @@ mod compression_level_tests;
 #[cfg(test)]
 #[path = "segment_manager/seal_outside_lock_test.rs"]
 mod seal_outside_lock_tests;
+
+#[cfg(test)]
+#[path = "segment_manager/seq_allocation_test.rs"]
+mod seq_allocation_tests;

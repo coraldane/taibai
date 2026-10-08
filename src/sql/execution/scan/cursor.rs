@@ -13,7 +13,6 @@ use crate::types::batch::{RecordBatch, Schema};
 
 use super::memtable;
 use super::partition;
-use super::row_group::RowGroupPruneResult;
 use super::runtime::ScanRuntime;
 
 /// Dedicated pool for the background decoder: its multi-millisecond chunk
@@ -59,6 +58,16 @@ pub struct ScanCursor {
     /// channel so row-group decode overlaps with downstream consumption
     /// (aggregate/limit/encode) instead of alternating in window barriers.
     decode_rx: Option<Receiver<Result<RecordBatch>>>,
+    /// Decoded bytes sent through `decode_rx` but not yet received by the
+    /// consumer, shared with the decoder thread. The producer refuses to
+    /// decode another chunk while this exceeds the byte cap — see
+    /// [`DECODE_CHANNEL_CAPACITY`] for why the batch count alone is not
+    /// enough.
+    decode_inflight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    /// Flipped by this cursor's Drop so a parked decode producer stops
+    /// instead of spinning forever when the consumer leaves without a
+    /// cancellation (LIMIT early exit, query error, drop).
+    decode_consumer_done: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Minimum decoded row groups before the background decoder is worth a
@@ -68,6 +77,58 @@ const BACKGROUND_DECODE_MIN_GROUPS: usize = 4;
 /// consumer (batches are ~10^4 rows, so 64 is a few hundred MB worst case
 /// for wide projections and far less for typical scans).
 const DECODE_CHANNEL_CAPACITY: usize = 64;
+
+/// Byte-dimension cap on the same channel: half the configured query memory
+/// limit (0 = unlimited). The batch-count cap above only bounds the number
+/// of batches, so a wide projection could still buffer hundreds of MB ahead
+/// of a slow consumer; this keeps the decoder's buffered footprint
+/// proportional to the memory budget instead.
+fn decode_channel_byte_cap() -> usize {
+    let limit_mb = crate::common::config::query_limits().query_memory_limit_mb;
+    if limit_mb == 0 {
+        usize::MAX
+    } else {
+        usize::try_from(limit_mb.saturating_mul(1024 * 1024) / 2).unwrap_or(usize::MAX)
+    }
+}
+
+/// Producer-side wait while the in-flight decoded bytes are over the cap.
+/// Deliberately a tiny sleep-poll instead of a condvar: the accounting only
+/// moves on consumer `recv`s, and an empty channel always means zero
+/// in-flight bytes, so the wait cannot deadlock — the consumer either keeps
+/// receiving (bytes drop, wait ends) or goes away entirely (the next send
+/// errors out and the thread exits). Cancellation must not be lost while
+/// parked here, so the captured query-cancel flag is checked each round (a
+/// spawned thread has no ambient cancel context).
+fn wait_for_byte_budget(
+    inflight: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    byte_cap: usize,
+    cancel_flag: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    consumer_done: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    while inflight.load(Ordering::Acquire) > byte_cap {
+        // A consumer that finishes early (LIMIT) or drops the cursor does
+        // NOT set the cancel flag — without this probe the producer would
+        // park here forever holding the channel's buffered batches. The
+        // cursor's Drop flips the shared flag (crossbeam senders expose no
+        // disconnected probe).
+        if consumer_done
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return false;
+        }
+        if cancel_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    true
+}
 
 impl ScanCursor {
     pub fn try_new(
@@ -102,6 +163,8 @@ impl ScanCursor {
             memtable_pos: 0,
             prefetch: VecDeque::new(),
             decode_rx: None,
+            decode_inflight: None,
+            decode_consumer_done: None,
         }))
     }
 
@@ -147,12 +210,25 @@ impl ScanCursor {
                     Some(batch) => batch,
                     None => {
                         self.decode_rx = None;
+                        self.decode_inflight = None;
                         if self.prefetch.is_empty() {
                             break;
                         }
                         continue;
                     }
                 };
+                // The batch left the channel: release its bytes from the
+                // decoder's in-flight budget so a parked producer resumes.
+                // The same pre-projection estimate the producer added is
+                // subtracted, so the counter can never drift.
+                if let Ok(released) = &received {
+                    if let Some(inflight) = self.decode_inflight.as_ref() {
+                        inflight.fetch_sub(
+                            released.estimated_size_bytes(),
+                            std::sync::atomic::Ordering::AcqRel,
+                        );
+                    }
+                }
                 let batch = strategy::apply_ttl_filter_and_projection(
                     received?,
                     &self.table_meta,
@@ -293,15 +369,12 @@ impl ScanCursor {
         if std::env::var("TAIBAI_INLINE_DECODE").as_deref() == Ok("1") {
             return Ok(false);
         }
-        let pred = self.spec.to_row_group_predicate();
-        let bloom_checks = super::row_group::build_bloom_check_list(&self.spec);
-        let in_checks = super::row_group::build_in_check_list(&self.spec);
-        let set_checks = super::row_group::build_set_check_list(&self.spec);
-        let set_in_checks = super::row_group::build_set_in_check_list(&self.spec);
         // Prune once here and hand the candidate lists to the decode thread,
         // which would otherwise repeat the same metadata pruning per segment.
-        // `None` entries (metadata unavailable at spawn time) fall back to
-        // reader-based pruning inside the thread.
+        // `None` entries (metadata unavailable — or unalignable — at spawn
+        // time) fall back to reader-based pruning inside the thread. The
+        // gateway aligns the catalog-space spec onto each footer's own
+        // column order before consulting its metadata.
         let per_segment_candidates: Vec<Option<Vec<usize>>> = self
             .segments
             .iter()
@@ -312,20 +385,10 @@ impl ScanCursor {
                     .segment_meta(segment)
                     .ok()
                     .flatten()?;
-                if !super::row_group::prune_segment_by_zone_map(&pred, &meta.segment_zone_maps) {
-                    return Some(Vec::new());
+                match super::row_filter::meta_prune_row_groups(&meta, &self.spec) {
+                    Ok(super::row_filter::MetaPrune::Candidates(indices)) => Some(indices),
+                    Ok(super::row_filter::MetaPrune::Unaligned) | Err(_) => None,
                 }
-                Some(
-                    super::row_group::prune_row_group_meta(
-                        &meta.row_groups,
-                        &pred,
-                        &bloom_checks,
-                        &in_checks,
-                        &set_checks,
-                        &set_in_checks,
-                    )
-                    .candidate_indices,
-                )
             })
             .collect();
         let total_candidates: usize = per_segment_candidates
@@ -339,6 +402,24 @@ impl ScanCursor {
 
         let (tx, rx) = crossbeam_channel::bounded(DECODE_CHANNEL_CAPACITY);
         let spec = self.spec.clone();
+        // Byte-dimension backpressure state, shared with the consumer: the
+        // producer adds each sent batch's estimated bytes and refuses to
+        // decode another chunk while the total exceeds the cap; the consumer
+        // subtracts on recv. Captured before the spawn below because a fresh
+        // thread has no ambient cancellation context (same contract as
+        // fill_prefetch's rayon lanes).
+        let inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0usize));
+        let producer_inflight = std::sync::Arc::clone(&inflight);
+        let byte_cap = decode_channel_byte_cap();
+        let cancel_flag = crate::common::query_cancel::current_flag();
+        // Shared with the producer thread; flipped by this cursor's Drop so
+        // a parked producer stops instead of spinning forever when the
+        // consumer leaves without a cancellation (LIMIT early exit, error).
+        let consumer_done = {
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.decode_consumer_done = Some(std::sync::Arc::clone(&flag));
+            Some(flag)
+        };
         // Small LIMIT queries waste decode work on 32-group chunks (the
         // channel buffers batches far past the consumer's early exit);
         // shrink the decode chunk for known-small limits.
@@ -395,6 +476,20 @@ impl ScanCursor {
                         // queueing the consumer's per-batch lane work behind
                         // multi-millisecond decode tasks on the global pool.
                         for chunk in candidates.chunks(decode_chunk_size) {
+                            // Byte backpressure: prefer decoding less over
+                            // buffering hundreds of MB ahead of a slow
+                            // consumer. See wait_for_byte_budget for the
+                            // deadlock-freedom argument; on cancellation the
+                            // thread simply stops producing (the consumer's
+                            // own cancel checks abort the query).
+                            if !wait_for_byte_budget(
+                                &producer_inflight,
+                                byte_cap,
+                                &cancel_flag,
+                                &consumer_done,
+                            ) {
+                                return;
+                            }
                             let decoded: Vec<_> = background_decode_pool().install(|| {
                                 chunk
                                     .par_iter()
@@ -415,6 +510,12 @@ impl ScanCursor {
                                 // Decode failures propagate: a silently dropped
                                 // row group would make the query return partial
                                 // results.
+                                if let Ok(sent) = &batch {
+                                    producer_inflight.fetch_add(
+                                        sent.estimated_size_bytes(),
+                                        std::sync::atomic::Ordering::AcqRel,
+                                    );
+                                }
                                 if tx.send(batch).is_err() {
                                     // Consumer went away (LIMIT early exit / drop).
                                     return;
@@ -431,6 +532,7 @@ impl ScanCursor {
             })
             .map_err(|e| TaibaiError::Internal(format!("spawn cursor decoder failed: {e}")))?;
         self.decode_rx = Some(rx);
+        self.decode_inflight = Some(inflight);
         Ok(true)
     }
 
@@ -455,45 +557,18 @@ impl ScanCursor {
 
     fn open_current_segment(&mut self) -> Result<()> {
         let segment = &self.segments[self.segment_pos];
-        let meta_candidates = self
-            .runtime
-            .segment_mgr()
-            .segment_meta(segment)
-            .ok()
-            .flatten()
-            .map(|meta| {
-                let pred = self.spec.to_row_group_predicate();
-                if !super::row_group::prune_segment_by_zone_map(&pred, &meta.segment_zone_maps) {
-                    return Vec::new();
-                }
-                super::row_group::prune_row_group_meta(
-                    &meta.row_groups,
-                    &pred,
-                    &super::row_group::build_bloom_check_list(&self.spec),
-                    &super::row_group::build_in_check_list(&self.spec),
-                    &super::row_group::build_set_check_list(&self.spec),
-                    &super::row_group::build_set_in_check_list(&self.spec),
-                )
-                .candidate_indices
-            });
-        if meta_candidates
-            .as_ref()
-            .is_some_and(|candidates| candidates.is_empty())
-        {
-            self.current_reader = None;
-            return Ok(());
-        }
-        let reader = match self
-            .runtime
-            .segment_mgr()
-            .open_scan_reader(segment, self.spec.reader_txn_id)
-        {
-            Ok(r) => r,
+        // Shared candidate enumeration: sidecar meta prune first (skips the
+        // segment without opening it when nothing survives), reader prune on
+        // fallback. A concurrent compaction may legitimately remove a
+        // segment mid-scan, but anything else (IO error, corrupt footer)
+        // must fail the query instead of silently dropping its rows.
+        let opened = match super::candidates::open_segment_with_candidates(
+            self.runtime.segment_mgr(),
+            segment,
+            &self.spec,
+        ) {
+            Ok(opened) => opened,
             Err(error) => {
-                // Same contract as the executor's inline path: a concurrent
-                // compaction may legitimately remove a segment mid-scan, but
-                // anything else (IO error, corrupt footer) must fail the
-                // query instead of silently dropping the segment's rows.
                 self.current_reader = None;
                 if segment.exists() {
                     return Err(error);
@@ -505,14 +580,13 @@ impl ScanCursor {
                 return Ok(());
             }
         };
-        let candidates = meta_candidates.unwrap_or_else(|| {
-            strategy::prune_segment(&self.spec, &reader)
-                .map(|r: RowGroupPruneResult| r.candidate_indices)
-                .unwrap_or_default()
-        });
-        self.current_candidates = candidates;
+        let Some(opened) = opened else {
+            self.current_reader = None;
+            return Ok(());
+        };
+        self.current_candidates = opened.indices;
         self.candidate_pos = 0;
-        self.current_reader = Some(reader);
+        self.current_reader = Some(opened.reader);
         Ok(())
     }
 
@@ -640,9 +714,26 @@ impl ScanCursor {
 }
 
 fn is_streamable(spec: &ScanSpec) -> bool {
-    !spec.is_count_star
-        && !spec.has_aggregate
-        && !spec.has_order_by
-        && !spec.has_group_by
-        && !spec.has_join
+    // ORDER BY keeps the executor's ordered-cluster early termination (the
+    // cursor's ordered path diverges on multi-column cluster orders);
+    // aggregates (metadata-folded or not), GROUP BY and JOINs consume
+    // batches incrementally (the aggregate operators fold per batch, the
+    // join sides are budgeted), so feeding them from the streaming cursor
+    // removes the whole-input materialization without changing the batch
+    // sequence (both sides share the same ScanPlanner, hence the same limit
+    // pushdown). COUNT(*) no longer needs an exception: its metadata folding
+    // now happens in the Aggregate branch's FoldedAggregateExec, above the
+    // scan, not inside the cursor.
+    !spec.has_order_by
+}
+
+impl Drop for ScanCursor {
+    fn drop(&mut self) {
+        // Release a decode producer parked on the byte budget: the consumer
+        // is gone for good (query end, error, or cursor drop) even though no
+        // cancellation flag was ever set.
+        if let Some(flag) = self.decode_consumer_done.take() {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
 }

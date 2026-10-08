@@ -891,3 +891,72 @@ fn lookup_partition_eq_month_partitioned_table() {
         .unwrap();
     assert_eq!(count, (total_rows as u64) / 2, "composite count lost rows");
 }
+
+/// Prefix compaction must reclaim interned strings the surviving chunks no
+/// longer reference: a released value resolves to "never seen" again, while
+/// surviving values keep their ids (postings in surviving chunks stay valid).
+#[test]
+fn string_pool_retain_releases_unreferenced_ids() {
+    let mut pool = StringPool::new();
+    let alpha = pool.intern("alpha");
+    let beta = pool.intern("beta");
+    let alpha_again = pool.intern("alpha");
+    assert_eq!(alpha, alpha_again);
+
+    // Only "alpha" survives compaction.
+    pool.retain_ids(&std::collections::HashSet::from([alpha]));
+
+    assert_eq!(pool.lookup("alpha"), Some(alpha));
+    assert_eq!(pool.lookup("beta"), None);
+    // Re-interning a released value allocates a fresh id (never the dead one).
+    let beta_new = pool.intern("beta");
+    assert_ne!(beta_new, beta);
+    assert_eq!(pool.lookup("beta"), Some(beta_new));
+    assert_eq!(pool.lookup("alpha"), Some(alpha));
+}
+
+/// End-to-end: appending two distinct symbols, compacting the prefix down to
+/// rows carrying only one of them, then probing the dropped symbol must not
+/// resurrect rows and the survivor must stay queryable.
+#[test]
+fn compact_prefix_reclaims_string_pool_entries() {
+    let schema = Schema::new(vec![
+        ColumnDef::new("category", DataType::VarChar),
+        ColumnDef::new("price", DataType::Float64),
+    ]);
+    let store = HotStore::new(schema, 0, None, u64::MAX);
+
+    let append_rows = |store: &HotStore, category: &str, prices: &[f64]| {
+        let mut batch = RecordBatch::new(store.schema().clone());
+        let c0 = batch.column_mut(0).unwrap();
+        for _ in prices {
+            c0.push(&ScalarValue::VarChar(Some(category.to_string())))
+                .unwrap();
+        }
+        let c1 = batch.column_mut(1).unwrap();
+        for price in prices {
+            c1.push(&ScalarValue::Float64(Some(*price))).unwrap();
+        }
+        store.append(&batch).unwrap();
+    };
+
+    append_rows(&store, "gone", &[1.0, 2.0]);
+    append_rows(&store, "kept", &[3.0]);
+
+    // Reclaim the two "gone" rows (append-prefix rows 0 and 1).
+    let reclaimed = store.compact_prefix(2);
+    assert_eq!(reclaimed, 2);
+
+    let key = ScalarValue::VarChar(Some("kept".to_string()));
+    assert_eq!(
+        store.count_by_key_partition_from(&key, None, 0),
+        Some(1),
+        "surviving symbol must stay queryable"
+    );
+    let dropped = ScalarValue::VarChar(Some("gone".to_string()));
+    assert_eq!(
+        store.count_by_key_partition_from(&dropped, None, 0),
+        None,
+        "a reclaimed symbol must resolve as never-seen"
+    );
+}

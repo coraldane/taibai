@@ -1,9 +1,20 @@
-use super::*;
+use std::fs;
+use std::io::Write;
+use std::path::Path;
+
+use uuid::Uuid;
+
+use crate::common::error::Result;
 use crate::protocol::types::DataType;
+use crate::sql::execution::wal_helper::serialize_batch_for_wal;
 use crate::storage::segment::constants::DEFAULT_ROW_GROUP_SIZE;
+use crate::storage::segment::reader::ImageDurabilityCheck;
 use crate::storage::segment::SegmentWriter;
-use crate::types::batch::ColumnDef;
+use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
+
+use super::generations::*;
+use super::*;
 
 fn test_batch(schema: &Schema, values: &[i64]) -> Result<RecordBatch> {
     let mut batch = RecordBatch::new(schema.clone());
@@ -264,7 +275,12 @@ fn finish_flush_batch_removes_tails_and_markers_in_one_pass() -> Result<()> {
     for id in ids {
         assert!(!has_tail(temp.path(), id));
     }
-    assert!(!temp.path().join(TAIL_DIR).exists());
+    // Tails and markers are gone, but the directory itself is left in place:
+    // the tail committer mints fresh generations there concurrently, and
+    // removing it under them raced their create (see create_tail_log_file).
+    // Recovery tidies an empty directory instead.
+    let tail_dir = temp.path().join(TAIL_DIR);
+    assert!(std::fs::read_dir(&tail_dir)?.next().is_none());
     Ok(())
 }
 
@@ -699,7 +715,7 @@ fn delete_sidecar_round_trips_through_recovery() -> Result<()> {
         &test_batch(&schema, &[0, 1, 2, 3, 4, 5])?,
     )?;
 
-    assert!(delete_rows(temp.path(), id, &mut [1, 3])?);
+    assert!(delete_rows(temp.path(), id, &[1, 3])?);
     // A sidecar pend: rows still exist, but the tail is no longer "plain"
     // (a spill must not run over it).
     assert!(has_tail(temp.path(), id));
@@ -735,10 +751,10 @@ fn stacked_delete_sidecars_apply_oldest_first() -> Result<()> {
         &test_batch(&schema, &[10, 20, 30, 40])?,
     )?;
     // First delete speaks in the original batch's coordinates (removes 20)...
-    delete_rows(temp.path(), id, &mut [1])?;
+    delete_rows(temp.path(), id, &[1])?;
     // ...the second in the post-first-delete batch's coordinates:
     // [10, 30, 40], position 0 removes 10.
-    delete_rows(temp.path(), id, &mut [0])?;
+    delete_rows(temp.path(), id, &[0])?;
 
     let recovered = recover(temp.path(), &schema)?;
     assert_eq!(recovered[0].batch.num_rows(), 2);
@@ -759,7 +775,7 @@ fn insert_delta_after_delete_keeps_positions_prefix_stable() -> Result<()> {
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
     let id = Uuid::new_v4();
     persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
-    delete_rows(temp.path(), id, &mut [1])?;
+    delete_rows(temp.path(), id, &[1])?;
     // New rows append at the end; recorded positions must keep referring to
     // the original prefix.
     append(temp.path(), id, "2026", &test_batch(&schema, &[4])?)?;
@@ -781,7 +797,7 @@ fn torn_delete_sidecar_fails_recovery_closed() -> Result<()> {
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
     let id = Uuid::new_v4();
     persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
-    delete_rows(temp.path(), id, &mut [0])?;
+    delete_rows(temp.path(), id, &[0])?;
 
     // Simulate on-disk corruption: a truncated sidecar must fail the whole
     // recovery instead of silently resurrecting the deleted row.
@@ -804,7 +820,7 @@ fn persist_supersedes_pending_sidecars() -> Result<()> {
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
     let id = Uuid::new_v4();
     persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
-    delete_rows(temp.path(), id, &mut [0])?;
+    delete_rows(temp.path(), id, &[0])?;
     // The DELETE statement's in-memory result, persisted as a fresh
     // generation: sidecars below it are superseded and must not re-apply.
     persist(temp.path(), id, "2026", &test_batch(&schema, &[2, 3])?)?;
@@ -825,7 +841,7 @@ fn clear_tombstone_removes_sidecars_too() -> Result<()> {
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
     let id = Uuid::new_v4();
     persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2])?)?;
-    delete_rows(temp.path(), id, &mut [0])?;
+    delete_rows(temp.path(), id, &[0])?;
     clear(temp.path(), id)?;
     assert!(recover(temp.path(), &schema)?.is_empty());
     assert!(!has_tail(temp.path(), id));
@@ -841,7 +857,7 @@ fn recover_index_folds_pending_sidecars_into_a_plain_tail() -> Result<()> {
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
     let id = Uuid::new_v4();
     persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
-    delete_rows(temp.path(), id, &mut [0])?;
+    delete_rows(temp.path(), id, &[0])?;
 
     let indexed = recover_index(temp.path(), &schema)?;
     assert_eq!(indexed.len(), 1);
@@ -854,6 +870,269 @@ fn recover_index_folds_pending_sidecars_into_a_plain_tail() -> Result<()> {
     assert_eq!(
         recovered[0].batch.scalar(0, 0),
         Some(ScalarValue::Int64(Some(2)))
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Update sidecars (`<id>.<seq>.upd`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn update_sidecar_round_trips_through_recovery() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(
+        temp.path(),
+        id,
+        "2026",
+        &test_batch(&schema, &[0, 1, 2, 3, 4, 5])?,
+    )?;
+
+    assert!(update_rows(
+        temp.path(),
+        id,
+        &[1, 3],
+        &[(0, ScalarValue::Int64(Some(100)))]
+    )?);
+    // A sidecar pends: the tail is still there, but no longer "plain"
+    // (a spill must not run over it).
+    assert!(has_tail(temp.path(), id));
+    assert!(!tail_is_plain(temp.path(), id)?);
+
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].batch.num_rows(), 6);
+    let values: Vec<Option<ScalarValue>> = (0..6)
+        .map(|row| recovered[0].batch.scalar(row, 0))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            Some(ScalarValue::Int64(Some(0))),
+            Some(ScalarValue::Int64(Some(100))),
+            Some(ScalarValue::Int64(Some(2))),
+            Some(ScalarValue::Int64(Some(100))),
+            Some(ScalarValue::Int64(Some(4))),
+            Some(ScalarValue::Int64(Some(5))),
+        ]
+    );
+    Ok(())
+}
+
+/// UPDATE never changes row count or order, and a later INSERT appends below
+/// the sidecar's coordinate space: appended rows must keep their own values.
+#[test]
+fn insert_delta_after_update_keeps_values_applied() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
+    update_rows(temp.path(), id, &[0], &[(0, ScalarValue::Int64(Some(99)))])?;
+    append(temp.path(), id, "2026", &test_batch(&schema, &[4])?)?;
+
+    let recovered = recover(temp.path(), &schema)?;
+    let values: Vec<i64> = (0..recovered[0].batch.num_rows())
+        .filter_map(|row| match recovered[0].batch.scalar(row, 0) {
+            Some(ScalarValue::Int64(Some(v))) => Some(v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(values, vec![99, 2, 3, 4]);
+    Ok(())
+}
+
+/// The sidecar chain replays in GENERATION order: an UPDATE recorded after a
+/// DELETE speaks in the post-delete coordinate space (its row ids would be
+/// meaningless against the raw tail), so replaying updates before deletes
+/// would corrupt the recovered batch.
+#[test]
+fn delete_then_update_sidecars_replay_in_generation_order() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(
+        temp.path(),
+        id,
+        "2026",
+        &test_batch(&schema, &[0, 1, 2, 3, 4, 5])?,
+    )?;
+    // Removes original positions 1 and 3 → [0, 2, 4, 5].
+    delete_rows(temp.path(), id, &[1, 3])?;
+    // The UPDATE statement saw [0, 2, 4, 5]: position 1 is the value 2.
+    update_rows(temp.path(), id, &[1], &[(0, ScalarValue::Int64(Some(99)))])?;
+
+    let recovered = recover(temp.path(), &schema)?;
+    let values: Vec<i64> = (0..recovered[0].batch.num_rows())
+        .filter_map(|row| match recovered[0].batch.scalar(row, 0) {
+            Some(ScalarValue::Int64(Some(v))) => Some(v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(values, vec![0, 99, 4, 5]);
+    Ok(())
+}
+
+/// The mirror image: an UPDATE recorded before a DELETE must keep its effect
+/// through the delete replay (values at stable positions), and the delete's
+/// positions speak in the post-update space.
+#[test]
+fn update_then_delete_sidecars_replay_in_generation_order() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(
+        temp.path(),
+        id,
+        "2026",
+        &test_batch(&schema, &[0, 1, 2, 3, 4, 5])?,
+    )?;
+    update_rows(
+        temp.path(),
+        id,
+        &[1, 3],
+        &[(0, ScalarValue::Int64(Some(100)))],
+    )?;
+    // The DELETE statement saw [0, 100, 2, 100, 4, 5]: position 2 removes 2.
+    delete_rows(temp.path(), id, &[2])?;
+
+    let recovered = recover(temp.path(), &schema)?;
+    let values: Vec<i64> = (0..recovered[0].batch.num_rows())
+        .filter_map(|row| match recovered[0].batch.scalar(row, 0) {
+            Some(ScalarValue::Int64(Some(v))) => Some(v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(values, vec![0, 100, 100, 4, 5]);
+    Ok(())
+}
+
+#[test]
+fn update_sidecar_covers_multi_column_null_and_variable_width_values() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![
+        ColumnDef::new("id", DataType::Int32),
+        ColumnDef::new("name", DataType::VarChar),
+        ColumnDef::new("flag", DataType::Bool),
+    ]);
+    let mut batch = RecordBatch::new(schema.clone());
+    let rows: [(i32, &str, bool); 3] =
+        [(1, "alpha", false), (2, "beta", false), (3, "gamma", true)];
+    for (id, name, flag) in rows {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int32(Some(id)))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(name.into())))?;
+        batch
+            .column_mut(2)
+            .unwrap()
+            .push(&ScalarValue::Bool(Some(flag)))?;
+    }
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &batch)?;
+
+    // SET name = NULL, flag = true WHERE id = 2 → position 1; id untouched.
+    update_rows(
+        temp.path(),
+        id,
+        &[1],
+        &[
+            (1, ScalarValue::VarChar(None)),
+            (2, ScalarValue::Bool(Some(true))),
+        ],
+    )?;
+
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(
+        recovered[0].batch.scalar(1, 0),
+        Some(ScalarValue::Int32(Some(2))),
+        "unassigned column keeps its value"
+    );
+    assert_eq!(
+        recovered[0].batch.scalar(1, 1),
+        Some(ScalarValue::VarChar(None))
+    );
+    assert_eq!(
+        recovered[0].batch.scalar(1, 2),
+        Some(ScalarValue::Bool(Some(true)))
+    );
+    assert_eq!(
+        recovered[0].batch.scalar(0, 1),
+        Some(ScalarValue::VarChar(Some("alpha".into()))),
+        "unmatched rows are untouched"
+    );
+    Ok(())
+}
+
+#[test]
+fn torn_update_sidecar_fails_recovery_closed() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
+    update_rows(temp.path(), id, &[0], &[(0, ScalarValue::Int64(Some(9)))])?;
+
+    // Simulate on-disk corruption: a truncated sidecar must fail the whole
+    // recovery instead of silently dropping the update.
+    let tail_dir = temp.path().join(TAIL_DIR);
+    let sidecar = std::fs::read_dir(&tail_dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|e| e.to_str()) == Some("upd"))
+        .expect("update sidecar exists");
+    let bytes = std::fs::read(&sidecar)?;
+    std::fs::write(&sidecar, &bytes[..bytes.len() - 3])?;
+
+    assert!(recover(temp.path(), &schema).is_err());
+    Ok(())
+}
+
+#[test]
+fn persist_supersedes_pending_update_sidecars() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
+    update_rows(temp.path(), id, &[0], &[(0, ScalarValue::Int64(Some(9)))])?;
+    // The UPDATE statement's in-memory result, persisted as a fresh
+    // generation: sidecars below it are superseded and must not re-apply
+    // (or stack forever).
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[9, 2, 3])?)?;
+
+    assert!(tail_is_plain(temp.path(), id)?);
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered[0].batch.num_rows(), 3);
+    assert_eq!(
+        recovered[0].batch.scalar(0, 0),
+        Some(ScalarValue::Int64(Some(9)))
+    );
+    Ok(())
+}
+
+#[test]
+fn recover_index_folds_pending_update_sidecars_into_a_plain_tail() -> Result<()> {
+    // Lazy recovery reads only the tail file: a pending update must be
+    // folded in at startup, or the memtable materializes pre-update values.
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
+    update_rows(temp.path(), id, &[1], &[(0, ScalarValue::Int64(Some(42)))])?;
+
+    let indexed = recover_index(temp.path(), &schema)?;
+    assert_eq!(indexed.len(), 1);
+    assert_eq!(indexed[0].rows, 3);
+
+    assert!(tail_is_plain(temp.path(), id)?);
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(
+        recovered[0].batch.scalar(1, 0),
+        Some(ScalarValue::Int64(Some(42)))
     );
     Ok(())
 }
@@ -905,5 +1184,443 @@ fn torn_tail_is_discarded_and_counted() -> Result<()> {
         "the discard must be counted"
     );
     assert!(after.tail_bytes_discarded > before.tail_bytes_discarded);
+    Ok(())
+}
+
+/// The replication applier dedups replayed tail appends by the last frame's
+/// LSN: tail_last_lsn must return the max complete-frame LSN, ignore a torn
+/// final frame, and report None for a missing or corrupt file.
+#[test]
+fn tail_last_lsn_tracks_frames_and_tolerates_torn_tail() {
+    use crate::types::batch::{ColumnDef, RecordBatch, Schema};
+
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("main").join("t");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let id = uuid::Uuid::new_v4();
+
+    let schema = Schema::new(vec![ColumnDef::new("n", DataType::Int64)]);
+    let make_batch = |values: &[i64]| {
+        let mut col = crate::types::array::ColumnArray::empty(DataType::Int64);
+        for v in values {
+            col.push(&crate::types::scalar::ScalarValue::Int64(Some(*v)))
+                .unwrap();
+        }
+        RecordBatch::try_new(schema.clone(), vec![col]).unwrap()
+    };
+
+    let tail_path = |table_dir: &std::path::Path, id: uuid::Uuid| {
+        crate::storage::core::durable_tail::live_tail_path(table_dir, id)
+            .unwrap()
+            .expect("tail exists")
+    };
+
+    // Missing tail: no LSN.
+    assert_eq!(
+        crate::storage::core::durable_tail::tail_last_lsn(&table_dir.join("nope")).unwrap(),
+        None
+    );
+
+    append_raw_frames(
+        &table_dir,
+        id,
+        "p2026",
+        &encode_tail_frame(&make_batch(&[1, 2])).unwrap(),
+    )
+    .unwrap();
+    let path = tail_path(&table_dir, id);
+    let lsn_after_first = crate::storage::core::durable_tail::tail_last_lsn(&path)
+        .unwrap()
+        .expect("v3 lsn");
+    assert!(lsn_after_first > 0);
+
+    append_raw_frames(
+        &table_dir,
+        id,
+        "p2026",
+        &encode_tail_frame(&make_batch(&[3])).unwrap(),
+    )
+    .unwrap();
+    let lsn_after_second = crate::storage::core::durable_tail::tail_last_lsn(&path)
+        .unwrap()
+        .expect("v3 lsn");
+    assert!(
+        lsn_after_second > lsn_after_first,
+        "lsn is append-ordered: {lsn_after_second} > {lsn_after_first}"
+    );
+    let rows = crate::storage::core::durable_tail::tail_log_rows(&path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rows, 3);
+
+    // A torn final frame (truncated mid-frame) must not crash the scan or
+    // invent an LSN from partial bytes: the last COMPLETE frame wins.
+    let full = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &full[..full.len() - 3]).unwrap();
+    let lsn_torn = crate::storage::core::durable_tail::tail_last_lsn(&path).unwrap();
+    assert_eq!(
+        lsn_torn,
+        Some(lsn_after_first),
+        "torn final frame is ignored; first frame's lsn remains"
+    );
+
+    // A corrupt (CRC-breaking) file reports None instead of a bogus LSN.
+    let mut corrupt = full.clone();
+    let mid = corrupt.len() - 6;
+    corrupt[mid] ^= 0xFF;
+    std::fs::write(&path, &corrupt).unwrap();
+    assert_eq!(
+        crate::storage::core::durable_tail::tail_last_lsn(&path).unwrap(),
+        None,
+        "crc mismatch must not yield an lsn"
+    );
+}
+
+/// The commit thread and the direct-write helpers must draw LSNs from the
+/// SAME monotonic channel. Drive both concurrently — direct `append`s racing
+/// the committer's group-commit window — and assert every frame on disk
+/// carries a unique LSN (the old thread-local counter handed out duplicates
+/// to direct writes that landed mid-group) and that each channel stays
+/// append-ordered.
+#[test]
+fn commit_thread_and_direct_writes_allocate_unique_monotonic_lsns() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let table_dir = temp.path().to_path_buf();
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let commit_id = Uuid::new_v4();
+    let direct_id = Uuid::new_v4();
+
+    let committer = TailCommitter::start(true);
+
+    // Direct-path channel: one fsynced frame per append, from this thread.
+    let direct_dir = table_dir.clone();
+    let direct_schema = schema.clone();
+    let direct = std::thread::spawn(move || -> Result<()> {
+        for value in 0..24i64 {
+            let mut batch = RecordBatch::new(direct_schema.clone());
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(value)))?;
+            append(&direct_dir, direct_id, "", &batch)?;
+        }
+        Ok(())
+    });
+
+    // Commit-path channel: submit a burst without waiting so several frames
+    // share one group-commit window, interleaved with the direct appends.
+    // Half of the commands use the lazy (commit-thread-encoded) variant.
+    let mut tickets = Vec::new();
+    for value in 0..24i64 {
+        let mut batch = RecordBatch::new(schema.clone());
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(1000 + value)))?;
+        let prepared = if value % 2 == 0 {
+            PreparedTailAppend::new(&batch)?
+        } else {
+            PreparedTailAppend::from_shared_batch(std::sync::Arc::new(batch))
+        };
+        tickets.push(committer.submit(table_dir.clone(), commit_id, "".into(), prepared));
+    }
+    for ticket in tickets {
+        ticket.wait()?;
+    }
+    direct.join().unwrap()?;
+    committer.barrier(&table_dir)?;
+    committer.stop();
+
+    fn frame_lsns(path: &Path, schema: &Schema) -> Result<Vec<u64>> {
+        let bytes = fs::read(path)?;
+        let (_, _, frames) = decode_tail_with_meta(&bytes, schema)?;
+        Ok(frames.into_iter().map(|meta| meta.lsn).collect())
+    }
+
+    let tail_dir = table_dir.join(TAIL_DIR);
+    let commit_path = newest_live_tail_path(&tail_dir, commit_id)?.expect("commit tail exists");
+    let direct_path = newest_live_tail_path(&tail_dir, direct_id)?.expect("direct tail exists");
+    let commit_lsns = frame_lsns(&commit_path, &schema)?;
+    let direct_lsns = frame_lsns(&direct_path, &schema)?;
+
+    assert_eq!(commit_lsns.len(), 24, "one frame per committed append");
+    assert_eq!(direct_lsns.len(), 24, "one frame per direct append");
+    // Single commit thread + single direct thread: each channel's LSNs are
+    // allocated in write order.
+    assert!(
+        commit_lsns.windows(2).all(|w| w[0] < w[1]),
+        "commit-channel LSNs must be append-ordered"
+    );
+    assert!(
+        direct_lsns.windows(2).all(|w| w[0] < w[1]),
+        "direct-channel LSNs must be append-ordered"
+    );
+
+    let mut all = commit_lsns;
+    all.extend_from_slice(&direct_lsns);
+    let unique = all.iter().collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        unique.len(),
+        all.len(),
+        "every durable frame must carry a unique LSN across both channels"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Statement guards: crash arbitration for multi-leg memtable deletes
+// ---------------------------------------------------------------------------
+
+fn watermark_of(id: Uuid, rows: u64) -> Vec<ImageDurabilityCheck> {
+    vec![ImageDurabilityCheck {
+        memtable_id: id,
+        partition: String::new(),
+        expected_rows: rows,
+    }]
+}
+
+/// The crash window the guard exists for: the sidecar is durable, the
+/// replacement images are not. Recovery must drop the sidecar (and the
+/// guard) and restore the deleted rows — the multi-leg statement rolled
+/// back, it must not lose them.
+#[test]
+fn guarded_delete_sidecar_rolls_back_when_images_not_durable() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "", &test_batch(&schema, &[1, 2, 3])?)?;
+
+    let never_durable_images = Uuid::new_v4();
+    assert!(delete_rows_guarded(
+        temp.path(),
+        id,
+        &[0, 1],
+        &watermark_of(never_durable_images, 2),
+    )?);
+    assert!(
+        memtable_has_statement_guard(temp.path(), id),
+        "the guard must gate this memtable's flush while the statement is pending"
+    );
+
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(
+        recovered[0].batch.num_rows(),
+        3,
+        "the guarded delete rolls back"
+    );
+    assert!(
+        !memtable_has_statement_guard(temp.path(), id),
+        "the decided guard is removed by recovery"
+    );
+    Ok(())
+}
+
+/// Roll-forward: the watermark's image memtable IS durable, so the guarded
+/// sidecar applies like a plain one.
+#[test]
+fn guarded_delete_sidecar_applies_when_images_durable() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "", &test_batch(&schema, &[1, 2, 3])?)?;
+
+    let images = Uuid::new_v4();
+    persist(temp.path(), images, "", &test_batch(&schema, &[10, 11])?)?;
+    assert!(delete_rows_guarded(
+        temp.path(),
+        id,
+        &[0, 1],
+        &watermark_of(images, 2),
+    )?);
+
+    let recovered = recover(temp.path(), &schema)?;
+    // Recovery resolves every id with a live tail; pick ours by id (the
+    // images memtable is also recovered, in arbitrary HashMap order).
+    let target = recovered
+        .iter()
+        .find(|entry| entry.id == id)
+        .expect("target memtable recovered");
+    assert_eq!(target.batch.num_rows(), 1, "the satisfied delete applies");
+    assert!(!memtable_has_statement_guard(temp.path(), id));
+    Ok(())
+}
+
+/// The acked statement clears its guards: afterwards the sidecar is
+/// unconditionally correct (the caller only clears after the images are
+/// durable) and applies without arbitration.
+#[test]
+fn cleared_guard_makes_sidecar_unconditional() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "", &test_batch(&schema, &[1, 2, 3])?)?;
+    assert!(delete_rows_guarded(
+        temp.path(),
+        id,
+        &[2],
+        &watermark_of(Uuid::new_v4(), 9),
+    )?);
+    clear_statement_guards(temp.path(), id);
+    assert!(!memtable_has_statement_guard(temp.path(), id));
+
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered[0].batch.num_rows(), 2, "the acked delete applies");
+    Ok(())
+}
+
+/// A crash between the guard write and the sidecar write leaves an orphan
+/// guard. Recovery must sweep it instead of gating the memtable's flush
+/// forever.
+#[test]
+fn orphan_guard_without_sidecar_is_swept_by_recovery() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "", &test_batch(&schema, &[1, 2])?)?;
+    assert!(delete_rows_guarded(
+        temp.path(),
+        id,
+        &[0],
+        &watermark_of(Uuid::new_v4(), 5),
+    )?);
+    // Simulate the crash-between-writes: the sidecar never landed.
+    let tail_dir = temp.path().join(TAIL_DIR);
+    for entry in std::fs::read_dir(&tail_dir)?.flatten() {
+        if entry.file_name().to_string_lossy().ends_with(".del") {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    assert!(memtable_has_statement_guard(temp.path(), id));
+
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered[0].batch.num_rows(), 2, "no delete was applied");
+    assert!(
+        !memtable_has_statement_guard(temp.path(), id),
+        "the orphan guard is swept"
+    );
+    Ok(())
+}
+
+/// A satisfied flush intent retires the image memtable's tail into a
+/// segment; the watermark check must still count those rows, so a flush
+/// that races a statement window cannot make recovery roll back a
+/// correctly committed statement.
+#[test]
+fn watermark_counts_rows_retired_into_segments_by_flush_intent() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let images = Uuid::new_v4();
+    let batch = test_batch(&schema, &[7, 8, 9])?;
+    persist(temp.path(), images, "", &batch)?;
+
+    let _intent = begin_flush(temp.path(), images, "seg_00001.dat", 3)?;
+    let mut writer = SegmentWriter::create(
+        &temp.path().join("seg_00001.dat"),
+        schema.clone(),
+        DEFAULT_ROW_GROUP_SIZE,
+        3,
+    )?;
+    writer.write_batch(&batch)?;
+    writer.seal()?;
+
+    // Retire the tail file: only the satisfied intent remains as proof.
+    let tail_dir = temp.path().join(TAIL_DIR);
+    for entry in std::fs::read_dir(&tail_dir)?.flatten() {
+        if entry.file_name().to_string_lossy().ends_with(".tail") {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    assert_eq!(
+        durable_tail_rows_for_memtable(temp.path(), images),
+        3,
+        "a satisfied flush intent must prove the rows durable"
+    );
+    Ok(())
+}
+
+/// Replication round trip: the sidecar the primary writes (`delete_rows`)
+/// ships verbatim (`apply_replicated_sidecar`) onto a standby copy of the
+/// tail directory, and both nodes recover the identical content. This is
+/// the contract `TailMutation` events rely on — without them a standby
+/// served deleted rows from its tail until the next flush.
+#[test]
+fn replicated_delete_sidecar_applies_identically_on_standby() -> Result<()> {
+    let primary = tempfile::tempdir()?;
+    let standby = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    let batch = test_batch(&schema, &[1, 2, 3])?;
+    persist(primary.path(), id, "", &batch)?;
+    // Standby holds the identical tail (TailAppend replay).
+    persist(standby.path(), id, "", &batch)?;
+
+    // Primary deletes rows 0..1; the sidecar bytes are the replication
+    // payload.
+    assert!(delete_rows(primary.path(), id, &[0, 1])?);
+    let tail_dir = primary.path().join(TAIL_DIR);
+    let mut payload = None;
+    let mut sequence = None;
+    for entry in std::fs::read_dir(&tail_dir)?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(stem) = name.strip_suffix(".del") {
+            payload = Some(std::fs::read(entry.path())?);
+            sequence = stem
+                .rsplit('.')
+                .next()
+                .and_then(|seq| seq.parse::<u64>().ok());
+        }
+    }
+    let payload = payload.expect("primary wrote a delete sidecar");
+    let sequence = sequence.expect("primary sidecar carries a sequence");
+    apply_replicated_sidecar(standby.path(), id, false, sequence, &payload)?;
+
+    let primary_rows = recover(primary.path(), &schema)?
+        .iter()
+        .find(|entry| entry.id == id)
+        .expect("primary memtable recovered")
+        .batch
+        .num_rows();
+    let standby_rows = recover(standby.path(), &schema)?
+        .iter()
+        .find(|entry| entry.id == id)
+        .expect("standby memtable recovered")
+        .batch
+        .num_rows();
+    assert_eq!(
+        primary_rows, standby_rows,
+        "standby converges to the primary"
+    );
+    assert_eq!(
+        standby_rows, 1,
+        "the replicated delete removed the same rows"
+    );
+
+    // Idempotent replay (standby crash before the seq watermark persists):
+    // the same primary sequence replaces the same generation instead of
+    // duplicating the delete.
+    apply_replicated_sidecar(standby.path(), id, false, sequence, &payload)?;
+    let replayed_rows = recover(standby.path(), &schema)?
+        .iter()
+        .find(|entry| entry.id == id)
+        .expect("standby memtable recovered")
+        .batch
+        .num_rows();
+    assert_eq!(replayed_rows, 1, "replayed delete sidecars are idempotent");
+    Ok(())
+}
+
+/// Corrupt payloads fail the apply loudly instead of landing on disk.
+#[test]
+fn replicated_sidecar_rejects_corrupt_payload() -> Result<()> {
+    let standby = tempfile::tempdir()?;
+    assert!(apply_replicated_sidecar(
+        standby.path(),
+        Uuid::new_v4(),
+        false,
+        1,
+        &[0xDE, 0xAD, 0xBE, 0xEF],
+    )
+    .is_err());
     Ok(())
 }

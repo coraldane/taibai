@@ -11,6 +11,7 @@
 
 面向日常使用，描述当前版本的实际行为：
 
+- [SQL 语法参考](user-guide/sql-reference.md)：**全部**支持的 SQL 语法——DDL、DML、查询、表达式、内置函数、管理语句，以及明确不支持的能力清单。taibai 方言不兼容主流数据库，请以此为准。
 - [事务与并发语义](user-guide/transactions-and-concurrency.md)：隔离级别、可见性、锁与持久化边界。
 - [查询管理与语句超时](user-guide/query-management.md)：`SHOW PROCESSLIST`、`KILL QUERY` 与语句超时配置。
 - [变更订阅（Pub/Sub）](user-guide/pubsub.md)：订阅表插入变更、主题通配符与慢消费者策略，以及可恢复的可靠订阅（序列确认、具名书签、列过滤）。
@@ -29,10 +30,10 @@
 
 - [Taibai 列式数据库服务器](design/TAIBAI_DESIGN_ZH.md)：整体架构与各子系统设计。
 - [分区级 mutation lock 设计](design/partition-mutation-locks.md)：写入互斥的锁粒度与锁序。
-- [Transaction State Model and Session Management](design/transaction-state-model.md)
-- [实时 tick 内存态设计](design/realtime-tick-inmemory-design.md)
+- [元数据折叠聚合执行](design/folded-aggregate-execution.md)：COUNT(*)/分组聚合从段 footer 元数据直接作答的设计。
 - [Direct Bulk 二进制协议](design/direct-bulk-binary-protocol.md)
 - [通用性能基础](general-performance-foundations.md)
+- [暂缓的设计决策](deferred-design-decisions.md)：当前版本有意保留的架构折衷与备选方案。
 
 ## 计划
 

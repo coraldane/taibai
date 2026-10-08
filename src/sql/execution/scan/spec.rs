@@ -16,7 +16,6 @@ pub struct ScanSpec {
 
     pub projection: Option<Vec<usize>>,
 
-    pub is_count_star: bool,
     pub has_aggregate: bool,
     pub has_order_by: bool,
     pub has_group_by: bool,
@@ -34,6 +33,14 @@ pub struct ScanSpec {
     pub minmax_index_columns: Vec<usize>,
     pub set_index_columns: Vec<usize>,
     pub reader_txn_id: u64,
+    /// TTL read-filtering is active for this table (`table_meta.ttl` set at
+    /// spec-compile time). Hot-store/memtable fast paths that truncate
+    /// gather early (LIMIT pushdown, key lookups) must be disabled when this
+    /// is set: TTL filters rows AFTER collection, so a pre-filter truncation
+    /// would return fewer rows than exist. This flag is the single decision
+    /// point — fast paths check it instead of re-deriving TTL state, so a
+    /// new fast path cannot forget the gate.
+    pub ttl_active: bool,
     /// Partial-residency bound when the hybrid hot-mirror leg is active:
     /// `(partition_column_index, covers_from_value)`. The mirror answers rows
     /// with `column > value` (its leg adds a `Gt` clause); every non-mirror
@@ -42,21 +49,100 @@ pub struct ScanSpec {
     /// above the bound (`TableMeta::hot_mirror_covers_from`).
     pub hot_mirror_bound: Option<(usize, ScalarValue)>,
 
-    /// Simple metadata-only aggregate fast path (COUNT/MIN/MAX/SUM/AVG, no
-    /// GROUP BY).
-    /// When set, the scan executor answers the query from row-group zone maps
-    /// / footers instead of streaming the data.
-    pub simple_metadata_aggregates: Option<Vec<AggregateExpr>>,
+    /// Metadata-folded aggregate fast path: the scan executor answers the
+    /// aggregate from row-group zone maps / footers (per fold unit, per
+    /// group) instead of streaming the data. Set from the query plan via
+    /// [`extract_metadata_fold`].
+    pub metadata_fold: Option<MetadataFoldRequest>,
 
     /// DISTINCT fast path target column (name in the table schema). Set only
     /// for single-column, predicate-free `SELECT DISTINCT` scans.
     pub distinct_column: Option<String>,
+
+    /// The catalog schema this spec was compiled against. Every column index
+    /// in the spec (predicates, projection, index columns) is an index into
+    /// THIS schema, while per-segment structures (footer zone maps, bloom
+    /// filters, physical column blocks) follow each segment's own footer
+    /// order — after a DROP/RENAME COLUMN the two drift apart. Readers
+    /// translate between the two spaces per segment via
+    /// `SegmentReader::align_indices` using this schema. Empty for
+    /// hand-built specs (tests): consumers then assume identity mapping.
+    pub table_schema: Schema,
 }
 
 #[derive(Debug, Clone)]
 pub struct InPredicate {
     pub column_index: usize,
     pub values: Vec<ScalarValue>,
+}
+
+/// A foldable `Aggregate(single Scan)` request: bare-column GROUP BY keys
+/// and non-DISTINCT COUNT/SUM/MIN/MAX/AVG over bare columns / wildcard, with
+/// no HAVING. The folding engine (`scan::aggregate_meta`) answers it from
+/// segment metadata, declining at runtime to the regular pipeline.
+#[derive(Debug, Clone)]
+pub struct MetadataFoldRequest {
+    pub group_by: Vec<LogicalExpr>,
+    pub aggregates: Vec<AggregateExpr>,
+}
+
+/// Extract the fold request for `table_name` from a query plan. The plan
+/// must be `Project?(Aggregate(Scan of table_name))` where the projection is
+/// positional identity over the aggregate output (`Column(i)` at position
+/// `i`) — the executor returns the aggregate rows directly, so any reorder,
+/// computed column or wrapper above declines here and keeps the pipeline.
+/// WHERE clauses the optimizer pushed into `ScanPlan::pushed_filter` are
+/// covered (they land in the compiled spec); residual `Filter` nodes carry
+/// predicates the spec never sees, so those decline too.
+pub fn extract_metadata_fold(plan: &LogicalPlan, table_name: &str) -> Option<MetadataFoldRequest> {
+    let inner = match plan {
+        LogicalPlan::Project(project) => &*project.input,
+        other => other,
+    };
+    let LogicalPlan::Aggregate(agg) = inner else {
+        return None;
+    };
+    if agg.having.is_some() || agg.distinct {
+        return None;
+    }
+    if agg
+        .group_by
+        .iter()
+        .any(|expr| !matches!(expr, LogicalExpr::Column(_)))
+    {
+        return None;
+    }
+    for aggregate in &agg.aggregates {
+        if aggregate.distinct {
+            return None;
+        }
+        match &*aggregate.arg {
+            LogicalExpr::Column(_) | LogicalExpr::Wildcard => {}
+            _ => return None,
+        }
+    }
+    let LogicalPlan::Scan(scan) = &*agg.input else {
+        return None;
+    };
+    if !scan.table_name.eq_ignore_ascii_case(table_name) {
+        return None;
+    }
+    // The identity-projection guard: when a Project sits above the
+    // Aggregate, its expressions must map the aggregate output
+    // position-for-position, otherwise the rows this path returns would have
+    // the wrong column order (or drop computed select items).
+    if let LogicalPlan::Project(project) = plan {
+        let identity = project.expressions.iter().enumerate().all(
+            |(position, expr)| matches!(expr, LogicalExpr::Column(index) if *index == position),
+        );
+        if !identity {
+            return None;
+        }
+    }
+    Some(MetadataFoldRequest {
+        group_by: agg.group_by.clone(),
+        aggregates: agg.aggregates.clone(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +168,6 @@ impl ScanSpec {
             in_predicates: Vec::new(),
             remaining_predicate: None,
             projection: None,
-            is_count_star: false,
             has_aggregate: false,
             has_distinct_or_window: false,
             has_order_by: false,
@@ -96,9 +181,11 @@ impl ScanSpec {
             minmax_index_columns: Vec::new(),
             set_index_columns: Vec::new(),
             reader_txn_id: 0,
+            ttl_active: false,
             hot_mirror_bound: None,
-            simple_metadata_aggregates: None,
+            metadata_fold: None,
             distinct_column: None,
+            table_schema: Schema::empty(),
         }
     }
 
@@ -160,6 +247,8 @@ pub fn compile_scan_spec(
     table_meta: &TableMeta,
 ) -> ScanSpec {
     let mut spec = ScanSpec::new(table_name);
+    spec.table_schema = table_schema.clone();
+    spec.ttl_active = table_meta.ttl.is_some();
 
     if let LogicalPlan::Scan(scan) = plan {
         spec.distinct_column = scan.distinct_column.clone();
@@ -188,7 +277,11 @@ pub fn compile_scan_spec(
     collect_from_plan(plan, table_name, table_schema, &mut spec);
 
     if spec.has_join {
-        spec.projection = None;
+        // The projection survives: join-condition side columns are merged
+        // into it during traversal, and the physical join re-pads its
+        // narrowed children to the full planned side layout
+        // (`ExpandToSchemaExec`), so consumers keep full-width semantics.
+        // A LIMIT above a join still must not push into one side.
         spec.limit = None;
     }
 
@@ -294,6 +387,20 @@ fn collect_expr_columns(expr: &LogicalExpr, cols: &mut Vec<usize>) {
 }
 
 fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec: &mut ScanSpec) {
+    collect_from_plan_ctx(plan, table_name, schema, spec, &[]);
+}
+
+/// `join_side_cols`: side-space column indices the enclosing joins'
+/// conditions read on THIS table's side — they must survive any projection
+/// pushdown, because the join's condition and row assembly address the full
+/// side layout.
+fn collect_from_plan_ctx(
+    plan: &LogicalPlan,
+    table_name: &str,
+    schema: &Schema,
+    spec: &mut ScanSpec,
+    join_side_cols: &[usize],
+) {
     match plan {
         LogicalPlan::Scan(scan) => {
             if !scan.table_name.eq_ignore_ascii_case(table_name) {
@@ -312,6 +419,23 @@ fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec
             if let Some(proj) = &scan.projection {
                 spec.projection = Some(proj.clone());
             }
+            if !join_side_cols.is_empty() {
+                // Union the join's side columns into an EXISTING narrowing
+                // only: `None` means "every column" and already includes
+                // them — turning it into a join-columns-only projection
+                // starved the join's other consumers (a GROUP BY above lost
+                // its key column and read padded NULLs).
+                if let Some(mut cols) = spec.projection.take() {
+                    for col in join_side_cols {
+                        if !cols.contains(col) {
+                            cols.push(*col);
+                        }
+                    }
+                    cols.sort_unstable();
+                    cols.dedup();
+                    spec.projection = Some(cols);
+                }
+            }
             if scan.time_range.is_some() || scan.partition_filter.is_some() {
                 if let Some(ref mut pi) = spec.partition_info {
                     pi.time_range = scan.time_range.clone();
@@ -319,9 +443,11 @@ fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec
                 }
             }
         }
-        LogicalPlan::Filter(f) => collect_from_plan(&f.input, table_name, schema, spec),
+        LogicalPlan::Filter(f) => {
+            collect_from_plan_ctx(&f.input, table_name, schema, spec, join_side_cols)
+        }
         LogicalPlan::Project(p) => {
-            collect_from_plan(&p.input, table_name, schema, spec);
+            collect_from_plan_ctx(&p.input, table_name, schema, spec, join_side_cols);
             // Above an Aggregate, projection expressions index the aggregate
             // OUTPUT, not this table's columns; slicing the scan by them
             // would drop group-key columns (materialized pipeline only).
@@ -346,40 +472,109 @@ fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec
         LogicalPlan::Aggregate(a) => {
             spec.has_aggregate = true;
             spec.has_group_by = !a.group_by.is_empty();
-            collect_from_plan(&a.input, table_name, schema, spec);
+            // Aggregate projection pushdown (materialized path): reading
+            // directly off this table's scan, restrict the read to GROUP BY
+            // keys + aggregate arguments — the same rule the physical
+            // pipeline applies via `pushdown_aggregate_projection`. Without
+            // it, the materialized path decoded the whole row width for
+            // aggregate queries. Only a bare Scan input qualifies: a residual
+            // Filter below the aggregate evaluates over the scan output and
+            // needs its own columns.
+            if let LogicalPlan::Scan(scan) = &*a.input {
+                if scan.table_name.eq_ignore_ascii_case(table_name) {
+                    let mut cols: Vec<usize> = Vec::new();
+                    let mut bare = true;
+                    for expr in &a.group_by {
+                        if let LogicalExpr::Column(index) = expr {
+                            cols.push(*index);
+                        } else {
+                            bare = false;
+                            break;
+                        }
+                    }
+                    if bare {
+                        for aggregate in &a.aggregates {
+                            match &*aggregate.arg {
+                                LogicalExpr::Column(index) => cols.push(*index),
+                                LogicalExpr::Wildcard => {}
+                                _ => {
+                                    bare = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if bare {
+                        cols.sort_unstable();
+                        cols.dedup();
+                        if !cols.is_empty() && cols.len() < scan.schema.columns.len() {
+                            spec.projection = Some(cols);
+                        }
+                    }
+                }
+            }
+            collect_from_plan_ctx(&a.input, table_name, schema, spec, join_side_cols);
         }
         LogicalPlan::Sort(s) => {
             spec.has_order_by = true;
             collect_sort_keys(&s.sort_keys, schema, spec);
-            collect_from_plan(&s.input, table_name, schema, spec);
+            collect_from_plan_ctx(&s.input, table_name, schema, spec, join_side_cols);
         }
         LogicalPlan::Limit(l) => {
             set_scan_limit(spec, l.limit.saturating_add(l.offset));
-            collect_from_plan(&l.input, table_name, schema, spec);
+            collect_from_plan_ctx(&l.input, table_name, schema, spec, join_side_cols);
         }
         LogicalPlan::TopN(t) => {
             spec.has_order_by = true;
             collect_sort_keys(&t.sort_keys, schema, spec);
             set_scan_limit(spec, t.limit.saturating_add(t.offset));
-            collect_from_plan(&t.input, table_name, schema, spec);
+            collect_from_plan_ctx(&t.input, table_name, schema, spec, join_side_cols);
         }
         LogicalPlan::Distinct(d) => {
             spec.has_distinct_or_window = true;
-            collect_from_plan(&d.input, table_name, schema, spec);
+            collect_from_plan_ctx(&d.input, table_name, schema, spec, join_side_cols);
         }
         LogicalPlan::Window(w) => {
             spec.has_distinct_or_window = true;
-            collect_from_plan(&w.input, table_name, schema, spec);
+            collect_from_plan_ctx(&w.input, table_name, schema, spec, join_side_cols);
         }
         LogicalPlan::Join(j) => {
             spec.has_join = true;
-            collect_from_plan(&j.left, table_name, schema, spec);
-            collect_from_plan(&j.right, table_name, schema, spec);
+            let mut condition_cols = Vec::new();
+            crate::sql::planner::expr::collect_cols_from_expr(&j.condition, &mut condition_cols);
+            let left_width = j.left_schema.columns.len();
+            let mut own = join_side_cols.to_vec();
+            own.retain(|col| *col < schema.num_columns());
+            let mut left_cols = own.clone();
+            left_cols.extend(condition_cols.iter().filter(|c| **c < left_width).copied());
+            let mut right_cols = own;
+            right_cols.extend(
+                condition_cols
+                    .iter()
+                    .filter(|c| **c >= left_width)
+                    .map(|c| *c - left_width),
+            );
+            collect_from_plan_ctx(&j.left, table_name, schema, spec, &left_cols);
+            collect_from_plan_ctx(&j.right, table_name, schema, spec, &right_cols);
         }
         LogicalPlan::SemiJoin(s) => {
             spec.has_join = true;
-            collect_from_plan(&s.left, table_name, schema, spec);
-            collect_from_plan(&s.right, table_name, schema, spec);
+            let mut condition_cols = Vec::new();
+            crate::sql::planner::expr::collect_cols_from_expr(&s.condition, &mut condition_cols);
+            let left_width = s.left_schema.columns.len();
+            let mut own = join_side_cols.to_vec();
+            own.retain(|col| *col < schema.num_columns());
+            let mut left_cols = own.clone();
+            left_cols.extend(condition_cols.iter().filter(|c| **c < left_width).copied());
+            let mut right_cols = own;
+            right_cols.extend(
+                condition_cols
+                    .iter()
+                    .filter(|c| **c >= left_width)
+                    .map(|c| *c - left_width),
+            );
+            collect_from_plan_ctx(&s.left, table_name, schema, spec, &left_cols);
+            collect_from_plan_ctx(&s.right, table_name, schema, spec, &right_cols);
         }
         LogicalPlan::Empty => {}
     }
@@ -711,105 +906,41 @@ fn coerce_scalar(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::protocol::types::DataType;
-    use crate::sql::parser::ast::BinOp;
-    use crate::types::batch::ColumnDef;
+/// A scan-side row cap that survived the pushdown-safety gate. Constructed
+/// only by [`pushdown_safe_limit`] — fast paths that truncate reads at a
+/// LIMIT (segment scan trim, memtable shortcut, hot-store key lookup, mirror
+/// legs) must take their cap from there. A hand-rolled `spec.limit` filter
+/// forgets a shape (aggregate, GROUP BY, DISTINCT, window, residual
+/// predicate) and silently truncates correct results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PushdownLimit(usize);
 
-    fn int32_schema() -> Schema {
-        Schema::new(vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("deal_date", DataType::Int32),
-        ])
-    }
-
-    /// Regression: IN literals must be coerced to the column type. Bloom and
-    /// set index pruning hash/compare the stored type exactly, so Int64
-    /// literals against an Int32 column used to prune every matching row.
-    #[test]
-    fn in_predicate_values_are_coerced_to_column_type() {
-        let schema = int32_schema();
-        let expr = LogicalExpr::In {
-            expr: Box::new(LogicalExpr::Column(1)),
-            values: vec![
-                ScalarValue::Int64(Some(20260916)),
-                ScalarValue::Int64(Some(20260917)),
-            ],
-            negated: false,
-        };
-        let mut spec = ScanSpec::new("t");
-        extract_predicates(&expr, &schema, &mut spec);
-
-        assert!(spec.remaining_predicate.is_none());
-        assert_eq!(spec.in_predicates.len(), 1);
-        assert_eq!(
-            spec.in_predicates[0].values,
-            vec![
-                ScalarValue::Int32(Some(20260916)),
-                ScalarValue::Int32(Some(20260917))
-            ]
-        );
-    }
-
-    /// Between bounds feed the same index checks as range clauses; coerce them
-    /// too so DECIMAL scale and integer widths match the stored column.
-    #[test]
-    fn between_bounds_are_coerced_to_column_type() {
-        let schema = int32_schema();
-        let expr = LogicalExpr::Between {
-            expr: Box::new(LogicalExpr::Column(1)),
-            low: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(20260901)))),
-            high: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(20260930)))),
-            negated: false,
-        };
-        let mut spec = ScanSpec::new("t");
-        extract_predicates(&expr, &schema, &mut spec);
-
-        assert!(spec.remaining_predicate.is_none());
-        assert_eq!(spec.range_predicates.len(), 2);
-        assert!(spec.range_predicates.iter().all(|clause| {
-            clause.value == ScalarValue::Int32(Some(20260901))
-                || clause.value == ScalarValue::Int32(Some(20260930))
-        }));
-    }
-
-    /// A literal that cannot be represented in the column type keeps the
-    /// predicate out of the pushed-down sets entirely (generic evaluation).
-    #[test]
-    fn in_predicate_with_uncoercible_value_stays_generic() {
-        let schema = int32_schema();
-        let expr = LogicalExpr::In {
-            expr: Box::new(LogicalExpr::Column(1)),
-            values: vec![
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Int64(Some(i64::from(i32::MAX) + 1)),
-            ],
-            negated: false,
-        };
-        let mut spec = ScanSpec::new("t");
-        extract_predicates(&expr, &schema, &mut spec);
-
-        assert!(spec.in_predicates.is_empty());
-        assert!(spec.remaining_predicate.is_some());
-    }
-
-    /// Sanity: eq literals were already coerced before the IN fix.
-    #[test]
-    fn eq_predicate_values_are_coerced_to_column_type() {
-        let schema = int32_schema();
-        let expr = LogicalExpr::BinaryOp {
-            left: Box::new(LogicalExpr::Column(1)),
-            op: BinOp::Eq,
-            right: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(20260916)))),
-        };
-        let mut spec = ScanSpec::new("t");
-        extract_predicates(&expr, &schema, &mut spec);
-
-        assert_eq!(
-            spec.eq_predicates,
-            vec![(1usize, ScalarValue::Int32(Some(20260916)))]
-        );
+impl PushdownLimit {
+    pub fn get(self) -> usize {
+        self.0
     }
 }
+
+/// The single gate for turning a plan LIMIT into a scan-side row cap.
+/// `ordered_lookup` says whether THIS path can serve the ORDER BY faithfully
+/// (ordered cluster scan / ordered hot lookup); when it cannot, an ORDER BY
+/// LIMIT must see every row to pick the right ones.
+pub(crate) fn pushdown_safe_limit(spec: &ScanSpec, ordered_lookup: bool) -> Option<PushdownLimit> {
+    let limit = spec.limit?;
+    if spec.has_aggregate
+        || spec.has_group_by
+        || spec.has_join
+        || spec.has_distinct_or_window
+        || spec.remaining_predicate.is_some()
+    {
+        return None;
+    }
+    if spec.has_order_by && !ordered_lookup {
+        return None;
+    }
+    Some(PushdownLimit(limit))
+}
+
+#[cfg(test)]
+#[path = "spec_test.rs"]
+mod tests;

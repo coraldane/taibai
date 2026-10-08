@@ -74,8 +74,9 @@ seq 高水位持久化在 `<data>/wal/replication_seq`（主）与
 | REPL_ACK | 0x74 | 备→主 | `[applied_seq u64]` |
 | REPL_SEGMENT_GONE | 0x75 | 主→备 | 空。请求的段已被 compaction/TTL 淘汰（事件环可证明）；备机跳过触发它的 `SegmentUpdate`，行数据由流中稍后的 `SegmentsReplaced`/`SegmentsRemoved` 交付。无退休记录的缺失文件仍返回 ERROR |
 
-REPL_HELLO 要求登录会话与 hello 用户一致，且用户持有 `REPLICATION` 权限
-（`GRANT REPLICATION ON *.* TO ...`；root 的 ALL 覆盖）。
+REPL_HELLO 要求登录会话与 hello 用户一致，且用户持有 `REPLICATION` 权限。
+`REPLICATION` 是全局权限：`GRANT REPLICATION TO repl_user;`（省略 ON，或用
+`*.*` 通配对象；带 `ON TABLE`/`ON DATABASE` 会报错）。root 的 `ALL` 覆盖该检查。
 
 ## 已知边界
 
@@ -92,7 +93,7 @@ REPL_HELLO 要求登录会话与 hello 用户一致，且用户持有 `REPLICATI
 | 行为 | 位置 |
 |---|---|
 | 事件编解码 / RepLog（seq、环形缓冲、fan-out） | `src/storage/replication/mod.rs` |
-| 提交线程内联发布 + 结构事件入队 | `src/storage/core/durable_tail.rs`（`TailCommitter::submit_event`、`write_append_group`） |
+| 提交线程内联发布 + 结构事件入队 | `src/storage/core/durable_tail/committer.rs`（`TailCommitter::submit_event`、`write_append_group`） |
 | flush/seal 发射点 | `src/storage/core/batch_writer.rs`、`src/storage/segment_manager/lifecycle.rs`、`buffered_write.rs` |
 | 主库会话（鉴权、历史续传、段拉取） | `src/net/handler.rs`（`handle_repl_*`） |
 | 备机 applier | `src/storage/replication/standby.rs` |

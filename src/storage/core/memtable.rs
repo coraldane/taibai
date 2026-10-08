@@ -18,6 +18,14 @@ pub enum MemTableState {
     /// it stays readable until an explicit close-of-day clears it. This realises
     /// the design's "checkpoint flush copies (does not move) and keeps the data
     /// resident" semantics for tables that are NOT accelerated by a hot store.
+    ///
+    /// RESERVED VALUE: no production path writes this state today (grep for
+    /// `MemTableState::Archived` — the only writers are `rename_table`, which
+    /// merely propagates an already-Archived state to its replacement, and
+    /// the `state()` byte mapping below). Do NOT remove the variant: the
+    /// u8 encoding is part of the state byte surface (`state()`/`set_state`)
+    /// and preserved for serialization compatibility; a future close-of-day
+    /// checkpoint flush is expected to take this value up again.
     Archived,
 }
 
@@ -281,6 +289,36 @@ impl MemTable {
         Ok(added)
     }
 
+    /// Freeze columns individually for mutation planning. Move the resident
+    /// payload into immutable leaves once; subsequent plans share those
+    /// leaves, including across row selections and constant assignments.
+    pub fn read_mutation_snapshot(&self) -> Result<Option<Arc<RecordBatch>>> {
+        self.ensure_resident()?;
+        let mut guard = self.batch.write().unwrap();
+        let Some(batch) = guard.as_mut() else {
+            return Ok(None);
+        };
+        if batch.columns.iter().all(|c| c.is_selected()) {
+            return Ok(Some(batch.clone()));
+        }
+        let owned = Arc::make_mut(batch);
+        let rows: Arc<[u32]> = (0..owned.num_rows() as u32).collect::<Vec<_>>().into();
+        for column in &mut owned.columns {
+            if column.is_selected() {
+                continue;
+            }
+            let data_type = column.data_type();
+            let leaf =
+                std::mem::replace(column, crate::types::array::ColumnArray::empty(data_type));
+            *column = crate::types::array::ColumnArray::selected(
+                vec![(Arc::new(leaf), rows.clone())].into(),
+                data_type,
+                rows.len(),
+            );
+        }
+        Ok(Some(batch.clone()))
+    }
+
     pub fn read(&self) -> Option<RecordBatch> {
         if self.ensure_resident().is_err() {
             return None;
@@ -289,12 +327,31 @@ impl MemTable {
         guard.as_ref().map(|batch| batch.as_ref().clone())
     }
 
-    pub fn read_with<R>(&self, f: impl FnOnce(&RecordBatch) -> R) -> Option<R> {
+    /// Owned-batch view without the deep copy: the same snapshot as `read()`
+    /// shared through its `Arc`. The memtable's mutators go through
+    /// `Arc::make_mut`, so the returned snapshot is frozen even if the
+    /// memtable appends or is replaced afterwards. Prefer this over `read()`
+    /// in new call sites that only read the batch — the deep clone of
+    /// `read()` is only worth paying when the caller needs to mutate the
+    /// batch.
+    pub fn read_arc(&self) -> Option<Arc<RecordBatch>> {
+        self.read_snapshot_arc()
+    }
+
+    /// Run `f` on a shared snapshot of the batch. The read lock is held
+    /// only for the `Arc` clone; the transform itself runs lock-free, and
+    /// the untouched-source fast paths of the scanner can take the
+    /// snapshot's ownership (zero copy) when this memtable is the sole
+    /// holder.
+    pub fn read_with<R>(&self, f: impl FnOnce(Arc<RecordBatch>) -> R) -> Option<R> {
         if self.ensure_resident().is_err() {
             return None;
         }
-        let guard = self.batch.read().unwrap();
-        guard.as_ref().map(|batch| f(batch.as_ref()))
+        let snapshot = {
+            let guard = self.batch.read().unwrap();
+            guard.as_ref().map(Arc::clone)
+        };
+        snapshot.map(f)
     }
 
     pub fn take_batch(&self) -> Option<RecordBatch> {
@@ -398,8 +455,32 @@ impl MemTable {
                 MemTableBacking::Spilled { tail_path, .. } => tail_path.clone(),
             }
         };
-        let decoded =
-            crate::storage::core::durable_tail::decode_tail_file(&tail_path, &self.schema);
+        // Sidecar-aware materialization: delete/update sidecars above the
+        // tail replay exactly as recovery would. The primary's spill path
+        // is gated to plain tails, so this matters for standby-registered
+        // memtables (sidecars arrived by replication) — without it their
+        // reads resurrected replicated deletes.
+        let table_dir = tail_path
+            .parent()
+            .and_then(|dir| dir.parent())
+            .map(|dir| dir.to_path_buf())
+            .unwrap_or_else(|| tail_path.clone());
+        let decoded = crate::storage::core::durable_tail::decode_tail_with_sidecars(
+            &table_dir,
+            self.id,
+            &self.schema,
+        )
+        .and_then(|decoded| {
+            decoded.map_or_else(
+                || {
+                    Err(crate::common::error::TaibaiError::Storage(format!(
+                        "tail vanished during materialization: {}",
+                        tail_path.display()
+                    )))
+                },
+                |(partition_key, batch)| Ok((partition_key, batch)),
+            )
+        });
         let mut batch_guard = self.batch.write().unwrap();
         let mut backing_guard = self.backing.write().unwrap();
         let expected_rows = match &*backing_guard {
@@ -407,6 +488,13 @@ impl MemTable {
             MemTableBacking::Spilled { rows, .. } => *rows,
         };
         let (_, batch) = decoded.map_err(|error| {
+            // A tail whose layout predates an ALTER COLUMN (legacy data from
+            // an older version) can never materialize against the current
+            // catalog: count it and say so loudly — the rows stay on disk
+            // but this memtable reads as empty until the table is reloaded.
+            if crate::storage::core::durable_tail::is_schema_drift_error(&error) {
+                crate::storage::core::durable_tail::note_tail_schema_drift(&tail_path, &error);
+            }
             tracing::error!(
                 error = %error,
                 path = %tail_path.display(),
@@ -540,8 +628,15 @@ impl MemTable {
         self.content_version.load(Ordering::Acquire)
     }
 
-    pub fn schema(&self) -> Option<Schema> {
-        Some(self.schema.clone())
+    pub fn schema(&self) -> Schema {
+        self.schema.clone()
+    }
+
+    /// Borrowed schema for the write path's per-statement layout checks —
+    /// `schema()` deep-copies every ColumnDef on each call, which sat inside
+    /// the partition mutation lock of every INSERT.
+    pub fn schema_ref(&self) -> &Schema {
+        &self.schema
     }
 
     pub fn age_secs(&self) -> u64 {
@@ -594,6 +689,49 @@ fn replace_key_positions_for_rows(
 
 type WritableTableKey = (String, String, String, u64);
 
+/// Whether a batch diverges from the target schema and needs
+/// [`align_batch_to_schema`]: widths differ, or same-width names sit at
+/// different positions (DROP + ADD keeps the width). An empty target schema
+/// (hand-built specs in tests) never aligns.
+pub(crate) fn batch_matches_schema(batch: &RecordBatch, schema: &Schema) -> bool {
+    if schema.num_columns() == 0 {
+        return true;
+    }
+    batch.num_columns() == schema.num_columns()
+        && batch
+            .schema
+            .columns
+            .iter()
+            .zip(schema.columns.iter())
+            .all(|(batch_col, target_col)| batch_col.name.eq_ignore_ascii_case(&target_col.name))
+}
+
+/// Align a batch to the target schema: map every target column into the
+/// batch by name (current name, then previous names — the batch keeps its
+/// insert-time layout across RENAME/DROP), and fill columns the batch
+/// predates (ALTER ADD COLUMN is catalog-only metadata) with the column's
+/// DEFAULT, through the same `default_value_column` the segment-side aligned
+/// read uses. Row count and row order are unchanged, so transactional
+/// position maps stay valid. This is the ONE reconciliation for in-memory
+/// batches; segment batches are reconciled at read time by
+/// `SegmentReader::read_row_group_columns_aligned`.
+pub(crate) fn align_batch_to_schema(batch: &RecordBatch, schema: &Schema) -> Result<RecordBatch> {
+    let mut columns = Vec::with_capacity(schema.num_columns());
+    for col_def in &schema.columns {
+        let mapped = std::iter::once(&col_def.name)
+            .chain(col_def.previous_names.iter())
+            .find_map(|name| batch.schema.index_of(name));
+        match mapped {
+            Some(batch_idx) => columns.push(batch.columns[batch_idx].clone()),
+            None => columns.push(crate::storage::segment::reader::default_value_column(
+                col_def,
+                batch.num_rows(),
+            )?),
+        }
+    }
+    RecordBatch::try_new(schema.clone(), columns)
+}
+
 pub struct MemTableManager {
     memtables: RwLock<Vec<Arc<MemTable>>>,
     writable: RwLock<HashMap<WritableTableKey, Weak<MemTable>>>,
@@ -613,6 +751,11 @@ pub struct MemTableManager {
     /// after construction; flush selection consults it to skip memtables
     /// pinned by live transactions.
     txn_mutations: RwLock<Option<Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>>>,
+    /// Per-table authoritative write layout, set by width-changing DDL after
+    /// the catalog flip (see `exec_alter_table`). New memtables are created
+    /// with it, so hot state always matches the catalog even when an
+    /// in-flight statement planned against the pre-ALTER schema.
+    table_schemas: Mutex<HashMap<(String, String), std::sync::Arc<Schema>>>,
 }
 
 /// What one hot-unfed accounting entry scopes to. `Table` marks bypasses
@@ -644,7 +787,32 @@ impl MemTableManager {
             replace_key_indexes: RwLock::new(HashMap::new()),
             hot_unfed_rows: Mutex::new(HashMap::new()),
             txn_mutations: RwLock::new(None),
+            table_schemas: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Publish the layout new memtables of this table must use. Called by
+    /// width-changing DDL under the table mutation lock, after the catalog
+    /// flip: statements queued on the lock read it before their first
+    /// append, so no memtable can outlive the ALTER with a stale layout.
+    pub fn set_table_schema(&self, db: &str, table: &str, schema: Schema) {
+        self.table_schemas.lock().unwrap().insert(
+            (db.to_string(), table.to_string()),
+            std::sync::Arc::new(schema),
+        );
+    }
+
+    /// The layout new memtables of this table must use, if a width-changing
+    /// DDL published one. Absent = the incoming statement schema governs.
+    /// Returns a shared handle: this sits on the per-statement INSERT path,
+    /// where the previous owned clone deep-copied every ColumnDef (name
+    /// strings, previous_names, defaults) on every write.
+    pub fn table_schema(&self, db: &str, table: &str) -> Option<std::sync::Arc<Schema>> {
+        self.table_schemas
+            .lock()
+            .unwrap()
+            .get(&(db.to_string(), table.to_string()))
+            .cloned()
     }
 
     pub fn set_txn_mutations(
@@ -672,7 +840,7 @@ impl MemTableManager {
     /// Standby replication: the primary's segment now durably holds these
     /// memtables' rows; retire the local spilled copies.
     pub fn retire_replicated_memtables(&self, ids: &[Uuid]) {
-        let memtables = self.memtables.write().unwrap();
+        let memtables = self.memtables.read().unwrap();
         for mt in memtables.iter() {
             if ids.contains(&mt.id()) {
                 mt.set_state(MemTableState::Flushed);
@@ -868,6 +1036,15 @@ impl MemTableManager {
         schema: &Schema,
         txn_id: u64,
     ) -> Arc<MemTable> {
+        // A width-changing DDL publishes the authoritative layout for new
+        // memtables; an in-flight statement that planned against the
+        // pre-ALTER schema must not create a stale-width memtable with it
+        // (its batch is aligned to this schema by the append site).
+        // Borrowed, not cloned: the deep copy happens only if a memtable is
+        // actually created below — the common existing-memtable path pays an
+        // Arc bump instead of a full schema clone per statement.
+        let authoritative = self.table_schema(db, table);
+        let schema: &Schema = authoritative.as_deref().unwrap_or(schema);
         let key = (
             db.to_string(),
             table.to_string(),
@@ -1055,8 +1232,10 @@ impl MemTableManager {
     /// Drop REPLACE key indexes whose memtables are no longer registered.
     fn prune_replace_key_indexes(&self) {
         let memtables = self.memtables.read().unwrap();
+        let live_ids: std::collections::HashSet<Uuid> =
+            memtables.iter().map(|mt| mt.id()).collect();
         let mut indexes = self.replace_key_indexes.write().unwrap();
-        indexes.retain(|id, _| memtables.iter().any(|mt| mt.id() == *id));
+        indexes.retain(|id, _| live_ids.contains(id));
     }
 
     pub fn get_readable_by_table(&self, db: &str, table: &str) -> Vec<Arc<MemTable>> {
@@ -1142,13 +1321,52 @@ impl MemTableManager {
 
     pub fn get_all_pending(&self) -> Vec<Arc<MemTable>> {
         let memtables = self.memtables.read().unwrap();
+        let pinned = self.txn_mutations.read().unwrap();
         memtables
             .iter()
             .filter(|mt| {
                 // FLUSH ALL (and shutdown) must never materialize another
-                // session's uncommitted rows into segments: transactional
-                // memtables only reach segments through COMMIT.
-                mt.state() == MemTableState::Pending && !mt.is_transactional()
+                // session's uncommitted rows into segments, nor flush a
+                // memtable a live deferred-DML transaction still pins:
+                // transactional memtables only reach segments through COMMIT,
+                // and pinned ones must keep their batch positions stable.
+                mt.state() == MemTableState::Pending
+                    && !mt.is_transactional()
+                    && !pinned
+                        .as_ref()
+                        .is_some_and(|registry| registry.is_memtable_pinned(mt.id()))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The single choke point every flush entry point (background flusher,
+    /// FLUSH TABLE, pressure passes, full-memtable checkpoints, DDL
+    /// convergence) must collect through. Centralizes the two exclusions
+    /// that keep flushes from breaking other sessions:
+    ///
+    /// * transactional memtables reach segments only at COMMIT — flushing
+    ///   one publishes another session's uncommitted rows as plain segment
+    ///   rows that a later ROLLBACK cannot retract;
+    /// * a deferred-DML pin means a live transaction still needs this
+    ///   memtable's batch positions stable until COMMIT — flushing it makes
+    ///   that transaction's COMMIT unrecoverably fail.
+    ///
+    /// Callers that need further narrowing (partition key, row-count
+    /// thresholds) filter on top of this snapshot; they must not widen it.
+    pub fn get_flushable_by_table(&self, db: &str, table: &str) -> Vec<Arc<MemTable>> {
+        let memtables = self.memtables.read().unwrap();
+        let pinned = self.txn_mutations.read().unwrap();
+        memtables
+            .iter()
+            .filter(|mt| {
+                mt.db() == db
+                    && mt.table() == table
+                    && mt.state() == MemTableState::Pending
+                    && !mt.is_transactional()
+                    && !pinned
+                        .as_ref()
+                        .is_some_and(|registry| registry.is_memtable_pinned(mt.id()))
             })
             .cloned()
             .collect()
@@ -1330,6 +1548,25 @@ impl MemTableManager {
             self.prune_replace_key_indexes();
         }
         rolled_back
+    }
+
+    /// Publish privately staged statement images into an open transaction.
+    /// Caller holds the table mutation locks; no durable visibility changes.
+    pub(crate) fn adopt_staged_transaction(&self, staged: u64, owner: u64) {
+        let mut writable = self.writable.write().unwrap();
+        let memtables = self.memtables.read().unwrap();
+        for mt in memtables.iter().filter(|mt| mt.txn_id() == staged) {
+            let old = (
+                mt.db().to_string(),
+                mt.table().to_string(),
+                mt.partition_key().to_string(),
+                staged,
+            );
+            writable.remove(&old);
+            mt.txn_id.store(owner, Ordering::Release);
+            *mt.visibility.write().unwrap() = TxnVisibility::Uncommitted(owner);
+            writable.insert((old.0, old.1, old.2, owner), Arc::downgrade(mt));
+        }
     }
 
     pub fn commit_txn(&self, txn_id: u64) -> Vec<Arc<MemTable>> {

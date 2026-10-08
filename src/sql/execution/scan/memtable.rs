@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
+use crate::common::error::Result;
 use crate::storage::catalog::schema::TableMeta;
 use crate::storage::core::hot_store::{HotStore, HotStoreManager};
 use crate::storage::core::memtable::MemTableManager;
-use crate::types::batch::RecordBatch;
+use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::spec::ScanSpec;
@@ -29,7 +32,10 @@ pub fn scan_resident_hot_store(
     table_meta: &TableMeta,
     spec: &ScanSpec,
 ) -> Option<RecordBatch> {
-    if spec.reader_txn_id != 0 {
+    // The hot gather truncates at the pushed LIMIT before TTL filtering
+    // runs, so with expired rows present it would return fewer live rows
+    // than exist.
+    if spec.reader_txn_id != 0 || spec.ttl_active || table_meta.ttl.is_some() {
         return None;
     }
     let store = hot_mgr.get(db, &spec.table_name)?;
@@ -40,26 +46,6 @@ pub fn scan_resident_hot_store(
         return None;
     }
     scan_hot_store_by_key(&store, spec, 0)
-}
-
-pub fn count_resident_hot_store(
-    hot_mgr: &HotStoreManager,
-    memtable_mgr: &MemTableManager,
-    db: &str,
-    table_meta: &TableMeta,
-    spec: &ScanSpec,
-) -> Option<u64> {
-    if spec.reader_txn_id != 0 || table_meta.ttl.is_some() {
-        return None;
-    }
-    let store = hot_mgr.get(db, &spec.table_name)?;
-    if store.row_count() == 0 {
-        return None;
-    }
-    if !resident_hot_covers(&store, memtable_mgr, db, table_meta, spec) {
-        return None;
-    }
-    count_hot_store_by_key(&store, spec, 0)
 }
 
 /// Partial-residency gate. Returns `(partition_column_index, covers_value)`
@@ -161,26 +147,6 @@ pub fn hybrid_hot_mirror_scan(
     Some((batch, pk_idx, covers))
 }
 
-/// Count counterpart of [`hybrid_hot_mirror_scan`].
-pub fn hybrid_hot_mirror_count(
-    hot_mgr: &HotStoreManager,
-    memtable_mgr: &MemTableManager,
-    db: &str,
-    table_meta: &TableMeta,
-    spec: &ScanSpec,
-) -> Option<(u64, usize, ScalarValue)> {
-    let store = hot_mgr.get(db, &spec.table_name)?;
-    let (pk_idx, covers) = hybrid_hot_mirror_bound(&store, memtable_mgr, db, table_meta, spec)?;
-    let mirror_spec = spec_with_mirror_bound(
-        spec,
-        pk_idx,
-        &covers,
-        crate::storage::partition::pruning::RangeOp::Gt,
-    );
-    let count = count_hot_store_by_key(&store, &mirror_spec, 0)?;
-    Some((count, pk_idx, covers))
-}
-
 /// The hot store may answer a partition scan alone only when it holds the
 /// partition's full row set: the store must mark the partition resident AND
 /// no write may have bypassed the hot-store mirror for it. The second check
@@ -218,6 +184,13 @@ fn resident_hot_covers(
     )
 }
 
+/// Whether a resident memtable batch diverges from the catalog schema and
+/// needs alignment. Hand-built specs (tests) carry an empty catalog schema
+/// and never align.
+fn memtable_batch_needs_alignment(batch: &RecordBatch, table_schema: &Schema) -> bool {
+    !crate::storage::core::memtable::batch_matches_schema(batch, table_schema)
+}
+
 pub fn scan_memtables(
     memtable_mgr: &MemTableManager,
     hot_mgr: &HotStoreManager,
@@ -247,6 +220,9 @@ pub fn scan_memtables(
     // to the plain memtable scan so those rows stay visible.
     if has_live_memtable_data
         && spec.reader_txn_id == 0
+        // TTL filtering runs after this gather truncates at the pushed
+        // LIMIT — the shortcut is only safe while no rows can expire.
+        && !spec.ttl_active
         && memtable_mgr.hot_table_fully_mirrored(db, table_name)
     {
         if let Some(store) = hot_mgr.get(db, table_name) {
@@ -276,68 +252,33 @@ pub fn scan_memtables(
             None
         };
         if let Some(mt_batch) = mt
-            .read_with(|source| {
+            .read_with(|snapshot| {
+                let source: &RecordBatch = &snapshot;
                 if source.num_rows() == 0 {
                     return None;
                 }
 
-                // Exactly one materialization per path: the txn-filtered
-                // batch is owned when present; the no-predicate path moves it
-                // (or clones the source once). The old code deep-cloned the
-                // source up front and cloned it again below.
-                let txn_filtered = match &txn_positions {
-                    Some(positions) => {
-                        match crate::storage::core::txn_mutations::filter_batch_excluding_positions(
-                            source, positions,
-                        ) {
-                            Ok(filtered) => Some(filtered),
-                            Err(e) => return Some(Err(e)),
-                        }
-                    }
-                    None => None,
-                };
-                let filtered = if let Some(txn_filtered) = txn_filtered {
-                    if spec.has_predicates() {
-                        match super::row_filter::apply_predicates(
-                            &txn_filtered,
-                            &spec.eq_predicates,
-                            &spec.range_predicates,
-                            &spec.in_predicates,
-                            spec.remaining_predicate.as_ref(),
-                        ) {
-                            Ok(filtered) => filtered,
-                            // Propagate: a failed predicate used to drop the
-                            // whole memtable batch from the result.
-                            Err(e) => return Some(Err(e)),
-                        }
-                    } else {
-                        txn_filtered
-                    }
-                } else if spec.has_predicates() {
-                    match super::row_filter::apply_predicates(
+                // A memtable predating an ALTER keeps its insert-time column
+                // layout while catalog indices move immediately: align to
+                // the catalog BEFORE any consumer below, so catalog indices
+                // resolve to the right columns and added columns fill with
+                // their DEFAULT (the segment-side aligned read's semantics).
+                // Alignment is row-preserving, so the deferred-DML tombstone
+                // positions — row indices, layout-independent — filter
+                // equivalently against the aligned batch; filtering before
+                // alignment (the old order) evaluated predicates against the
+                // stale layout after a DROP/ADD COLUMN.
+                if memtable_batch_needs_alignment(source, &spec.table_schema) {
+                    let aligned = match crate::storage::core::memtable::align_batch_to_schema(
                         source,
-                        &spec.eq_predicates,
-                        &spec.range_predicates,
-                        &spec.in_predicates,
-                        spec.remaining_predicate.as_ref(),
+                        &spec.table_schema,
                     ) {
-                        Ok(filtered) => filtered,
+                        Ok(batch) => batch,
                         Err(e) => return Some(Err(e)),
-                    }
-                } else {
-                    source.clone()
-                };
-
-                if filtered.num_rows() == 0 {
-                    return None;
+                    };
+                    return scan_aligned_memtable_batch(aligned, spec, &txn_positions);
                 }
-
-                let ordered = apply_order_if_cluster_prefix_matches(filtered, spec);
-                Some(Ok(if let Some(proj) = &spec.projection {
-                    apply_projection(&ordered, proj)
-                } else {
-                    ordered
-                }))
+                scan_memtable_snapshot(snapshot, spec, &txn_positions)
             })
             .flatten()
         {
@@ -388,9 +329,16 @@ pub fn scan_hot_store_by_key(
 
     let ordered_lookup = ordered_cluster_order_for_schema(store.schema(), spec);
     let reverse_lookup = ordered_lookup.as_ref().is_some_and(|order| order.desc);
-    let lookup_limit = spec
-        .limit
-        .filter(|_| direct_filter_lookup && (!spec.has_order_by || ordered_lookup.is_some()));
+    // The shared pushdown gate — the hot path must not re-derive limit
+    // safety. It used to hand `spec.limit` straight to the lookup, so a
+    // `SELECT DISTINCT ... LIMIT n` over a resident store truncated the
+    // dedup input and aggregate shapes under-counted.
+    let lookup_limit = if direct_filter_lookup {
+        super::spec::pushdown_safe_limit(spec, ordered_lookup.is_some())
+    } else {
+        None
+    }
+    .map(|limit| limit.get());
     let batch = match store.lookup_filtered(
         key_value,
         partition_value,
@@ -453,146 +401,6 @@ pub fn scan_hot_store_by_key(
     Some(projected)
 }
 
-pub fn count_hot_memtable_rows(
-    memtable_mgr: &MemTableManager,
-    hot_mgr: &HotStoreManager,
-    db: &str,
-    table_name: &str,
-    spec: &ScanSpec,
-) -> Option<u64> {
-    let store = hot_mgr.get(db, table_name)?;
-    hot_count_key_partition_values(&store, spec)?;
-    let (has_live_memtable_data, watermark) =
-        live_memtables_and_watermark(memtable_mgr, db, table_name, spec.reader_txn_id, &store);
-    if !has_live_memtable_data {
-        return None;
-    }
-    count_hot_store_by_key(&store, spec, watermark)
-}
-
-pub fn count_hot_store_by_key(store: &HotStore, spec: &ScanSpec, watermark: u64) -> Option<u64> {
-    let (key_value, partition_value) = hot_count_key_partition_values(store, spec)?;
-    let posting_list_only = spec.range_predicates.is_empty()
-        && spec.eq_predicates.iter().all(|(idx, _)| {
-            *idx == store.key_column_index() || Some(*idx) == store.partition_column_index()
-        });
-    if posting_list_only {
-        store.count_by_key_partition_from(key_value, partition_value, watermark)
-    } else {
-        store.count_filtered(
-            key_value,
-            partition_value,
-            watermark,
-            &spec.eq_predicates,
-            &spec.range_predicates,
-        )
-    }
-}
-
-fn hot_count_key_partition_values<'a>(
-    store: &HotStore,
-    spec: &'a ScanSpec,
-) -> Option<(&'a ScalarValue, Option<&'a ScalarValue>)> {
-    if spec.reader_txn_id != 0
-        || !spec.in_predicates.is_empty()
-        || spec.remaining_predicate.is_some()
-    {
-        return None;
-    }
-    let key_idx = store.key_column_index();
-    let partition_col_idx = store.partition_column_index();
-    let key_value = spec.eq_value_for_column(key_idx)?;
-    let partition_value = partition_col_idx.and_then(|idx| spec.eq_value_for_column(idx));
-    Some((key_value, partition_value))
-}
-
-pub fn count_memtable_rows(
-    memtable_mgr: &MemTableManager,
-    db: &str,
-    table_name: &str,
-    spec: &ScanSpec,
-) -> u64 {
-    let memtables = memtable_mgr
-        .get_readable_by_table(db, table_name)
-        .into_iter()
-        .filter(|mt| mt.is_visible_to(spec.reader_txn_id))
-        .collect::<Vec<_>>();
-    let mut total: u64 = 0;
-
-    for mt in &memtables {
-        let txn_positions = if spec.reader_txn_id != 0 {
-            memtable_mgr
-                .txn_mutations()
-                .and_then(|registry| registry.memtable_positions(spec.reader_txn_id, mt.id()))
-        } else {
-            None
-        };
-        if let Some(count) = mt.read_with(|mt_batch| {
-            if mt_batch.num_rows() == 0 {
-                return 0;
-            }
-
-            // Counting is read-only: work through a reference. The old
-            // committed-read branch deep-cloned the whole batch (all
-            // columns of every memtable, every count query) only to then
-            // use it by reference.
-            let filtered_holder;
-            let mt_batch: &RecordBatch = match &txn_positions {
-                Some(positions) => {
-                    match crate::storage::core::txn_mutations::filter_batch_excluding_positions(
-                        mt_batch, positions,
-                    ) {
-                        Ok(filtered) => {
-                            filtered_holder = filtered;
-                            &filtered_holder
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "memtable overlay filter failed");
-                            return 0;
-                        }
-                    }
-                }
-                None => mt_batch,
-            };
-
-            if spec.eq_predicates.len() == 1
-                && spec.range_predicates.is_empty()
-                && spec.in_predicates.is_empty()
-                && spec.remaining_predicate.is_none()
-            {
-                let (col_idx, value) = &spec.eq_predicates[0];
-                if let Some(col) = mt_batch.column(*col_idx) {
-                    let mask = col.eq_vec(value);
-                    mask.iter().filter(|&&m| m).count() as u64
-                } else {
-                    0
-                }
-            } else if spec.has_predicates() {
-                let filtered = match super::row_filter::apply_predicates(
-                    mt_batch,
-                    &spec.eq_predicates,
-                    &spec.range_predicates,
-                    &spec.in_predicates,
-                    spec.remaining_predicate.as_ref(),
-                ) {
-                    Ok(filtered) => filtered,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "memtable count predicate failed");
-                        return 0;
-                    }
-                };
-                filtered.num_rows() as u64
-            } else {
-                mt_batch.num_rows() as u64
-            }
-        }) {
-            total += count;
-        }
-    }
-
-    total
-}
-
 fn apply_projection(batch: &RecordBatch, projection: &[usize]) -> RecordBatch {
     let mut col_defs = Vec::with_capacity(projection.len());
     let mut columns = Vec::with_capacity(projection.len());
@@ -606,6 +414,126 @@ fn apply_projection(batch: &RecordBatch, projection: &[usize]) -> RecordBatch {
     }
     let schema = crate::types::batch::Schema::new(col_defs);
     RecordBatch::try_new(schema, columns).unwrap_or_else(|_| batch.clone())
+}
+
+/// Shared tail of every memtable scan path: empty → `None`, cluster-prefix
+/// order normalization, projection.
+fn finish_memtable_batch(batch: RecordBatch, spec: &ScanSpec) -> Option<Result<RecordBatch>> {
+    if batch.num_rows() == 0 {
+        return None;
+    }
+    let ordered = apply_order_if_cluster_prefix_matches(batch, spec);
+    Some(Ok(if let Some(proj) = &spec.projection {
+        apply_projection(&ordered, proj)
+    } else {
+        ordered
+    }))
+}
+
+/// A drifted (re-aligned) batch: alignment already materialized once, so
+/// the transform pipeline consumes it by value — the untouched case moves
+/// it instead of cloning again.
+fn scan_aligned_memtable_batch(
+    aligned: RecordBatch,
+    spec: &ScanSpec,
+    txn_positions: &Option<std::sync::Arc<std::collections::BTreeSet<u32>>>,
+) -> Option<Result<RecordBatch>> {
+    if let Some(positions) = txn_positions {
+        match crate::storage::core::txn_mutations::filter_batch_excluding_positions(
+            &aligned, positions,
+        ) {
+            Ok(filtered) => return scan_filtered_memtable_batch(filtered, spec),
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    if spec.has_predicates() {
+        match super::row_filter::apply_predicates(
+            &aligned,
+            &spec.eq_predicates,
+            &spec.range_predicates,
+            &spec.in_predicates,
+            spec.remaining_predicate.as_ref(),
+        ) {
+            Ok(filtered) => return finish_memtable_batch(filtered, spec),
+            // Propagate: a failed predicate used to drop the whole memtable
+            // batch from the result.
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    finish_memtable_batch(aligned, spec)
+}
+
+/// A predicate- or txn-filtered batch: the filter already produced an owned
+/// result, finish it.
+fn scan_filtered_memtable_batch(
+    filtered: RecordBatch,
+    spec: &ScanSpec,
+) -> Option<Result<RecordBatch>> {
+    if !spec.has_predicates() {
+        return finish_memtable_batch(filtered, spec);
+    }
+    match super::row_filter::apply_predicates(
+        &filtered,
+        &spec.eq_predicates,
+        &spec.range_predicates,
+        &spec.in_predicates,
+        spec.remaining_predicate.as_ref(),
+    ) {
+        Ok(narrowed) => finish_memtable_batch(narrowed, spec),
+        Err(e) => Some(Err(e)),
+    }
+}
+
+/// The untouched-snapshot fast path. Order normalization here only ever
+/// leaves the batch unchanged or reverses it (`apply_order` never sorts),
+/// and `reverse_batch` builds from a reference — so no full-width copy is
+/// ever needed: a projection copies only the projected columns from the
+/// borrowed snapshot, and without one the snapshot's ownership transfers
+/// zero-copy when the memtable is the sole holder (one clone only against
+/// a concurrent reader).
+fn scan_memtable_snapshot(
+    snapshot: std::sync::Arc<RecordBatch>,
+    spec: &ScanSpec,
+    txn_positions: &Option<std::sync::Arc<std::collections::BTreeSet<u32>>>,
+) -> Option<Result<RecordBatch>> {
+    let source: &RecordBatch = &snapshot;
+    if let Some(positions) = txn_positions {
+        match crate::storage::core::txn_mutations::filter_batch_excluding_positions(
+            source, positions,
+        ) {
+            Ok(filtered) => return scan_filtered_memtable_batch(filtered, spec),
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    if spec.has_predicates() {
+        return match super::row_filter::apply_predicates(
+            source,
+            &spec.eq_predicates,
+            &spec.range_predicates,
+            &spec.in_predicates,
+            spec.remaining_predicate.as_ref(),
+        ) {
+            Ok(filtered) => finish_memtable_batch(filtered, spec),
+            Err(e) => Some(Err(e)),
+        };
+    }
+    let needs_reverse = ordered_cluster_order_for_batch(source, spec).is_some_and(|order| {
+        !is_batch_ordered_by(source, order.column_index, order.desc)
+            && is_batch_ordered_by(source, order.column_index, !order.desc)
+    });
+    if needs_reverse {
+        if let Some(reversed) = reverse_batch(source) {
+            return finish_memtable_batch(reversed, spec);
+        }
+        // A type the reversal does not support keeps insert order — the
+        // same fallback `apply_order_if_cluster_prefix_matches` makes.
+    }
+    if let Some(proj) = &spec.projection {
+        return Some(Ok(apply_projection(source, proj)));
+    }
+    Some(Ok(
+        Arc::try_unwrap(snapshot).unwrap_or_else(|shared| shared.as_ref().clone())
+    ))
 }
 
 fn apply_order_if_cluster_prefix_matches(batch: RecordBatch, spec: &ScanSpec) -> RecordBatch {
@@ -695,3 +623,7 @@ fn reverse_batch(batch: &RecordBatch) -> Option<RecordBatch> {
         .collect();
     RecordBatch::try_new(batch.schema.clone(), columns).ok()
 }
+
+#[cfg(test)]
+#[path = "memtable_test.rs"]
+mod audit_tests;

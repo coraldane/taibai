@@ -16,7 +16,7 @@ use crate::common::error::{Result, TaibaiError};
 use crate::net::handler::{build_error, is_heavy_request, Handler};
 use crate::net::tls::TlsMode;
 use crate::protocol::codec::MessageCodec;
-use crate::protocol::message::Message;
+use crate::protocol::message::{Message, MSG_TYPE_QUERY};
 use crate::sql::execution::Engine;
 
 pub struct Server {
@@ -24,7 +24,33 @@ pub struct Server {
     engine: Arc<Engine>,
     tls_acceptor: Option<TlsAcceptor>,
     connection_limiter: Arc<Semaphore>,
-    request_limiter: Arc<Semaphore>,
+    limiters: RequestLimiters,
+}
+
+#[derive(Clone)]
+struct RequestLimiters {
+    shared: Arc<Semaphore>,
+    query: Arc<Semaphore>,
+}
+
+impl RequestLimiters {
+    fn new(max_concurrent_requests: usize, reserved_bulk_slots: usize) -> Self {
+        let shared = max_concurrent_requests.max(1);
+        let reserved = reserved_bulk_slots.min(shared - 1);
+        Self {
+            shared: Arc::new(Semaphore::new(shared)),
+            query: Arc::new(Semaphore::new(shared - reserved)),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_shared(shared: Arc<Semaphore>) -> Self {
+        let size = shared.available_permits().max(1);
+        Self {
+            shared,
+            query: Arc::new(Semaphore::new(size)),
+        }
+    }
 }
 
 impl Server {
@@ -47,7 +73,10 @@ impl Server {
         };
         Self {
             connection_limiter: Arc::new(Semaphore::new(config.server.max_connections.max(1))),
-            request_limiter: Arc::new(Semaphore::new(config.server.max_concurrent_requests.max(1))),
+            limiters: RequestLimiters::new(
+                config.server.max_concurrent_requests,
+                config.server.reserved_bulk_slots,
+            ),
             config,
             engine,
             tls_acceptor,
@@ -93,7 +122,7 @@ impl Server {
                     let config = self.config.clone();
                     let engine = self.engine.clone();
                     let tls_acceptor = self.tls_acceptor.clone();
-                    let request_limiter = Arc::clone(&self.request_limiter);
+                    let limiters = self.limiters.clone();
                     tokio::spawn(async move {
                         let _connection_permit = connection_permit;
                         if let Err(e) = handle_connection(
@@ -101,7 +130,7 @@ impl Server {
                             config,
                             engine,
                             tls_acceptor,
-                            request_limiter,
+                            limiters,
                         ).await {
                             tracing::error!(peer = %addr, error = %e, "connection error");
                         }
@@ -118,7 +147,7 @@ async fn handle_connection(
     config: Arc<ServerConfig>,
     engine: Arc<Engine>,
     tls_acceptor: Option<TlsAcceptor>,
-    request_limiter: Arc<Semaphore>,
+    limiters: RequestLimiters,
 ) -> Result<()> {
     if let Some(acceptor) = tls_acceptor {
         tracing::debug!("Performing TLS handshake");
@@ -135,9 +164,9 @@ async fn handle_connection(
         }
         .map_err(|e| TaibaiError::Network(format!("TLS handshake failed: {}", e)))?;
         tracing::debug!("TLS handshake completed");
-        handle_framed(tls_stream, config, engine, request_limiter).await
+        handle_framed(tls_stream, config, engine, limiters).await
     } else {
-        handle_framed(stream, config, engine, request_limiter).await
+        handle_framed(stream, config, engine, limiters).await
     }
 }
 
@@ -145,7 +174,7 @@ async fn handle_framed<S>(
     stream: S,
     config: Arc<ServerConfig>,
     engine: Arc<Engine>,
-    request_limiter: Arc<Semaphore>,
+    limiters: RequestLimiters,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -179,6 +208,13 @@ where
         .set_push_channel(push_tx);
     let mut pending_messages: VecDeque<Message> = VecDeque::new();
     let mut pending_bytes = 0usize;
+    // Requests the connection has accepted (dispatched to a worker) whose
+    // responses have not been delivered yet. The idle close must treat such
+    // requests — and frames still sitting in `pending_messages` — as
+    // connection activity: a client blocked waiting for a slow response
+    // (bulk writes queue on table locks for a long time) legitimately sends
+    // nothing, and must not lose its connection on top of that.
+    let mut requests_in_flight: usize = 0;
 
     let outcome = 'connection: loop {
         // Fetch the next request frame, giving the pending queue priority so
@@ -209,6 +245,22 @@ where
                 match timeout(Duration::from_secs(effective_idle_timeout_secs), wait).await {
                     Ok(incoming) => incoming,
                     Err(_) => {
+                        // In-flight or queued requests count as activity:
+                        // restart the idle window instead of closing. With
+                        // the current one-worker-at-a-time dispatch this is
+                        // defense in depth (the fetch wait is only reached
+                        // once the previous request's responses went out and
+                        // the pending queue is empty), but it keeps the idle
+                        // close correct by construction if dispatch ever
+                        // overlaps response delivery.
+                        if requests_in_flight > 0 || !pending_messages.is_empty() {
+                            tracing::debug!(
+                                requests_in_flight,
+                                queued_frames = pending_messages.len(),
+                                "idle timeout deferred: connection still has in-flight or queued requests"
+                            );
+                            continue;
+                        }
                         tracing::warn!(
                             idle_timeout_secs = effective_idle_timeout_secs,
                             "closing idle connection"
@@ -229,13 +281,14 @@ where
         };
 
         tracing::debug!(msg_type = msg.msg_type, "message received");
+        requests_in_flight += 1;
 
         let context = build_query_context(&config, Arc::new(AtomicBool::new(false)));
         let (stream_sender, mut stream_receiver) = tokio::sync::mpsc::channel(1);
         let mut worker = run_handler(
             handler.take().expect("handler available between requests"),
             msg,
-            Arc::clone(&request_limiter),
+            limiters.clone(),
             Arc::clone(&context),
             stream_sender,
             request_queue_timeout_secs,
@@ -344,7 +397,7 @@ where
                         // reaper: when the query finally stops, the handler
                         // still reaches `flush_on_disconnect` instead of being
                         // dropped with bulk-import dirty data unflushed.
-                        let reaper_limiter = Arc::clone(&request_limiter);
+                        let reaper_limiter = Arc::clone(&limiters.shared);
                         tokio::spawn(async move {
                             let (handler, responses) = unpack_worker_output(worker.await);
                             if let Err(error) = responses {
@@ -391,10 +444,11 @@ where
                 break 'connection Err(e);
             }
         }
+        requests_in_flight = requests_in_flight.saturating_sub(1);
     };
 
     if let Some(handler) = handler.take() {
-        cleanup_handler_blocking(handler, request_limiter).await;
+        cleanup_handler_blocking(handler, Arc::clone(&limiters.shared)).await;
     }
     tracing::info!("connection closed");
     drop(keep_push_tx);
@@ -520,10 +574,57 @@ fn build_query_context(
 /// recover it after a bounded wait. Heavy requests are listed in the engine's
 /// query registry before queueing, so queued work shows in `SHOW PROCESSLIST`
 /// and can be cancelled via `KILL QUERY`.
+enum SlotAcquisition {
+    Permit(tokio::sync::OwnedSemaphorePermit),
+    Rejected(String),
+}
+
+async fn acquire_slot(
+    limiter: &Arc<Semaphore>,
+    context: &Arc<crate::common::query_cancel::QueryContext>,
+    msg_type: u8,
+    queue_timeout_secs: u64,
+    slot_pool: &'static str,
+) -> std::result::Result<SlotAcquisition, TaibaiError> {
+    // Wait for a request slot while watching the cancellation context, so
+    // a disconnect (or KILL) during a full queue does not stall cleanup
+    // for the whole queue timeout.
+    let deadline = Instant::now() + Duration::from_secs(queue_timeout_secs.max(1));
+    loop {
+        if let Err(error) = context.check() {
+            return Ok(SlotAcquisition::Rejected(error.to_string()));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!(
+                msg_type,
+                slot_pool,
+                queue_timeout_secs,
+                "request queue wait timeout; rejecting request with overload error"
+            );
+            return Ok(SlotAcquisition::Rejected(
+                "server overloaded: request queue wait timeout".into(),
+            ));
+        }
+        match timeout(
+            remaining.min(QUEUE_CANCEL_POLL),
+            Arc::clone(limiter).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => return Ok(SlotAcquisition::Permit(permit)),
+            Ok(Err(_)) => {
+                return Err(TaibaiError::Internal("request limiter closed".into()));
+            }
+            Err(_elapsed) => {} // poll tick: re-check cancelled / deadline
+        }
+    }
+}
+
 fn run_handler(
     mut handler: Handler,
     msg: Message,
-    request_limiter: Arc<Semaphore>,
+    limiters: RequestLimiters,
     context: Arc<crate::common::query_cancel::QueryContext>,
     stream_sender: tokio::sync::mpsc::Sender<Message>,
     queue_timeout_secs: u64,
@@ -540,43 +641,43 @@ fn run_handler(
             return (Some(handler), responses);
         }
 
-        // Wait for a request slot while watching the cancellation context, so
-        // a disconnect (or KILL) during a full queue does not stall cleanup
-        // for the whole queue timeout.
-        let deadline = Instant::now() + Duration::from_secs(queue_timeout_secs.max(1));
-        let permit = loop {
-            if let Err(error) = context.check() {
-                return (Some(handler), Ok(vec![build_error(&error.to_string())]));
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                tracing::warn!(
-                    msg_type = msg.msg_type,
-                    queue_timeout_secs,
-                    "request queue wait timeout; rejecting request with overload error"
-                );
-                return (
-                    Some(handler),
-                    Ok(vec![build_error(
-                        "server overloaded: request queue wait timeout",
-                    )]),
-                );
-            }
-            match timeout(
-                remaining.min(QUEUE_CANCEL_POLL),
-                Arc::clone(&request_limiter).acquire_owned(),
+        // Queries admit through the capped pool first, so a burst of
+        // analytical scans can never occupy the slots bulk writes need to
+        // keep committing (`reserved_bulk_slots`).
+        let _query_cap = if msg.msg_type == MSG_TYPE_QUERY {
+            match acquire_slot(
+                &limiters.query,
+                &context,
+                msg.msg_type,
+                queue_timeout_secs,
+                "query",
             )
             .await
             {
-                Ok(Ok(permit)) => break permit,
-                Ok(Err(_)) => {
-                    return (
-                        Some(handler),
-                        Err(TaibaiError::Internal("request limiter closed".into())),
-                    );
+                Ok(SlotAcquisition::Permit(permit)) => Some(permit),
+                Ok(SlotAcquisition::Rejected(reason)) => {
+                    return (Some(handler), Ok(vec![build_error(&reason)]));
                 }
-                Err(_elapsed) => {} // poll tick: re-check cancelled / deadline
+                Err(error) => return (Some(handler), Err(error)),
             }
+        } else {
+            None
+        };
+
+        let permit = match acquire_slot(
+            &limiters.shared,
+            &context,
+            msg.msg_type,
+            queue_timeout_secs,
+            "shared",
+        )
+        .await
+        {
+            Ok(SlotAcquisition::Permit(permit)) => permit,
+            Ok(SlotAcquisition::Rejected(reason)) => {
+                return (Some(handler), Ok(vec![build_error(&reason)]));
+            }
+            Err(error) => return (Some(handler), Err(error)),
         };
 
         let joined = tokio::task::spawn_blocking(move || {

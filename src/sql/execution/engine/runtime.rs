@@ -1,3 +1,5 @@
+use super::*;
+
 /// Held for the duration of one hot-store feed: from the append until the
 /// batch's memtable staging completes. Dropping it releases the in-flight
 /// accounting; the captured epoch lets `feed_hot_store` detect that a
@@ -19,6 +21,22 @@ impl Drop for HotFeedGuard<'_> {
     fn drop(&mut self) {
         self.mgr.end_feed(&self.db, &self.table);
     }
+}
+
+/// C13: process-wide positive cache of non-partitioned table directories
+/// known to own at least one segment file. "Has a segment" is monotone —
+/// once a table owns a segment it keeps owning one while its table state
+/// exists — so a cached entry short-circuits the `discover_segments`
+/// directory listing that every non-partitioned HOT INSERT would otherwise
+/// pay. Entries are dropped by [`Engine::clear_hot_partition_segments`] and
+/// [`Engine::invalidate_hot_segment_hint`] when the table's data is removed
+/// or moved (DROP / TRUNCATE / RENAME); a stale entry is only ever
+/// conservative (it skips the FullTable resident mark, it never fakes one).
+static HOT_TABLES_WITH_SEGMENTS: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+fn hot_tables_with_segments() -> &'static Mutex<HashSet<PathBuf>> {
+    HOT_TABLES_WITH_SEGMENTS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 impl Engine {
@@ -77,6 +95,15 @@ impl Engine {
         batch: &crate::types::batch::RecordBatch,
         feed: &HotFeedGuard<'_>,
     ) -> crate::common::error::Result<()> {
+        // A dropped-and-stale mirror (an UPDATE/DELETE invalidated it) is
+        // rebuilt from the FULL live state before this feed: recreating it
+        // from this batch alone would hide older live memtable rows behind
+        // the watermark derivation. Rebuilding here coalesces any number of
+        // invalidating mutations into one rebuild; until then readers fall
+        // back to the generic scan, which is correct.
+        if self.hot_store_mgr.is_stale(db, table) {
+            self.rebuild_stale_hot_store(db, table, table_meta);
+        }
         let resident_mark = self.hot_resident_mark_for_append(db, table, table_meta, batch);
         self.hot_store_mgr
             .try_append(db, table, table_meta, batch)?;
@@ -88,6 +115,54 @@ impl Engine {
             self.apply_hot_resident_mark(db, table, resident_mark);
         }
         Ok(())
+    }
+
+    /// Full-live-state rebuild of a stale hot store: every reader-visible
+    /// memtable batch, plus closing the `hot_mirror_covers_from` gate — the
+    /// rebuilt mirror holds no flushed-prefix rows, so any pre-invalidation
+    /// coverage bound must stop answering. Best-effort: a failed rebuild
+    /// leaves the table stale (generic-scan reads stay correct).
+    fn rebuild_stale_hot_store(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+    ) {
+        let live_batches = self
+            .memtable_manager()
+            .get_readable_by_table(db, table)
+            .into_iter()
+            .filter(|mt| mt.is_visible_to(0))
+            .filter_map(|mt| mt.read_snapshot_arc())
+            .collect::<Vec<_>>();
+        match self
+            .hot_store_mgr
+            .rebuild_from_live_state(db, table, table_meta, &live_batches)
+        {
+            Ok(_) => {
+                let mut catalogs = self.catalogs.write().unwrap();
+                if let Some(catalog) = catalogs.get_mut(db) {
+                    if let Some(meta) = catalog.get_table_mut(table) {
+                        meta.hot_mirror_covers_from = None;
+                    }
+                    let meta_dir = self.data_dir.join("meta");
+                    if let Err(error) = catalog.save(&meta_dir) {
+                        tracing::warn!(
+                            db,
+                            table,
+                            error = %error,
+                            "hot store rebuild: persisting cleared mirror coverage failed"
+                        );
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(
+                db,
+                table,
+                error = %error,
+                "hot store rebuild from live state failed; table stays stale (generic-scan reads remain correct)"
+            ),
+        }
     }
 
     /// Account a hot-store feed for the whole write: the guard must be held
@@ -119,11 +194,25 @@ impl Engine {
 
         let table_dir = self.segment_mgr.table_dir(db, table);
         if !table_meta.is_partitioned() {
-            return if !Self::table_has_any_segment(&table_dir) {
-                HotResidentMark::FullTable
-            } else {
-                HotResidentMark::None
-            };
+            // C13: consult the positive "known to have a segment" cache
+            // before the filesystem: the miss path is a full
+            // `discover_segments` directory listing, paid by every INSERT
+            // of a non-partitioned HOT table once segments exist.
+            if hot_tables_with_segments()
+                .lock()
+                .unwrap()
+                .contains(&table_dir)
+            {
+                return HotResidentMark::None;
+            }
+            if Self::table_has_any_segment(&table_dir) {
+                hot_tables_with_segments()
+                    .lock()
+                    .unwrap()
+                    .insert(table_dir.clone());
+                return HotResidentMark::None;
+            }
+            return HotResidentMark::FullTable;
         }
 
         let partitions = Self::batch_partition_keys(table_meta, batch);
@@ -249,7 +338,7 @@ impl Engine {
         }
     }
 
-    fn apply_hot_resident_mark(&self, db: &str, table: &str, mark: HotResidentMark) {
+    pub(super) fn apply_hot_resident_mark(&self, db: &str, table: &str, mark: HotResidentMark) {
         let Some(store) = self.hot_store_mgr.get(db, table) else {
             return;
         };
@@ -265,11 +354,29 @@ impl Engine {
     }
 
     /// Drop the cached partition-segment knowledge for one table directory.
+    /// Also drops the C13 table-level "known to have a segment" hint, so a
+    /// same-name recreate re-probes the filesystem (DROP TABLE and the TTL
+    /// purge land here).
     pub fn clear_hot_partition_segments(&self, table_dir: &std::path::Path) {
         self.hot_partition_segments
             .lock()
             .unwrap()
             .remove(table_dir);
+        hot_tables_with_segments().lock().unwrap().remove(table_dir);
+    }
+
+    /// Drop the C13 "known to have a segment" hint for one table. Wire this
+    /// wherever a table's segment files are removed or moved out from under
+    /// its directory (TRUNCATE TABLE, RENAME TABLE) — paths that do not pass
+    /// through [`Self::clear_hot_partition_segments`]. A missed call is only
+    /// a lost FullTable fast path for the recreated table, never a wrong
+    /// mark, so wiring is an optimization, not a correctness requirement.
+    pub fn invalidate_hot_segment_hint(&self, db: &str, table: &str) {
+        let table_dir = self.segment_mgr.table_dir(db, table);
+        hot_tables_with_segments()
+            .lock()
+            .unwrap()
+            .remove(&table_dir);
     }
 
     pub(crate) fn table_has_any_segment(table_dir: &std::path::Path) -> bool {
@@ -401,8 +508,13 @@ impl Engine {
         if had_writes {
             // Deferred in-transaction DELETE/UPDATE must be durable (footer
             // rewrites, memtable tail rewrites) before the visibility flip
-            // inside commit_txn exposes the transaction's new rows.
-            super::txn_dml::materialize_txn_mutations_at_commit(self, txn_id)?;
+            // inside commit_txn exposes the transaction's new rows. Every
+            // tombstone leg runs under the DEFERRED journal lifecycle with
+            // the transaction's own memtables as the image watermark, so a
+            // crash before COMMIT's tail fsync rolls the tombstones back at
+            // startup instead of deleting rows whose images were lost.
+            let materialization =
+                crate::sql::execution::txn_dml::materialize_txn_mutations_at_commit(self, txn_id)?;
             if let Err(first_error) = self.batch_writer().commit_txn(txn_id) {
                 // By the time commit_txn reports an error, the visibility flip
                 // has usually already happened (the failure comes from the
@@ -422,13 +534,20 @@ impl Engine {
                         retry_error = %retry_error,
                         "COMMIT durable-tail wait failed and durability redrive failed; transaction fate ambiguous"
                     );
+                    // The journals and guards stay on disk: startup recovery
+                    // judges each leg against the watermark and keeps only
+                    // the tombstones whose images provably survived.
                     return Err(TaibaiError::Storage(format!(
                         "COMMIT applied but the durable-tail wait failed twice ({retry_error}); \
                          the transaction's changes are visible and ROLLBACK cannot undo them — \
                          verify the data with SELECT"
                     )));
                 }
+                // The redrive persisted the images as segments: that also
+                // satisfies every watermark, so fall through to finish
+                // materialization like the success path.
             }
+            crate::sql::execution::txn_dml::finish_materialization(self, materialization);
         }
 
         // The published index entries are authoritative now; drop the
@@ -453,10 +572,27 @@ impl Engine {
             return Err(TaibaiError::Sql("no active transaction".into()));
         }
         let txn_id = session.active_txn_id();
+        // Retract the catalog row_count of rows INSERT statements already
+        // counted at statement time. Without this, a rolled-back
+        // transaction's rows stayed in the stats forever (only DELETE's
+        // COMMIT path ever decremented).
+        for (db, table, rows) in self.txn_mutations().take_inserted_rows_by_table(txn_id) {
+            if let Err(error) = self.record_inserted_rows(&db, &table, -(rows as i64), true, false)
+            {
+                tracing::warn!(
+                    db,
+                    table,
+                    rows,
+                    error = %error,
+                    "failed to retract rolled-back rows from catalog row_count"
+                );
+            }
+        }
         // Deferred DML plans are dropped first: no durable state was
         // written at statement time, so discarding them restores the
         // pre-statement state.
-        let discarded_dml = super::txn_dml::discard_txn_mutations_at_rollback(self, txn_id);
+        let discarded_dml =
+            crate::sql::execution::txn_dml::discard_txn_mutations_at_rollback(self, txn_id);
         let rolled_back = self.batch_writer().rollback_txn(txn_id)?;
         // Retract the unique/PK index entries INSERT statements published at
         // statement time; otherwise the next INSERT of the same key sees a
@@ -525,18 +661,30 @@ impl Engine {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        let mut total = 0u64;
-        for (db, table) in tables {
-            total = total.saturating_add(self.flush_table_buffers(&db, &table)?);
-            self.bulk_dirty_tables.lock().unwrap().remove(&(db, table));
-        }
+        // The resume must run even when a table's flush errors: skipping it
+        // left unique-index compaction paused FOREVER (the error paths of
+        // both callers only log). Flush failures keep the table queued for
+        // the next end-of-bulk attempt; the pause does not get a second
+        // chance.
+        let flush_all = |tables: &[(String, String)]| -> Result<u64> {
+            let mut total = 0u64;
+            for (db, table) in tables {
+                total = total.saturating_add(self.flush_table_buffers(db, table)?);
+                self.bulk_dirty_tables
+                    .lock()
+                    .unwrap()
+                    .remove(&(db.clone(), table.clone()));
+            }
+            Ok(total)
+        };
+        let result = flush_all(&tables);
         if !self.is_bulk_mode() {
             self.index_manager.resume_unique_index_compaction();
         }
-        Ok(total)
+        result
     }
 
-    fn begin_operation(&self) -> EngineOperationGuard<'_> {
+    pub(super) fn begin_operation(&self) -> EngineOperationGuard<'_> {
         self.in_flight_operations.fetch_add(1, Ordering::AcqRel);
         EngineOperationGuard { engine: self }
     }
@@ -704,10 +852,17 @@ impl Engine {
         } else if !dirty_partitions.is_empty() {
             stats = compactor.optimize_table(db, table, &table_meta)?;
         }
+        if stats.segments_written > 0 {
+            // Compaction freed segment path numbers that later writers can
+            // reuse; drop this table's cached SUM metadata (see drop table).
+            crate::sql::execution::scan::aggregate_meta::invalidate_segment_sum_cache_under(
+                &self.data_dir.join(db).join(table),
+            );
+        }
         if stats.segments_written > 0 || stats.rows_dropped > 0 {
             let schema = Schema::new(table_meta.columns.clone());
             let rebuilt = self.segment_mgr.with_table_mutation_lock(db, table, || {
-                super::dml_insert::rebuild_table_location_indexes(
+                crate::sql::execution::dml_insert::rebuild_table_location_indexes(
                     self,
                     db,
                     table,
@@ -803,7 +958,18 @@ impl Engine {
         let mut max: Option<i64> = None;
         for seg in segments {
             let meta = self.segment_mgr.segment_meta(seg).ok().flatten()?;
-            let zone = meta.segment_zone_maps.get(pk_idx)?;
+            // `pk_idx` is a CATALOG index; the snapshot's zone maps are in the
+            // segment's own footer order. Resolve by name (current +
+            // previous), the same translation every prune path performs —
+            // positional access read the wrong column's zone map after any
+            // DDL drift.
+            let mut names = Vec::with_capacity(column.previous_names.len() + 1);
+            names.push(column.name.as_str());
+            names.extend(column.previous_names.iter().map(String::as_str));
+            let footer_idx = names
+                .iter()
+                .find_map(|name| meta.footer_schema().index_of(name))?;
+            let zone = meta.footer_zone_maps().get(footer_idx)?;
             if zone.row_count == 0 {
                 continue;
             }
@@ -918,6 +1084,10 @@ impl Engine {
                 let mut loaded_segments: HashSet<std::path::PathBuf> = HashSet::new();
                 let mut failed_segments: HashSet<std::path::PathBuf> = HashSet::new();
                 let mut budget_exhausted = false;
+                // Old-layout segments feed through the catalog alignment:
+                // the store is always catalog-width, so a table whose
+                // segments predate an ALTER still warms up after restart.
+                let warmup_schema = Schema::new(table_meta.columns.clone());
                 let eligible: HashSet<std::path::PathBuf> =
                     mtimed.iter().map(|(_, path)| path.clone()).collect();
                 for (_, seg_path) in &mtimed {
@@ -954,9 +1124,38 @@ impl Engine {
                         };
                         let first_row_id = reader.row_group_start_row(rg);
                         let batch = if has_deletes {
-                            match delete_bitmap::filter_batch(&batch, first_row_id, del_bitmap) {
+                            match delete_bitmap::filter_batch(batch, first_row_id, del_bitmap) {
                                 Ok(b) => b,
-                                Err(_) => batch,
+                                Err(e) => {
+                                    // Cannot guarantee which rows are live:
+                                    // skip this row group instead of feeding
+                                    // possibly-deleted rows into the hot store.
+                                    tracing::warn!(error = %e, "warmup: delete-bitmap filter failed");
+                                    segment_loaded = false;
+                                    continue;
+                                }
+                            }
+                        } else {
+                            batch
+                        };
+                        // Segments predating an ALTER carry the old layout:
+                        // align to the catalog — added columns fill with
+                        // their DEFAULT — so the store is always
+                        // catalog-width and old segments still warm it.
+                        let batch = if !crate::storage::core::memtable::batch_matches_schema(
+                            &batch,
+                            &warmup_schema,
+                        ) {
+                            match crate::storage::core::memtable::align_batch_to_schema(
+                                &batch,
+                                &warmup_schema,
+                            ) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "warmup: schema alignment failed");
+                                    segment_loaded = false;
+                                    continue;
+                                }
                             }
                         } else {
                             batch
@@ -1071,6 +1270,24 @@ impl Engine {
     /// in memtable form so routine restarts do not create tiny segments.
     pub fn shutdown(&mut self) -> Result<()> {
         tracing::info!("engine shutdown: checkpointing resident data");
+        // Supervised background schedulers (auto-compact, close-of-day) stop
+        // first so no compaction or archival flush races the final
+        // checkpoint. Idempotent: a taken handle is gone on the next call.
+        for handle in [
+            self.auto_compact_supervisor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+            self.close_of_day_supervisor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            handle.shutdown();
+        }
         if let Err(e) = self.flush_shutdown_buffers() {
             tracing::warn!(error = %e, "engine shutdown checkpoint failed");
         }

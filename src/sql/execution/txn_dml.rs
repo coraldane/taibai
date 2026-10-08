@@ -2,7 +2,7 @@
 //!
 //! Statement time only *plans*: matched segment rows are recorded as
 //! tombstone row ids and matched rows of committed memtables as batch
-//! positions in the [`TxnMutationRegistry`]; UPDATE additionally appends the
+//! positions in the `TxnMutationRegistry`; UPDATE additionally appends the
 //! new row images to the transaction's own memtable (visible to this
 //! transaction only). ROLLBACK drops the registry entry — no durable state
 //! was touched, which also makes a crash equivalent to ROLLBACK. COMMIT
@@ -25,8 +25,8 @@ use crate::storage::segment::delete_bitmap;
 use crate::types::batch::{RecordBatch, Schema};
 
 use super::dml_delete::{
-    apply_replace_memtable_conflicts, delete_partition_eq_key, plan_delete_memtable_rows,
-    prune_segments_by_cluster_key, prune_segments_by_partition,
+    delete_partition_eq_key, plan_delete_memtable_rows, prune_segments_by_cluster_key,
+    prune_segments_by_partition,
 };
 use super::engine::{Engine, ExecResult};
 use super::helpers::{build_row_group_predicate, collect_expr_column_indices};
@@ -58,6 +58,139 @@ pub(crate) fn ensure_txn_dml_supported(table_meta: &TableMeta) -> Result<()> {
         return reject("TTL table");
     }
     Ok(())
+}
+
+/// C8: charge one newly materialized UPDATE row image against the
+/// transaction's in-memory mutation budget, checking INCREMENTALLY per row
+/// group instead of first materializing everything and only failing at
+/// write-back. The estimate doubles `estimated_size_bytes` to approximate
+/// the gather/clone/append overhead around the raw column bytes. This is an
+/// early checkpoint only — the write path keeps its authoritative charge
+/// against the same budget, unchanged.
+fn charge_updated_image_bytes(total: &mut u64, image: &RecordBatch) -> Result<()> {
+    *total = total.saturating_add((image.estimated_size_bytes() as u64).saturating_mul(2));
+    let budget = crate::storage::core::txn_mutations::txn_mutation_budget_bytes();
+    if *total > budget {
+        return Err(TaibaiError::ResourceBusy(format!(
+            "transaction UPDATE materialized {} bytes of updated row images, exceeding the {} byte in-memory mutation budget before write-back; commit or roll back and split the work",
+            *total, budget
+        )));
+    }
+    Ok(())
+}
+
+/// Apply the staged tombstone registrations for one in-transaction DELETE or
+/// UPDATE, unwinding what already applied if a registration fails so COMMIT
+/// cannot materialize a half-statement (a statement that failed midway used
+/// to leave registered tombstones behind, silently deleting rows whose
+/// replacement images never appeared). Registrations are corruption-class
+/// failures only — the budget pre-check made their charges non-failing —
+/// but the unwind keeps even that path reversible.
+fn apply_staged_tombstones(
+    engine: &Engine,
+    reader_txn_id: u64,
+    db: &str,
+    table: &str,
+    partitions: &Option<Vec<String>>,
+    staged_segment_tombstones: &[(std::path::PathBuf, Vec<u8>, Vec<u64>)],
+    staged_memtable_tombstones: &[(Arc<crate::storage::core::memtable::MemTable>, Vec<u32>)],
+) -> Result<()> {
+    let mut applied_segments: Vec<(std::path::PathBuf, Vec<u64>)> = Vec::new();
+    for (seg_path, footer_bitmap, ids) in staged_segment_tombstones {
+        if let Err(error) = engine.txn_mutations().register_segment_tombstones(
+            reader_txn_id,
+            db,
+            table,
+            partitions.as_deref(),
+            seg_path,
+            footer_bitmap,
+            ids.iter().copied(),
+        ) {
+            for (path, applied_ids) in &applied_segments {
+                engine.txn_mutations().unregister_segment_tombstones(
+                    reader_txn_id,
+                    db,
+                    table,
+                    path,
+                    applied_ids,
+                );
+            }
+            return Err(error);
+        }
+        applied_segments.push((seg_path.clone(), ids.clone()));
+    }
+    let mut applied_memtables: Vec<(uuid::Uuid, Vec<u32>)> = Vec::new();
+    for (memtable, positions) in staged_memtable_tombstones {
+        if let Err(error) = engine.txn_mutations().register_memtable_tombstones(
+            reader_txn_id,
+            db,
+            table,
+            partitions.as_deref(),
+            Arc::clone(memtable),
+            positions.iter().copied(),
+        ) {
+            for (path, applied_ids) in &applied_segments {
+                engine.txn_mutations().unregister_segment_tombstones(
+                    reader_txn_id,
+                    db,
+                    table,
+                    path,
+                    applied_ids,
+                );
+            }
+            for (applied_id, applied_positions) in &applied_memtables {
+                engine.txn_mutations().unregister_memtable_tombstones(
+                    reader_txn_id,
+                    db,
+                    table,
+                    *applied_id,
+                    applied_positions,
+                );
+            }
+            return Err(error);
+        }
+        applied_memtables.push((memtable.id(), positions.clone()));
+    }
+    Ok(())
+}
+
+/// Shared UPDATE front matter: refuse partition-key assignment, then resolve
+/// subqueries in the SET values (exactly like the WHERE clause inside
+/// `DmlStatementContext::plan` — without it, a SET subquery would reach the
+/// evaluator as an opaque expression). Both auto-commit UPDATE and
+/// in-transaction UPDATE run this before touching any state.
+pub(crate) fn plan_update_assignments(
+    engine: &Engine,
+    db: &str,
+    assignments: &[Assignment],
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+) -> Result<Vec<Assignment>> {
+    if table_meta.is_partitioned()
+        && assignments.iter().any(|assignment| {
+            assignment
+                .column
+                .eq_ignore_ascii_case(&table_meta.partition_key)
+        })
+    {
+        return Err(TaibaiError::Sql(format!(
+            "updating partition key '{}' is not supported; use DELETE followed by INSERT",
+            table_meta.partition_key
+        )));
+    }
+
+    assignments
+        .iter()
+        .map(|assignment| {
+            Ok(Assignment {
+                column: assignment.column.clone(),
+                value: super::query::resolve_expr_in_subqueries_clone(
+                    engine,
+                    db,
+                    &assignment.value,
+                )?,
+            })
+        })
+        .collect()
 }
 
 /// Write-write conflict gate for auto-commit DML: an open transaction's
@@ -225,9 +358,8 @@ pub(crate) fn exec_delete_in_txn(
         refuse_txn_dml_on_pinned_table(engine, reader_txn_id, db, table)?;
         let mut statement_deleted: u64 = 0;
 
-        // Rows the transaction itself inserted live in transactional
-        // memtables: swap them out of the batch right away (no durable
-        // state, ROLLBACK-safe by construction).
+        // Transaction-owned rows use the same plan-before-publish protocol
+        // as committed rows; a later read failure must preserve them too.
         let memtable_plans = plan_delete_memtable_rows(
             engine,
             db,
@@ -240,32 +372,28 @@ pub(crate) fn exec_delete_in_txn(
         let (own_plans, committed_plans): (Vec<_>, Vec<_>) = memtable_plans
             .into_iter()
             .partition(|plan| plan.memtable.is_transactional());
-        if !own_plans.is_empty() {
-            let undo = apply_replace_memtable_conflicts(engine, db, table, own_plans)?;
-            statement_deleted += undo.deleted_rows();
-        }
+        statement_deleted += own_plans
+            .iter()
+            .map(|plan| plan.removed_positions.len() as u64)
+            .sum::<u64>();
         // Committed memtable rows are deferred: hide the positions from this
         // transaction's readers and remove them physically at COMMIT.
+        //
+        // Statement staging (P0, the same protocol UPDATE uses): registrations
+        // and deferred events are COLLECTED here and only applied after the
+        // whole scan and a budget pre-check succeed. A statement that failed
+        // midway used to leave already-registered tombstones behind; the
+        // transaction's later COMMIT then deleted those rows as a
+        // half-statement the client had seen fail.
+        let mut staged_memtable_tombstones: Vec<(Arc<MemTable>, Vec<u32>)> = Vec::new();
+        let mut staged_delete_events: Vec<RecordBatch> = Vec::new();
         for plan in committed_plans {
             statement_deleted += plan.removed_positions.len() as u64;
-            engine.txn_mutations().register_memtable_tombstones(
-                reader_txn_id,
-                db,
-                table,
-                partitions.as_deref(),
-                Arc::clone(&plan.memtable),
-                plan.removed_positions.iter().copied(),
-            )?;
+            staged_memtable_tombstones
+                .push((Arc::clone(&plan.memtable), plan.removed_positions.to_vec()));
             if engine.pubsub().has_subscribers() {
                 match plan.original.take_rows(&plan.removed_positions) {
-                    Ok(deleted) => {
-                        engine.txn_mutations().defer_delete_event(
-                            reader_txn_id,
-                            db,
-                            table,
-                            deleted,
-                        )?;
-                    }
+                    Ok(deleted) => staged_delete_events.push(deleted),
                     Err(error) => tracing::warn!(
                         db,
                         table,
@@ -282,32 +410,42 @@ pub(crate) fn exec_delete_in_txn(
         let mut segment_files = if table_dir.exists() {
             prune_segments_by_partition(
                 crate::storage::segment_manager::SegmentManager::discover_segments(&table_dir)?,
-                &resolved_where_clause,
-                &table_schema,
-                &table_meta,
+                resolved_where_clause,
+                table_schema,
+                table_meta,
             )
         } else {
             Vec::new()
         };
-        if let Some(ref pred) = predicate {
-            segment_files = prune_segments_by_cluster_key(
-                segment_files,
-                mgr,
-                &table_schema,
-                &table_meta,
-                pred,
-            )?;
+        if let Some(pred) = predicate {
+            segment_files =
+                prune_segments_by_cluster_key(segment_files, mgr, table_schema, table_meta, pred)?;
+        }
+        // Point-DELETE fast path (same contract as the auto-commit path):
+        // resolve the affected segments through the location index; the
+        // predicate evaluation below still re-verifies the located rows.
+        if let Some(located) = super::dml_delete::point_delete_segments(
+            engine,
+            db,
+            table,
+            resolved_where_clause,
+            table_schema,
+            table_meta,
+        )? {
+            segment_files = located;
         }
 
         let publish_deletes = engine.pubsub().has_subscribers();
+        let mut staged_segment_tombstones: Vec<(std::path::PathBuf, Vec<u8>, Vec<u64>)> =
+            Vec::new();
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
             let total_rows = reader.row_count();
             if total_rows == 0 {
                 continue;
             }
-            if let Some(ref pred) = predicate {
-                if !super::helpers::segment_may_match(&reader, Some(pred)) {
+            if let Some(pred) = predicate {
+                if !super::helpers::segment_may_match(&reader, table_schema, Some(pred)) {
                     continue;
                 }
             }
@@ -319,23 +457,19 @@ pub(crate) fn exec_delete_in_txn(
             // evaluated.
             let outcome = super::dml_delete::match_segment_for_delete(
                 &reader,
+                table_schema,
                 predicate,
                 resolved_where_clause.as_ref(),
                 &prior_ids,
                 resolved_where_clause.is_some(),
-                |reader, rg_idx| reader.read_row_group(rg_idx),
+                |reader, rg_idx| reader.read_row_group_columns_aligned(rg_idx, table_schema),
                 |batch, matched| {
                     if !publish_deletes {
                         return Ok(());
                     }
                     let deleted_in_rg: Vec<u32> = matched.iter().map(|(idx, _)| *idx).collect();
                     match batch.take_rows(&deleted_in_rg) {
-                        Ok(deleted) => engine.txn_mutations().defer_delete_event(
-                            reader_txn_id,
-                            db,
-                            table,
-                            deleted,
-                        )?,
+                        Ok(deleted) => staged_delete_events.push(deleted),
                         Err(error) => tracing::warn!(
                             db,
                             table,
@@ -351,15 +485,94 @@ pub(crate) fn exec_delete_in_txn(
                 continue;
             }
             statement_deleted += outcome.matched_ids.len() as u64;
-            engine.txn_mutations().register_segment_tombstones(
-                reader_txn_id,
-                db,
-                table,
-                partitions.as_deref(),
-                &seg_path,
-                &outcome.footer_bitmap,
-                outcome.matched_ids,
-            )?;
+            staged_segment_tombstones.push((seg_path, outcome.footer_bitmap, outcome.matched_ids));
+        }
+
+        if own_plans.iter().any(|plan| {
+            plan.memtable.state() != crate::storage::core::memtable::MemTableState::Pending
+        }) {
+            return Err(TaibaiError::Internal(
+                "transactional DELETE target left pending state".into(),
+            ));
+        }
+        let own_view_bytes = own_plans
+            .iter()
+            .map(|plan| plan.filtered.mutation_allocation_bytes(&plan.original) as u64)
+            .sum::<u64>();
+        // Apply the staged registrations. The budget pre-check makes the
+        // charges non-failing; any other failure (corruption class)
+        // unregisters what already applied so COMMIT cannot materialize a
+        // half-statement — mirroring UPDATE's staged-apply block.
+        let staged_charges = staged_memtable_tombstones
+            .iter()
+            .map(|(_, positions)| positions.len())
+            .chain(
+                staged_segment_tombstones
+                    .iter()
+                    .map(|(_, _, ids)| ids.len()),
+            )
+            .map(crate::storage::core::txn_mutations::estimate_position_charge)
+            .sum::<u64>()
+            .saturating_add(
+                staged_delete_events
+                    .iter()
+                    .map(|batch| batch.estimated_size_bytes() as u64)
+                    .sum::<u64>(),
+            );
+        engine.txn_mutations().precheck_statement_charge(
+            reader_txn_id,
+            staged_charges.saturating_add(own_view_bytes),
+        )?;
+        engine
+            .txn_mutations()
+            .charge_txn_insert_bytes(reader_txn_id, db, table, own_view_bytes)?;
+
+        if let Err(error) = apply_staged_tombstones(
+            engine,
+            reader_txn_id,
+            db,
+            table,
+            &partitions,
+            &staged_segment_tombstones,
+            &staged_memtable_tombstones,
+        ) {
+            engine
+                .txn_mutations()
+                .release_insert_bytes(reader_txn_id, own_view_bytes);
+            return Err(error);
+        }
+        if let Err(error) = engine.txn_mutations().defer_delete_events(
+            reader_txn_id,
+            db,
+            table,
+            staged_delete_events,
+        ) {
+            for (path, _, ids) in &staged_segment_tombstones {
+                engine.txn_mutations().unregister_segment_tombstones(
+                    reader_txn_id,
+                    db,
+                    table,
+                    path,
+                    ids,
+                );
+            }
+            for (mt, positions) in &staged_memtable_tombstones {
+                engine.txn_mutations().unregister_memtable_tombstones(
+                    reader_txn_id,
+                    db,
+                    table,
+                    mt.id(),
+                    positions,
+                );
+            }
+            engine
+                .txn_mutations()
+                .release_insert_bytes(reader_txn_id, own_view_bytes);
+            return Err(error);
+        }
+        // No fallible operation follows these private, pending-only swaps.
+        for plan in own_plans {
+            assert!(plan.memtable.replace_pending_batch(plan.filtered));
         }
 
         Ok(statement_deleted)
@@ -389,36 +602,16 @@ pub(crate) fn exec_update_in_txn(
     assignments: &[Assignment],
     where_clause: &Option<Expr>,
     reader_txn_id: u64,
+    timezone_offset_hours: i32,
 ) -> Result<ExecResult> {
     let ctx = DmlStatementContext::plan(engine, db, table, where_clause)?;
     ensure_txn_dml_supported(&ctx.table_meta)?;
-    if ctx.table_meta.is_partitioned()
-        && assignments.iter().any(|assignment| {
-            assignment
-                .column
-                .eq_ignore_ascii_case(&ctx.table_meta.partition_key)
-        })
-    {
-        return Err(TaibaiError::Sql(format!(
-            "updating partition key '{}' is not supported; use DELETE followed by INSERT",
-            ctx.table_meta.partition_key
-        )));
-    }
-
-    let resolved_assignments: Vec<Assignment> = assignments
-        .iter()
-        .map(|assignment| {
-            Ok(Assignment {
-                column: assignment.column.clone(),
-                value: super::query::resolve_expr_in_subqueries_clone(
-                    engine,
-                    db,
-                    &assignment.value,
-                )?,
-            })
-        })
-        .collect::<Result<_>>()?;
-    let assignments = resolved_assignments.as_slice();
+    let resolved_assignments = plan_update_assignments(engine, db, assignments, &ctx.table_meta)?;
+    let assigned = super::dml_update::precompute_assigned_values(
+        &resolved_assignments,
+        &ctx.table_schema,
+        timezone_offset_hours,
+    )?;
 
     let resolved_where_clause = &ctx.resolved_where;
     let table_schema = &ctx.table_schema;
@@ -439,6 +632,10 @@ pub(crate) fn exec_update_in_txn(
         // New row images per target partition, appended to the transaction's
         // own memtable after the planning pass.
         let mut new_rows: Vec<(String, RecordBatch)> = Vec::new();
+        // C8: running total of the updated-row-image bytes this statement has
+        // materialized so far, checked after every row group (and memtable
+        // image) against the transaction mutation budget.
+        let mut updated_image_bytes: u64 = 0;
 
         // Transactional memtables (this transaction's own INSERTs) update in
         // place — no durable state, ROLLBACK-safe. Committed memtables defer
@@ -446,31 +643,52 @@ pub(crate) fn exec_update_in_txn(
         // shared walk applies the transaction-tombstone view (same contract
         // as the DELETE planner), so a second UPDATE of the same row cannot
         // append a second copy of its new image at COMMIT.
-        let txn_mutations = engine.txn_mutations();
+        // Statement staging (P0): registrations and deferred events are
+        // COLLECTED here and only applied after the whole planning pass and
+        // a budget pre-check succeed. A statement that failed midway used to
+        // leave already-registered tombstones behind; the transaction's
+        // later COMMIT then deleted those rows without inserting their
+        // replacement images — silent data loss with no IO failure needed.
+        let mut staged_memtable_tombstones: Vec<(
+            Arc<crate::storage::core::memtable::MemTable>,
+            Vec<u32>,
+        )> = Vec::new();
+        let mut staged_events: Vec<RecordBatch> = Vec::new();
+        let mut own_swaps = Vec::new();
         super::dml_delete::for_each_visible_memtable(
             engine,
             db,
             table,
+            table_schema,
             reader_txn_id,
             narrowed_partition,
-            |memtable, _original, batch, live_positions| {
-                let (new_batch, affected, matched_rows) = super::dml_update::update_memtable_batch(
-                    assignments,
-                    &resolved_where_clause,
-                    &table_schema,
-                    &batch,
-                )?;
+            |memtable, original, batch, live_positions| {
+                // C9: `batch` (the Arc) is consumed — untouched columns move
+                // into the replacement when this closure is the sole owner.
+                let (new_batch, affected, matched_rows, _assigned_pairs) =
+                    super::dml_update::update_memtable_batch(
+                        &assigned,
+                        resolved_where_clause,
+                        table_schema,
+                        batch,
+                    )?;
                 let Some(new_batch) = new_batch else {
                     return Ok(());
                 };
                 statement_updated += affected;
                 if memtable.is_transactional() {
-                    if !memtable.replace_pending_batch(Arc::new(new_batch)) {
-                        return Err(TaibaiError::Internal(
-                            "transactional memtable left pending state during in-transaction UPDATE"
-                                .to_string(),
+                    updated_image_bytes = updated_image_bytes
+                        .saturating_add(new_batch.mutation_allocation_bytes(&original) as u64);
+                    if updated_image_bytes
+                        > crate::storage::core::txn_mutations::txn_mutation_budget_bytes()
+                    {
+                        return Err(TaibaiError::ResourceBusy(
+                            "transaction UPDATE view staging exceeded mutation budget".into(),
                         ));
                     }
+                    // COMMIT publishes these transaction-owned rows as
+                    // inserts with their final values.
+                    own_swaps.push((memtable, original, Arc::new(new_batch)));
                     return Ok(());
                 }
                 // Map the filtered-batch positions back to absolute positions in
@@ -479,22 +697,13 @@ pub(crate) fn exec_update_in_txn(
                     Some(map) => matched_rows.iter().map(|&pos| map[pos as usize]).collect(),
                     None => matched_rows.clone(),
                 };
-                txn_mutations.register_memtable_tombstones(
-                    reader_txn_id,
-                    db,
-                    table,
-                    partitions.as_deref(),
-                    Arc::clone(&memtable),
-                    absolute_rows.iter().copied(),
-                )?;
+                staged_memtable_tombstones.push((Arc::clone(&memtable), absolute_rows));
                 let updated_rows = new_batch.take_rows(&matched_rows)?;
+                // C8: memtable-sourced images count toward the same
+                // incremental budget as segment-sourced ones.
+                charge_updated_image_bytes(&mut updated_image_bytes, &updated_rows)?;
                 if publish_updates {
-                    engine.txn_mutations().defer_update_event(
-                        reader_txn_id,
-                        db,
-                        table,
-                        updated_rows.clone(),
-                    )?;
+                    staged_events.push(updated_rows.clone());
                 }
                 new_rows.push((memtable.partition_key().to_string(), updated_rows));
                 Ok(())
@@ -503,30 +712,32 @@ pub(crate) fn exec_update_in_txn(
 
         // Segment rows: tombstone ids + new row images; no rewrite, no seal,
         // so everything here is reversible until COMMIT.
-        let assigned = super::dml_update::precompute_assigned_values(assignments, &table_schema)?;
+
         let mut segment_files = if table_dir.exists() {
             super::dml_delete::prune_segments_by_partition(
                 crate::storage::segment_manager::SegmentManager::discover_segments(&table_dir)?,
-                &resolved_where_clause,
-                &table_schema,
-                &table_meta,
+                resolved_where_clause,
+                table_schema,
+                table_meta,
             )
         } else {
             Vec::new()
         };
-        if let Some(ref pred) = predicate {
+        if let Some(pred) = predicate {
             segment_files = super::dml_delete::prune_segments_by_cluster_key(
                 segment_files,
                 mgr,
-                &table_schema,
-                &table_meta,
+                table_schema,
+                table_meta,
                 pred,
             )?;
         }
 
+        let mut staged_segment_tombstones: Vec<(std::path::PathBuf, Vec<u8>, Vec<u64>)> =
+            Vec::new();
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
-            if !super::helpers::segment_may_match(&reader, predicate) {
+            if !super::helpers::segment_may_match(&reader, table_schema, predicate) {
                 continue;
             }
             let prior_ids = engine
@@ -535,8 +746,20 @@ pub(crate) fn exec_update_in_txn(
             let mut newly_deleted: Vec<u64> = Vec::new();
             let mut updated_images: Vec<RecordBatch> = Vec::new();
 
+            // Footer zone maps follow the segment's own column order: re-anchor
+            // the catalog-space predicate per segment. When a predicate column
+            // is absent from this footer, alignment fails and row-group pruning
+            // is disabled for the whole segment — the default-filled aligned
+            // read below then decides row by row (the absent-column semantics
+            // DELETE/SELECT/COUNT already use). The old code `break`ed out of
+            // the loop here, silently skipping every remaining row group of the
+            // segment and losing updates.
+            let aligned_predicate = predicate
+                .as_ref()
+                .and_then(|pred| reader.align_row_group_predicate(table_schema, pred).ok());
+
             for rg_idx in 0..reader.num_row_groups() {
-                if let Some(ref pred) = predicate {
+                if let Some(ref pred) = aligned_predicate {
                     if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
                         continue;
                     }
@@ -544,14 +767,15 @@ pub(crate) fn exec_update_in_txn(
                 let mask = super::dml_update::build_update_mask(
                     &reader,
                     rg_idx,
-                    &resolved_where_clause,
-                    &predicate_projection,
-                    &table_schema,
+                    resolved_where_clause,
+                    predicate_projection,
+                    table_schema,
                 )?;
                 if !mask.iter().any(|m| *m) {
                     continue;
                 }
-                let batch = reader.read_row_group(rg_idx)?;
+                // Catalog-ordered read: `assigned` maps catalog indices.
+                let batch = reader.read_row_group_columns_aligned(rg_idx, table_schema)?;
                 let start_row = reader.row_group_start_row(rg_idx);
                 let footer_bitmap = reader.delete_bitmap();
                 let mut matched: Vec<u32> = Vec::new();
@@ -571,66 +795,184 @@ pub(crate) fn exec_update_in_txn(
                 }
                 // The updated image of exactly the matched rows.
                 let kept_matched = vec![true; matched.len()];
-                let mut columns = Vec::with_capacity(batch.num_columns());
-                for (col_idx, column) in batch.columns.iter().enumerate() {
-                    columns.push(super::dml_update::rebuild_update_column(
-                        column,
-                        assigned.get(&col_idx),
-                        &matched,
-                        &kept_matched,
-                    )?);
-                }
-                updated_images.push(RecordBatch::try_new(batch.schema.clone(), columns)?);
+                let image = super::dml_update::rebuild_update_batch(
+                    &batch,
+                    &assigned,
+                    &matched,
+                    &kept_matched,
+                )?;
+                // C8: fail as soon as THIS row group pushes the statement
+                // over the budget, instead of accumulating every remaining
+                // row group first.
+                charge_updated_image_bytes(&mut updated_image_bytes, &image)?;
+                updated_images.push(image);
             }
 
             if newly_deleted.is_empty() {
                 continue;
             }
             let footer_bitmap = reader.delete_bitmap().to_vec();
-            engine.txn_mutations().register_segment_tombstones(
-                reader_txn_id,
-                db,
-                table,
-                partitions.as_deref(),
-                &seg_path,
-                &footer_bitmap,
-                newly_deleted,
-            )?;
+            staged_segment_tombstones.push((seg_path.clone(), footer_bitmap, newly_deleted));
             let partition_key = seg_path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .and_then(|name| crate::storage::partition::parse_partition_key(name))
+                .and_then(crate::storage::partition::parse_partition_key)
                 .unwrap_or_default();
             for image in updated_images {
                 statement_updated += image.num_rows() as u64;
                 if publish_updates {
-                    engine.txn_mutations().defer_update_event(
-                        reader_txn_id,
-                        db,
-                        table,
-                        image.clone(),
-                    )?;
+                    staged_events.push(image.clone());
                 }
                 new_rows.push((partition_key.clone(), image));
             }
         }
 
-        // Append the new row images to the transaction's own memtable.
-        for (partition, batch) in new_rows {
-            if batch.num_rows() == 0 {
-                continue;
+        let own_view_bytes = own_swaps
+            .iter()
+            .map(|(_, original, replacement)| {
+                replacement.mutation_allocation_bytes(original) as u64
+            })
+            .sum::<u64>();
+        // Budget pre-check: every charge this statement is about to make —
+        // the write path's authoritative per-batch image charges plus the
+        // position charges of the staged tombstones — must fit the remaining
+        // budget BEFORE the first side effect. Failing mid-append or
+        // mid-registration is what used to strand half a statement.
+        {
+            let image_append_bytes: u64 = new_rows
+                .iter()
+                .map(|(_, batch)| batch.estimated_size_bytes() as u64)
+                .sum();
+            let position_bytes: u64 = staged_segment_tombstones
+                .iter()
+                .map(|(_, _, ids)| (ids.len() as u64).saturating_mul(48))
+                .chain(
+                    staged_memtable_tombstones
+                        .iter()
+                        .map(|(_, positions)| (positions.len() as u64).saturating_mul(48)),
+                )
+                .sum();
+            let budget = crate::storage::core::txn_mutations::txn_mutation_budget_bytes();
+            let projected = engine
+                .txn_mutations()
+                .mutation_bytes_of(reader_txn_id)
+                .saturating_add(image_append_bytes)
+                .saturating_add(own_view_bytes)
+                .saturating_add(position_bytes)
+                .saturating_add(
+                    staged_events
+                        .iter()
+                        .map(|b| b.estimated_size_bytes() as u64)
+                        .sum::<u64>(),
+                );
+            if projected > budget {
+                return Err(TaibaiError::ResourceBusy(format!(
+                    "transaction UPDATE would charge {} bytes against the {} byte in-memory mutation budget; commit or roll back and split the work",
+                    projected, budget
+                )));
+            }
+        }
+
+        // Images belong to a private statement transaction until ALL appends
+        // and registrations succeed. A second append failure can therefore
+        // discard only this statement, preserving earlier transaction work.
+        let staged_id = engine.alloc_txn_id();
+        let apply = (|| -> Result<()> {
+            for (partition, batch) in new_rows {
+                if batch.is_empty() {
+                    continue;
+                }
+                engine
+                    .batch_writer()
+                    .write_columns_with_txn_under_table_lock(
+                        db,
+                        table,
+                        &partition,
+                        batch,
+                        table_schema.clone(),
+                        staged_id,
+                        false,
+                    )?;
+                #[cfg(test)]
+                if crate::common::fault_injection::should_fail(
+                    crate::common::fault_injection::FaultPoint::TxnImageAppend,
+                ) {
+                    return Err(TaibaiError::Internal(
+                        "forced transactional UPDATE image append failure".into(),
+                    ));
+                }
+            }
+            // Check pending state before the first statement effect.
+            if own_swaps.iter().any(|(mt, _, _)| {
+                mt.state() != crate::storage::core::memtable::MemTableState::Pending
+            }) {
+                return Err(TaibaiError::Internal(
+                    "transactional UPDATE target left pending state".into(),
+                ));
+            }
+            let image_charge = engine.txn_mutations().adopt_staged_insert_bytes(
+                staged_id,
+                reader_txn_id,
+                db,
+                table,
+                own_view_bytes,
+            )?;
+            if let Err(error) = apply_staged_tombstones(
+                engine,
+                reader_txn_id,
+                db,
+                table,
+                &partitions,
+                &staged_segment_tombstones,
+                &staged_memtable_tombstones,
+            ) {
+                engine
+                    .txn_mutations()
+                    .release_insert_bytes(reader_txn_id, image_charge);
+                return Err(error);
+            }
+            if let Err(error) =
+                engine
+                    .txn_mutations()
+                    .defer_update_events(reader_txn_id, db, table, staged_events)
+            {
+                for (path, _, ids) in &staged_segment_tombstones {
+                    engine.txn_mutations().unregister_segment_tombstones(
+                        reader_txn_id,
+                        db,
+                        table,
+                        path,
+                        ids,
+                    );
+                }
+                for (mt, positions) in &staged_memtable_tombstones {
+                    engine.txn_mutations().unregister_memtable_tombstones(
+                        reader_txn_id,
+                        db,
+                        table,
+                        mt.id(),
+                        positions,
+                    );
+                }
+                engine
+                    .txn_mutations()
+                    .release_insert_bytes(reader_txn_id, image_charge);
+                return Err(error);
+            }
+            // These swaps are infallible under the locks after the pending
+            // state check; they occur only after the last fallible operation.
+            for (mt, _, batch) in own_swaps {
+                assert!(mt.replace_pending_batch(batch));
             }
             engine
-                .batch_writer()
-                .write_columns_with_txn_under_table_lock(
-                    db,
-                    table,
-                    &partition,
-                    batch,
-                    table_schema.clone(),
-                    reader_txn_id,
-                    false,
-                )?;
+                .memtable_manager()
+                .adopt_staged_transaction(staged_id, reader_txn_id);
+            Ok(())
+        })();
+        if let Err(error) = apply {
+            engine.batch_writer().rollback_txn(staged_id)?;
+            engine.txn_mutations().remove(staged_id);
+            return Err(error);
         }
 
         Ok(statement_updated)
@@ -646,40 +988,114 @@ pub(crate) fn exec_update_in_txn(
 // COMMIT / ROLLBACK
 // ---------------------------------------------------------------------------
 
+/// Durable state written by [`materialize_txn_mutations_at_commit`] that must
+/// be finalized — journals and memtable guards cleared — once COMMIT's tail
+/// fsync (or its segment-flush rescue) makes the transaction's images
+/// durable. Kept opaque to the caller; consumed by
+/// [`finish_materialization`].
+#[derive(Default)]
+pub(crate) struct TxnMaterialization {
+    footers: Vec<(String, String, std::path::PathBuf, Vec<u8>, u64)>,
+    memtables: Vec<(String, String, uuid::Uuid)>,
+}
+
 /// Materialize the transaction's deferred mutations: physically remove the
 /// memtable rows, rewrite the segment footers with the union tombstones,
 /// publish the deferred change events, fix the catalog counters. Runs under
 /// the same table/partition mutation locks as auto-commit DML. Called by the
 /// engine right before the memtable visibility flip, so concurrent readers
 /// never observe old and new rows at the same time.
-pub(crate) fn materialize_txn_mutations_at_commit(engine: &Engine, txn_id: u64) -> Result<()> {
+///
+/// Every tombstone leg runs under the DEFERRED journal lifecycle carrying
+/// the transaction's own memtables as the image watermark, mirroring
+/// auto-commit UPDATE: a crash between this materialization and COMMIT's
+/// tail fsync rolls the tombstones back at startup instead of deleting rows
+/// whose replacement images were lost.
+pub(crate) fn materialize_txn_mutations_at_commit(
+    engine: &Engine,
+    txn_id: u64,
+) -> Result<TxnMaterialization> {
     let Some(mutations) = engine.txn_mutations().take(txn_id) else {
-        return Ok(());
+        return Ok(TxnMaterialization::default());
     };
-    if let Err(error) = materialize_tables(engine, &mutations) {
-        // Keep the plans so the transaction can retry COMMIT or ROLLBACK;
-        // the applied subset is idempotent (bitmap union, batch swap).
-        engine.txn_mutations().put_back(txn_id, mutations);
-        return Err(error);
+    match materialize_tables(engine, txn_id, &mutations) {
+        Ok(done) => Ok(done),
+        Err(error) => {
+            // Keep the plans so the transaction can retry COMMIT or ROLLBACK;
+            // the applied subset is idempotent (bitmap union, batch swap).
+            engine.txn_mutations().put_back(txn_id, mutations);
+            Err(error)
+        }
     }
-    Ok(())
 }
 
-fn materialize_tables(engine: &Engine, mutations: &TxnMutations) -> Result<()> {
+/// After COMMIT made the transaction's images durable (tail fsync or the
+/// segment-flush redrive), the deferred journals and memtable guards written
+/// by materialization are unconditionally correct: clear them under the same
+/// locks they were written under. The footer clear is ownership-checked, so
+/// a later statement's journal on the same segment is never discarded.
+/// Best-effort — a leftover is re-judged by startup recovery, which finds
+/// the watermark satisfied and rolls forward.
+pub(crate) fn finish_materialization(engine: &Engine, done: TxnMaterialization) {
     let mgr = engine.segment_mgr();
+    for (db, table, seg_path, bitmap, deleted) in &done.footers {
+        let table_dir = engine.data_dir().join(db).join(table);
+        let seg_path = seg_path.clone();
+        let bitmap = bitmap.clone();
+        let deleted = *deleted;
+        let _ = mgr.with_table_mutation_lock(db, table, || {
+            crate::storage::segment::reader::clear_deferred_delete_journal_for_statement(
+                &table_dir, &seg_path, &bitmap, deleted,
+            );
+            Ok(())
+        });
+    }
+    for (db, table, memtable_id) in &done.memtables {
+        let table_dir = engine.data_dir().join(db).join(table);
+        crate::storage::core::durable_tail::clear_statement_guards(&table_dir, *memtable_id);
+    }
+}
+
+fn materialize_tables(
+    engine: &Engine,
+    txn_id: u64,
+    mutations: &TxnMutations,
+) -> Result<TxnMaterialization> {
+    let mgr = engine.segment_mgr();
+    let mut done = TxnMaterialization::default();
     for table_mutations in mutations.tables() {
         let db = table_mutations.db.as_str();
         let table = table_mutations.table.as_str();
+        // The transaction's own writes for this table ARE the images the
+        // tombstones below must wait for: their memtables' tails become
+        // durable in the COMMIT that follows this materialization. Journaling
+        // them as the watermark lets recovery roll the tombstones back when a
+        // crash lands before that durability — the same arbitration
+        // auto-commit UPDATE applies to its staged images.
+        let watermark = super::dml_staging::collect_txn_watermark(engine, db, table, txn_id);
         let materialize = || -> Result<()> {
             // 1. Committed memtable rows: swap the current batch for a
-            //    filtered one and rewrite the durable tail, so crash
-            //    recovery cannot resurrect removed rows.
+            //    filtered one and record the delete durably (guarded sidecar
+            //    first), so crash recovery cannot resurrect removed rows —
+            //    nor keep a delete whose images were lost.
             for entry in &table_mutations.memtables {
-                materialize_memtable(engine, &entry.memtable, &entry.positions)?;
+                materialize_memtable(
+                    engine,
+                    &entry.memtable,
+                    &entry.positions,
+                    watermark.as_slice(),
+                )?;
+                done.memtables.push((
+                    table_mutations.db.clone(),
+                    table_mutations.table.clone(),
+                    entry.memtable.id(),
+                ));
             }
             // 2. Segment tombstones: union the recorded ids into the fresh
             //    footer bitmap (the segment may have grown since planning)
-            //    and rewrite via the journaled, idempotent path.
+            //    and rewrite via the journaled, idempotent path — DEFERRED,
+            //    carrying the watermark, so a crash before COMMIT's tail
+            //    fsync restores the pre-statement footers.
             for entry in &table_mutations.segments {
                 let reader = mgr.open_reader(&entry.path)?;
                 let total_rows = reader.row_count();
@@ -695,7 +1111,21 @@ fn materialize_tables(engine: &Engine, mutations: &TxnMutations) -> Result<()> {
                 }
                 let deleted_count: u64 = bitmap.iter().map(|byte| byte.count_ones() as u64).sum();
                 drop(reader);
-                mgr.rewrite_delete_footer(&entry.path, &bitmap, deleted_count)?;
+                mgr.rewrite_delete_footer_with_mode(
+                    &entry.path,
+                    &bitmap,
+                    deleted_count,
+                    crate::storage::segment::reader::FooterRewriteMode::Deferred(
+                        watermark.as_slice().to_vec(),
+                    ),
+                )?;
+                done.footers.push((
+                    table_mutations.db.clone(),
+                    table_mutations.table.clone(),
+                    entry.path.clone(),
+                    bitmap,
+                    deleted_count,
+                ));
             }
             // 3. Deferred change events, matching the auto-commit order:
             //    deletions first, then the post-update images.
@@ -751,13 +1181,14 @@ fn materialize_tables(engine: &Engine, mutations: &TxnMutations) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(done)
 }
 
 fn materialize_memtable(
     engine: &Engine,
     memtable: &Arc<MemTable>,
     positions: &BTreeSet<u32>,
+    watermark: &[crate::storage::segment::reader::ImageDurabilityCheck],
 ) -> Result<()> {
     let Some(snapshot) = memtable.read_snapshot_arc() else {
         return Err(TaibaiError::Internal(
@@ -765,17 +1196,33 @@ fn materialize_memtable(
         ));
     };
     let filtered = filter_batch_excluding_positions(&snapshot, positions)?;
-    // Durable tail BEFORE the in-memory swap: this runs under the table's
-    // mutation lock, so a crash between the two steps restores the filtered
-    // tail (deletes preserved) instead of resurrecting the deleted rows next
-    // to a possibly already-rewritten tail.
     let table_dir = engine.data_dir().join(memtable.db()).join(memtable.table());
-    crate::storage::core::durable_tail::persist(
+    // Durable delete BEFORE the in-memory swap (this runs under the table's
+    // mutation lock). A GUARDED sidecar, not a whole-tail persist: recovery
+    // can drop a guarded sidecar while the transaction's images are not yet
+    // durable — restoring the pre-statement rows — while a persist rewrite
+    // would keep the delete even when the crash lost the images, silently
+    // deleting committed-then-rolled-back rows.
+    let position_slice: Vec<u32> = positions.iter().copied().collect();
+    match crate::storage::core::durable_tail::delete_rows_guarded(
         &table_dir,
         memtable.id(),
-        memtable.partition_key(),
-        &filtered,
-    )?;
+        &position_slice,
+        watermark,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            // No live tail: the memtable's rows were never durable, so
+            // recovery cannot resurrect them and nothing needs guarding.
+            crate::storage::core::durable_tail::persist(
+                &table_dir,
+                memtable.id(),
+                memtable.partition_key(),
+                &filtered,
+            )?;
+        }
+        Err(error) => return Err(error),
+    }
     if !memtable.replace_pending_batch(Arc::new(filtered.clone())) {
         return Err(TaibaiError::Internal(
             "deferred-DELETE memtable left pending state before COMMIT (a flush raced the transaction)"

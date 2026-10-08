@@ -660,9 +660,10 @@ impl ExecutionOp for HashAggregateExec {
         // `groups` maps the stringified key to its accumulators; `group_keys`
         // preserves insertion order alongside the original (typed) group-by
         // scalar values so the output keeps the correct column types.
-        let mut groups: HashMap<Vec<u8>, Vec<Accumulator>> = HashMap::new();
+        let mut groups: HashMap<Vec<u8>, Vec<Accumulator>> = HashMap::with_capacity(1024);
         let mut group_keys: Vec<(Vec<u8>, Vec<ScalarValue>)> = Vec::new();
         let mut estimated_group_bytes = 0usize;
+        let mut batch_refresh_counter = 0usize;
         let mut spills = Vec::new();
         let mut memory = MemoryManager::reservation();
         let mut key_buf: Vec<u8> = Vec::new();
@@ -713,16 +714,17 @@ impl ExecutionOp for HashAggregateExec {
             // and accumulate through pre-resolved typed column views across
             // per-lane tables merged at the end. Falls back to the generic
             // per-row loop for any unsupported shape.
-            if !fast_unsupported && fast_tables.is_empty() {
-                if !fast_group_supported(
+            if !fast_unsupported
+                && fast_tables.is_empty()
+                && !fast_group_supported(
                     &group_by,
                     &gb_indices,
                     &aggregates,
                     &agg_col_indices,
                     &batch,
-                ) {
-                    fast_unsupported = true;
-                }
+                )
+            {
+                fast_unsupported = true;
             }
             if !fast_unsupported {
                 let phys = physical_schema.as_ref().unwrap_or(&self.input_schema);
@@ -811,33 +813,39 @@ impl ExecutionOp for HashAggregateExec {
                 }
             }
 
-            // Deep memory refresh once per batch (matching the no-GROUP-BY
-            // path): DISTINCT sets and MIN/MAX values grow per row, but
-            // re-estimating on every row dominated grouped-query profiles.
-            estimated_group_bytes = group_keys
-                .iter()
-                .map(|(key, scalars)| {
-                    key.len() + scalars.len() * std::mem::size_of::<ScalarValue>()
-                })
-                .sum::<usize>()
-                + groups
-                    .values()
-                    .map(|accums| {
-                        accums
-                            .iter()
-                            .map(Accumulator::estimated_size_bytes)
-                            .sum::<usize>()
+            // Deep memory refresh: DISTINCT sets and MIN/MAX values grow per
+            // row, but re-estimating every group on every batch made grouped
+            // queries O(batches × groups). New-group growth is accounted
+            // incrementally at insert; the full sweep (which catches
+            // accumulator growth) runs periodically.
+            batch_refresh_counter += 1;
+            if batch_refresh_counter >= 64 {
+                batch_refresh_counter = 0;
+                estimated_group_bytes = group_keys
+                    .iter()
+                    .map(|(key, scalars)| {
+                        key.len() + scalars.len() * std::mem::size_of::<ScalarValue>()
                     })
-                    .sum::<usize>();
-            super::profile::record_current_peak_memory(estimated_group_bytes);
-            if estimated_group_bytes >= self.memory_limit_bytes
-                || !memory.try_resize(estimated_group_bytes)
-            {
-                spills.push(spill_group_run(&groups, &group_keys, spill_rows)?);
-                groups.clear();
-                group_keys.clear();
-                estimated_group_bytes = 0;
-                memory.release();
+                    .sum::<usize>()
+                    + groups
+                        .values()
+                        .map(|accums| {
+                            accums
+                                .iter()
+                                .map(Accumulator::estimated_size_bytes)
+                                .sum::<usize>()
+                        })
+                        .sum::<usize>();
+                super::profile::record_current_peak_memory(estimated_group_bytes);
+                if estimated_group_bytes >= self.memory_limit_bytes
+                    || !memory.try_resize(estimated_group_bytes)
+                {
+                    spills.push(spill_group_run(&groups, &group_keys, spill_rows)?);
+                    groups.clear();
+                    group_keys.clear();
+                    estimated_group_bytes = 0;
+                    memory.release();
+                }
             }
         }
 
@@ -1108,7 +1116,11 @@ fn spill_group_run(
     SpillFile::write_batches_from_iter(schema, batches, spill_rows)
 }
 
-struct GroupSpillCursor {
+/// Shared row cursor over a spilled, segment-encoded aggregate file: walks
+/// non-empty row groups and exposes row-level positioning. Payload decoding
+/// stays with the two merge algorithms (`current_group_payload` and
+/// `current_distinct_key`).
+struct SpillCursor {
     _spill: SpillFile,
     reader: SegmentReader,
     row_group: usize,
@@ -1116,7 +1128,7 @@ struct GroupSpillCursor {
     row: usize,
 }
 
-impl GroupSpillCursor {
+impl SpillCursor {
     fn new(spill: SpillFile) -> Result<Self> {
         let reader = spill.open_reader()?;
         let mut cursor = Self {
@@ -1147,7 +1159,7 @@ impl GroupSpillCursor {
     /// Byte key (the merge identity, identical to the in-memory group-key
     /// encoding), the scalar values for output reconstruction, and the JSON
     /// accumulator state.
-    fn current(&self) -> Result<(Vec<u8>, Vec<ScalarValue>, String)> {
+    fn current_group_payload(&self) -> Result<(Vec<u8>, Vec<ScalarValue>, String)> {
         let batch = self
             .batch
             .as_ref()
@@ -1173,6 +1185,14 @@ impl GroupSpillCursor {
             }
         };
         Ok((bytes, scalars, state))
+    }
+
+    /// Distinct-merge payload: the single Blob key column.
+    fn current_distinct_key(&self) -> Option<Vec<u8>> {
+        match self.batch.as_ref()?.scalar(self.row, 0) {
+            Some(ScalarValue::Blob(Some(value))) => Some(value),
+            _ => None,
+        }
     }
 
     fn advance(&mut self) -> Result<()> {
@@ -1216,7 +1236,7 @@ impl PartialOrd for GroupHeapItem {
 }
 
 struct GroupSpillMerge {
-    cursors: Vec<GroupSpillCursor>,
+    cursors: Vec<SpillCursor>,
     heap: BinaryHeap<GroupHeapItem>,
     output_schema: Schema,
     aggregates: Vec<AggregateExpr>,
@@ -1229,6 +1249,7 @@ struct GroupSpillMerge {
 }
 
 impl GroupSpillMerge {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         spills: Vec<SpillFile>,
         output_schema: Schema,
@@ -1242,11 +1263,11 @@ impl GroupSpillMerge {
         let mut cursors = Vec::with_capacity(spills.len());
         let mut heap = BinaryHeap::new();
         for spill in spills {
-            let cursor = GroupSpillCursor::new(spill)?;
+            let cursor = SpillCursor::new(spill)?;
             let index = cursors.len();
             if cursor.has_row() {
                 heap.push(GroupHeapItem {
-                    key: cursor.current()?.0,
+                    key: cursor.current_group_payload()?.0,
                     cursor: index,
                 });
             }
@@ -1272,14 +1293,14 @@ impl GroupSpillMerge {
             .pop()
             .ok_or_else(|| TaibaiError::Internal("aggregate spill heap exhausted".into()))?;
         let cursor = &mut self.cursors[item.cursor];
-        let (key, key_scalars, encoded_state) = cursor.current()?;
+        let (key, key_scalars, encoded_state) = cursor.current_group_payload()?;
         let state = serde_json::from_str(&encoded_state).map_err(|error| {
             TaibaiError::Internal(format!("failed to decode aggregate spill state: {error}"))
         })?;
         cursor.advance()?;
         if cursor.has_row() {
             self.heap.push(GroupHeapItem {
-                key: cursor.current()?.0,
+                key: cursor.current_group_payload()?.0,
                 cursor: item.cursor,
             });
         }
@@ -1580,9 +1601,9 @@ impl DistinctSpillAccumulator {
         let mut cursors = Vec::with_capacity(self.runs.len());
         let mut heap = BinaryHeap::new();
         for run in self.runs {
-            let cursor = DistinctSpillCursor::new(run)?;
+            let cursor = SpillCursor::new(run)?;
             let index = cursors.len();
-            if let Some(value) = cursor.current() {
+            if let Some(value) = cursor.current_distinct_key() {
                 heap.push(DistinctHeapItem {
                     value,
                     cursor: index,
@@ -1600,7 +1621,7 @@ impl DistinctSpillAccumulator {
             }
             let cursor = &mut cursors[item.cursor];
             cursor.advance()?;
-            if let Some(value) = cursor.current() {
+            if let Some(value) = cursor.current_distinct_key() {
                 heap.push(DistinctHeapItem {
                     value,
                     cursor: item.cursor,
@@ -1608,62 +1629,6 @@ impl DistinctSpillAccumulator {
             }
         }
         Ok(summary.finalize(self.func, col_type))
-    }
-}
-
-struct DistinctSpillCursor {
-    _spill: SpillFile,
-    reader: SegmentReader,
-    row_group: usize,
-    batch: Option<RecordBatch>,
-    row: usize,
-}
-
-impl DistinctSpillCursor {
-    fn new(spill: SpillFile) -> Result<Self> {
-        let reader = spill.open_reader()?;
-        let mut cursor = Self {
-            _spill: spill,
-            reader,
-            row_group: 0,
-            batch: None,
-            row: 0,
-        };
-        cursor.load_next_batch()?;
-        Ok(cursor)
-    }
-
-    fn load_next_batch(&mut self) -> Result<()> {
-        while self.row_group < self.reader.num_row_groups() {
-            let batch = self.reader.read_row_group(self.row_group)?;
-            self.row_group += 1;
-            if batch.num_rows() > 0 {
-                self.batch = Some(batch);
-                self.row = 0;
-                return Ok(());
-            }
-        }
-        self.batch = None;
-        Ok(())
-    }
-
-    fn current(&self) -> Option<Vec<u8>> {
-        match self.batch.as_ref()?.scalar(self.row, 0) {
-            Some(ScalarValue::Blob(Some(value))) => Some(value),
-            _ => None,
-        }
-    }
-
-    fn advance(&mut self) -> Result<()> {
-        self.row += 1;
-        if self
-            .batch
-            .as_ref()
-            .is_some_and(|batch| self.row >= batch.num_rows())
-        {
-            self.load_next_batch()?;
-        }
-        Ok(())
     }
 }
 
@@ -1688,7 +1653,7 @@ impl PartialOrd for DistinctHeapItem {
     }
 }
 
-fn arg_column_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
+pub(super) fn arg_column_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
     match &*agg.arg {
         LogicalExpr::Column(idx) => schema
             .columns
@@ -1795,37 +1760,12 @@ pub fn aggregate_result_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
     }
 }
 
+/// Total order for MIN/MAX folds, window frame checks and spill merges.
+/// NULLs sort first; see `ScalarValue::compare_ordered` (this used to be a
+/// drifting copy without Bool/Time/Interval/Blob arms, which made MIN/MAX
+/// on those types return the first-seen value).
 pub fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
-    if a.is_null() && b.is_null() {
-        return std::cmp::Ordering::Equal;
-    }
-    if a.is_null() {
-        return std::cmp::Ordering::Less;
-    }
-    if b.is_null() {
-        return std::cmp::Ordering::Greater;
-    }
-    match (a, b) {
-        _ if a.numeric_cmp(b).is_some() => a.numeric_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
-        (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => l.cmp(r),
-        (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => l.cmp(r),
-        (ScalarValue::Int16(Some(l)), ScalarValue::Int16(Some(r))) => l.cmp(r),
-        (ScalarValue::Int8(Some(l)), ScalarValue::Int8(Some(r))) => l.cmp(r),
-        (ScalarValue::UInt64(Some(l)), ScalarValue::UInt64(Some(r))) => l.cmp(r),
-        (ScalarValue::UInt32(Some(l)), ScalarValue::UInt32(Some(r))) => l.cmp(r),
-        (ScalarValue::UInt16(Some(l)), ScalarValue::UInt16(Some(r))) => l.cmp(r),
-        (ScalarValue::UInt8(Some(l)), ScalarValue::UInt8(Some(r))) => l.cmp(r),
-        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => {
-            l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (ScalarValue::Float32(Some(l)), ScalarValue::Float32(Some(r))) => {
-            l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) => l.cmp(r),
-        (ScalarValue::Date(Some(l)), ScalarValue::Date(Some(r))) => l.cmp(r),
-        (ScalarValue::Timestamp(Some(l)), ScalarValue::Timestamp(Some(r))) => l.cmp(r),
-        _ => std::cmp::Ordering::Equal,
-    }
+    a.compare_ordered(b, std::cmp::Ordering::Less)
 }
 
 /// Apply DISTINCT to a RecordBatch, removing duplicate rows.
@@ -1867,7 +1807,7 @@ fn apply_having(
     // but operates on the aggregated result schema
     let remapped = remap_expr_for_batch(predicate, logical_schema, &batch.schema);
     let mask = crate::sql::execution::operators::filter::eval_filter(&remapped, &batch)?;
-    Ok(super::apply_filter_mask(&batch, &mask))
+    Ok(super::apply_filter_mask(batch, &mask))
 }
 
 #[cfg(test)]

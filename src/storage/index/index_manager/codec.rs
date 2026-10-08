@@ -67,6 +67,7 @@ pub(super) struct UniqueIndexBaseWriter<W: Write> {
     blocks: Vec<UniqueIndexBlockRef>,
     paths: Vec<String>,
     path_ids: HashMap<String, u32>,
+    metadata_bytes: usize,
 }
 
 impl<W: Write> UniqueIndexBaseWriter<W> {
@@ -91,6 +92,7 @@ impl<W: Write> UniqueIndexBaseWriter<W> {
             blocks: Vec::new(),
             paths: Vec::new(),
             path_ids: HashMap::new(),
+            metadata_bytes: 0,
         };
         let mut header = Vec::with_capacity(64);
         header.extend_from_slice(UNIQUE_INDEX_MAGIC_V6);
@@ -105,6 +107,17 @@ impl<W: Write> UniqueIndexBaseWriter<W> {
         Ok(out)
     }
 
+    pub(super) fn resident_build_bytes(&self) -> usize {
+        self.metadata_bytes
+            .saturating_add(
+                self.blocks
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<UniqueIndexBlockRef>()),
+            )
+            .saturating_add(self.run.capacity())
+            .saturating_add(self.run_first_key.capacity())
+    }
+
     fn write_all_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         self.writer.write_all(bytes)?;
         self.bytes_written += bytes.len() as u64;
@@ -116,6 +129,9 @@ impl<W: Write> UniqueIndexBaseWriter<W> {
             return *id;
         }
         let id = self.paths.len() as u32;
+        self.metadata_bytes = self
+            .metadata_bytes
+            .saturating_add(segment_path.len().saturating_mul(2).saturating_add(128));
         self.paths.push(segment_path.to_string());
         self.path_ids.insert(segment_path.to_string(), id);
         id
@@ -160,6 +176,7 @@ impl<W: Write> UniqueIndexBaseWriter<W> {
         let run = std::mem::take(&mut self.run);
         self.write_all_bytes(&run)?;
         self.run_entries = 0;
+        self.metadata_bytes = self.metadata_bytes.saturating_add(block.first_key.len());
         self.blocks.push(block);
         Ok(())
     }
@@ -281,6 +298,21 @@ pub(super) fn append_prepared_unique_index_delta(
     path: &Path,
     entries: &[PreparedUniqueIndexEntry],
 ) -> Result<()> {
+    // Same bytes, then one fsync: the single-index append keeps its original
+    // lock/write/sync semantics on top of the deferred-sync primitive.
+    append_prepared_unique_index_delta_deferred_sync(path, entries)?.sync_all()?;
+    Ok(())
+}
+
+/// Append prepared entries and flush the buffered writes WITHOUT fsyncing;
+/// returns the still-open file so the caller can issue one sync after a
+/// whole batch of index delta files has been written under a shared lock
+/// pass (see `append_prepared_unique_index_entries_batch`). The file format
+/// is byte-for-byte identical to the syncing variant.
+pub(super) fn append_prepared_unique_index_delta_deferred_sync(
+    path: &Path,
+    entries: &[PreparedUniqueIndexEntry],
+) -> Result<std::fs::File> {
     let is_new = !path.exists() || std::fs::metadata(path)?.len() == 0;
     let raw = std::fs::OpenOptions::new()
         .create(true)
@@ -311,8 +343,9 @@ pub(super) fn append_prepared_unique_index_delta(
     let file = file
         .into_inner()
         .map_err(|e| TaibaiError::Storage(format!("unique index delta flush failed: {}", e)))?;
-    file.sync_all()?;
-    Ok(())
+    // No sync_all here: the caller batches one fsync per file after the
+    // whole statement's delta appends are on their way to disk.
+    Ok(file)
 }
 
 pub(super) fn append_unique_index_tombstone_delta(
@@ -476,13 +509,29 @@ pub(super) fn decode_unique_index_delta_records(
     let mut delta = UniqueIndexDelta::default();
     let mut cursor = Cursor::new(tail);
     while (cursor.position() as usize) < tail.len() {
-        let len = read_u32(&mut cursor)? as usize;
+        // A crash between an append's write() and its sync_all() can tear
+        // only the FINAL record (batches are framed and fsynced as a unit).
+        // Such entries were never durably published — ignoring the suffix
+        // preserves the last durable state instead of failing every
+        // load_unique_index_state forever, which bricked the table's writes
+        // until the delta file was deleted by hand.
+        let len = match read_u32(&mut cursor) {
+            Ok(len) => len as usize,
+            Err(_) => {
+                tracing::warn!(
+                    "unique index delta ends in a torn record; ignoring the trailing bytes"
+                );
+                break;
+            }
+        };
         let start = cursor.position() as usize;
         let end = start + len;
         if end > tail.len() {
-            return Err(TaibaiError::Storage(
-                "truncated unique index delta record".to_string(),
-            ));
+            tracing::warn!(
+                remaining = tail.len() - start,
+                "unique index delta ends in a torn record; ignoring the trailing bytes"
+            );
+            break;
         }
         let record = &tail[start..end];
         let mut record_cursor = Cursor::new(record);

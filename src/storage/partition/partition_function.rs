@@ -79,6 +79,12 @@ pub fn compute_partition_key_from_scalar(func: &PartitionFunction, val: &ScalarV
     }
 }
 
+/// The temporal partition key of a scalar value, or `None` when the value
+/// carries no calendar meaning (NULL, a non-calendar integer — see
+/// `date_parts_from_scalar`, a non-date string). Range-pruning callers
+/// treat `None` as "no bound on this side" so an unparseable literal can
+/// never eliminate partitions; write routing and eq pruning route such rows
+/// to the unpartitioned bucket.
 pub fn temporal_partition_key(func: &PartitionFunction, val: &ScalarValue) -> Option<String> {
     let parts = date_parts_from_scalar(val)?;
     match func {
@@ -128,60 +134,34 @@ pub fn mod_partition_value(val: &ScalarValue, divisor: i64) -> i64 {
     }
 }
 
+/// One value, one interpretation, over disjoint magnitude domains: a valid
+/// calendar number (`YYYYMMDD` / `YYYYMM`) reads as a calendar date; a bare
+/// integer in the epoch windows (see [`date_parts_from_epoch_number`])
+/// reads as an epoch timestamp; everything else yields `None`. Every
+/// caller (write routing, eq and range pruning, DELETE/UPDATE partition
+/// narrowing) shares this one function, so a `None` row lands in — and is
+/// read from — the unpartitioned bucket exactly like NULL. The old
+/// unconditional seconds fallback used to reinterpret every non-calendar
+/// integer (an invalid date number like `20240132`, a wall-clock `930`) as
+/// Unix seconds, silently collapsing whole date ranges into
+/// `p19700823`-style partitions that the TTL purger then treated as
+/// half-century-old data and dropped.
 fn date_parts_from_scalar(val: &ScalarValue) -> Option<DateParts> {
     match val {
         ScalarValue::Timestamp(Some(v)) => Some(date_parts_from_epoch_micros(*v)),
         ScalarValue::Date(Some(days)) => Some(date_parts_from_epoch_days(*days as i64)),
-        ScalarValue::Int32(Some(v)) => date_parts_from_date_number(*v as i64).or_else(|| {
-            Some(date_parts_from_epoch_micros(normalize_epoch_to_micros(
-                *v as i64,
-            )))
-        }),
-        ScalarValue::Int64(Some(v)) => date_parts_from_date_number(*v)
-            .or_else(|| Some(date_parts_from_epoch_micros(normalize_epoch_to_micros(*v)))),
-        ScalarValue::UInt32(Some(v)) => date_parts_from_date_number(*v as i64).or_else(|| {
-            Some(date_parts_from_epoch_micros(normalize_epoch_to_micros(
-                *v as i64,
-            )))
-        }),
+        ScalarValue::Int32(Some(v)) => date_parts_from_date_number(*v as i64)
+            .or_else(|| date_parts_from_epoch_number(*v as i64)),
+        ScalarValue::Int64(Some(v)) => {
+            date_parts_from_date_number(*v).or_else(|| date_parts_from_epoch_number(*v))
+        }
+        ScalarValue::UInt32(Some(v)) => date_parts_from_date_number(*v as i64)
+            .or_else(|| date_parts_from_epoch_number(*v as i64)),
         ScalarValue::UInt64(Some(v)) if *v <= i64::MAX as u64 => {
             let v = *v as i64;
-            date_parts_from_date_number(v)
-                .or_else(|| Some(date_parts_from_epoch_micros(normalize_epoch_to_micros(v))))
+            date_parts_from_date_number(v).or_else(|| date_parts_from_epoch_number(v))
         }
         ScalarValue::VarChar(Some(s)) => date_parts_from_str(s),
-        _ => None,
-    }
-}
-
-/// Like [`temporal_partition_key`], but without the epoch-micros fallback for
-/// bare integers: a bound that is not a valid YYYYMMDD-style date number (for
-/// example a `deal_time` wall-clock value like `930`, or an invalid date such
-/// as `20261000`) yields `None`. Range-pruning callers treat `None` as "no
-/// bound on this side" so a misparsed literal can never eliminate partitions.
-pub fn strict_temporal_partition_key(
-    func: &PartitionFunction,
-    val: &ScalarValue,
-) -> Option<String> {
-    let parts = match val {
-        ScalarValue::Timestamp(Some(v)) => date_parts_from_epoch_micros(*v),
-        ScalarValue::Date(Some(days)) => date_parts_from_epoch_days(*days as i64),
-        ScalarValue::Int32(Some(v)) => date_parts_from_date_number(*v as i64)?,
-        ScalarValue::Int64(Some(v)) => date_parts_from_date_number(*v)?,
-        ScalarValue::UInt32(Some(v)) => date_parts_from_date_number(*v as i64)?,
-        ScalarValue::UInt64(Some(v)) if *v <= i64::MAX as u64 => {
-            date_parts_from_date_number(*v as i64)?
-        }
-        ScalarValue::VarChar(Some(s)) => date_parts_from_str(s)?,
-        _ => return None,
-    };
-    match func {
-        PartitionFunction::Day => Some(format!(
-            "{:04}{:02}{:02}",
-            parts.year, parts.month, parts.day
-        )),
-        PartitionFunction::Month => Some(format!("{:04}{:02}", parts.year, parts.month)),
-        PartitionFunction::Year => Some(format!("{:04}", parts.year)),
         _ => None,
     }
 }
@@ -241,15 +221,27 @@ fn is_leap_year(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
-fn normalize_epoch_to_micros(v: i64) -> i64 {
+/// Epoch interpretation of a bare integer, restricted to magnitude windows
+/// that cannot collide with calendar numbers (`YYYYMMDD` tops out at
+/// 99_991_231, `YYYYMM` at 999_912): seconds `[10^9, 10^10)`, millis
+/// `[10^10, 10^13)`, micros `>= 10^13`. Any smaller non-calendar integer
+/// (a wall-clock value like `930`, an invalid date number like `20240132`)
+/// has no temporal meaning and returns `None` — such rows partition into
+/// the unpartitioned bucket exactly like NULL, instead of silently
+/// collapsing into `p1970xxxx` partitions that the TTL purger would then
+/// treat as half-century-old data and drop.
+fn date_parts_from_epoch_number(v: i64) -> Option<DateParts> {
     let abs = v.abs();
-    if abs < 10_000_000_000 {
+    let micros = if (1_000_000_000..10_000_000_000).contains(&abs) {
         v.saturating_mul(1_000_000)
-    } else if abs < 10_000_000_000_000 {
+    } else if (10_000_000_000..10_000_000_000_000).contains(&abs) {
         v.saturating_mul(1_000)
-    } else {
+    } else if abs >= 10_000_000_000_000 {
         v
-    }
+    } else {
+        return None;
+    };
+    Some(date_parts_from_epoch_micros(micros))
 }
 
 fn date_parts_from_epoch_micros(micros: i64) -> DateParts {
@@ -377,9 +369,7 @@ pub fn compute_partition_key_at(
                 PartitionFunction::Day | PartitionFunction::Month | PartitionFunction::Year => {
                     temporal_key_from_parts(
                         func,
-                        date_parts_from_date_number(v).or_else(|| {
-                            Some(date_parts_from_epoch_micros(normalize_epoch_to_micros(v)))
-                        }),
+                        date_parts_from_date_number(v).or_else(|| date_parts_from_epoch_number(v)),
                     )
                 }
                 PartitionFunction::Hash(_) => func.apply(v).to_string(),
@@ -393,9 +383,7 @@ pub fn compute_partition_key_at(
                 PartitionFunction::Day | PartitionFunction::Month | PartitionFunction::Year => {
                     temporal_key_from_parts(
                         func,
-                        date_parts_from_date_number(v).or_else(|| {
-                            Some(date_parts_from_epoch_micros(normalize_epoch_to_micros(v)))
-                        }),
+                        date_parts_from_date_number(v).or_else(|| date_parts_from_epoch_number(v)),
                     )
                 }
                 PartitionFunction::Hash(_) => func.apply(v).to_string(),
@@ -409,11 +397,8 @@ pub fn compute_partition_key_at(
                 PartitionFunction::Day | PartitionFunction::Month | PartitionFunction::Year => {
                     temporal_key_from_parts(
                         func,
-                        date_parts_from_date_number(v as i64).or_else(|| {
-                            Some(date_parts_from_epoch_micros(normalize_epoch_to_micros(
-                                v as i64,
-                            )))
-                        }),
+                        date_parts_from_date_number(v as i64)
+                            .or_else(|| date_parts_from_epoch_number(v as i64)),
                     )
                 }
                 PartitionFunction::Hash(buckets) => if *buckets > 0 {
@@ -438,15 +423,13 @@ pub fn compute_partition_key_at(
                     temporal_key_from_parts(
                         func,
                         (v <= i64::MAX as u64)
-                            .then(|| {
-                                let signed = v as i64;
-                                date_parts_from_date_number(signed).or_else(|| {
-                                    Some(date_parts_from_epoch_micros(normalize_epoch_to_micros(
-                                        signed,
-                                    )))
-                                })
-                            })
-                            .flatten(),
+                            .then(|| date_parts_from_date_number(v as i64))
+                            .flatten()
+                            .or_else(|| {
+                                (v <= i64::MAX as u64)
+                                    .then(|| date_parts_from_epoch_number(v as i64))
+                                    .flatten()
+                            }),
                     )
                 }
                 PartitionFunction::Hash(buckets) => if *buckets > 0 {

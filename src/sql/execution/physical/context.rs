@@ -13,7 +13,6 @@ pub struct PhysicalContext<'a> {
     pub table_refs: &'a [ResolvedTableRef],
     pub table_schemas: &'a HashMap<String, Schema>,
     pub table_metas: &'a HashMap<String, TableMeta>,
-    pub is_count_star: bool,
     /// Snapshot registry for correlated subqueries, used by the profiled
     /// materialized pipeline (EXPLAIN ANALYZE) to evaluate markers that
     /// could not be decorrelated.
@@ -26,14 +25,12 @@ impl<'a> PhysicalContext<'a> {
         table_refs: &'a [ResolvedTableRef],
         table_schemas: &'a HashMap<String, Schema>,
         table_metas: &'a HashMap<String, TableMeta>,
-        is_count_star: bool,
     ) -> Self {
         Self {
             scan_runtime: ScanRuntime::from_engine(engine),
             table_refs,
             table_schemas,
             table_metas,
-            is_count_star,
             subqueries: None,
         }
     }

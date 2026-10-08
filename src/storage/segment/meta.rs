@@ -26,15 +26,44 @@ pub struct SidecarFooter {
     pub footer: Vec<u8>,
 }
 
+/// Parsed snapshot of a segment's metadata (sidecar or embedded footer).
+///
+/// # Column-index spaces
+///
+/// `schema`, `row_groups` and `segment_zone_maps` are FOOTER-space: indexed
+/// by the segment's own column order, which drifts from the catalog's after
+/// DROP/RENAME COLUMN while sealed segments keep their layout. The fields
+/// are module-private on purpose — positional use with catalog-space
+/// indices once pruned the wrong row groups and silently dropped rows.
+/// Outside `crate::storage::segment` they are reachable only through the
+/// `footer_*` accessors (whose names carry the space) or, for pruning,
+/// through the catalog-aligned gateway `scan::row_filter::meta_prune_row_groups`.
 #[derive(Debug, Clone)]
 pub struct SegmentMetaSnapshot {
     pub data_end: u64,
-    pub schema: Schema,
+    pub(in crate::storage::segment) schema: Schema,
     pub row_count: u64,
-    pub row_groups: Vec<RowGroupMeta>,
+    pub(in crate::storage::segment) row_groups: Vec<RowGroupMeta>,
     pub delete_bitmap: Vec<u8>,
     pub deleted_row_count: u64,
-    pub segment_zone_maps: Vec<ZoneMap>,
+    pub(in crate::storage::segment) segment_zone_maps: Vec<ZoneMap>,
+}
+
+impl SegmentMetaSnapshot {
+    /// The segment's own schema, in footer column order.
+    pub fn footer_schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// Row-group metadata in footer column order.
+    pub fn footer_row_groups(&self) -> &[RowGroupMeta] {
+        &self.row_groups
+    }
+
+    /// Segment-level zone maps in footer column order.
+    pub fn footer_zone_maps(&self) -> &[ZoneMap] {
+        &self.segment_zone_maps
+    }
 }
 
 pub fn sidecar_meta_path(segment_path: &Path) -> PathBuf {

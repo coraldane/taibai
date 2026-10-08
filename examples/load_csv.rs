@@ -102,11 +102,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             batch.column_mut(*target_idx).unwrap().push(&value)?;
         }
         total += 1;
-        if total % batch_rows == 0 {
+        if total.is_multiple_of(batch_rows) {
             let payload = encode_columnar_bulk_insert(&table, &batch)?;
             client.pipeline_bulk_insert_columnar(payload).await?;
             batch = RecordBatch::with_capacity(schema.clone(), batch_rows);
-            if total % (batch_rows * 5) == 0 {
+            if total.is_multiple_of(batch_rows * 5) {
                 eprintln!(
                     "loaded {} rows, elapsed {:?}, in-flight {}",
                     total,

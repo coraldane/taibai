@@ -31,6 +31,60 @@ const MAX_BINARY_RESULT_COLUMNS: usize = 4_096;
 /// payload; anything denser is malformed.
 const MAX_BINARY_RESULT_ROWS_PER_BYTE: u64 = 1;
 
+/// Stable marker the server prefixes onto transient (resource-busy) SQL
+/// errors. The wire protocol has no error-code or classification field —
+/// `MSG_TYPE_ERROR` payloads are plain message text — so this prefix is the
+/// minimal extension letting a client tell "back off and re-issue" apart
+/// from "fail the statement". See `Handler::build_query_error`.
+pub const RETRYABLE_ERROR_PREFIX: &str = "[RETRYABLE]";
+
+/// Automatic retries a read-only statement gets when the server answers
+/// with a retryable (resource-busy) error before the client gives up and
+/// surfaces the error to the caller.
+const RETRYABLE_MAX_RETRIES: usize = 3;
+
+/// Backoff before retry attempt `n` (0-based): 10ms / 40ms / 160ms plus
+/// jitter of up to +50%, so a cohort of clients hitting the same busy
+/// resource de-synchronizes instead of retrying in lockstep.
+fn retry_backoff_delay(attempt: usize) -> Duration {
+    let base_ms = 10u64.saturating_mul(1u64 << (2 * attempt.min(6) as u32));
+    let base_ms = base_ms.min(160);
+    // No rand dependency: hash the wall clock. The goal is de-synchronization,
+    // not cryptographic quality.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let jitter = nanos % (base_ms / 2 + 1);
+    Duration::from_millis(base_ms + jitter)
+}
+
+/// Whether a server error message carries the retryable marker.
+pub fn is_retryable_error_message(message: &str) -> bool {
+    message.trim_start().starts_with(RETRYABLE_ERROR_PREFIX)
+}
+
+/// Whether `sql` is a statement the client may safely re-issue after a
+/// retryable server error. ONLY leading-keyword SELECT / SHOW / EXPLAIN
+/// qualify: they are idempotent reads, so a retry can never commit anything
+/// twice.
+///
+/// Everything else — INSERT/UPDATE/DELETE/REPLACE, DDL, transaction control,
+/// and read/write CTEs (`WITH ... INSERT`) — is deliberately excluded: the
+/// first attempt may have committed before the error was raised (or the
+/// retry may commit twice), so auto-retrying a write is an
+/// at-least-once/at-most-once gamble the CLIENT cannot resolve. For those
+/// statements the retryable marker is passed straight through to the caller
+/// (see [`Client::query`]); the application decides whether and how to
+/// retry.
+pub fn statement_is_read_only(sql: &str) -> bool {
+    let first_word = sql.split_whitespace().next().unwrap_or("");
+    matches!(
+        first_word.to_ascii_uppercase().as_str(),
+        "SELECT" | "SHOW" | "EXPLAIN"
+    )
+}
+
 pub struct Client {
     framed: Framed<tokio::net::TcpStream, MessageCodec>,
     session_id: Option<String>,
@@ -196,7 +250,42 @@ impl Client {
         Ok(start.elapsed())
     }
 
+    /// Execute `sql` and return the full result.
+    ///
+    /// Retry boundary: when the server answers a READ-ONLY statement
+    /// (leading SELECT/SHOW/EXPLAIN, see [`statement_is_read_only`]) with a
+    /// retryable error ([`RETRYABLE_ERROR_PREFIX`] — transient resource
+    /// busy), the client automatically re-issues it up to
+    /// `RETRYABLE_MAX_RETRIES` times with 10ms/40ms/160ms (+jitter)
+    /// backoff. Write statements are NEVER auto-retried here: a retried
+    /// INSERT may commit twice, so their retryable errors are returned
+    /// as-is (marker intact) and the application decides.
     pub async fn query(&mut self, sql: &str) -> Result<QueryResult> {
+        let read_only = statement_is_read_only(sql);
+        for attempt in 0..=RETRYABLE_MAX_RETRIES {
+            let result = self.query_once(sql).await?;
+            let QueryResult::Error(message) = &result else {
+                return Ok(result);
+            };
+            if attempt == RETRYABLE_MAX_RETRIES
+                || !read_only
+                || !is_retryable_error_message(message)
+            {
+                return Ok(result);
+            }
+            let delay = retry_backoff_delay(attempt);
+            tracing::debug!(
+                attempt,
+                delay_ms = delay.as_millis() as u64,
+                sql,
+                "retryable server error on read-only statement; backing off before retry"
+            );
+            tokio::time::sleep(delay).await;
+        }
+        unreachable!("the loop returns on the final attempt")
+    }
+
+    async fn query_once(&mut self, sql: &str) -> Result<QueryResult> {
         let mut payload = Vec::new();
         write_len_prefixed_string(&mut payload, "");
         write_len_prefixed_string(&mut payload, sql);
@@ -292,6 +381,14 @@ impl Client {
         Ok(result)
     }
 
+    /// Stream `sql` result batch-by-batch.
+    ///
+    /// No automatic retry here, by design: batches are handed to `on_batch`
+    /// as they arrive, so a mid-stream retry would re-deliver rows the
+    /// callback has already seen — not idempotent from the consumer's
+    /// perspective. Retryable errors surface as `Err(TaibaiError::Sql(msg))`
+    /// with the [`RETRYABLE_ERROR_PREFIX`] marker intact; re-issue from the
+    /// caller if the statement is read-only.
     pub async fn query_each_batch<F>(
         &mut self,
         sql: &str,
@@ -340,6 +437,12 @@ impl Client {
         }
     }
 
+    /// Execute a (typically write) statement and return rows_affected.
+    ///
+    /// Delegates to [`Client::query`](Self::query), so read-only statements
+    /// benefit from its automatic retryable-error retry; write statements
+    /// are not retried there, and their retryable marker travels unchanged
+    /// inside the returned error for the application to act on.
     pub async fn execute(&mut self, sql: &str) -> Result<u64> {
         match self.query(sql).await? {
             QueryResult::Ok { rows_affected, .. } => Ok(rows_affected),
@@ -1184,8 +1287,10 @@ fn decode_binary_column(
         let value = if is_null {
             ScalarValue::null_for_type(data_type)
         } else {
-            let (value, consumed) =
-                read_scalar_value(data.get(offset..).unwrap_or(&[]), data_type, 0)?;
+            let (value, consumed) = crate::protocol::scalar_codec::decode_param_value(
+                data.get(offset..).unwrap_or(&[]),
+                data_type,
+            )?;
             offset += consumed;
             value
         };
@@ -1228,387 +1333,8 @@ fn parse_server_elapsed_trailer(payload: &[u8], offset: usize) -> Option<Duratio
     Some(Duration::from_micros(micros))
 }
 
-fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarValue, usize)> {
-    match dt {
-        DataType::Bool => {
-            if data.is_empty() {
-                return Err(TaibaiError::Protocol("no data for Bool".into()));
-            }
-            Ok((ScalarValue::Bool(Some(data[0] != 0)), 1))
-        }
-        DataType::Int8 => {
-            if data.is_empty() {
-                return Err(TaibaiError::Protocol("no data for Int8".into()));
-            }
-            Ok((ScalarValue::Int8(Some(data[0] as i8)), 1))
-        }
-        DataType::Int16 => {
-            if data.len() < 2 {
-                return Err(TaibaiError::Protocol("no data for Int16".into()));
-            }
-            Ok((
-                ScalarValue::Int16(Some(i16::from_le_bytes(data[..2].try_into().unwrap()))),
-                2,
-            ))
-        }
-        DataType::Int32 => {
-            if data.len() < 4 {
-                return Err(TaibaiError::Protocol("no data for Int32".into()));
-            }
-            Ok((
-                ScalarValue::Int32(Some(i32::from_le_bytes(data[..4].try_into().unwrap()))),
-                4,
-            ))
-        }
-        DataType::Int64 => {
-            if data.len() < 8 {
-                return Err(TaibaiError::Protocol("no data for Int64".into()));
-            }
-            Ok((
-                ScalarValue::Int64(Some(i64::from_le_bytes(data[..8].try_into().unwrap()))),
-                8,
-            ))
-        }
-        DataType::UInt8 => {
-            if data.is_empty() {
-                return Err(TaibaiError::Protocol("no data for UInt8".into()));
-            }
-            Ok((ScalarValue::UInt8(Some(data[0])), 1))
-        }
-        DataType::UInt16 => {
-            if data.len() < 2 {
-                return Err(TaibaiError::Protocol("no data for UInt16".into()));
-            }
-            Ok((
-                ScalarValue::UInt16(Some(u16::from_le_bytes(data[..2].try_into().unwrap()))),
-                2,
-            ))
-        }
-        DataType::UInt32 => {
-            if data.len() < 4 {
-                return Err(TaibaiError::Protocol("no data for UInt32".into()));
-            }
-            Ok((
-                ScalarValue::UInt32(Some(u32::from_le_bytes(data[..4].try_into().unwrap()))),
-                4,
-            ))
-        }
-        DataType::UInt64 => {
-            if data.len() < 8 {
-                return Err(TaibaiError::Protocol("no data for UInt64".into()));
-            }
-            Ok((
-                ScalarValue::UInt64(Some(u64::from_le_bytes(data[..8].try_into().unwrap()))),
-                8,
-            ))
-        }
-        DataType::Float32 => {
-            if data.len() < 4 {
-                return Err(TaibaiError::Protocol("no data for Float32".into()));
-            }
-            Ok((
-                ScalarValue::Float32(Some(f32::from_le_bytes(data[..4].try_into().unwrap()))),
-                4,
-            ))
-        }
-        DataType::Float64 => {
-            if data.len() < 8 {
-                return Err(TaibaiError::Protocol("no data for Float64".into()));
-            }
-            Ok((
-                ScalarValue::Float64(Some(f64::from_le_bytes(data[..8].try_into().unwrap()))),
-                8,
-            ))
-        }
-        DataType::Decimal => {
-            if scale > 0 {
-                if data.len() < 4 {
-                    return Err(TaibaiError::Protocol("no data for Decimal".into()));
-                }
-                let len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
-                if data.len() < 4 + len {
-                    return Err(TaibaiError::Protocol("Decimal data truncated".into()));
-                }
-                let s = std::str::from_utf8(&data[4..4 + len]).map_err(|e| {
-                    TaibaiError::Protocol(format!("invalid UTF-8 in Decimal: {}", e))
-                })?;
-                let value = parse_scaled_decimal_text(s, scale)?;
-                return Ok((ScalarValue::Decimal(Some(value)), 4 + len));
-            }
-            if data.len() < 8 {
-                return Err(TaibaiError::Protocol("no data for Decimal".into()));
-            }
-            Ok((
-                ScalarValue::Decimal(Some(i64::from_le_bytes(data[..8].try_into().unwrap()))),
-                8,
-            ))
-        }
-        DataType::Date => {
-            if data.len() < 4 {
-                return Err(TaibaiError::Protocol("no data for Date".into()));
-            }
-            Ok((
-                ScalarValue::Date(Some(i32::from_le_bytes(data[..4].try_into().unwrap()))),
-                4,
-            ))
-        }
-        DataType::Time => {
-            if data.len() < 8 {
-                return Err(TaibaiError::Protocol("no data for Time".into()));
-            }
-            Ok((
-                ScalarValue::Time(Some(i64::from_le_bytes(data[..8].try_into().unwrap()))),
-                8,
-            ))
-        }
-        DataType::Timestamp => {
-            if data.len() < 8 {
-                return Err(TaibaiError::Protocol("no data for Timestamp".into()));
-            }
-            Ok((
-                ScalarValue::Timestamp(Some(i64::from_le_bytes(data[..8].try_into().unwrap()))),
-                8,
-            ))
-        }
-        DataType::Interval => {
-            if data.len() < 8 {
-                return Err(TaibaiError::Protocol("no data for Interval".into()));
-            }
-            Ok((
-                ScalarValue::Interval(Some(i64::from_le_bytes(data[..8].try_into().unwrap()))),
-                8,
-            ))
-        }
-        DataType::VarChar => {
-            if data.len() < 4 {
-                return Err(TaibaiError::Protocol("no data for VarChar".into()));
-            }
-            let len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
-            if data.len() < 4 + len {
-                return Err(TaibaiError::Protocol("VarChar data truncated".into()));
-            }
-            let s = String::from_utf8_lossy(&data[4..4 + len]).to_string();
-            Ok((ScalarValue::VarChar(Some(s)), 4 + len))
-        }
-        DataType::Blob => {
-            if data.len() < 4 {
-                return Err(TaibaiError::Protocol("no data for Blob".into()));
-            }
-            let len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
-            if data.len() < 4 + len {
-                return Err(TaibaiError::Protocol("Blob data truncated".into()));
-            }
-            let b = data[4..4 + len].to_vec();
-            Ok((ScalarValue::Blob(Some(b)), 4 + len))
-        }
-        DataType::Vector => {
-            if data.len() < 4 {
-                return Err(TaibaiError::Protocol("no data for Vector".into()));
-            }
-            let len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
-            let total_bytes = 4 + len * 4;
-            if data.len() < total_bytes {
-                return Err(TaibaiError::Protocol("Vector data truncated".into()));
-            }
-            let mut floats = Vec::with_capacity(len);
-            for i in 0..len {
-                let start = 4 + i * 4;
-                floats.push(f32::from_le_bytes(
-                    data[start..start + 4].try_into().unwrap(),
-                ));
-            }
-            Ok((ScalarValue::Vector(Some(floats)), total_bytes))
-        }
-    }
-}
-
-fn parse_scaled_decimal_text(s: &str, scale: i32) -> Result<i64> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err(TaibaiError::Protocol("empty Decimal value".into()));
-    }
-
-    let negative = s.starts_with('-');
-    let unsigned = if negative || s.starts_with('+') {
-        &s[1..]
-    } else {
-        s
-    };
-    let mut parts = unsigned.splitn(2, '.');
-    let int_part = parts.next().unwrap_or("");
-    let frac_part = parts.next().unwrap_or("");
-
-    if int_part.is_empty() && frac_part.is_empty() {
-        return Err(TaibaiError::Protocol(format!("invalid Decimal '{}'", s)));
-    }
-    if !int_part.chars().all(|c| c.is_ascii_digit())
-        || !frac_part.chars().all(|c| c.is_ascii_digit())
-    {
-        return Err(TaibaiError::Protocol(format!("invalid Decimal '{}'", s)));
-    }
-
-    let multiplier = 10_i64
-        .checked_pow(scale as u32)
-        .ok_or_else(|| TaibaiError::Protocol(format!("Decimal scale {} overflows", scale)))?;
-    let int_value = if int_part.is_empty() {
-        0
-    } else {
-        int_part
-            .parse::<i64>()
-            .map_err(|e| TaibaiError::Protocol(format!("invalid Decimal '{}': {}", s, e)))?
-    };
-
-    let mut frac = frac_part.to_string();
-    let scale_usize = scale as usize;
-    if frac.len() > scale_usize {
-        return Err(TaibaiError::Protocol(format!(
-            "Decimal '{}' exceeds scale {}",
-            s, scale
-        )));
-    }
-    while frac.len() < scale_usize {
-        frac.push('0');
-    }
-    let frac_value = if frac.is_empty() {
-        0
-    } else {
-        frac.parse::<i64>()
-            .map_err(|e| TaibaiError::Protocol(format!("invalid Decimal '{}': {}", s, e)))?
-    };
-
-    let magnitude = int_value
-        .checked_mul(multiplier)
-        .and_then(|v| v.checked_add(frac_value))
-        .ok_or_else(|| TaibaiError::Protocol(format!("Decimal '{}' overflows", s)))?;
-    Ok(if negative { -magnitude } else { magnitude })
-}
-
-#[cfg(test)]
-#[path = "client_test.rs"]
-mod tests;
-
 fn encode_scalar_param(buf: &mut Vec<u8>, val: &ScalarValue) {
-    match val {
-        ScalarValue::Bool(Some(v)) => {
-            buf.push(DataType::Bool as u8);
-            buf.push(if *v { 1 } else { 0 });
-        }
-        ScalarValue::Bool(None) => buf.push(0u8),
-
-        ScalarValue::Int8(Some(v)) => {
-            buf.push(DataType::Int8 as u8);
-            buf.push(*v as u8);
-        }
-        ScalarValue::Int8(None) => buf.push(0u8),
-
-        ScalarValue::Int16(Some(v)) => {
-            buf.push(DataType::Int16 as u8);
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        ScalarValue::Int16(None) => buf.push(0u8),
-
-        ScalarValue::Int32(Some(v)) => {
-            buf.push(DataType::Int32 as u8);
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        ScalarValue::Int32(None) => buf.push(0u8),
-
-        ScalarValue::Int64(Some(v)) => {
-            buf.push(DataType::Int64 as u8);
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        ScalarValue::Int64(None) => buf.push(0u8),
-
-        ScalarValue::UInt8(Some(v)) => {
-            buf.push(DataType::UInt8 as u8);
-            buf.push(*v);
-        }
-        ScalarValue::UInt8(None) => buf.push(0u8),
-
-        ScalarValue::UInt16(Some(v)) => {
-            buf.push(DataType::UInt16 as u8);
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        ScalarValue::UInt16(None) => buf.push(0u8),
-
-        ScalarValue::UInt32(Some(v)) => {
-            buf.push(DataType::UInt32 as u8);
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        ScalarValue::UInt32(None) => buf.push(0u8),
-
-        ScalarValue::UInt64(Some(v)) => {
-            buf.push(DataType::UInt64 as u8);
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        ScalarValue::UInt64(None) => buf.push(0u8),
-
-        ScalarValue::Float32(Some(v)) => {
-            buf.push(DataType::Float32 as u8);
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        ScalarValue::Float32(None) => buf.push(0u8),
-
-        ScalarValue::Float64(Some(v)) => {
-            buf.push(DataType::Float64 as u8);
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        ScalarValue::Float64(None) => buf.push(0u8),
-
-        ScalarValue::Decimal(Some(v)) => {
-            buf.push(DataType::Decimal as u8);
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        ScalarValue::Decimal(None) => buf.push(0u8),
-
-        ScalarValue::Date(Some(v)) => {
-            buf.push(DataType::Date as u8);
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        ScalarValue::Date(None) => buf.push(0u8),
-
-        ScalarValue::Time(Some(v)) => {
-            buf.push(DataType::Time as u8);
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        ScalarValue::Time(None) => buf.push(0u8),
-
-        ScalarValue::Timestamp(Some(v)) => {
-            buf.push(DataType::Timestamp as u8);
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        ScalarValue::Timestamp(None) => buf.push(0u8),
-
-        ScalarValue::Interval(Some(v)) => {
-            buf.push(DataType::Interval as u8);
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        ScalarValue::Interval(None) => buf.push(0u8),
-
-        ScalarValue::VarChar(Some(v)) => {
-            buf.push(DataType::VarChar as u8);
-            let bytes = v.as_bytes();
-            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(bytes);
-        }
-        ScalarValue::VarChar(None) => buf.push(0u8),
-
-        ScalarValue::Blob(Some(v)) => {
-            buf.push(DataType::Blob as u8);
-            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            buf.extend_from_slice(v);
-        }
-        ScalarValue::Blob(None) => buf.push(0u8),
-
-        ScalarValue::Vector(Some(v)) => {
-            buf.push(DataType::Vector as u8);
-            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            for f in v {
-                buf.extend_from_slice(&f.to_le_bytes());
-            }
-        }
-        ScalarValue::Vector(None) => buf.push(0u8),
-    }
+    crate::protocol::scalar_codec::encode_scalar_param(buf, val);
 }
 
 /// A server-pushed change notification for one committed insert batch.

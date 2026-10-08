@@ -1,3 +1,5 @@
+use super::*;
+
 pub fn exec_show_tables(engine: &Engine, db: &str) -> Result<ExecResult> {
     let catalogs = engine.catalogs().read().unwrap();
     let catalog = catalogs
@@ -347,7 +349,7 @@ pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<
     })
 }
 
-fn get_existing_catalog<'a>(
+pub(super) fn get_existing_catalog<'a>(
     catalogs: &'a mut HashMap<String, DatabaseCatalog>,
     db: &str,
 ) -> Result<&'a mut DatabaseCatalog> {
@@ -599,11 +601,16 @@ pub fn exec_show_processlist(engine: &Engine, full: bool) -> Result<ExecResult> 
                 crate::common::query_cancel::QueryPhase::Committing => "Committing".to_string(),
             }
         };
-        batch.column_mut(5).unwrap().push(&ScalarValue::VarChar(Some(state)))?;
+        batch
+            .column_mut(5)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(state)))?;
         batch
             .column_mut(6)
             .unwrap()
-            .push(&ScalarValue::VarChar(Some(processlist_info(&entry.sql, full))))?;
+            .push(&ScalarValue::VarChar(Some(processlist_info(
+                &entry.sql, full,
+            ))))?;
     }
     Ok(ExecResult::Query {
         schema,
@@ -684,6 +691,12 @@ pub fn exec_optimize_table(
         compactor.optimize_table(db, table, &table_meta)?
     };
 
+    // Compaction frees segment path numbers the next writer may reuse; the
+    // sum-cache key cannot tell incarnations apart (see drop table).
+    crate::sql::execution::scan::aggregate_meta::invalidate_segment_sum_cache_under(
+        &engine.data_dir().join(db).join(table),
+    );
+
     // TTL-expired rows physically removed by the rewrite were never
     // subtracted from the catalog by a DELETE; correct row_count first.
     if stats.rows_dropped_ttl > 0 {
@@ -702,15 +715,17 @@ pub fn exec_optimize_table(
     // lazy rebuild on the next probe. Skip when compaction was a no-op.
     if stats.segments_written > 0 || stats.rows_dropped > 0 {
         let schema = Schema::new(table_meta.columns.clone());
-        let rebuilt = engine.segment_mgr().with_table_mutation_lock(db, table, || {
-            super::dml_insert::rebuild_table_location_indexes(
-                engine,
-                db,
-                table,
-                &table_meta,
-                &schema,
-            )
-        });
+        let rebuilt = engine
+            .segment_mgr()
+            .with_table_mutation_lock(db, table, || {
+                crate::sql::execution::dml_insert::rebuild_table_location_indexes(
+                    engine,
+                    db,
+                    table,
+                    &table_meta,
+                    &schema,
+                )
+            });
         if let Err(error) = rebuilt {
             tracing::warn!(
                 db,
@@ -783,7 +798,7 @@ pub fn exec_analyze_table(engine: &Engine, db: &str, table: &str) -> Result<Exec
                         let mut batch = reader.read_row_group(row_group)?;
                         if !reader.delete_bitmap().is_empty() {
                             batch = crate::storage::segment::delete_bitmap::filter_batch(
-                                &batch,
+                                batch,
                                 reader.row_group_start_row(row_group),
                                 reader.delete_bitmap(),
                             )?;
@@ -841,8 +856,8 @@ pub fn exec_analyze_table(engine: &Engine, db: &str, table: &str) -> Result<Exec
 
 const ANALYZE_HLL_PRECISION: u32 = 12;
 const ANALYZE_HLL_REGISTERS: usize = 1 << ANALYZE_HLL_PRECISION;
-const ANALYZE_HISTOGRAM_SAMPLE_SIZE: usize = 2048;
-const ANALYZE_HISTOGRAM_BUCKETS: usize = 32;
+pub(crate) const ANALYZE_HISTOGRAM_SAMPLE_SIZE: usize = 2048;
+pub(crate) const ANALYZE_HISTOGRAM_BUCKETS: usize = 32;
 const ANALYZE_HISTOGRAM_MAX_VALUE_BYTES: usize = 1024;
 const ANALYZE_COMPOSITE_GROUP_LIMIT: usize = 32;
 
@@ -911,7 +926,7 @@ struct AnalyzeCompositeCollector {
 }
 
 impl AnalyzeCompositeCollector {
-    fn new(group: AnalyzeCompositeGroup) -> Self {
+    pub(crate) fn new(group: AnalyzeCompositeGroup) -> Self {
         Self {
             group,
             null_count: 0,
@@ -939,7 +954,7 @@ impl AnalyzeCompositeCollector {
         }
     }
 
-    fn finish(self) -> crate::storage::catalog::schema::CompositeStatisticsMeta {
+    pub(crate) fn finish(self) -> crate::storage::catalog::schema::CompositeStatisticsMeta {
         crate::storage::catalog::schema::CompositeStatisticsMeta {
             columns: self.group.columns,
             distinct_count: estimate_hll(&self.registers).min(i64::MAX as u64) as i64,
@@ -949,7 +964,7 @@ impl AnalyzeCompositeCollector {
     }
 }
 
-struct AnalyzeSample {
+pub(crate) struct AnalyzeSample {
     priority: u64,
     value: ScalarValue,
 }
@@ -974,17 +989,17 @@ impl Ord for AnalyzeSample {
     }
 }
 
-struct AnalyzeColumnCollector {
-    null_count: u64,
-    non_null_count: u64,
-    min_value: Option<ScalarValue>,
-    max_value: Option<ScalarValue>,
+pub(crate) struct AnalyzeColumnCollector {
+    pub(crate) null_count: u64,
+    pub(crate) non_null_count: u64,
+    pub(crate) min_value: Option<ScalarValue>,
+    pub(crate) max_value: Option<ScalarValue>,
     registers: Vec<u8>,
-    samples: std::collections::BinaryHeap<AnalyzeSample>,
+    pub(crate) samples: std::collections::BinaryHeap<AnalyzeSample>,
 }
 
 impl AnalyzeColumnCollector {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             null_count: 0,
             non_null_count: 0,
@@ -1004,12 +1019,14 @@ impl AnalyzeColumnCollector {
             }
             self.non_null_count = self.non_null_count.saturating_add(1);
             if self.min_value.as_ref().is_none_or(|current| {
-                crate::sql::execution::operators::sort::compare_scalars_null_last(&value, current).is_lt()
+                crate::sql::execution::operators::sort::compare_scalars_null_last(&value, current)
+                    .is_lt()
             }) {
                 self.min_value = Some(value.clone());
             }
             if self.max_value.as_ref().is_none_or(|current| {
-                crate::sql::execution::operators::sort::compare_scalars_null_last(&value, current).is_gt()
+                crate::sql::execution::operators::sort::compare_scalars_null_last(&value, current)
+                    .is_gt()
             }) {
                 self.max_value = Some(value.clone());
             }
@@ -1021,7 +1038,7 @@ impl AnalyzeColumnCollector {
         }
     }
 
-    fn sample_value(&mut self, value: ScalarValue) {
+    pub(crate) fn sample_value(&mut self, value: ScalarValue) {
         if histogram_value_size(&value) > ANALYZE_HISTOGRAM_MAX_VALUE_BYTES {
             return;
         }
@@ -1044,7 +1061,7 @@ impl AnalyzeColumnCollector {
         }
     }
 
-    fn finish(self) -> crate::storage::catalog::schema::ColumnStatisticsMeta {
+    pub(crate) fn finish(self) -> crate::storage::catalog::schema::ColumnStatisticsMeta {
         crate::storage::catalog::schema::ColumnStatisticsMeta {
             distinct_count: estimate_hll(&self.registers).min(i64::MAX as u64) as i64,
             null_count: self.null_count.min(i64::MAX as u64) as i64,
@@ -1125,5 +1142,3 @@ fn estimate_hll(registers: &[u8]) -> u64 {
     };
     corrected.round().max(0.0) as u64
 }
-
-

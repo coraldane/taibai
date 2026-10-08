@@ -138,7 +138,12 @@
 
 ## 6. 实施进度
 
-**已完成（2026-09-11）**：
+> **实施状态差异（2026-10）**：下文标记 M1 已完成的"服务端 v2 bulk 编码"部分**不在
+> `dev` 分支当前代码中**——`src/storage/bulk_payload.rs` / `direct_bulk.rs` 没有
+> magic/encoding 分支，服务端目前只接受 v1 载荷。差异记录与当前分支基线以
+> [向量化执行路线图](vectorization-parquet-timeseries-roadmap.md)为准。
+
+**已完成（2026-09-11，M1 的服务端部分见上方差异说明）**：
 
 - **M1（A1 + B1，二进制列式端到端）**：服务端 `DirectBulkRequest` 支持 v2 二进制编码（定宽列整段 memcpy 进 `ColumnArray`，VarChar 走连续缓冲 + offsets），v1 路径原样保留；taibai-cpp `RecordBatch` 改为类型化 `ColumnBuffer`（整段 memcpy、原生 null 位图、Decimal 直传 unscaled int64）。协议细节见 [Direct Bulk 列式载荷协议](../design/direct-bulk-binary-protocol.md)。
 - **B2 + C1（微批直写通道）**：taibai-cpp 新增 `ColumnarBatchWriter<Row>`（SPSC 环形队列 + 后台聚批线程，`close()` 排空并等待全部批次确认）；tonglian-md 新增 `TaibaiWriter` 双写通道（MDL 回调线程内规整为定长 POD 行，每表一个后台聚批线程 + 独立连接，懒建表，与 NatsWriter 同级），由 `[taibai]` 配置段控制（默认 `enabled=false`）。

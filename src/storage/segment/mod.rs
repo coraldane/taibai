@@ -69,3 +69,7 @@ pub use crate::storage::codec::scalar_tag::decode_scalar_with_tag;
 pub use crate::storage::partition::pruning::{
     RangeClause, RangeOp, RowGroupPredicate, ScanStats, ZoneMap,
 };
+
+#[cfg(test)]
+#[path = "statement_journal_test.rs"]
+mod statement_journal_tests;

@@ -272,9 +272,12 @@ impl UniqueIndexCompactionJob {
             std::fs::write(&delta_tmp, suffix_file)?;
             std::fs::rename(delta_tmp, &delta_path)?;
         }
-        // The new state reads the rewritten base lazily; a failure here
-        // leaves the old state installed, whose block loads transparently
-        // resolve against the renamed file (a superset minus dead entries).
+        // The new state opens the renamed file (pinned by handle); a failure
+        // here leaves the old state installed, whose block loads keep reading
+        // its own pinned snapshot — NOT the renamed file's bytes, whose block
+        // layout (offsets, first keys, path table) does not match the old
+        // directory. That mismatch is exactly why the base pins a handle
+        // instead of reading by path.
         let base = UniqueIndexBase::open(&self.base_path())?;
         let progress = self.state.progress.read().unwrap().clone();
         self.unique_indexes.write().unwrap().insert(

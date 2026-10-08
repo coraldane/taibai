@@ -1,3 +1,5 @@
+use super::*;
+
 /// Generates a same-variant `Column op Literal` comparison kernel
 /// (`eq_vec`/`lt_vec`/…). `$ord_op`/`$ord_val` describe the cross-variant
 /// fallback: it routes through `compare_scalar_at` and keeps the same
@@ -5,6 +7,9 @@
 macro_rules! cmp_vec_fn {
     ($fn_name:ident, $op:tt, $ord_op:tt, $ord_val:ident) => {
         pub fn $fn_name(&self, value: &ScalarValue) -> Vec<bool> {
+            if self.is_selected() {
+                return (0..self.len()).map(|row| self.compare_scalar_at(row, value).is_some_and(|ordering| ordering $ord_op std::cmp::Ordering::$ord_val)).collect();
+            }
             // Zero-copy views / dictionary encodings compare through their
             // materialized form; row indexes are preserved by `flattened`.
             if matches!(
@@ -85,142 +90,102 @@ macro_rules! cmp_vec_fn {
     };
 }
 
-impl ColumnArray {
-    pub fn count_eq(&self, value: &ScalarValue) -> u64 {
-        let num_rows = self.len();
-        let bitmap = self.bitmap();
-        match (self, value) {
-            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Int16 { data, .. }, ScalarValue::Int16(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Int8 { data, .. }, ScalarValue::Int8(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::UInt64 { data, .. }, ScalarValue::UInt64(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::UInt32 { data, .. }, ScalarValue::UInt32(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::UInt16 { data, .. }, ScalarValue::UInt16(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::UInt8 { data, .. }, ScalarValue::UInt8(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Float64 { data, .. }, ScalarValue::Float64(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Float32 { data, .. }, ScalarValue::Float32(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Decimal { data, .. }, ScalarValue::Decimal(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Date { data, .. }, ScalarValue::Date(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Timestamp { data, .. }, ScalarValue::Timestamp(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Time { data, .. }, ScalarValue::Time(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Interval { data, .. }, ScalarValue::Interval(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
-                .count()
-                as u64,
-            (ColumnArray::Bool { data, .. }, ScalarValue::Bool(Some(v))) => (0..num_rows)
-                .filter(|&i| !bitmap.is_null(i) && (data[i] != 0) == *v)
-                .count()
-                as u64,
-            _ => 0,
-        }
-    }
+// One type table drives BOTH equality-count functions. The deleted
+// variant used to cover only Int64/Int32/VarChar while count_eq covered
+// every type, so the COUNT fast path's `raw - deleted` arithmetic silently
+// counted deleted rows for every other column type.
+macro_rules! impl_eq_counts {
 
-    pub fn count_eq_deleted(
-        &self,
-        value: &ScalarValue,
-        rg_start_row: u64,
-        delete_bitmap: &[u8],
-    ) -> u64 {
-        let num_rows = self.len();
-        let bitmap = self.bitmap();
-        let mut deleted_count: u64 = 0;
-        match (self, value) {
-            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => {
-                for (i, item) in data.iter().enumerate().take(num_rows) {
-                    if !bitmap.is_null(i) && *item == *v {
-                        let row_id = rg_start_row + i as u64;
-                        let byte = (row_id / 8) as usize;
-                        let bit = (row_id % 8) as u8;
-                        if delete_bitmap
-                            .get(byte)
-                            .is_some_and(|b| (b & (1u8 << bit)) != 0)
-                        {
-                            deleted_count += 1;
+        ($($variant:ident => $scalar:ident),+ $(,)?) => {
+            pub fn count_eq(&self, value: &ScalarValue) -> u64 {
+                let num_rows = self.len();
+                let bitmap = self.bitmap();
+                match (self, value) {
+                    $(
+                        (ColumnArray::$variant { data, .. }, ScalarValue::$scalar(Some(v))) => {
+                            (0..num_rows)
+                                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                                .count() as u64
                         }
-                    }
+                    )+
+                    (ColumnArray::Bool { data, .. }, ScalarValue::Bool(Some(v))) => (0..num_rows)
+                        .filter(|&i| !bitmap.is_null(i) && (data[i] != 0) == *v)
+                        .count() as u64,
+                    _ => 0,
                 }
             }
-            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => {
-                for (i, item) in data.iter().enumerate().take(num_rows) {
-                    if !bitmap.is_null(i) && *item == *v {
-                        let row_id = rg_start_row + i as u64;
-                        let byte = (row_id / 8) as usize;
-                        let bit = (row_id % 8) as u8;
-                        if delete_bitmap
-                            .get(byte)
-                            .is_some_and(|b| (b & (1u8 << bit)) != 0)
-                        {
-                            deleted_count += 1;
+
+            /// Count `count_eq`-matching rows whose absolute row id is marked
+            /// deleted. Type coverage MUST stay identical to [`Self::count_eq`]
+            /// — both are generated from the same table above for that reason.
+            pub fn count_eq_deleted(
+                &self,
+                value: &ScalarValue,
+                rg_start_row: u64,
+                delete_bitmap: &[u8],
+            ) -> u64 {
+                let num_rows = self.len();
+                let bitmap = self.bitmap();
+                let mut deleted_count: u64 = 0;
+                match (self, value) {
+                    $(
+                        (ColumnArray::$variant { data, .. }, ScalarValue::$scalar(Some(v))) => {
+                            for i in 0..num_rows {
+                                if !bitmap.is_null(i) && data[i] == *v {
+                                    let row_id = rg_start_row + i as u64;
+                                    let byte = (row_id / 8) as usize;
+                                    let bit = (row_id % 8) as u8;
+                                    if delete_bitmap
+                                        .get(byte)
+                                        .is_some_and(|b| (b & (1u8 << bit)) != 0)
+                                    {
+                                        deleted_count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    )+
+                    (ColumnArray::Bool { data, .. }, ScalarValue::Bool(Some(v))) => {
+                        for i in 0..num_rows {
+                            if !bitmap.is_null(i) && (data[i] != 0) == *v {
+                                let row_id = rg_start_row + i as u64;
+                                let byte = (row_id / 8) as usize;
+                                let bit = (row_id % 8) as u8;
+                                if delete_bitmap
+                                    .get(byte)
+                                    .is_some_and(|b| (b & (1u8 << bit)) != 0)
+                                {
+                                    deleted_count += 1;
+                                }
+                            }
                         }
                     }
+                    _ => {}
                 }
+                deleted_count
             }
-            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => {
-                for (i, item) in data.iter().enumerate().take(num_rows) {
-                    if !bitmap.is_null(i) && *item == *v {
-                        let row_id = rg_start_row + i as u64;
-                        let byte = (row_id / 8) as usize;
-                        let bit = (row_id % 8) as u8;
-                        if delete_bitmap
-                            .get(byte)
-                            .is_some_and(|b| (b & (1u8 << bit)) != 0)
-                        {
-                            deleted_count += 1;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        deleted_count
-    }
+        };
+}
+
+impl ColumnArray {
+    impl_eq_counts!(
+        Int64 => Int64,
+        Int32 => Int32,
+        Int16 => Int16,
+        Int8 => Int8,
+        UInt64 => UInt64,
+        UInt32 => UInt32,
+        UInt16 => UInt16,
+        UInt8 => UInt8,
+        VarChar => VarChar,
+        Float64 => Float64,
+        Float32 => Float32,
+        Decimal => Decimal,
+        Date => Date,
+        Timestamp => Timestamp,
+        Time => Time,
+        Interval => Interval,
+    );
 
     /// Column-wide minimum over non-null values (vectorized, no per-cell boxing).
     /// Returns None when the column has no non-null values.
@@ -242,9 +207,9 @@ impl ColumnArray {
             }};
         }
         match self {
-            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => {
-                self.flattened().col_min()
-            }
+            ColumnArray::Selected { .. }
+            | ColumnArray::Dictionary { .. }
+            | ColumnArray::Rle { .. } => self.flattened().col_min(),
             ColumnArray::Int64 { data, .. } => numeric_min!(data, Int64),
             ColumnArray::Int32 { data, .. } => numeric_min!(data, Int32),
             ColumnArray::Int16 { data, .. } => numeric_min!(data, Int16),
@@ -337,9 +302,9 @@ impl ColumnArray {
             }};
         }
         match self {
-            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => {
-                self.flattened().col_max()
-            }
+            ColumnArray::Selected { .. }
+            | ColumnArray::Dictionary { .. }
+            | ColumnArray::Rle { .. } => self.flattened().col_max(),
             ColumnArray::Int64 { data, .. } => numeric_max!(data, Int64),
             ColumnArray::Int32 { data, .. } => numeric_max!(data, Int32),
             ColumnArray::Int16 { data, .. } => numeric_max!(data, Int16),
@@ -415,6 +380,16 @@ impl ColumnArray {
 
     /// Count of non-null values in this column (vectorized).
     pub fn col_count_non_null(&self) -> u64 {
+        if let Self::Selected { parts, .. } = self {
+            return parts
+                .iter()
+                .map(|(source, rows)| {
+                    rows.iter()
+                        .filter(|&&row| !source.bitmap().is_null(row as usize))
+                        .count() as u64
+                })
+                .sum();
+        }
         (self.len() as u64).saturating_sub(self.bitmap().null_count() as u64)
     }
 
@@ -429,6 +404,22 @@ impl ColumnArray {
     /// value or the column type is not i64-viewable — the same contract as
     /// [`Self::col_sum_i64`].
     pub fn col_sum_i64_range(&self, offset: usize, count: usize) -> Option<i64> {
+        if self.is_selected() {
+            let mut sum = None;
+            for row in offset..offset.saturating_add(count).min(self.len()) {
+                let (source, position) = self.selected_source_at(row)?;
+                if let Some(value) = source.col_sum_i64_range(position, 1) {
+                    sum = Some(sum.unwrap_or(0i64).wrapping_add(value));
+                }
+            }
+            return sum;
+        }
+        // Run-form columns read through their materialized expansion; the
+        // lazy flatten is cached, so repeated range sums over the same column
+        // expand once.
+        if let ColumnArray::Rle { .. } = self {
+            return self.flattened().col_sum_i64_range(offset, count);
+        }
         let bitmap = self.bitmap();
         macro_rules! int_sum_range {
             ($data:expr, $cast:ty) => {{
@@ -486,6 +477,21 @@ impl ColumnArray {
     /// Column-wide sum as f64 for float columns (vectorized). Returns None if
     /// all values are null or the column type is not float.
     pub fn col_sum_f64(&self) -> Option<f64> {
+        if self.is_selected() {
+            if !matches!(self.data_type(), DataType::Float32 | DataType::Float64) {
+                return None;
+            }
+            let mut sum = None;
+            for row in 0..self.len() {
+                if let Some(value) = self.numeric_f64_at(row) {
+                    sum = Some(sum.unwrap_or(0.0) + value);
+                }
+            }
+            return sum;
+        }
+        if let ColumnArray::Rle { .. } = self {
+            return self.flattened().col_sum_f64();
+        }
         let bitmap = self.bitmap();
         match self {
             ColumnArray::Float64 { data, .. } => {
@@ -699,12 +705,20 @@ impl ColumnArray {
             ColumnArray::Timestamp { data, bitmap } => slice_copy_column!(Timestamp, data, bitmap),
             ColumnArray::Interval { data, bitmap } => slice_copy_column!(Interval, data, bitmap),
             ColumnArray::VarChar { data, bitmap } => {
-                let mut out = ColumnArray::with_capacity(crate::protocol::types::DataType::VarChar, end - start);
+                let mut out = ColumnArray::with_capacity(
+                    crate::protocol::types::DataType::VarChar,
+                    end - start,
+                );
                 for i in start..end {
-                    if bitmap.is_null(i) { out.push_null_value(); } else { out.push(&ScalarValue::VarChar(Some(data.value(i).to_owned()))).unwrap(); }
+                    if bitmap.is_null(i) {
+                        out.push_null_value();
+                    } else {
+                        out.push(&ScalarValue::VarChar(Some(data.value(i).to_owned())))
+                            .unwrap();
+                    }
                 }
                 out
-            },
+            }
             _ => {
                 let mut new_col = ColumnArray::empty(self.data_type());
                 for i in start..end {
@@ -744,6 +758,15 @@ impl ColumnArray {
         if indices.is_empty() {
             return Ok(());
         }
+        if self.is_selected() {
+            for &row in indices {
+                dst.push(&self.scalar(row as usize))?;
+            }
+            return Ok(());
+        }
+        if matches!(self, Self::Dictionary { .. } | Self::Rle { .. }) {
+            return self.flattened().gather_into(indices, dst);
+        }
         // A source column without nulls lets the gather extend the output
         // bitmap in bulk instead of a branch per row, which is the common case
         // for ingested hot data. Detecting "no nulls" scans the whole source
@@ -762,7 +785,8 @@ impl ColumnArray {
                     while i < indices.len() {
                         let first = indices[i] as usize;
                         let mut run = 1usize;
-                        while i + run < indices.len() && indices[i + run] == indices[i + run - 1] + 1
+                        while i + run < indices.len()
+                            && indices[i + run] == indices[i + run - 1] + 1
                         {
                             run += 1;
                         }
@@ -1133,54 +1157,166 @@ impl ColumnArray {
             return None;
         }
         let out = match (self, other) {
-            (C::Int8 { data: l, bitmap: lb }, C::Int8 { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Int16 { data: l, bitmap: lb }, C::Int16 { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Int32 { data: l, bitmap: lb }, C::Int32 { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Int64 { data: l, bitmap: lb }, C::Int64 { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::UInt8 { data: l, bitmap: lb }, C::UInt8 { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::UInt16 { data: l, bitmap: lb }, C::UInt16 { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::UInt32 { data: l, bitmap: lb }, C::UInt32 { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::UInt64 { data: l, bitmap: lb }, C::UInt64 { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Decimal { data: l, bitmap: lb }, C::Decimal { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Date { data: l, bitmap: lb }, C::Date { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Time { data: l, bitmap: lb }, C::Time { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Timestamp { data: l, bitmap: lb }, C::Timestamp { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Interval { data: l, bitmap: lb }, C::Interval { data: r, bitmap: rb }) => {
-                cmp_mask_ord(l, lb, r, rb, op)
-            }
-            (C::Float32 { data: l, bitmap: lb }, C::Float32 { data: r, bitmap: rb }) => {
-                cmp_mask_f32(l, lb, r, rb, op)
-            }
-            (C::Float64 { data: l, bitmap: lb }, C::Float64 { data: r, bitmap: rb }) => {
-                cmp_mask_f64(l, lb, r, rb, op)
-            }
-            (C::VarChar { data: l, bitmap: lb }, C::VarChar { data: r, bitmap: rb }) => {
-                cmp_mask_str(l, lb, r, rb, op)
-            }
+            (
+                C::Int8 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Int8 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Int16 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Int16 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Int32 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Int32 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Int64 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Int64 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::UInt8 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::UInt8 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::UInt16 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::UInt16 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::UInt32 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::UInt32 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::UInt64 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::UInt64 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Decimal {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Decimal {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Date {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Date {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Time {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Time {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Timestamp {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Timestamp {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Interval {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Interval {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_ord(l, lb, r, rb, op),
+            (
+                C::Float32 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Float32 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_f32(l, lb, r, rb, op),
+            (
+                C::Float64 {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::Float64 {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_f64(l, lb, r, rb, op),
+            (
+                C::VarChar {
+                    data: l,
+                    bitmap: lb,
+                },
+                C::VarChar {
+                    data: r,
+                    bitmap: rb,
+                },
+            ) => cmp_mask_str(l, lb, r, rb, op),
             _ => return None,
         };
         Some(out)
@@ -1280,9 +1416,7 @@ impl ColumnArray {
             let value = literal.integer_i128()?;
             return Some(self.arith_integer(op, |_| Some(value)));
         }
-        if (self.is_integer_class() || self.is_float_class())
-            && literal.numeric_f64().is_some()
-        {
+        if (self.is_integer_class() || self.is_float_class()) && literal.numeric_f64().is_some() {
             let value = literal.numeric_f64()?;
             return self.arith_numeric_f64(op, |_| Some(value));
         }
@@ -1398,7 +1532,6 @@ impl ColumnArray {
     }
 }
 
-
 /// Word-at-a-time valid-row sum over `[offset, end)` for fixed-width data.
 fn sum_valid_range_words<T: Copy>(
     data: &[T],
@@ -1422,7 +1555,7 @@ fn sum_valid_range_words<T: Copy>(
             any = true;
         } else {
             for (bit, &v) in data[start..word_end].iter().enumerate() {
-                if word & (1u64 << (start + bit) % 64) == 0 {
+                if word & (1u64 << ((start + bit) % 64)) == 0 {
                     sum = sum.wrapping_add(cvt(v));
                     any = true;
                 }

@@ -1,0 +1,31 @@
+{
+  "block_count": 385,
+  "total_dup_lines": 5719,
+  "non_test_dup_lines": 3595,
+  "top_non_test_files": {
+    "sql/execution/engine_test/dml.rs": 1344,
+    "sql/execution/engine_test/replace_semantics.rs": 582,
+    "sql/execution/engine_test/p0_regressions.rs": 536,
+    "sql/planner/expr.rs": 286,
+    "sql/execution/engine_test/unique_index.rs": 284,
+    "sql/execution/wal_helper.rs": 268,
+    "sql/execution/query.rs": 268,
+    "sql/execution/operators/join.rs": 260,
+    "sql/execution/prepared.rs": 220,
+    "storage/core/batch_writer.rs": 178,
+    "storage/codec/column_codec.rs": 162,
+    "sql/parser/expr.rs": 156,
+    "types/array.rs": 138,
+    "sql/execution/scan/row_group.rs": 120,
+    "sql/execution/dml_insert/fast.rs": 105,
+    "types/array/analytics.rs": 104,
+    "sql/execution/engine_test/window_regressions.rs": 97,
+    "storage/codec/predicate_scan.rs": 96,
+    "sql/parser/query.rs": 94,
+    "storage/segment_manager/buffered_write.rs": 88
+  },
+  "allows": {
+    "too_many_arguments": 62,
+    "type_complexity": 5
+  }
+}

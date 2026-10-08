@@ -577,3 +577,35 @@ fn count_star_survives_engine_reopen() {
         engine.segment_mgr().shutdown();
     }
 }
+
+#[test]
+fn min_max_bool_column_folds_correctly() {
+    // Sanity for MIN/MAX over a Bool column across the flush boundary. The
+    // compare primitive itself is locked by compare_ordered unit tests and
+    // the spilled_min_max_merge_orders_bool_states unit test (the spill path
+    // is where the former missing Bool arm actually bit).
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(&mut session, "CREATE TABLE flags (id INT, on_off BOOLEAN)")
+        .expect("create flags");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO flags VALUES (2, true), (1, false), (3, true)",
+        )
+        .expect("insert flags");
+
+    for stage in ["memtable", "flushed"] {
+        if stage == "flushed" {
+            engine.execute(&mut session, "FLUSH TABLE flags").expect("flush");
+        }
+        let (_schema, rows) = collect_rows(
+            engine
+                .execute(&mut session, "SELECT MIN(on_off), MAX(on_off) FROM flags")
+                .expect("select min/max"),
+        );
+        assert_eq!(rows.len(), 1, "{stage}");
+        assert_eq!(rows[0][0], ScalarValue::Bool(Some(false)), "{stage}: MIN");
+        assert_eq!(rows[0][1], ScalarValue::Bool(Some(true)), "{stage}: MAX");
+    }
+}

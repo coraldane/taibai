@@ -7,6 +7,18 @@ Taibai 是用 Rust 编写的偏分析场景的列式数据库服务端：适合�
 - SQL 语法是项目自有实现，不代表完整兼容 MySQL、PostgreSQL、ClickHouse 或其他数据库。
 - 升级前应备份数据，并在隔离环境验证读取、写入和恢复流程。
 - 配置项、命令行参数、SQL 行为或公共接口的不兼容变更会在 Pull Request 描述中突出说明。
+## 列变更（ALTER TABLE ADD/DROP COLUMN）与数据布局
+
+- 列的增删是 catalog 元数据操作；**不可变的段**保留写入时刻的布局，读取时按列名对齐，
+  早于 ADD COLUMN 的段按列的 DEFAULT（无 DEFAULT 则 NULL）参与谓词与投影——SELECT、
+  COUNT、聚合、UPDATE、DELETE 全部同一语义。
+- **热状态（常驻 memtable、durable tail、hot mirror）在 ADD/DROP COLUMN 时于表突变锁内
+  先收敛（flush 落段）再翻转 catalog**，因此这些 ALTER 会强制未落盘数据落盘，耗时与
+  未刷数据量成正比；执行期间有打开事务写过该表时 ALTER 会明确拒绝（先 COMMIT/ROLLBACK）。
+- 由**旧版本**二进制产生、未经收敛的 durable tail 在新版本恢复时会被隔离：文件保留在磁盘，
+  该 memtable 的行不可用，`tail_damage_snapshot().tails_schema_drift` 计数，日志给出
+  remedy——此类表需从 ALTER 前的备份重载。
+
 ## 段格式版本
 
 数据目录中的 segment 文件带格式版本号。升级二进制时：

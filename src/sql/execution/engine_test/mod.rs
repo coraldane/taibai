@@ -5,13 +5,18 @@ use crate::storage::segment_manager::SegmentManager;
 use crate::types::scalar::ScalarValue;
 
 mod aggregate_cache;
+mod amplification_regressions;
+mod audit_regression;
 mod bulk_payload;
 mod cancellation;
+mod crud_root_regressions;
 mod dml;
 mod durability;
 mod lifecycle;
+mod p0_regressions;
 mod replace_semantics;
 mod unique_index;
+mod window_regressions;
 
 fn session() -> Session {
     Session::new("root".to_string(), "main".to_string())

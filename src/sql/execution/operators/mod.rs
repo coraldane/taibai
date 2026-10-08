@@ -1,5 +1,6 @@
 pub mod aggregate;
 pub mod filter;
+pub mod folded_aggregate;
 pub mod join;
 mod join_spill;
 pub mod limit;
@@ -125,15 +126,18 @@ impl ExecutionOp for DistinctExec {
     }
 }
 
-pub fn apply_filter_mask(batch: &RecordBatch, mask: &[bool]) -> RecordBatch {
+/// Applies a boolean filter mask to an owned batch. Takes the batch by value
+/// so the all-true case (common when the scan already pushed the predicate
+/// down) returns it unchanged instead of deep-copying every column.
+pub fn apply_filter_mask(batch: RecordBatch, mask: &[bool]) -> RecordBatch {
     if mask.iter().all(|&m| m) {
-        return batch.clone();
+        return batch;
     }
     let selection = crate::types::selection::SelectionVector::from_mask(mask);
     if selection.is_empty() {
         return RecordBatch::new(batch.schema.clone());
     }
-    selection.apply(batch)
+    selection.apply(&batch)
 }
 
 pub fn build_pipeline(
@@ -210,8 +214,17 @@ pub fn build_pipeline_with_subqueries(
             Ok(Box::new(exec))
         }
         LogicalPlan::Join(join) => {
-            let left = build_pipeline_with_subqueries(*join.left, table_batches, subqueries)?;
-            let right = build_pipeline_with_subqueries(*join.right, table_batches, subqueries)?;
+            // Children are padded to the full planned side schemas — the
+            // column-pruning rules may have narrowed the scans below (see
+            // the physical planner's Join arm).
+            let left = Box::new(ExpandToSchemaExec::new(
+                build_pipeline_with_subqueries(*join.left, table_batches, subqueries)?,
+                join.left_schema.clone(),
+            )) as Box<dyn ExecutionOp>;
+            let right = Box::new(ExpandToSchemaExec::new(
+                build_pipeline_with_subqueries(*join.right, table_batches, subqueries)?,
+                join.right_schema.clone(),
+            ));
             Ok(Box::new(HashJoinExec::new(
                 left,
                 right,
@@ -223,8 +236,14 @@ pub fn build_pipeline_with_subqueries(
             )))
         }
         LogicalPlan::SemiJoin(semi) => {
-            let left = build_pipeline_with_subqueries(*semi.left, table_batches, subqueries)?;
-            let right = build_pipeline_with_subqueries(*semi.right, table_batches, subqueries)?;
+            let left = Box::new(ExpandToSchemaExec::new(
+                build_pipeline_with_subqueries(*semi.left, table_batches, subqueries)?,
+                semi.left_schema.clone(),
+            )) as Box<dyn ExecutionOp>;
+            let right = Box::new(ExpandToSchemaExec::new(
+                build_pipeline_with_subqueries(*semi.right, table_batches, subqueries)?,
+                semi.right_schema.clone(),
+            ));
             Ok(Box::new(SemiJoinExec::new(
                 left,
                 right,
@@ -290,5 +309,72 @@ fn get_scan_schema(plan: &LogicalPlan) -> Schema {
         LogicalPlan::Distinct(d) => get_scan_schema(&d.input),
         LogicalPlan::Window(w) => get_scan_schema(&w.input),
         LogicalPlan::Empty => Schema::empty(),
+    }
+}
+
+/// Expand (or pass through) each input batch to a fixed target schema.
+/// Columns present by name keep their values; missing ones become typed NULL
+/// columns. Join-side projection pruning wraps every join child in this: the
+/// scan below decodes only the required columns, while the join above — whose
+/// condition evaluation and row assembly address the FULL planned side
+/// layout — sees exactly the schema it was planned against. A child that was
+/// not pruned (schema already equal) passes through unchanged, so the
+/// wrapper is free for unpruned queries.
+///
+/// This is the load-bearing seam of projection pushdown across joins: every
+/// consumer above (and the join itself) keeps full-width, full-index
+/// semantics; only the leaf scan narrows, and only this operator knows.
+pub struct ExpandToSchemaExec {
+    input: Box<dyn ExecutionOp>,
+    target: Schema,
+}
+
+impl ExpandToSchemaExec {
+    pub fn new(input: Box<dyn ExecutionOp>, target: Schema) -> Self {
+        Self { input, target }
+    }
+}
+
+impl ExecutionOp for ExpandToSchemaExec {
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        match self.input.next_batch()? {
+            None => Ok(None),
+            Some(batch) => {
+                if batch.schema.columns.len() == self.target.columns.len()
+                    && batch
+                        .schema
+                        .columns
+                        .iter()
+                        .zip(self.target.columns.iter())
+                        .all(|(actual, wanted)| {
+                            actual.name == wanted.name && actual.data_type == wanted.data_type
+                        })
+                {
+                    return Ok(Some(batch));
+                }
+                let rows = batch.num_rows();
+                let mut columns = Vec::with_capacity(self.target.columns.len());
+                for col_def in &self.target.columns {
+                    match batch
+                        .schema
+                        .index_of(&col_def.name)
+                        .and_then(|idx| batch.column(idx))
+                    {
+                        Some(column) => columns.push(column.clone()),
+                        None => {
+                            let mut column =
+                                crate::types::array::ColumnArray::empty(col_def.data_type);
+                            let null =
+                                crate::types::scalar::ScalarValue::null_for_type(col_def.data_type);
+                            for _ in 0..rows {
+                                column.push(&null)?;
+                            }
+                            columns.push(column);
+                        }
+                    }
+                }
+                Ok(Some(RecordBatch::try_new(self.target.clone(), columns)?))
+            }
+        }
     }
 }

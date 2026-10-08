@@ -453,38 +453,10 @@ impl ExternalMerge {
 /// Total order over scalars with NULLs sorting LAST in ascending order.
 /// Distinct from `aggregate::compare_scalars`, which sorts NULLs first;
 /// the two exist because TopN/ORDER BY and MIN/MAX differ in NULL intent.
+/// Both now delegate to `ScalarValue::compare_ordered` with the NULL
+/// placement as the only knob.
 pub fn compare_scalars_null_last(left: &ScalarValue, right: &ScalarValue) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match (left, right) {
-        (ScalarValue::Int8(Some(left)), ScalarValue::Int8(Some(right))) => left.cmp(right),
-        (ScalarValue::Int16(Some(left)), ScalarValue::Int16(Some(right))) => left.cmp(right),
-        (ScalarValue::Int32(Some(left)), ScalarValue::Int32(Some(right))) => left.cmp(right),
-        (ScalarValue::Int64(Some(left)), ScalarValue::Int64(Some(right))) => left.cmp(right),
-        (ScalarValue::UInt8(Some(left)), ScalarValue::UInt8(Some(right))) => left.cmp(right),
-        (ScalarValue::UInt16(Some(left)), ScalarValue::UInt16(Some(right))) => left.cmp(right),
-        (ScalarValue::UInt32(Some(left)), ScalarValue::UInt32(Some(right))) => left.cmp(right),
-        (ScalarValue::UInt64(Some(left)), ScalarValue::UInt64(Some(right))) => left.cmp(right),
-        (ScalarValue::Float32(Some(left)), ScalarValue::Float32(Some(right))) => {
-            left.partial_cmp(right).unwrap_or(Ordering::Equal)
-        }
-        (ScalarValue::Float64(Some(left)), ScalarValue::Float64(Some(right))) => {
-            left.partial_cmp(right).unwrap_or(Ordering::Equal)
-        }
-        (ScalarValue::Decimal(Some(left)), ScalarValue::Decimal(Some(right))) => left.cmp(right),
-        (ScalarValue::Date(Some(left)), ScalarValue::Date(Some(right))) => left.cmp(right),
-        (ScalarValue::Time(Some(left)), ScalarValue::Time(Some(right))) => left.cmp(right),
-        (ScalarValue::Timestamp(Some(left)), ScalarValue::Timestamp(Some(right))) => {
-            left.cmp(right)
-        }
-        (ScalarValue::Interval(Some(left)), ScalarValue::Interval(Some(right))) => left.cmp(right),
-        (ScalarValue::VarChar(Some(left)), ScalarValue::VarChar(Some(right))) => left.cmp(right),
-        (left, right) if left.is_null() && right.is_null() => Ordering::Equal,
-        (left, _) if left.is_null() => Ordering::Greater,
-        (_, right) if right.is_null() => Ordering::Less,
-        _ => left
-            .numeric_cmp(right)
-            .unwrap_or_else(|| left.to_string().cmp(&right.to_string())),
-    }
+    left.compare_ordered(right, std::cmp::Ordering::Greater)
 }
 
 #[cfg(test)]

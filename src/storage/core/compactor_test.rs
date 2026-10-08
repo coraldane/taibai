@@ -557,93 +557,292 @@ fn compaction_materializes_value_sets_in_rewritten_segment() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// External merge sort (bounded-memory clustered optimization)
+// Dirty-segment-only compaction (non-clustered tables)
 // ---------------------------------------------------------------------------
 
-#[test]
-fn external_merge_sort_matches_in_memory_result() -> Result<()> {
-    let tmp = tempfile::tempdir().unwrap();
-    let table_dir = tmp.path().join("default").join("t");
-    std::fs::create_dir_all(&table_dir)?;
+/// Manager whose target row group is 2 rows, so 2-row test segments count as
+/// "full" (not under-full) and only tombstones/fragmentation make them dirty.
+fn noncluster_dirty_only_manager(tmp: &tempfile::TempDir) -> Result<Arc<SegmentManager>> {
+    Ok(Arc::new(SegmentManager::with_config(
+        tmp.path(),
+        SegmentConfig {
+            row_group_target_rows: 2,
+            ..SegmentConfig::default()
+        },
+    )?))
+}
 
-    let schema = test_schema();
-    // Two shuffled segments with interleaved keys.
-    write_segment(
-        &table_dir.join("seg_00001.dat"),
-        &schema,
-        &[(5, "e"), (1, "a"), (9, "i"), (3, "c")],
-    )?;
-    write_segment(
-        &table_dir.join("seg_00002.dat"),
-        &schema,
-        &[(8, "h"), (2, "b"), (7, "g"), (4, "d"), (6, "f")],
-    )?;
-
-    // Force the external path with a tiny budget so the data spills into
-    // multiple sorted runs (and force small run chunks so more than one run
-    // is produced).
-    CLUSTERED_MERGE_BUDGET_OVERRIDE.store(
-        estimated_row_width_bytes(&schema) * 2,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-
-    let segment_mgr = Arc::new(SegmentManager::new(tmp.path())?);
-    let compactor = Compactor::new(segment_mgr, tmp.path().to_path_buf());
-    let stats = compactor.optimize_table("default", "t", &test_meta(&schema))?;
-
-    CLUSTERED_MERGE_BUDGET_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
-
-    assert_eq!(stats.segments_written, 1);
-    assert_eq!(stats.rows_written, 9);
-    let segments = SegmentManager::discover_segments(&table_dir)?;
-    assert_eq!(segments.len(), 1);
-    assert_eq!(
-        read_ids(&segments[0])?,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
-        "external merge output must be fully sorted"
-    );
-    // No leftover merge temp files.
-    for entry in std::fs::read_dir(&table_dir)? {
-        let name = entry?.file_name().to_string_lossy().into_owned();
-        assert!(!name.contains(".merge.tmp."), "leftover run file {name}");
-    }
-    Ok(())
+fn file_mtime(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path).unwrap().modified().unwrap()
 }
 
 #[test]
-fn external_merge_sort_drops_deleted_rows() -> Result<()> {
+fn noncluster_compaction_rewrites_only_dirty_segments() -> Result<()> {
     let tmp = tempfile::tempdir().unwrap();
     let table_dir = tmp.path().join("default").join("t");
     std::fs::create_dir_all(&table_dir)?;
 
     let schema = test_schema();
-    write_segment(
-        &table_dir.join("seg_00001.dat"),
-        &schema,
-        &[(4, "d"), (2, "b"), (6, "f")],
-    )?;
+    let clean1 = table_dir.join("seg_00001.dat");
+    let clean2 = table_dir.join("seg_00002.dat");
+    let dirty = table_dir.join("seg_00003.dat");
+    write_segment(&clean1, &schema, &[(1, "a"), (2, "b")])?;
+    write_segment(&clean2, &schema, &[(3, "c"), (4, "d")])?;
+    write_segment(&dirty, &schema, &[(5, "e"), (6, "f"), (7, "g")])?;
 
-    // Tombstone the middle row of the single row group.
-    {
-        let reader = SegmentReader::open(&table_dir.join("seg_00001.dat"))?;
-        let mut bitmap = vec![0u8; 3u64.div_ceil(8) as usize];
-        crate::storage::segment::delete_bitmap::mark_deleted(&mut bitmap, 1);
-        drop(reader);
-        SegmentReader::rewrite_footer_with_deletes(&table_dir.join("seg_00001.dat"), &bitmap, 1)?;
-    }
+    let segment_mgr = noncluster_dirty_only_manager(&tmp)?;
+    segment_mgr.rewrite_delete_footer(&dirty, &[0b0000_0010], 1)?;
 
-    CLUSTERED_MERGE_BUDGET_OVERRIDE.store(
-        estimated_row_width_bytes(&schema) * 2,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    let segment_mgr = Arc::new(SegmentManager::new(tmp.path())?);
-    let compactor = Compactor::new(segment_mgr, tmp.path().to_path_buf());
-    let stats = compactor.optimize_table("default", "t", &test_meta(&schema))?;
-    CLUSTERED_MERGE_BUDGET_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+    let clean1_mtime = file_mtime(&clean1);
+    let clean2_mtime = file_mtime(&clean2);
 
+    let compactor = Compactor::new(Arc::clone(&segment_mgr), tmp.path().to_path_buf());
+    let stats = compactor.optimize_table("default", "t", &test_meta_without_cluster(&schema))?;
+
+    // Only the dirty segment entered the input set and was replaced.
+    assert_eq!(stats.segments_read, 1);
+    assert_eq!(stats.segments_written, 1);
     assert_eq!(stats.rows_written, 2);
     assert_eq!(stats.rows_dropped, 1);
+
+    // The clean segments were neither replaced nor touched.
+    assert!(clean1.exists());
+    assert!(clean2.exists());
+    assert!(!dirty.exists());
+    assert_eq!(file_mtime(&clean1), clean1_mtime);
+    assert_eq!(file_mtime(&clean2), clean2_mtime);
+
     let segments = SegmentManager::discover_segments(&table_dir)?;
-    assert_eq!(read_ids(&segments[0])?, vec![4, 6]);
+    assert_eq!(segments.len(), 3);
+    // The replacement keeps the dirty segment's surviving rows, purged of
+    // tombstones.
+    assert_eq!(read_ids(&table_dir.join("seg_00004.dat"))?, vec![5, 7]);
+    let reader = SegmentReader::open(&table_dir.join("seg_00004.dat"))?;
+    assert_eq!(reader.deleted_row_count(), 0);
     Ok(())
 }
+
+#[test]
+fn noncluster_compaction_skips_when_all_segments_clean() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let table_dir = tmp.path().join("default").join("t");
+    std::fs::create_dir_all(&table_dir)?;
+
+    let schema = test_schema();
+    let clean1 = table_dir.join("seg_00001.dat");
+    let clean2 = table_dir.join("seg_00002.dat");
+    write_segment(&clean1, &schema, &[(1, "a"), (2, "b")])?;
+    write_segment(&clean2, &schema, &[(3, "c"), (4, "d")])?;
+
+    let segment_mgr = noncluster_dirty_only_manager(&tmp)?;
+    let clean1_mtime = file_mtime(&clean1);
+    let clean2_mtime = file_mtime(&clean2);
+
+    let compactor = Compactor::new(Arc::clone(&segment_mgr), tmp.path().to_path_buf());
+    let stats = compactor.optimize_table("default", "t", &test_meta_without_cluster(&schema))?;
+
+    // Clean, compact, full-size segments: no rewrite at all.
+    assert_eq!(stats.segments_read, 0);
+    assert_eq!(stats.segments_written, 0);
+    assert_eq!(stats.rows_written, 0);
+    assert_eq!(stats.rows_dropped, 0);
+
+    let segments = SegmentManager::discover_segments(&table_dir)?;
+    assert_eq!(segments, vec![clean1.clone(), clean2.clone()]);
+    assert_eq!(file_mtime(&clean1), clean1_mtime);
+    assert_eq!(file_mtime(&clean2), clean2_mtime);
+    Ok(())
+}
+
+#[test]
+fn noncluster_compaction_keeps_lone_small_clean_segment() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let table_dir = tmp.path().join("default").join("t");
+    std::fs::create_dir_all(&table_dir)?;
+
+    let schema = test_schema();
+    let seg = table_dir.join("seg_00001.dat");
+    write_segment(&seg, &schema, &[(1, "a"), (2, "b")])?;
+
+    // Default manager: one 8192-row target row group, so the 2-row segment is
+    // under-full but has no merge partner.
+    let segment_mgr = Arc::new(SegmentManager::new(tmp.path())?);
+    let seg_mtime = file_mtime(&seg);
+
+    let compactor = Compactor::new(Arc::clone(&segment_mgr), tmp.path().to_path_buf());
+    let stats = compactor.optimize_table("default", "t", &test_meta_without_cluster(&schema))?;
+
+    // Rewriting a lone small segment would reproduce the same lone small
+    // file: skipped, exactly like the old clean single-segment case.
+    assert_eq!(stats.segments_read, 0);
+    assert_eq!(stats.segments_written, 0);
+    let segments = SegmentManager::discover_segments(&table_dir)?;
+    assert_eq!(segments, vec![seg.clone()]);
+    assert_eq!(file_mtime(&seg), seg_mtime);
+    Ok(())
+}
+
+#[test]
+fn delete_cleanup_on_clustered_table_still_merges_full_partition() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let table_dir = tmp.path().join("default").join("t");
+    std::fs::create_dir_all(&table_dir)?;
+
+    let schema = test_schema();
+    let clean1 = table_dir.join("seg_00001.dat");
+    let clean2 = table_dir.join("seg_00002.dat");
+    let dirty = table_dir.join("seg_00003.dat");
+    write_segment(&clean1, &schema, &[(1, "a"), (2, "b")])?;
+    write_segment(&clean2, &schema, &[(3, "c"), (4, "d")])?;
+    write_segment(&dirty, &schema, &[(5, "e"), (6, "f"), (7, "g")])?;
+
+    let segment_mgr = Arc::new(SegmentManager::with_config(
+        tmp.path(),
+        SegmentConfig {
+            row_group_target_rows: 2,
+            ..SegmentConfig::default()
+        },
+    )?);
+    segment_mgr.rewrite_delete_footer(&dirty, &[0b0000_0010], 1)?;
+
+    let compactor = Compactor::new(Arc::clone(&segment_mgr), tmp.path().to_path_buf());
+    let stats = compactor.compact_table_for_delete_cleanup("default", "t", &test_meta(&schema))?;
+
+    // Clustered tables keep the full-partition merge (global cluster order
+    // is an invariant): the clean segments join the rewrite too, and the
+    // dirtiness gate (30%/8192) already justified the IO.
+    assert_eq!(stats.segments_read, 3);
+    assert_eq!(stats.segments_written, 1);
+    assert_eq!(stats.rows_written, 6);
+    assert_eq!(stats.rows_dropped, 1);
+
+    let segments = SegmentManager::discover_segments(&table_dir)?;
+    assert_eq!(segments.len(), 1);
+    // Source order preserved across the whole partition (delete cleanup does
+    // not re-sort).
+    assert_eq!(read_ids(&segments[0])?, vec![1, 2, 3, 4, 5, 7]);
+    let reader = SegmentReader::open(&segments[0])?;
+    assert_eq!(reader.deleted_row_count(), 0);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// TTL expiry vs. clean-segment retention (non-clustered tables)
+// ---------------------------------------------------------------------------
+
+fn ttl_schema() -> Schema {
+    Schema::new(vec![
+        ColumnDef::new("id", DataType::Int64),
+        ColumnDef::new("ts", DataType::Timestamp),
+    ])
+}
+
+fn ttl_meta(schema: &Schema, duration_secs: i64) -> TableMeta {
+    let mut meta = test_meta_without_cluster(schema);
+    meta.set_ttl("ts", duration_secs);
+    meta
+}
+
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64
+}
+
+fn write_ttl_segment(path: &Path, schema: &Schema, stamps: &[i64]) -> Result<()> {
+    let mut batch = RecordBatch::new(schema.clone());
+    for (row, ts) in stamps.iter().enumerate() {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(row as i64)))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::Timestamp(Some(*ts)))?;
+    }
+    let mut writer = SegmentWriter::create(path, schema.clone(), TEST_ROW_GROUP_SIZE, 3)?;
+    writer.write_batch(&batch)?;
+    writer.seal()
+}
+
+#[test]
+fn noncluster_compaction_purges_ttl_expired_clean_segment() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let table_dir = tmp.path().join("default").join("t");
+    std::fs::create_dir_all(&table_dir)?;
+
+    let schema = ttl_schema();
+    let now = now_micros();
+    // Both segments are clean (no tombstones), full, and unfragmented under
+    // the 2-row target — pure Keep candidates without the TTL exemption.
+    // One holds only rows expired an hour ago; the other only fresh rows.
+    let hour_ago = now - 3_600 * 1_000_000;
+    let expired = table_dir.join("seg_00001.dat");
+    let fresh = table_dir.join("seg_00002.dat");
+    write_ttl_segment(&expired, &schema, &[hour_ago, hour_ago + 1])?;
+    write_ttl_segment(&fresh, &schema, &[now, now + 1])?;
+    let fresh_mtime = file_mtime(&fresh);
+
+    let segment_mgr = noncluster_dirty_only_manager(&tmp)?;
+    let compactor = Compactor::new(Arc::clone(&segment_mgr), tmp.path().to_path_buf());
+    let stats = compactor.optimize_table("default", "t", &ttl_meta(&schema, 60))?;
+
+    // The zone map proves the first segment fully expired, so the Keep
+    // classification was overridden and it entered the rewrite; every row
+    // was physically dropped, removing the input entirely.
+    assert_eq!(stats.segments_read, 1);
+    assert_eq!(stats.segments_written, 0);
+    assert_eq!(stats.rows_written, 0);
+    // rows_dropped_ttl is exactly the value the engine's
+    // adjust_row_count_for_ttl_drops subtracts from the catalog row_count —
+    // one subtraction for the two rows physically removed here.
+    assert_eq!(stats.rows_dropped, 2);
+    assert_eq!(stats.rows_dropped_ttl, 2);
+    assert!(!expired.exists());
+
+    // The provably-unexpired clean segment stays untouched: the exemption
+    // only pulls in segments whose zone map proves full expiry.
+    assert_eq!(file_mtime(&fresh), fresh_mtime);
+    assert_eq!(
+        SegmentManager::discover_segments(&table_dir)?,
+        vec![fresh.clone()]
+    );
+    Ok(())
+}
+
+#[test]
+fn noncluster_compaction_keeps_ttl_segment_with_visible_rows() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let table_dir = tmp.path().join("default").join("t");
+    std::fs::create_dir_all(&table_dir)?;
+
+    let schema = ttl_schema();
+    let now = now_micros();
+    // Mixed expired/fresh rows: the fresh timestamp lifts the zone-map max
+    // past the TTL horizon, so full expiry cannot be proven and the clean
+    // segment must stay Keep — rewriting it would drop the expired row but
+    // is not the rewrite path's call to make without a proof.
+    let seg = table_dir.join("seg_00001.dat");
+    write_ttl_segment(&seg, &schema, &[now - 3_600 * 1_000_000, now])?;
+    let seg_mtime = file_mtime(&seg);
+
+    let segment_mgr = noncluster_dirty_only_manager(&tmp)?;
+    let compactor = Compactor::new(Arc::clone(&segment_mgr), tmp.path().to_path_buf());
+    let stats = compactor.optimize_table("default", "t", &ttl_meta(&schema, 60))?;
+
+    assert_eq!(stats.segments_read, 0);
+    assert_eq!(stats.segments_written, 0);
+    assert_eq!(stats.rows_written, 0);
+    assert_eq!(stats.rows_dropped, 0);
+    assert_eq!(file_mtime(&seg), seg_mtime);
+    assert_eq!(
+        SegmentManager::discover_segments(&table_dir)?,
+        vec![seg.clone()]
+    );
+    Ok(())
+}
+
+#[path = "compactor/budget_test.rs"]
+mod budget;

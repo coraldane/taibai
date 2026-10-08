@@ -55,6 +55,14 @@ pub fn parse_datetime_string(s: &str, timezone_offset_hours: i32) -> Option<i64>
     })
 }
 
+/// Epoch days for a `YYYY-MM-DD[ HH:MM:SS]` string. The single string→DATE
+/// conversion point: `parse_datetime_string` returns micros, so the days
+/// divisor is 86_400_000_000 — dividing by seconds-per-day here produced
+/// values 10^6 too large that wrapped i32 on every string date insert.
+pub fn datetime_string_to_days(s: &str, timezone_offset_hours: i32) -> Option<i32> {
+    parse_datetime_string(s, timezone_offset_hours).map(|micros| (micros / 86_400_000_000) as i32)
+}
+
 pub fn now(_args: &[ScalarValue]) -> Result<ScalarValue> {
     let ts = Local::now().timestamp_micros();
     Ok(ScalarValue::Timestamp(Some(ts)))
@@ -219,3 +227,7 @@ fn extract_datetime(args: &[ScalarValue]) -> Option<NaiveDateTime> {
 fn sql_to_chrono_format(fmt: &str) -> String {
     fmt.replace("%i", "%M").replace("%s", "%S")
 }
+
+#[cfg(test)]
+#[path = "date_test.rs"]
+mod date_conversion_tests;

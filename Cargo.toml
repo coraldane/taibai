@@ -11,7 +11,7 @@ members = [
 
 [package]
 name = "taibai"
-version = "0.2.5"
+version = "0.2.7"
 edition = "2021"
 autotests = false
 description = "An experimental Rust columnar database server for analytical workloads"
@@ -269,3 +269,31 @@ path = "tests/direct_bulk_multi_session_test.rs"
 [[test]]
 name = "join_fast_path_test"
 path = "tests/join_fast_path_test.rs"
+
+[[test]]
+name = "alter_column_drift_test"
+path = "tests/alter_column_drift_test.rs"
+
+[[test]]
+name = "aggregate_drift_fastpath_test"
+path = "tests/aggregate_drift_fastpath_test.rs"
+
+[[test]]
+name = "grouped_metadata_fold_test"
+path = "tests/grouped_metadata_fold_test.rs"
+
+[[test]]
+name = "partition_int_calendar_test"
+path = "tests/partition_int_calendar_test.rs"
+
+[[test]]
+name = "retryable_error_test"
+path = "tests/retryable_error_test.rs"
+
+[[test]]
+name = "sql_reference_doc_test"
+path = "tests/sql_reference_doc_test.rs"
+
+[[test]]
+name = "grant_replication_test"
+path = "tests/grant_replication_test.rs"

@@ -10,7 +10,7 @@ use crate::storage::codec::column_codec::choose_stored_column_encoding;
 use crate::storage::codec::io_util::encode_len_prefixed_str;
 use crate::storage::codec::scalar_tag::{encode_scalar_with_tag, null_for_dtype};
 use crate::storage::index::bloomfilter::BloomFilter;
-use crate::storage::partition::pruning::ZoneMap;
+use crate::storage::partition::pruning::{compute_segment_zone_maps_from_row_groups, ZoneMap};
 use crate::types::array::ColumnArray;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
@@ -409,7 +409,7 @@ impl SegmentWriter {
         deleted_row_count: u64,
     ) -> Result<Vec<u8>> {
         let segment_zone_maps =
-            compute_segment_zone_maps(&self.row_groups, self.schema.num_columns());
+            compute_segment_zone_maps_from_row_groups(&self.row_groups, self.schema.num_columns());
 
         Ok(encode_segment_footer(
             &self.schema,
@@ -712,10 +712,10 @@ fn build_column_metadata(
             })
         }
         ColumnArray::Float32 { data, bitmap } => {
-            metadata_float32(data, bitmap, offset, count, bloom_enabled)
+            metadata_float(data, bitmap, offset, count, bloom_enabled)
         }
         ColumnArray::Float64 { data, bitmap } => {
-            metadata_float64(data, bitmap, offset, count, bloom_enabled)
+            metadata_float(data, bitmap, offset, count, bloom_enabled)
         }
         ColumnArray::Decimal { data, bitmap } => {
             metadata_ord(data, bitmap, offset, count, bloom_enabled, 11, |value| {
@@ -851,51 +851,47 @@ where
     }
 }
 
-fn metadata_float32(
-    data: &[f32],
-    bitmap: &crate::types::bitmap::NullBitmap,
-    offset: usize,
-    count: usize,
-    bloom_enabled: bool,
-) -> ColumnMetadata {
-    let mut min_value = None;
-    let mut max_value = None;
-    let mut null_count = 0u64;
-    let mut bloom_filter = bloom_enabled.then(BloomFilter::with_defaults);
-    let mut values = Some(HashSet::new());
-    for (row, &value) in data.iter().enumerate().skip(offset).take(count) {
-        if bitmap.is_null(row) {
-            null_count += 1;
-            continue;
-        }
-        if min_value.is_none_or(|current| value < current) {
-            min_value = Some(value);
-        }
-        if max_value.is_none_or(|current| value > current) {
-            max_value = Some(value);
-        }
-        let bits = value.to_bits();
-        if let Some(filter) = &mut bloom_filter {
-            filter.add_typed(9, &bits);
-        }
-        insert_bounded(&mut values, bits);
+/// Float columns share one metadata pipeline; only the width's bloom tag and
+/// bit-level round-trip differ. Value sets keep raw bits (not floats) so NaN
+/// payloads and -0.0 stay distinct, exactly as the former f32/f64 pair did.
+trait FloatMeta: Copy + PartialOrd {
+    const BLOOM_TYPE_TAG: u8;
+    type Bits: Copy + Eq + std::hash::Hash;
+    fn to_meta_bits(self) -> Self::Bits;
+    fn from_meta_bits(bits: Self::Bits) -> Self;
+    fn scalar(self) -> ScalarValue;
+}
+
+impl FloatMeta for f32 {
+    const BLOOM_TYPE_TAG: u8 = 9;
+    type Bits = u32;
+    fn to_meta_bits(self) -> u32 {
+        self.to_bits()
     }
-    ColumnMetadata {
-        min_value: min_value.map(|value| ScalarValue::Float32(Some(value))),
-        max_value: max_value.map(|value| ScalarValue::Float32(Some(value))),
-        null_count,
-        bloom_filter,
-        value_set: values.map(|values| {
-            values
-                .into_iter()
-                .map(|bits| ScalarValue::Float32(Some(f32::from_bits(bits))))
-                .collect()
-        }),
+    fn from_meta_bits(bits: u32) -> f32 {
+        f32::from_bits(bits)
+    }
+    fn scalar(self) -> ScalarValue {
+        ScalarValue::Float32(Some(self))
     }
 }
 
-fn metadata_float64(
-    data: &[f64],
+impl FloatMeta for f64 {
+    const BLOOM_TYPE_TAG: u8 = 10;
+    type Bits = u64;
+    fn to_meta_bits(self) -> u64 {
+        self.to_bits()
+    }
+    fn from_meta_bits(bits: u64) -> f64 {
+        f64::from_bits(bits)
+    }
+    fn scalar(self) -> ScalarValue {
+        ScalarValue::Float64(Some(self))
+    }
+}
+
+fn metadata_float<T: FloatMeta>(
+    data: &[T],
     bitmap: &crate::types::bitmap::NullBitmap,
     offset: usize,
     count: usize,
@@ -917,21 +913,21 @@ fn metadata_float64(
         if max_value.is_none_or(|current| value > current) {
             max_value = Some(value);
         }
-        let bits = value.to_bits();
+        let bits = value.to_meta_bits();
         if let Some(filter) = &mut bloom_filter {
-            filter.add_typed(10, &bits);
+            filter.add_typed(T::BLOOM_TYPE_TAG, &bits);
         }
         insert_bounded(&mut values, bits);
     }
     ColumnMetadata {
-        min_value: min_value.map(|value| ScalarValue::Float64(Some(value))),
-        max_value: max_value.map(|value| ScalarValue::Float64(Some(value))),
+        min_value: min_value.map(T::scalar),
+        max_value: max_value.map(T::scalar),
         null_count,
         bloom_filter,
         value_set: values.map(|values| {
             values
                 .into_iter()
-                .map(|bits| ScalarValue::Float64(Some(f64::from_bits(bits))))
+                .map(|bits| T::scalar(T::from_meta_bits(bits)))
                 .collect()
         }),
     }
@@ -992,58 +988,4 @@ fn insert_bounded<T: Eq + std::hash::Hash>(values: &mut Option<HashSet<T>>, valu
             *values = None;
         }
     }
-}
-
-fn compute_segment_zone_maps(
-    row_groups: &[crate::storage::segment::RowGroupMeta],
-    num_columns: usize,
-) -> Vec<ZoneMap> {
-    if row_groups.is_empty() {
-        return Vec::new();
-    }
-
-    let mut segment_maps = Vec::with_capacity(num_columns);
-    for col_idx in 0..num_columns {
-        let mut seg_min: Option<ScalarValue> = None;
-        let mut seg_max: Option<ScalarValue> = None;
-        let mut total_null_count: u64 = 0;
-        let mut total_row_count: u64 = 0;
-
-        for rg in row_groups {
-            if let Some(zm) = rg.zone_maps.get(col_idx) {
-                total_row_count += zm.row_count;
-                total_null_count += zm.null_count;
-
-                if !zm.min_value.is_null() {
-                    match &seg_min {
-                        None => seg_min = Some(zm.min_value.clone()),
-                        Some(m) => {
-                            if crate::storage::index::sort_key::scalar_lt(&zm.min_value, m) {
-                                seg_min = Some(zm.min_value.clone());
-                            }
-                        }
-                    }
-                }
-                if !zm.max_value.is_null() {
-                    match &seg_max {
-                        None => seg_max = Some(zm.max_value.clone()),
-                        Some(m) => {
-                            if crate::storage::index::sort_key::scalar_lt(m, &zm.max_value) {
-                                seg_max = Some(zm.max_value.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        segment_maps.push(ZoneMap {
-            min_value: seg_min.unwrap_or(ScalarValue::Int64(None)),
-            max_value: seg_max.unwrap_or(ScalarValue::Int64(None)),
-            null_count: total_null_count,
-            row_count: total_row_count,
-        });
-    }
-
-    segment_maps
 }

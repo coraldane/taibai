@@ -22,6 +22,7 @@ pub struct TopNExec {
     schema: Schema,
     capacity: usize,
     state: TopNState,
+    memory_limit_bytes: usize,
 }
 
 enum TopNState {
@@ -38,6 +39,7 @@ impl TopNExec {
             schema,
             capacity: usize::MAX,
             state: TopNState::Ready,
+            memory_limit_bytes: super::super::spill::operator_memory_limit(),
         }
     }
 
@@ -46,11 +48,21 @@ impl TopNExec {
         self
     }
 
+    pub fn with_memory_limit_bytes(mut self, bytes: usize) -> Self {
+        self.memory_limit_bytes = bytes.max(1);
+        self
+    }
+
     fn consume(&mut self) -> Result<Option<RecordBatch>> {
         if self.capacity == 0 {
             return Ok(None);
         }
-        let mut acc = Accumulator::new(self.capacity, &self.sort_keys, self.schema.clone());
+        let mut acc = Accumulator::new(
+            self.capacity,
+            &self.sort_keys,
+            self.schema.clone(),
+            self.memory_limit_bytes,
+        );
         while let Some(batch) = self.input.next_batch()? {
             crate::common::query_cancel::check()?;
             acc.push_batch(&batch)?;
@@ -92,6 +104,9 @@ struct Accumulator {
     live: Vec<bool>,
     dead: usize,
     heap: BinaryHeap<HeapEntry>,
+    memory: super::super::spill::OperatorMemory,
+    retained_bytes: usize,
+    temporary_bytes: usize,
 }
 
 struct HeapEntry {
@@ -132,7 +147,7 @@ impl PartialEq for HeapEntry {
 }
 
 impl Accumulator {
-    fn new(capacity: usize, sort_keys: &[SortKey], schema: Schema) -> Self {
+    fn new(capacity: usize, sort_keys: &[SortKey], schema: Schema, memory_limit: usize) -> Self {
         let descending = Arc::new(sort_keys.iter().map(|key| key.desc).collect::<Vec<_>>());
         Self {
             capacity,
@@ -145,7 +160,10 @@ impl Accumulator {
             slots: 0,
             live: Vec::new(),
             dead: 0,
-            heap: BinaryHeap::with_capacity(capacity.min(1024)),
+            heap: BinaryHeap::new(),
+            memory: super::super::spill::OperatorMemory::new("TopN", memory_limit),
+            retained_bytes: 0,
+            temporary_bytes: 0,
         }
     }
 
@@ -168,12 +186,26 @@ impl Accumulator {
         if batch.num_rows() == 0 {
             return Ok(());
         }
+        self.temporary_bytes = batch
+            .estimated_size_bytes()
+            .saturating_mul(self.sort_keys.len() + 1)
+            .saturating_add(
+                batch
+                    .num_rows()
+                    .saturating_mul(self.sort_keys.len())
+                    .saturating_mul(std::mem::size_of::<ScalarValue>()),
+            );
+        self.memory
+            .reserve(self.retained_bytes.saturating_add(self.temporary_bytes))?;
         let sort_exprs = self.sort_exprs.as_ref().expect("sort exprs initialized");
         let key_columns = sort_exprs
             .iter()
             .map(|(expr, _)| eval_expr_column(expr, batch))
             .collect::<Result<Vec<_>>>()?;
         for row in 0..batch.num_rows() {
+            if row % 1024 == 0 {
+                crate::common::query_cancel::check()?;
+            }
             // Decide acceptance against the heap's worst entry BEFORE
             // materializing the key vector: with a full heap the overwhelming
             // majority of rows fail the test, and the old code cloned every
@@ -198,6 +230,18 @@ impl Accumulator {
             if !accept {
                 continue;
             }
+            let key_bytes = key_columns
+                .iter()
+                .map(|column| {
+                    super::super::spill::scalar_heap_bytes(&column[row])
+                        + std::mem::size_of::<ScalarValue>()
+                })
+                .sum::<usize>();
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_add(key_bytes + std::mem::size_of::<HeapEntry>() + 16);
+            self.memory
+                .reserve(self.retained_bytes.saturating_add(self.temporary_bytes))?;
             let keys = key_columns
                 .iter()
                 .map(|column| column[row].clone())
@@ -218,6 +262,8 @@ impl Accumulator {
                 self.compact()?;
             }
         }
+        self.temporary_bytes = 0;
+        self.memory.reserve(self.retained_bytes)?;
         Ok(())
     }
 
@@ -229,6 +275,17 @@ impl Accumulator {
         if need_new_chunk {
             let schema = self.schema.clone().expect("schema initialized");
             let hint = CHUNK_ROWS.min(self.capacity.max(8));
+            let allocation = schema
+                .columns
+                .iter()
+                .map(|c| {
+                    hint.saturating_mul(c.data_type.fixed_size().unwrap_or(4))
+                        .saturating_add(hint.div_ceil(8) + 128)
+                })
+                .sum::<usize>();
+            self.retained_bytes = self.retained_bytes.saturating_add(allocation);
+            self.memory
+                .reserve(self.retained_bytes.saturating_add(self.temporary_bytes))?;
             let columns = schema
                 .columns
                 .iter()
@@ -239,6 +296,11 @@ impl Accumulator {
         let chunk = self.chunks.last_mut().expect("chunk appended above");
         for (index, column) in batch.columns.iter().enumerate() {
             let value = column.scalar(row);
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_add(super::super::spill::scalar_heap_bytes(&value));
+            self.memory
+                .reserve(self.retained_bytes.saturating_add(self.temporary_bytes))?;
             chunk
                 .column_mut(index)
                 .expect("column present")
@@ -250,6 +312,12 @@ impl Accumulator {
     }
 
     fn compact(&mut self) -> Result<()> {
+        self.memory.reserve(
+            self.retained_bytes
+                .saturating_mul(2)
+                .saturating_add(self.slots.saturating_mul(128))
+                .saturating_add(self.temporary_bytes),
+        )?;
         let live_slots = self
             .live
             .iter()
@@ -297,6 +365,27 @@ impl Accumulator {
         self.live = vec![true; live_slots.len()];
         self.slots = live_slots.len();
         self.dead = 0;
+        self.retained_bytes = self
+            .chunks
+            .iter()
+            .map(|b| b.estimated_size_bytes())
+            .sum::<usize>()
+            .saturating_add(
+                self.heap
+                    .iter()
+                    .map(|e| {
+                        std::mem::size_of::<HeapEntry>()
+                            + e.keys.capacity() * std::mem::size_of::<ScalarValue>()
+                            + e.keys
+                                .iter()
+                                .map(super::super::spill::scalar_heap_bytes)
+                                .sum::<usize>()
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(self.live.capacity());
+        self.memory
+            .reserve(self.retained_bytes.saturating_add(self.temporary_bytes))?;
         Ok(())
     }
 
@@ -305,6 +394,11 @@ impl Accumulator {
             return Ok(None);
         }
         self.compact()?;
+        self.memory.reserve(
+            self.retained_bytes
+                .saturating_mul(2)
+                .saturating_add(self.slots.saturating_mul(64)),
+        )?;
         let mut entries = self.heap.drain().collect::<Vec<_>>();
         entries.sort();
         let rows = entries

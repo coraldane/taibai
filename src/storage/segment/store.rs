@@ -52,6 +52,19 @@ pub fn partition_segment_filename(partition_key: &str, seq: u32) -> String {
 }
 
 pub fn next_segment_path_by_scan(table_dir: &Path, partition_key: Option<&str>) -> Result<PathBuf> {
+    let next_seq = max_segment_seq_by_scan(table_dir, partition_key)? + 1;
+    Ok(match partition_key {
+        Some(key) => table_dir.join(partition_segment_filename(key, next_seq)),
+        None => table_dir.join(regular_segment_filename(next_seq)),
+    })
+}
+
+/// Highest segment sequence currently present in `table_dir` for the given
+/// namespace (regular or one partition). 0 when none exist. This is the
+/// on-disk source of truth that the in-process counters must never fall
+/// behind — a counter below this value hands out a path that already holds a
+/// compaction replacement segment.
+pub fn max_segment_seq_by_scan(table_dir: &Path, partition_key: Option<&str>) -> Result<u32> {
     let mut max_seq = 0u32;
     if table_dir.exists() {
         for entry in std::fs::read_dir(table_dir)? {
@@ -66,12 +79,7 @@ pub fn next_segment_path_by_scan(table_dir: &Path, partition_key: Option<&str>) 
             }
         }
     }
-
-    let next_seq = max_seq + 1;
-    Ok(match partition_key {
-        Some(key) => table_dir.join(partition_segment_filename(key, next_seq)),
-        None => table_dir.join(regular_segment_filename(next_seq)),
-    })
+    Ok(max_seq)
 }
 
 pub fn replacement_tmp_path(final_path: &Path, suffix: &str) -> PathBuf {

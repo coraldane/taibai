@@ -127,11 +127,13 @@ fn analyze_table_collects_persists_and_invalidates_statistics() {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            count_plan.contains("Aggregate: estimated_rows=1, actual_rows=1"),
+            count_plan.contains("AggregateFold metrics: estimated_rows=1, actual_rows=1"),
             "{count_plan}"
         );
+        // COUNT(*) was answered from segment metadata (zero rows decoded),
+        // so the operator metrics carry no Scan entry for this query.
         assert!(
-            count_plan.contains("Scan metrics: estimated_rows=4, actual_rows=4"),
+            !count_plan.contains("Scan metrics: estimated_rows=4"),
             "{count_plan}"
         );
 

@@ -1437,3 +1437,111 @@ fn warmup_disabled_keeps_restart_cold() {
 
     engine.segment_mgr().shutdown();
 }
+
+/// EXPLAIN ANALYZE must surface the fast-path chain's answer: a resident
+/// shortcut lookup renders `fast_path : answered by resident_hot` and, per
+/// the no-segment-scan contract, no scan counter block at all.
+#[test]
+fn explain_analyze_renders_fast_path_answer() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        let mut engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE stock_tick (
+                    security_id VARCHAR,
+                    deal_date INT64,
+                    deal_time INT32,
+                    gmt_trade TIMESTAMP,
+                    price INT32
+                ) CLUSTER BY (security_id, deal_date, deal_time)
+                  HOT BY (gmt_trade) INDEX (security_id)
+                  PARTITION BY deal_date",
+            )
+            .expect("create stock_tick");
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO stock_tick VALUES
+                    ('688256.SH', 20260709, 103904, 1783564744000000, 10),
+                    ('688256.SH', 20260709, 103913, 1783564753000000, 30),
+                    ('000001.SZ', 20260709, 103999, 1783564799000000, 99),
+                    ('688256.SH', 20260709, 103910, 1783564750000000, 20)",
+            )
+            .expect("insert rows");
+        engine
+            .execute(&mut session, "FLUSH TABLE stock_tick")
+            .expect("flush rows");
+        engine.shutdown().expect("shutdown engine");
+    }
+
+    let engine = Engine::new(temp_dir.path(), "main").expect("restart engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    let store = engine
+        .hot_store_manager()
+        .get("main", "stock_tick")
+        .expect("warmup should rebuild hot store");
+    assert!(store.is_resident_for_partition(Some("20260709")));
+
+    let plan = explain_text(
+        engine
+            .execute(
+                &mut session,
+                "EXPLAIN ANALYZE SELECT price FROM stock_tick
+                 WHERE deal_date = 20260709 AND security_id = '688256.SH'
+                 ORDER BY deal_time DESC",
+            )
+            .expect("explain analyze resident hot point lookup"),
+    );
+    assert!(
+        plan.contains("fast_path     : answered by resident_hot"),
+        "EXPLAIN ANALYZE should name the answering fast-path node, got:\n{}",
+        plan
+    );
+    assert!(
+        !plan.contains("segments      :"),
+        "resident hot lookup should skip segment scan, got:\n{}",
+        plan
+    );
+
+    // A TTL table exercises the decline rendering: the chain's universal TTL
+    // gate blocks every node before any runs, the general scan serves the
+    // rows, and EXPLAIN ANALYZE shows both the decline reason and the real
+    // scan counters.
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE tick_ttl (
+                security_id VARCHAR,
+                ts TIMESTAMP,
+                price INT32
+            ) TTL (ts, 3600)",
+        )
+        .expect("create ttl table");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO tick_ttl VALUES ('688256.SH', 1783564744000000, 10)",
+        )
+        .expect("insert ttl row");
+
+    let ttl_plan = explain_text(
+        engine
+            .execute(
+                &mut session,
+                "EXPLAIN ANALYZE SELECT price FROM tick_ttl
+                 WHERE security_id = '688256.SH'",
+            )
+            .expect("explain analyze ttl table"),
+    );
+    assert!(
+        ttl_plan.contains("fast_path     : declined by ttl_gate"),
+        "EXPLAIN ANALYZE should list the TTL gate decline, got:\n{}",
+        ttl_plan
+    );
+
+    engine.segment_mgr().shutdown();
+}

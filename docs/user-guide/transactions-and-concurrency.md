@@ -104,5 +104,5 @@ Taibai 的可见性以 **memtable 为粒度**，不是行级多版本（MVCC）�
 | 事务内 DELETE/UPDATE 延迟物化与隔离 | `src/sql/execution/txn_dml.rs`、`src/storage/core/txn_mutations.rs`、`tests/transaction_dml_test.rs` |
 | flush 期间读写一致性 | `tests/concurrency_stability_test.rs` |
 | 约束与冲突原子性 | `tests/constraints_test.rs` |
-| durable tail 组提交与惰性刷盘 | `src/storage/core/durable_tail.rs`（`tail_commit_loop` / 自适应窗口 / `sync_dirty_tails_for_table`） |
+| durable tail 组提交与惰性刷盘 | `src/storage/core/durable_tail/committer.rs`（`tail_commit_loop` / 自适应窗口 / `sync_dirty_tails_for_table`） |
 | 实时写入扩展性与恢复契约 | `tests/realtime_write_scaling_test.rs` |

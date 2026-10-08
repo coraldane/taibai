@@ -1,3 +1,9 @@
+use crate::common::error::{Result, TaibaiError};
+use crate::protocol::types::DataType;
+use crate::sql::parser::ast::Expr;
+use crate::types::batch::Schema;
+use crate::types::scalar::ScalarValue;
+
 use super::*;
 
 #[test]
@@ -90,4 +96,33 @@ fn incompatible_param_type_returns_sql_error_not_internal_mismatch() {
 fn null_param_stays_null_for_target_type() {
     let got = eval(ScalarValue::Int32(None), DataType::VarChar, 0).unwrap();
     assert_eq!(got, ScalarValue::VarChar(None));
+}
+
+/// The hashed `column IN (literals)` fast path keeps the generic loop's
+/// mask exactly: only listed rows match, everything else (including NULL
+/// column values) is excluded.
+#[test]
+fn in_literal_hash_mask_keeps_only_listed_rows() {
+    use crate::sql::parser::ast::Expr;
+    use crate::types::array::ColumnArray;
+    use crate::types::batch::{ColumnDef, RecordBatch};
+
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int32)]);
+    let mut ids = ColumnArray::empty(DataType::Int32);
+    for i in 0..40 {
+        ids.push(&ScalarValue::Int32(Some(i))).unwrap();
+    }
+    let batch = RecordBatch::try_new(schema.clone(), vec![ids]).unwrap();
+
+    let values: Vec<Expr> = (0..5)
+        .map(|i| Expr::Literal(ScalarValue::Int32(Some(i))))
+        .collect();
+    let expr = Expr::In {
+        expr: Box::new(Expr::Column("id".to_string())),
+        values,
+        negated: false,
+    };
+    let mask = eval_where_clause_batch(&expr, &batch, &schema).unwrap();
+    let kept: Vec<i32> = (0..40).filter(|i| mask[*i]).map(|i| i as i32).collect();
+    assert_eq!(kept, vec![0, 1, 2, 3, 4], "mask: {mask:?}");
 }

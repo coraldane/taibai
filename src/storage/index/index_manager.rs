@@ -10,6 +10,7 @@ use crate::types::scalar::ScalarValue;
 mod codec;
 mod compaction;
 mod state_ops;
+mod stream_build;
 mod types;
 
 use self::codec::*;
@@ -23,6 +24,11 @@ pub use self::types::{
 };
 pub const PRIMARY_LOCATION_INDEX_NAME: &str = "__taibai_primary_location";
 
+/// Unique/PK keys published per explicit transaction, per (db, table), per
+/// index name — the statement-time visibility record ROLLBACK retracts.
+type TxnPublishedUniqueKeys =
+    std::sync::Mutex<HashMap<u64, HashMap<(String, String), Vec<(String, Vec<Vec<ScalarValue>>)>>>>;
+
 pub struct IndexManager {
     unique_indexes: Arc<RwLock<HashMap<String, Arc<UniqueIndexState>>>>,
     primary_key_indexes: RwLock<HashMap<String, HashSet<Vec<u8>>>>,
@@ -34,8 +40,7 @@ pub struct IndexManager {
     /// COMMIT, so ROLLBACK must retract exactly these keys — otherwise the
     /// next INSERT of the same key sees a phantom duplicate until the next
     /// snapshot refresh. COMMIT only drops the record.
-    txn_published:
-        Mutex<HashMap<u64, HashMap<(String, String), Vec<(String, Vec<Vec<ScalarValue>>)>>>>,
+    txn_published: TxnPublishedUniqueKeys,
 }
 
 #[derive(Default)]
@@ -694,6 +699,10 @@ impl IndexManager {
             .collect::<Result<Vec<_>>>()?;
         let mut locations = {
             let delta = state.delta.read().unwrap();
+            // Build the tombstone probe index once for the whole key loop:
+            // per-location linear scans made many-key probes quadratic in the
+            // tombstone count.
+            let tombstone_index = UniqueTombstoneIndex::build(&delta.tombstones);
             let mut locations = Vec::new();
             for encoded in &encoded_keys {
                 if let Some(matches) = delta.key_locations.get(encoded) {
@@ -702,18 +711,13 @@ impl IndexManager {
                             .iter()
                             .filter(|location| {
                                 !location.segment_path.is_empty()
-                                    && !unique_index_tombstones_contains(
-                                        &delta.tombstones,
-                                        location,
-                                    )
+                                    && !tombstone_index.contains(location)
                             })
                             .cloned(),
                     );
                 }
                 for location in state.base.find_locations(encoded)? {
-                    if !location.segment_path.is_empty()
-                        && !unique_index_tombstones_contains(&delta.tombstones, &location)
-                    {
+                    if !location.segment_path.is_empty() && !tombstone_index.contains(&location) {
                         locations.push(location);
                     }
                 }
@@ -750,7 +754,7 @@ impl IndexManager {
         Ok(Some(locations))
     }
 
-    /// Generic for the same reason as [`unique_key_locations`].
+    /// Generic for the same reason as `unique_key_locations`.
     pub fn unique_keys_exist<I>(
         &self,
         db: &str,
@@ -893,6 +897,140 @@ impl IndexManager {
     ) -> Result<bool> {
         let prepared = self.prepare_unique_index_entries(entries)?;
         self.append_prepared_unique_index_entries(db, table, index_name, prepared)
+    }
+
+    /// Batched variant of `append_prepared_unique_index_entries` for one
+    /// statement's entries across all of a table's location indexes (named
+    /// unique indexes plus the primary-key location index). Instead of a full
+    /// load-state / lock / write / fsync cycle per index, every state is
+    /// loaded once up front, every index's mutation lock is held across the
+    /// whole batch, the delta files are appended without per-append fsyncs,
+    /// and each written file is then fsynced exactly once before the locks
+    /// are released — one shared lock pass and one fsync per delta file per
+    /// statement. Per-index lock semantics and the on-disk delta format are
+    /// unchanged; an index whose entries are empty or whose snapshot is
+    /// absent is skipped exactly as the per-index path's early returns did,
+    /// and an index whose state was concurrently replaced falls back to the
+    /// single-index append (which reloads and rechecks). `Err` carries the
+    /// index name whose append failed so the caller can invalidate exactly
+    /// that one snapshot, as the previous per-index loop did.
+    pub fn append_prepared_unique_index_entries_batch(
+        &self,
+        db: &str,
+        table: &str,
+        batches: Vec<(String, Vec<PreparedUniqueIndexEntry>)>,
+    ) -> std::result::Result<(), (String, TaibaiError)> {
+        // Phase 1 (no locks): resolve every state up front so cache-miss
+        // loads and their full-file decodes never run inside a mutation
+        // lock. Empty entry lists and absent snapshots are no-ops, matching
+        // the per-index early `Ok(true)`/`Ok(false)` returns.
+        let mut pending: Vec<(String, Vec<PreparedUniqueIndexEntry>, Arc<UniqueIndexState>)> =
+            Vec::new();
+        for (index_name, entries) in batches {
+            if entries.is_empty() {
+                continue;
+            }
+            match self.load_unique_index_state(db, table, &index_name) {
+                Ok(Some(state)) => pending.push((index_name, entries, state)),
+                Ok(None) => {}
+                Err(error) => return Err((index_name, error)),
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        // Phase 2: take every index's mutation lock in list order and hold
+        // all of them for the whole statement. No other code path acquires
+        // two of these per-index locks, so the ordering cannot deadlock.
+        let guards: Vec<_> = pending
+            .iter()
+            .map(|(_, _, state)| state.mutation_lock.lock().unwrap())
+            .collect();
+        let mut failure: Option<(String, TaibaiError)> = None;
+        let mut deferred: Vec<usize> = Vec::new();
+        let mut to_sync: Vec<(String, std::fs::File)> = Vec::new();
+        let mut to_compact: Vec<(String, Arc<UniqueIndexState>)> = Vec::new();
+        for (pos, (index_name, entries, state)) in pending.iter().enumerate() {
+            let _guard = &guards[pos];
+            let cache_key = unique_index_key(db, table, index_name);
+            let is_current = self
+                .unique_indexes
+                .read()
+                .unwrap()
+                .get(&cache_key)
+                .is_some_and(|current| Arc::ptr_eq(current, state));
+            if !is_current {
+                // The loaded state was replaced (refresh/rebuild) after the
+                // phase-1 load; retry through the single-index path once the
+                // locks are released, exactly as its self-retry did.
+                deferred.push(pos);
+                continue;
+            }
+            let append_result = (|| -> Result<std::fs::File> {
+                let dir = self.unique_index_dir(db, table);
+                std::fs::create_dir_all(&dir)?;
+                let base = sanitize_file_component(index_name);
+                let delta_path = dir.join(format!("{}.delta.tbi", base));
+                append_prepared_unique_index_delta_deferred_sync(&delta_path, entries)
+            })();
+            let file = match append_result {
+                Ok(file) => file,
+                Err(error) => {
+                    failure = Some((index_name.clone(), error));
+                    break;
+                }
+            };
+            to_sync.push((index_name.clone(), file));
+            let needs_compaction = {
+                let mut delta = state.delta.write().unwrap();
+                for addition in entries {
+                    delta
+                        .key_locations
+                        .entry(addition.encoded_key.clone())
+                        .or_default()
+                        .push(addition.entry.location.clone());
+                    delta.entry_count += 1;
+                }
+                let delta_count = delta
+                    .entry_count
+                    .saturating_add(delta.tombstones.len() as u64);
+                unique_index_delta_needs_compaction(delta_count, state.base.entry_count)
+            };
+            if needs_compaction {
+                to_compact.push((index_name.clone(), Arc::clone(state)));
+            }
+        }
+        // Phase 3: one fsync per written file, still under the shared lock
+        // pass — the delta bytes must be durable before a concurrent
+        // compaction could rename the file out from under this append.
+        if failure.is_none() {
+            for (index_name, file) in &mut to_sync {
+                if let Err(error) = file.sync_all() {
+                    failure = Some((index_name.clone(), error.into()));
+                    break;
+                }
+            }
+        }
+        drop(guards);
+
+        if let Some((index_name, error)) = failure {
+            return Err((index_name, error));
+        }
+        for (index_name, state) in &to_compact {
+            self.try_dispatch_unique_index_compaction(db, table, index_name, state);
+        }
+        for pos in deferred {
+            let (index_name, entries, _) = &mut pending[pos];
+            let index_name = index_name.clone();
+            let entries = std::mem::take(entries);
+            if let Err(error) =
+                self.append_prepared_unique_index_entries(db, table, &index_name, entries)
+            {
+                return Err((index_name, error));
+            }
+        }
+        Ok(())
     }
 
     pub fn append_unique_index_tombstones(
@@ -1042,6 +1180,23 @@ impl IndexManager {
             .write()
             .unwrap()
             .remove(&unique_index_key(db, table, index_name));
+    }
+
+    /// Evict every cached index state of the table WITHOUT touching the
+    /// on-disk files. Base states pin open file handles (the rename-race
+    /// fix in `UniqueIndexBase`), so directory-level operations — RENAME
+    /// TABLE, TRUNCATE's staged move, DROP TABLE — must call this first:
+    /// on Windows, renaming or removing a directory that still has an open
+    /// handle inside fails with PermissionDenied.
+    pub fn drop_table_index_states(&self, db: &str, table: &str) {
+        self.primary_key_indexes
+            .write()
+            .unwrap()
+            .remove(&format!("{}\0{}", db, table));
+        self.unique_indexes
+            .write()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&format!("{}\0{}\0", db, table)));
     }
 
     pub fn invalidate_table_unique_index_snapshots(

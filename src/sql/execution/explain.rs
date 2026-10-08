@@ -12,9 +12,10 @@ use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
 use super::operators::profile::{OperatorProfileSnapshot, QueryProfile};
-use super::physical::planner::{estimate_plan_rows, prepare_physical_plan};
+use super::physical::planner::prepare_physical_plan;
 use super::physical::PhysicalContext;
 use super::query::extract_table_refs;
+use crate::sql::optimizer::join_order::estimate_plan_rows;
 
 pub fn exec_explain(
     engine: &Engine,
@@ -94,8 +95,7 @@ pub fn exec_explain(
     let plan = reconcile_plan_indexes(plan, &table_metas);
     let query_shape = plan_shape(&plan);
     let fingerprint = stable_fingerprint(&query_shape);
-    let physical_ctx =
-        PhysicalContext::new(engine, &table_refs, &table_schemas, &table_metas, false);
+    let physical_ctx = PhysicalContext::new(engine, &table_refs, &table_schemas, &table_metas);
     let plan = prepare_physical_plan(plan, &physical_ctx);
 
     let mut out = String::new();
@@ -132,7 +132,36 @@ pub fn exec_explain(
         tables.sort();
         for t in tables {
             let s = &stats[t];
+            // A fast-path-only entry (resident shortcut / metadata fold
+            // answered, nothing scanned) must not render the counter block:
+            // the resident-shortcut contract is asserted by the ABSENCE of
+            // the segments line — no segment scan happened, so no scan
+            // counters exist for this table.
+            let has_activity = s.segments_opened > 0
+                || s.segments_pruned_by_cluster_key > 0
+                || s.row_groups_total > 0
+                || s.row_groups_read > 0
+                || s.row_groups_pruned > 0
+                || s.rows_scanned > 0
+                || s.rows_filtered_by_delete_bitmap > 0
+                || s.bytes_read_compressed > 0
+                || s.hot_mirror_rows > 0;
+            if !has_activity && s.fast_path_answered.is_none() && s.fast_path_declined.is_empty() {
+                continue;
+            }
             out.push_str(&format!("Scan {}:\n", t));
+            if let Some(node) = s.fast_path_answered {
+                out.push_str(&format!("  fast_path     : answered by {node}\n"));
+            }
+            if !s.fast_path_declined.is_empty() {
+                out.push_str(&format!(
+                    "  fast_path     : declined by {}\n",
+                    s.fast_path_declined.join(", ")
+                ));
+            }
+            if !has_activity {
+                continue;
+            }
             out.push_str(&format!("  segments      : {}\n", s.segments_opened));
             if s.hot_mirror_rows > 0 {
                 out.push_str(&format!(

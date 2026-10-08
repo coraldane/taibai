@@ -314,3 +314,53 @@ fn is_leap_year(year: u64) -> bool {
 #[cfg(test)]
 #[path = "segment_test.rs"]
 mod tests;
+
+/// Enumerate the table directories under a taibai data dir as
+/// `(db, table, path)` triples, applying the shared skip rules (hidden dirs,
+/// `meta`/`wal`, `.taibai-` tombstones) and the optional `--db`/`--table`
+/// filters. Shared by the backup and migrate tools; results are sorted so
+/// both tools process tables in a stable order.
+pub fn collect_table_dirs(
+    data_dir: &Path,
+    only_db: Option<&str>,
+    only_table: Option<&str>,
+) -> Vec<(String, String, PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(dbs) = fs::read_dir(data_dir) else {
+        return out;
+    };
+    for db_entry in dbs.flatten() {
+        if !db_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let db_name = db_entry.file_name().to_string_lossy().to_string();
+        if db_name.starts_with('.') || db_name == "meta" || db_name == "wal" {
+            continue;
+        }
+        if let Some(only_db) = only_db {
+            if db_name != only_db {
+                continue;
+            }
+        }
+        let Ok(tables) = fs::read_dir(db_entry.path()) else {
+            continue;
+        };
+        for table_entry in tables.flatten() {
+            if !table_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let table_name = table_entry.file_name().to_string_lossy().to_string();
+            if table_name.starts_with(".taibai-") {
+                continue;
+            }
+            if let Some(only_table) = only_table {
+                if table_name != only_table {
+                    continue;
+                }
+            }
+            out.push((db_name.clone(), table_name.clone(), table_entry.path()));
+        }
+    }
+    out.sort();
+    out
+}

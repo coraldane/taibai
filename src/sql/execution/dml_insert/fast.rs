@@ -1,8 +1,11 @@
+use super::write::*;
+use super::*;
+
 fn insert_profile_enabled() -> bool {
     crate::common::config::insert_profile_enabled()
 }
 
-fn log_insert_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
+pub(super) fn log_insert_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
     if insert_profile_enabled() {
         eprintln!(
             "[insert-profile] stage={} rows={} elapsed_us={}",
@@ -85,6 +88,13 @@ fn try_exec_fast_insert_sql_inner(
         return FastInsertOutcome::Unsupported;
     }
     let table_raw = &sql[table_start..pos];
+    // This scanner has no grammar: a quoted identifier (`"order"`,
+    // "`group`", `db."tbl"`) would reach the catalog as a literal with
+    // quotes glued on — permission checks and lookups against that string
+    // always miss. Anything quoted is the standard parser's problem.
+    if table_raw.contains('"') || table_raw.contains('`') || table_raw.contains('[') {
+        return FastInsertOutcome::Unsupported;
+    }
     let (db, table) = if let Some((db, table)) = table_raw.split_once('.') {
         (db, table)
     } else {
@@ -114,12 +124,13 @@ fn try_exec_fast_insert_sql_inner(
     {
         Some(meta) => meta,
         None => {
-            let missing = if catalogs.get(db).is_none() {
-                format!("database '{}' does not exist", db)
-            } else {
-                format!("table '{}.{}' does not exist", db, table)
-            };
-            return FastInsertOutcome::Executed(Err(TaibaiError::Sql(missing)));
+            // A miss is NOT this path's error to report: the fast scanner
+            // cannot distinguish a genuinely missing table from syntax it
+            // mis-tokenized (qualified names, odd spacing, future grammar).
+            // Falling back lets the standard parser produce the real verdict
+            // — including its own permission and existence errors — instead
+            // of a wrong "table does not exist" for valid SQL.
+            return FastInsertOutcome::Unsupported;
         }
     };
     drop(catalogs);
@@ -151,6 +162,57 @@ fn try_exec_fast_insert_sql_inner(
         None
     };
 
+    // First pass — supportability check only (C20). parse_fast_value and
+    // the separator grammar below are pure functions of the SQL bytes (they
+    // only advance a cursor over borrowed slices), so this walk materializes
+    // no rows and consumes no auto-increment values. Any row the fast path
+    // cannot fully parse bails out to the standard parser BEFORE the first
+    // row is materialized, so a mid-batch fallback can no longer strand
+    // auto-increment values the fast path already consumed.
+    {
+        let mut check_pos = pos;
+        loop {
+            skip_spaces(bytes, &mut check_pos);
+            if check_pos >= bytes.len() {
+                break;
+            }
+            if bytes[check_pos] != b'(' {
+                return FastInsertOutcome::Unsupported;
+            }
+            check_pos += 1;
+            for value_idx in 0..col_indices.len() {
+                skip_spaces(bytes, &mut check_pos);
+                if parse_fast_value(sql, bytes, &mut check_pos).is_none() {
+                    return FastInsertOutcome::Unsupported;
+                }
+                skip_spaces(bytes, &mut check_pos);
+                if value_idx + 1 < col_indices.len() {
+                    if check_pos >= bytes.len() || bytes[check_pos] != b',' {
+                        return FastInsertOutcome::Unsupported;
+                    }
+                    check_pos += 1;
+                }
+            }
+            skip_spaces(bytes, &mut check_pos);
+            if check_pos >= bytes.len() || bytes[check_pos] != b')' {
+                return FastInsertOutcome::Unsupported;
+            }
+            check_pos += 1;
+            skip_spaces(bytes, &mut check_pos);
+            if check_pos >= bytes.len() {
+                break;
+            }
+            if bytes[check_pos] == b',' {
+                check_pos += 1;
+                continue;
+            }
+            return FastInsertOutcome::Unsupported;
+        }
+    }
+
+    // Second pass — materialization. The first pass proved the whole VALUES
+    // list parses, so this loop can no longer hit an Unsupported condition
+    // partway through; coercion errors surface here exactly as before.
     let capacity = estimate_values_rows(bytes, pos).clamp(1, 100_000);
     let mut batch = RecordBatch::with_capacity(schema.clone(), capacity);
     let mut rows = 0usize;
@@ -313,9 +375,7 @@ fn parse_insert_column_list(sql: &str, bytes: &[u8], pos: &mut usize) -> Option<
             let mut name = String::new();
             let mut seg_start = *pos;
             loop {
-                let Some(&c) = bytes.get(*pos) else {
-                    return None;
-                };
+                let &c = bytes.get(*pos)?;
                 if c == quote {
                     if bytes.get(*pos + 1) == Some(&quote) {
                         name.push_str(&sql[seg_start..*pos]);
@@ -697,7 +757,7 @@ fn push_fast_value_direct(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn materialize_insert_row<F>(
+pub(super) fn materialize_insert_row<F>(
     engine: &Engine,
     db: &str,
     table: &str,
@@ -755,7 +815,7 @@ fn push_missing_insert_value(
     col.push(&scalar)
 }
 
-fn materialize_missing_insert_scalar(
+pub(super) fn materialize_missing_insert_scalar(
     engine: &Engine,
     db: &str,
     table: &str,
@@ -791,9 +851,15 @@ fn materialize_auto_increment_value(
         ))
     };
     Ok(match schema.columns[col_idx].data_type {
-        DataType::Int32 => ScalarValue::Int32(Some(i32::try_from(next_val).map_err(|_| overflow())?)),
-        DataType::Int64 => ScalarValue::Int64(Some(i64::try_from(next_val).map_err(|_| overflow())?)),
-        DataType::UInt32 => ScalarValue::UInt32(Some(u32::try_from(next_val).map_err(|_| overflow())?)),
+        DataType::Int32 => {
+            ScalarValue::Int32(Some(i32::try_from(next_val).map_err(|_| overflow())?))
+        }
+        DataType::Int64 => {
+            ScalarValue::Int64(Some(i64::try_from(next_val).map_err(|_| overflow())?))
+        }
+        DataType::UInt32 => {
+            ScalarValue::UInt32(Some(u32::try_from(next_val).map_err(|_| overflow())?))
+        }
         DataType::UInt64 => ScalarValue::UInt64(Some(next_val)),
         _ => ScalarValue::Int64(Some(i64::try_from(next_val).map_err(|_| overflow())?)),
     })
@@ -816,12 +882,11 @@ fn parse_timestamp_string_fast(value: FastValue<'_>, timezone_offset_hours: i32)
 }
 
 /// `'2024-01-01'`-style DATE literals as days since epoch, mirroring the
-/// standard path's `parse_datetime_string` conversion.
+/// standard path's conversion (single conversion point in
+/// `functions::date::datetime_string_to_days`).
 fn parse_date_string_fast(value: FastValue<'_>, timezone_offset_hours: i32) -> Option<i32> {
     let text = parse_text_fast(value).ok()?;
-    let ts =
-        crate::sql::execution::functions::date::parse_datetime_string(text, timezone_offset_hours)?;
-    Some((ts / 86400) as i32)
+    crate::sql::execution::functions::date::datetime_string_to_days(text, timezone_offset_hours)
 }
 
 fn parse_owned_string_fast(value: FastValue<'_>) -> Result<String> {

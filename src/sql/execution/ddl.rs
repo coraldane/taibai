@@ -721,9 +721,15 @@ fn validate_hot_def(col_defs: &[ColumnDef], table: &str, hot_def: &HotDef) -> Re
     Ok(())
 }
 
-include!("ddl/table.rs");
-include!("ddl/database_auth.rs");
-include!("ddl/introspection.rs");
+mod database_auth;
+mod introspection;
+mod table;
+
+// Glob re-exports keep every `ddl::…` path that the flat (include!) layout
+// used to expose; item visibility is preserved (min of pub and the item's).
+pub use database_auth::*;
+pub use introspection::*;
+pub use table::*;
 
 #[cfg(test)]
 #[path = "ddl_test.rs"]

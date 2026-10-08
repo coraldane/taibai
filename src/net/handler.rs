@@ -443,7 +443,7 @@ impl Handler {
                         if has_query_database {
                             session.database = original_database;
                         }
-                        return Ok(vec![build_error(&error.to_string())]);
+                        return Ok(vec![build_query_error(&error)]);
                     }
                 }
             }
@@ -491,7 +491,7 @@ impl Handler {
                 let msg = build_binary_query_result_with_timings(&schema, &batches, timings);
                 let msg = match self.validate_query_response(msg) {
                     Ok(msg) => msg,
-                    Err(error) => return Ok(vec![build_error(&error.to_string())]),
+                    Err(error) => return Ok(vec![build_query_error(&error)]),
                 };
                 log_query_if_needed(
                     should_log_query,
@@ -516,7 +516,7 @@ impl Handler {
                     &status,
                     server_start.elapsed(),
                 );
-                Ok(vec![build_error(&e.to_string())])
+                Ok(vec![build_query_error(&e)])
             }
         }
     }
@@ -695,6 +695,55 @@ impl Handler {
         }
     }
 
+    /// Take the prepared statement `stmt_id` out of the session cache, or
+    /// produce the protocol error response when the id is unknown (with a
+    /// diagnostic warn — usually a protocol/version mismatch or a stale
+    /// connection). The statement is removed up front so a failed execute
+    /// cannot double-run it; successful paths re-insert it.
+    fn take_prepared_statement(
+        session: &mut Session,
+        stmt_id: u32,
+        context: &str,
+    ) -> std::result::Result<crate::sql::execution::prepared::PreparedStatement, Vec<Message>> {
+        match session.prepared_statements.remove(stmt_id) {
+            Some(stmt) => Ok(stmt),
+            None => {
+                tracing::warn!(
+                    stmt_id,
+                    live_statements = session.prepared_statements.len(),
+                    next_unissued_id = session.prepared_statements.next_id(),
+                    "prepared statement lookup failed on {context}; client may reference an unknown id (protocol/version mismatch or stale connection)"
+                );
+                Err(vec![build_error(&format!(
+                    "prepared statement {} not found (session has {} prepared statement(s); ids start at 1, next unissued id is {})",
+                    stmt_id,
+                    session.prepared_statements.len(),
+                    session.prepared_statements.next_id()
+                ))])
+            }
+        }
+    }
+
+    /// Reject a prepared statement whose target table's parameter types no
+    /// longer match the PREPARE-time signature. `Ok(stmt)` hands the
+    /// statement back unchanged; `Err(messages)` carries the rejection
+    /// response (the statement is re-inserted into the session cache).
+    fn reject_if_schema_changed(
+        engine: &Engine,
+        session: &mut Session,
+        stmt: crate::sql::execution::prepared::PreparedStatement,
+        stmt_id: u32,
+    ) -> std::result::Result<crate::sql::execution::prepared::PreparedStatement, Vec<Message>> {
+        if let Some((_, current_types)) = Self::current_insert_param_types(engine, session, &stmt) {
+            if !stmt.param_types.is_empty() && stmt.param_types != current_types {
+                return Err(Self::reject_stale_prepared_statement(
+                    engine, session, stmt, stmt_id,
+                ));
+            }
+        }
+        Ok(stmt)
+    }
+
     fn current_insert_param_types(
         engine: &Engine,
         session: &Session,
@@ -811,38 +860,17 @@ impl Handler {
             }
         }
 
-        let mut stmt = match session.prepared_statements.remove(stmt_id) {
-            Some(s) => s,
-            None => {
-                tracing::warn!(
-                    stmt_id,
-                    live_statements = session.prepared_statements.len(),
-                    next_unissued_id = session.prepared_statements.next_id(),
-                    "prepared statement lookup failed on execute; client may reference an unknown id (protocol/version mismatch or stale connection)"
-                );
-                return Ok(vec![build_error(&format!(
-                    "prepared statement {} not found (session has {} prepared statement(s); ids start at 1, next unissued id is {})",
-                    stmt_id,
-                    session.prepared_statements.len(),
-                    session.prepared_statements.next_id()
-                ))]);
-            }
+        let mut stmt = match Self::take_prepared_statement(session, stmt_id, "execute") {
+            Ok(stmt) => stmt,
+            Err(messages) => return Ok(messages),
         };
 
         stmt.params = params;
 
-        if let Some((_, current_types)) =
-            Self::current_insert_param_types(&self.engine, session, &stmt)
-        {
-            if !stmt.param_types.is_empty() && stmt.param_types != current_types {
-                return Ok(Self::reject_stale_prepared_statement(
-                    &self.engine,
-                    session,
-                    stmt,
-                    stmt_id,
-                ));
-            }
-        }
+        let mut stmt = match Self::reject_if_schema_changed(&self.engine, session, stmt, stmt_id) {
+            Ok(stmt) => stmt,
+            Err(messages) => return Ok(messages),
+        };
 
         let execute_start = Instant::now();
         let result = self.engine.execute_prepared(session, &mut stmt);
@@ -869,188 +897,16 @@ impl Handler {
                 let msg = build_binary_query_result_with_timings(&schema, &batches, timings);
                 let msg = match self.validate_query_response(msg) {
                     Ok(msg) => msg,
-                    Err(error) => return Ok(vec![build_error(&error.to_string())]),
+                    Err(error) => return Ok(vec![build_query_error(&error)]),
                 };
                 Ok(vec![msg])
             }
-            Err(e) => Ok(vec![build_error(&e.to_string())]),
+            Err(e) => Ok(vec![build_query_error(&e)]),
         }
     }
 
     fn decode_param_value(data: &[u8], dt: DataType) -> Result<(ScalarValue, usize)> {
-        match dt {
-            DataType::Bool => {
-                if data.is_empty() {
-                    return Err(TaibaiError::Protocol("no data for Bool param".into()));
-                }
-                Ok((ScalarValue::Bool(Some(data[0] != 0)), 1))
-            }
-            DataType::Int8 => {
-                if data.is_empty() {
-                    return Err(TaibaiError::Protocol("no data for Int8 param".into()));
-                }
-                Ok((ScalarValue::Int8(Some(data[0] as i8)), 1))
-            }
-            DataType::Int16 => {
-                if data.len() < 2 {
-                    return Err(TaibaiError::Protocol("no data for Int16 param".into()));
-                }
-                Ok((
-                    ScalarValue::Int16(Some(i16::from_le_bytes([data[0], data[1]]))),
-                    2,
-                ))
-            }
-            DataType::Int32 => {
-                if data.len() < 4 {
-                    return Err(TaibaiError::Protocol("no data for Int32 param".into()));
-                }
-                let v = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                Ok((ScalarValue::Int32(Some(v)), 4))
-            }
-            DataType::Int64 => {
-                if data.len() < 8 {
-                    return Err(TaibaiError::Protocol("no data for Int64 param".into()));
-                }
-                let v = i64::from_le_bytes([
-                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                ]);
-                Ok((ScalarValue::Int64(Some(v)), 8))
-            }
-            DataType::UInt8 => {
-                if data.is_empty() {
-                    return Err(TaibaiError::Protocol("no data for UInt8 param".into()));
-                }
-                Ok((ScalarValue::UInt8(Some(data[0])), 1))
-            }
-            DataType::UInt16 => {
-                if data.len() < 2 {
-                    return Err(TaibaiError::Protocol("no data for UInt16 param".into()));
-                }
-                Ok((
-                    ScalarValue::UInt16(Some(u16::from_le_bytes([data[0], data[1]]))),
-                    2,
-                ))
-            }
-            DataType::UInt32 => {
-                if data.len() < 4 {
-                    return Err(TaibaiError::Protocol("no data for UInt32 param".into()));
-                }
-                let v = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                Ok((ScalarValue::UInt32(Some(v)), 4))
-            }
-            DataType::UInt64 => {
-                if data.len() < 8 {
-                    return Err(TaibaiError::Protocol("no data for UInt64 param".into()));
-                }
-                let v = u64::from_le_bytes([
-                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                ]);
-                Ok((ScalarValue::UInt64(Some(v)), 8))
-            }
-            DataType::Float32 => {
-                if data.len() < 4 {
-                    return Err(TaibaiError::Protocol("no data for Float32 param".into()));
-                }
-                let v = f32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                Ok((ScalarValue::Float32(Some(v)), 4))
-            }
-            DataType::Float64 => {
-                if data.len() < 8 {
-                    return Err(TaibaiError::Protocol("no data for Float64 param".into()));
-                }
-                let v = f64::from_le_bytes([
-                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                ]);
-                Ok((ScalarValue::Float64(Some(v)), 8))
-            }
-            DataType::Decimal => {
-                if data.len() < 8 {
-                    return Err(TaibaiError::Protocol("no data for Decimal param".into()));
-                }
-                let v = i64::from_le_bytes([
-                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                ]);
-                Ok((ScalarValue::Decimal(Some(v)), 8))
-            }
-            DataType::Date => {
-                if data.len() < 4 {
-                    return Err(TaibaiError::Protocol("no data for Date param".into()));
-                }
-                let v = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                Ok((ScalarValue::Date(Some(v)), 4))
-            }
-            DataType::Time => {
-                if data.len() < 8 {
-                    return Err(TaibaiError::Protocol("no data for Time param".into()));
-                }
-                let v = i64::from_le_bytes([
-                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                ]);
-                Ok((ScalarValue::Time(Some(v)), 8))
-            }
-            DataType::Timestamp => {
-                if data.len() < 8 {
-                    return Err(TaibaiError::Protocol("no data for Timestamp param".into()));
-                }
-                let v = i64::from_le_bytes([
-                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                ]);
-                Ok((ScalarValue::Timestamp(Some(v)), 8))
-            }
-            DataType::Interval => {
-                if data.len() < 8 {
-                    return Err(TaibaiError::Protocol("no data for Interval param".into()));
-                }
-                let v = i64::from_le_bytes([
-                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                ]);
-                Ok((ScalarValue::Interval(Some(v)), 8))
-            }
-            DataType::VarChar => {
-                if data.len() < 4 {
-                    return Err(TaibaiError::Protocol("no data for VarChar param".into()));
-                }
-                let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-                if data.len() < 4 + len {
-                    return Err(TaibaiError::Protocol("VarChar param data truncated".into()));
-                }
-                let s = std::str::from_utf8(&data[4..4 + len]).map_err(|e| {
-                    TaibaiError::Protocol(format!("invalid UTF-8 in VarChar param: {}", e))
-                })?;
-                Ok((ScalarValue::VarChar(Some(s.to_string())), 4 + len))
-            }
-            DataType::Blob => {
-                if data.len() < 4 {
-                    return Err(TaibaiError::Protocol("no data for Blob param".into()));
-                }
-                let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-                if data.len() < 4 + len {
-                    return Err(TaibaiError::Protocol("Blob param data truncated".into()));
-                }
-                Ok((ScalarValue::Blob(Some(data[4..4 + len].to_vec())), 4 + len))
-            }
-            DataType::Vector => {
-                if data.len() < 4 {
-                    return Err(TaibaiError::Protocol("no data for Vector param".into()));
-                }
-                let dim = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-                let total = 4 + dim * 4;
-                if data.len() < total {
-                    return Err(TaibaiError::Protocol("Vector param data truncated".into()));
-                }
-                let mut floats = Vec::with_capacity(dim);
-                for i in 0..dim {
-                    let off = 4 + i * 4;
-                    floats.push(f32::from_le_bytes([
-                        data[off],
-                        data[off + 1],
-                        data[off + 2],
-                        data[off + 3],
-                    ]));
-                }
-                Ok((ScalarValue::Vector(Some(floats)), total))
-            }
-        }
+        crate::protocol::scalar_codec::decode_param_value(data, dt)
     }
 
     fn handle_batch_execute(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
@@ -1073,38 +929,17 @@ impl Handler {
 
         let mut offset = 8usize;
 
-        let mut stmt = match session.prepared_statements.remove(stmt_id) {
-            Some(s) => s,
-            None => {
-                tracing::warn!(
-                    stmt_id,
-                    live_statements = session.prepared_statements.len(),
-                    next_unissued_id = session.prepared_statements.next_id(),
-                    "prepared statement lookup failed on batch execute; client may reference an unknown id (protocol/version mismatch or stale connection)"
-                );
-                return Ok(vec![build_error(&format!(
-                    "prepared statement {} not found (session has {} prepared statement(s); ids start at 1, next unissued id is {})",
-                    stmt_id,
-                    session.prepared_statements.len(),
-                    session.prepared_statements.next_id()
-                ))]);
-            }
+        let stmt = match Self::take_prepared_statement(session, stmt_id, "batch execute") {
+            Ok(stmt) => stmt,
+            Err(messages) => return Ok(messages),
         };
 
         let param_count = stmt.param_count;
 
-        if let Some((_, current_types)) =
-            Self::current_insert_param_types(&self.engine, session, &stmt)
-        {
-            if !stmt.param_types.is_empty() && stmt.param_types != current_types {
-                return Ok(Self::reject_stale_prepared_statement(
-                    &self.engine,
-                    session,
-                    stmt,
-                    stmt_id,
-                ));
-            }
-        }
+        let mut stmt = match Self::reject_if_schema_changed(&self.engine, session, stmt, stmt_id) {
+            Ok(stmt) => stmt,
+            Err(messages) => return Ok(messages),
+        };
         let mut parameter_batch = Vec::with_capacity(batch_size);
 
         for row_idx in 0..batch_size {
@@ -1789,17 +1624,19 @@ impl Handler {
             ))]);
         }
 
+        // A (re)connecting standby proved it durably applied `last_seq`.
+        // Fast-forward BEFORE reading history: a primary that restarted on a
+        // stale seq file may have stamped fresh events with seqs this
+        // standby already consumed. note_standby_applied re-stamps the ring
+        // above the watermark so the history below (and the live fan-out)
+        // delivers them; calling it after events_after would hand the bridge
+        // a snapshot that still skips them.
+        rep_log.note_standby_applied(last_seq);
+
         let history = match rep_log.events_after(last_seq) {
             Ok(history) => history,
             Err(error) => return Ok(vec![build_error(&error.to_string())]),
         };
-
-        // A (re)connecting standby proved it durably applied `last_seq`.
-        // Fast-forward the seq file before handing out any new events: the
-        // primary may have crashed and restarted with the file lagging behind
-        // this seq, and re-stamping consumed seqs would make the standby skip
-        // everything up to its old position.
-        rep_log.note_standby_applied(last_seq);
 
         let Some(push_tx) = self.push_channel.clone() else {
             return Ok(vec![build_error(
@@ -1901,7 +1738,7 @@ impl Handler {
         {
             return Ok(vec![build_error("REPL_SEGMENT_FETCH: unsafe path")]);
         }
-        let path = self.engine.data_dir().join(&db).join(&table).join(&segment);
+        let path = self.engine.data_dir().join(db).join(table).join(segment);
         let file = match std::fs::File::open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1912,7 +1749,7 @@ impl Handler {
                 if self
                     .engine
                     .rep_log()
-                    .is_some_and(|log| log.segment_retired(&db, &table, &segment))
+                    .is_some_and(|log| log.segment_retired(db, table, segment))
                 {
                     return Ok(vec![Message::empty(MSG_TYPE_REPL_SEGMENT_GONE)]);
                 }
@@ -1982,6 +1819,39 @@ pub fn build_error(msg: &str) -> Message {
     Message::new(MSG_TYPE_ERROR, Bytes::from(msg.to_string()))
 }
 
+/// Error response for the SQL execution paths (`MSG_TYPE_QUERY` /
+/// `MSG_TYPE_EXECUTE`). The wire protocol carries error payloads as plain
+/// text with no error-code or classification field, so transient
+/// resource-busy conditions (concurrent DML inside the ALTER convergence
+/// window, hot-store backpressure, join/semi-join budget) get the stable
+/// [`RETRYABLE_ERROR_PREFIX`] marker instead — the minimal extension that
+/// lets clients distinguish "back off and re-issue" from "fail the
+/// statement". Everything else keeps the plain one-shot error text.
+/// Connection-layer and authentication errors intentionally do NOT pass
+/// through here: they are not transient.
+fn build_query_error(error: &TaibaiError) -> Message {
+    match error {
+        TaibaiError::ResourceBusy(message) => {
+            // Budget overruns are DETERMINISTIC: retrying just redoes the
+            // same doomed work four times over. Only contention-shaped
+            // busy (lock windows, backpressure) is transient.
+            let budget_error = message.contains("memory budget")
+                || message.contains("transaction budget")
+                || message.contains("exceeded the budget");
+            if budget_error {
+                build_error(&format!("resource busy: {message}"))
+            } else {
+                build_error(&format!(
+                    "{} resource busy: {} (transient server-side contention; the                      built-in client auto-retries this only for read-only statements                      — SELECT/SHOW/EXPLAIN; writes must be retried by the application)",
+                    crate::net::client::RETRYABLE_ERROR_PREFIX,
+                    message
+                ))
+            }
+        }
+        other => build_error(&other.to_string()),
+    }
+}
+
 fn append_server_timings(msg: Message, timings: ServerTimings) -> Message {
     let mut payload = Vec::with_capacity(msg.payload.len() + 28);
     payload.extend_from_slice(&msg.payload);
@@ -2012,6 +1882,10 @@ fn build_binary_query_result_with_timings(
     append_server_timing_trailer(&mut encoded, timings);
     Message::new(MSG_TYPE_BINARY_QUERY_RESULT, Bytes::from(encoded))
 }
+
+#[cfg(test)]
+#[path = "handler_query_error_test.rs"]
+mod query_error_tests;
 
 #[cfg(test)]
 #[path = "handler_test.rs"]

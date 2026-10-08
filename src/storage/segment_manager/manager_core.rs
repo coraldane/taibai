@@ -1,4 +1,26 @@
+use super::*;
+
 static FLUSH_TRANSITION_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Striped mutexes serializing per-table flush-epoch file persistence outside
+/// the global epoch lock. Hashing the table key to one of N stripes keeps
+/// same-table writes ordered while unrelated tables usually proceed in
+/// parallel; the critical section is one small tmp+rename, so stripe sharing
+/// between different tables is immaterial. Instance-local semantics are not
+/// needed: the persisted value is re-read from the owning manager's memory
+/// inside the stripe lock (see `persist_flush_epoch`).
+fn flush_epoch_persist_lock(key: &str) -> &std::sync::Mutex<()> {
+    const STRIPES: usize = 16;
+    static LOCKS: std::sync::OnceLock<Vec<std::sync::Mutex<()>>> = std::sync::OnceLock::new();
+    let locks = LOCKS.get_or_init(|| (0..STRIPES).map(|_| std::sync::Mutex::new(())).collect());
+    // FNV-1a: stable, allocation-free stripe selection for short table keys.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    &locks[(hash as usize) % locks.len()]
+}
 
 impl SegmentManager {
     pub fn set_flush_transition_delay_for_tests(&self, ms: u64) {
@@ -66,6 +88,12 @@ impl SegmentManager {
                             let tbl_dir = tbl_entry.path();
                             cleanup_incomplete_compaction_files(&tbl_dir);
                             recover_replace_journals(&tbl_dir);
+                            // Deferred (V02) statement journals are judged
+                            // ONLY here: single writer per data dir means no
+                            // statement is in flight at startup.
+                            crate::storage::segment::reader::recover_statement_footer_journals(
+                                &tbl_dir,
+                            );
                             let max_seq = discover_max_seq(&tbl_dir);
                             let partition_seq = discover_max_partition_seq(&tbl_dir);
                             let key = table_key(&db_name, &table_name);
@@ -339,15 +367,15 @@ impl SegmentManager {
                 .is_some_and(|registry| registry.segment_overlay(reader_txn_id, path).is_some())
     }
 
-    fn pubsub(&self) -> Option<std::sync::Arc<crate::pubsub::PubSubHub>> {
+    pub(super) fn pubsub(&self) -> Option<std::sync::Arc<crate::pubsub::PubSubHub>> {
         self.pubsub.get().cloned()
     }
 
-    fn min_segment_seal_size(&self) -> u64 {
+    pub(super) fn min_segment_seal_size(&self) -> u64 {
         self.config.min_segment_size
     }
 
-    fn max_segment_size(&self) -> u64 {
+    pub(super) fn max_segment_size(&self) -> u64 {
         self.config.max_segment_size
     }
 
@@ -359,24 +387,38 @@ impl SegmentManager {
         let mgr_clone = Arc::clone(mgr);
         let stop = mgr.flush_stop.clone();
         let paused = mgr.flush_paused.clone();
-        std::thread::Builder::new()
-            .name("taibai-flush".into())
-            .spawn(move || {
-                while !stop.load(Ordering::Acquire) {
-                    std::thread::sleep(std::time::Duration::from_secs(FLUSH_CHECK_INTERVAL_SECS));
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if paused.load(Ordering::Acquire) {
-                        tracing::debug!("flush thread paused, skipping periodic check");
-                        continue;
-                    }
-                    if let Err(e) = mgr_clone.periodic_flush_check() {
-                        tracing::warn!(error = %e, "periodic flush check failed");
-                    }
-                }
-            })
-            .expect("failed to spawn flush thread");
+        let body_stop = Arc::clone(&stop);
+        let body = move || {
+            // One supervised round = one iteration of the original polling
+            // loop. The supervisor (audit P1-5) catches a panicking
+            // `periodic_flush_check` — e.g. a poisoned-lock `unwrap` — logs
+            // it and retries with backoff instead of leaving periodic
+            // sealing silently dead until process restart.
+            crate::common::thread_supervisor::sleep_interruptibly(
+                &body_stop,
+                Duration::from_secs(FLUSH_CHECK_INTERVAL_SECS),
+            );
+            if body_stop.load(Ordering::Acquire) {
+                return;
+            }
+            if paused.load(Ordering::Acquire) {
+                tracing::debug!("flush thread paused, skipping periodic check");
+                return;
+            }
+            if let Err(e) = mgr_clone.periodic_flush_check() {
+                tracing::warn!(error = %e, "periodic flush check failed");
+            }
+        };
+        // The supervisor shares `flush_stop`, so `SegmentManager::shutdown`
+        // stops the loop exactly as before supervision; the returned handle
+        // detaches (dropped here), matching the previous discarded
+        // JoinHandle. Pause/resume semantics are unchanged: the flag is
+        // re-read at the top of every round.
+        let _ = crate::common::thread_supervisor::spawn_supervised_with_stop(
+            "taibai-flush",
+            stop,
+            body,
+        );
     }
 
     pub fn shutdown(&self) {
@@ -437,34 +479,63 @@ impl SegmentManager {
     /// installs, and removal-only paths do not). Unique index snapshots
     /// stamped with the previous epoch are potentially incomplete and must
     /// be refreshed before probing.
+    ///
+    /// The global epoch lock only covers the in-memory bump — the file write
+    /// runs outside it, serialized per table through a stripe lock — so one
+    /// table's `fsync` no longer blocks every other table's epoch reads.
     pub fn note_segments_changed(&self, db: &str, table: &str) {
         let key = table_key(db, table);
         let path = self.flush_epoch_file_path(db, table);
-        let mut epochs = self.flush_epochs.write().unwrap();
-        let current = epochs
-            .get(&key)
+        {
+            let mut epochs = self.flush_epochs.write().unwrap();
+            let current = epochs
+                .get(&key)
+                .copied()
+                .unwrap_or_else(|| read_flush_epoch_file(&path));
+            let next = current.saturating_add(1);
+            epochs.insert(key.clone(), next);
+        }
+        self.persist_flush_epoch(&key, &path);
+    }
+
+    /// Persist the table's epoch file outside the global epoch lock.
+    ///
+    /// Same-table persistence is serialized by a stripe mutex, and the value
+    /// written is re-read from memory INSIDE that mutex, so a concurrent
+    /// newer bump always wins and the file never regresses (a bump's own
+    /// value may be superseded before it reaches disk — persisting the newer
+    /// one implies it). Losing the very last persistence to a crash is
+    /// acceptable by design: restart restores the epoch from the file, the
+    /// only lost value is the in-memory maximum, and the sole consequence is
+    /// one extra index-snapshot invalidation after the next write.
+    fn persist_flush_epoch(&self, key: &str, path: &Path) {
+        let _stripe = flush_epoch_persist_lock(key)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let value = self
+            .flush_epochs
+            .read()
+            .unwrap()
+            .get(key)
             .copied()
-            .unwrap_or_else(|| read_flush_epoch_file(&path));
-        let next = current.saturating_add(1);
+            .unwrap_or_else(|| read_flush_epoch_file(path));
         if let Some(parent) = path.parent() {
             // tmp+rename: a torn in-place overwrite of the epoch file made
             // it fall back to 0 on read, wrongly marking index snapshots as
             // stale (or fresh) after a crash.
             let tmp = path.with_extension("epoch.tmp");
             if let Err(error) = std::fs::create_dir_all(parent).and_then(|_| {
-                std::fs::write(&tmp, next.to_string())?;
-                std::fs::rename(&tmp, &path)
+                std::fs::write(&tmp, value.to_string())?;
+                std::fs::rename(&tmp, path)
             }) {
                 let _ = std::fs::remove_file(&tmp);
                 tracing::error!(
-                    db,
-                    table,
+                    key,
                     error = %error,
                     "failed to persist memtable flush epoch; in-memory epoch still advanced"
                 );
             }
         }
-        epochs.insert(key, next);
     }
 
     /// Bump the content epoch for the table owning `path`, derived from the
@@ -541,7 +612,7 @@ impl SegmentManager {
         f()
     }
 
-    fn get_or_create_state(&self, key: &str) -> Arc<TableSegmentState> {
+    pub(super) fn get_or_create_state(&self, key: &str) -> Arc<TableSegmentState> {
         {
             let tables = self.tables.read().unwrap();
             if let Some(state) = tables.get(key) {
@@ -565,7 +636,9 @@ impl SegmentManager {
     }
 
     /// Effective level for the table right now: its DDL override, or the
-    /// global configured level when unset.
+    /// global configured level when unset. Test-only observation point —
+    /// production writers resolve through `table_compression_level_for_path`.
+    #[cfg(test)]
     pub(crate) fn table_compression_level(&self, db: &str, table: &str) -> i32 {
         let key = table_key(db, table);
         let tables = self.tables.read().unwrap();
@@ -578,7 +651,7 @@ impl SegmentManager {
     /// Same resolution, keyed by any path inside the table directory (a
     /// segment file or the dir itself). Used by writers that only carry a
     /// path, e.g. recovery and standalone tail-flush segments.
-    fn table_compression_level_for_path(&self, path: &Path) -> Result<i32> {
+    pub(super) fn table_compression_level_for_path(&self, path: &Path) -> Result<i32> {
         let key = self.table_state_key_from_dir(path)?;
         let tables = self.tables.read().unwrap();
         let override_level = tables
@@ -662,6 +735,21 @@ impl SegmentManager {
         table_dir: &Path,
     ) -> Result<u64> {
         self.with_table_mutation_lock(db, table, || {
+            // Same pin gate as compaction/TTL/DDL: an open transaction's
+            // deferred tombstones reference segment paths, and deleting a
+            // fully-deleted segment under them left that COMMIT retrying a
+            // vanished path forever.
+            if self
+                .txn_mutations()
+                .is_some_and(|registry| registry.table_has_pins(db, table))
+            {
+                tracing::debug!(
+                    db,
+                    table,
+                    "table pinned by an open transaction, skipping fully-deleted cleanup"
+                );
+                return Ok(0);
+            }
             let mut removed = 0u64;
             for path in self.discover_inactive_segments(db, table, table_dir)? {
                 let reader = self.open_reader_cached(&path)?;
@@ -682,6 +770,17 @@ impl SegmentManager {
         let segments = Self::discover_segments(table_dir)?;
 
         for seg_path in segments.iter().rev() {
+            // This search serves the unpartitioned bucket (empty partition
+            // key, regular `seg_*.dat` files) and unpartitioned tables.
+            // Partition files must be skipped: appending NULL-key rows to a
+            // `p<key>_*.dat` segment silently relocates them into a named
+            // partition, where filename-based partition pruning then hides
+            // them from every range-bounded scan.
+            if let Some(name) = seg_path.file_name().and_then(|n| n.to_str()) {
+                if crate::storage::partition::is_partition_segment(name) {
+                    continue;
+                }
+            }
             // A path excluded here is mid-seal outside the locks: its footer
             // is about to be finalized by its own seal, so it must never be
             // resumed for append or reported as an append target.
@@ -713,9 +812,26 @@ impl SegmentManager {
     }
 
     pub fn next_segment_path(&self, table_dir: &Path, _partition_key: &str) -> Result<PathBuf> {
-        let state = self.get_or_create_state_for_table_dir(table_dir)?;
-        let seq = state.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        Ok(table_dir.join(store::regular_segment_filename(seq)))
+        loop {
+            let state = self.get_or_create_state_for_table_dir(table_dir)?;
+            let seq = state.seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let path = table_dir.join(store::regular_segment_filename(seq));
+            if !path.exists() {
+                return Ok(path);
+            }
+            // The in-process counter fell behind the directory — a scan-based
+            // allocation (compaction replacement) owns this sequence. Reseed
+            // from the on-disk truth and retry; opening with truncate would
+            // silently destroy the replacement segment.
+            let dir_max = store::max_segment_seq_by_scan(table_dir, None)?;
+            tracing::warn!(
+                seq,
+                dir_max,
+                table_dir = %table_dir.display(),
+                "segment sequence collision; reseeding counter from directory"
+            );
+            state.seq.fetch_max(dir_max, Ordering::Relaxed);
+        }
     }
 
     pub fn next_partition_segment_path(
@@ -723,14 +839,31 @@ impl SegmentManager {
         table_dir: &Path,
         partition_key: &str,
     ) -> Result<PathBuf> {
-        let state = self.get_or_create_state_for_table_dir(table_dir)?;
-        let seq = {
+        loop {
+            let state = self.get_or_create_state_for_table_dir(table_dir)?;
+            let seq = {
+                let mut partition_seq = state.partition_seq.lock().unwrap();
+                let entry = partition_seq.entry(partition_key.to_string()).or_insert(0);
+                *entry += 1;
+                *entry
+            };
+            let path = table_dir.join(store::partition_segment_filename(partition_key, seq));
+            if !path.exists() {
+                return Ok(path);
+            }
+            let dir_max = store::max_segment_seq_by_scan(table_dir, Some(partition_key))?;
+            tracing::warn!(
+                seq,
+                dir_max,
+                partition_key,
+                table_dir = %table_dir.display(),
+                "partition segment sequence collision; reseeding counter from directory"
+            );
             let mut partition_seq = state.partition_seq.lock().unwrap();
-            let entry = partition_seq.entry(partition_key.to_string()).or_insert(0);
-            *entry += 1;
-            *entry
-        };
-        Ok(table_dir.join(store::partition_segment_filename(partition_key, seq)))
+            if let Some(entry) = partition_seq.get_mut(partition_key) {
+                *entry = (*entry).max(dir_max);
+            }
+        }
     }
 
     pub fn next_replacement_segment_path(
@@ -738,7 +871,36 @@ impl SegmentManager {
         table_dir: &Path,
         partition_key: Option<&str>,
     ) -> Result<PathBuf> {
-        store::next_segment_path_by_scan(table_dir, partition_key)
+        let path = store::next_segment_path_by_scan(table_dir, partition_key)?;
+        // Fold the scan-based allocation back into the in-process counters so
+        // `next_segment_path`/`next_partition_segment_path` can never hand out
+        // the same sequence again (their `truncate`-on-create would destroy
+        // this replacement segment). Failure to sync is non-fatal: the
+        // exists-check loop in the counter allocators still self-heals.
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            let seq = match partition_key {
+                Some(key) => store::parse_partition_seq(name, key),
+                None => store::parse_regular_seq(name),
+            };
+            if let Some(seq) = seq {
+                if let Ok(state) = self.get_or_create_state_for_table_dir(table_dir) {
+                    match partition_key {
+                        Some(key) => {
+                            let mut partition_seq = state.partition_seq.lock().unwrap();
+                            if let Some(entry) = partition_seq.get_mut(key) {
+                                *entry = (*entry).max(seq);
+                            } else {
+                                partition_seq.insert(key.to_string(), seq);
+                            }
+                        }
+                        None => {
+                            state.seq.fetch_max(seq, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(path)
     }
 
     pub fn open_reader(&self, path: &Path) -> Result<SegmentReader> {
@@ -772,7 +934,17 @@ impl SegmentManager {
             let reader = std::sync::Arc::new(self.open_mutable_reader_owned(path)?);
             let mut cache = self.mutable_reader_cache.lock().unwrap();
             if cache.len() >= reader_cache_capacity().max(1) * 4 {
-                cache.clear();
+                // Evict ONE entry instead of clearing the whole cache: a full
+                // clear made every other active segment's next read pay a
+                // full reopen + footer parse at once. The cache field is a
+                // plain `HashMap` (defined with the struct, no order kept),
+                // so the victim is the first entry in iteration order — any
+                // single eviction bounds growth, and cache correctness never
+                // depended on the choice: `invalidate_reader` evicts on every
+                // visibility change regardless.
+                if let Some(victim) = cache.keys().next().cloned() {
+                    cache.remove(&victim);
+                }
             }
             cache.insert(path.to_path_buf(), reader.clone());
             return Ok(reader);
@@ -782,20 +954,41 @@ impl SegmentManager {
             return Ok(reader);
         }
 
-        let reader = match if self.requires_owned_reader(path) {
-            SegmentReader::open_owned(path)
+        // The reader cache is bounded by BYTES, not entry count: owned
+        // readers hold a full heap copy of the file, so before a5b116b's
+        // smaller replacement segments the count-bounded cache could retain
+        // `capacity` copies of up to ~255 MB each. Charge each entry by its
+        // real footprint — file length for owned readers, a small fixed
+        // constant for mmap readers (whose mapping lives in the page cache).
+        let (reader, owned) = if self.requires_owned_reader(path) {
+            match SegmentReader::open_owned(path) {
+                Ok(reader) => (reader, true),
+                Err(err) if is_transient_footer_error(&err) => {
+                    (self.open_mutable_reader_owned(path)?, true)
+                }
+                Err(err) => return Err(err),
+            }
         } else {
-            SegmentReader::open(path)
-        } {
-            Ok(reader) => reader,
-            Err(err) if is_transient_footer_error(&err) => self.open_mutable_reader_owned(path)?,
-            Err(err) => return Err(err),
+            match SegmentReader::open(path) {
+                Ok(reader) => (reader, false),
+                Err(err) if is_transient_footer_error(&err) => {
+                    (self.open_mutable_reader_owned(path)?, true)
+                }
+                Err(err) => return Err(err),
+            }
+        };
+        let cost_bytes = if owned {
+            std::fs::metadata(path)
+                .map(|meta| meta.len())
+                .unwrap_or(reader_cache::AVG_READER_COST_BYTES)
+        } else {
+            reader_cache::AVG_READER_COST_BYTES
         };
         Ok(self
             .reader_cache
             .lock()
             .unwrap()
-            .put(path.to_path_buf(), reader))
+            .put(path.to_path_buf(), reader, cost_bytes))
     }
 
     /// True when the active segment for `path` has appended rows that are not
@@ -857,46 +1050,91 @@ impl SegmentManager {
 
     /// Read-side metadata cache for a sealed segment's cluster-key column zone map.
     ///
-    /// Returns the cached zone map for `col_idx` in `path`, deriving and caching it
-    /// on first access. Returns `None` when the segment has no usable bounds for the
-    /// column (empty/null). Mutable (unsealed) segments are never cached because their
-    /// footer can still change. The cache shares the reader-cache invalidation
-    /// lifecycle, so compaction/seal/delete automatically clears stale entries.
+    /// Returns the cached zone map for the catalog column `col_idx` (resolved
+    /// against `table_schema`) in `path`, deriving and caching it on first
+    /// access. Returns `None` when the segment has no usable bounds for the
+    /// column (empty/null) or the footer predates the column. Mutable
+    /// (unsealed) segments are never cached because their footer can still
+    /// change. The cache shares the reader-cache invalidation lifecycle, so
+    /// compaction/seal/delete automatically clears stale entries.
     pub fn cluster_zone_map_cached(
         &self,
         path: &Path,
+        table_schema: &crate::types::batch::Schema,
         col_idx: usize,
     ) -> Option<crate::storage::partition::pruning::ZoneMap> {
+        // Resolve the catalog column to the footer index BY NAME. Positional
+        // use of the catalog index reads the wrong physical column once a
+        // DROP/RENAME COLUMN shifts catalog indices while sealed footers
+        // keep their layout — pruning then skips segments that hold matching
+        // rows. The footer index also keys the cache: for a fixed segment
+        // file it identifies the physical column, so post-DDL lookups land
+        // on a fresh key instead of a stale entry.
+        let footer_idx = self.resolve_footer_column_index(path, table_schema, col_idx)?;
         if self.is_mutable_segment_path(path) {
-            return self.derive_cluster_zone_map(path, col_idx);
+            return self.derive_cluster_zone_map(path, footer_idx);
         }
 
-        if let Some(cached) = self.cluster_meta_cache.lock().unwrap().get(path, col_idx) {
+        if let Some(cached) = self
+            .cluster_meta_cache
+            .lock()
+            .unwrap()
+            .get(path, footer_idx)
+        {
             return cached;
         }
 
-        let derived = self.derive_cluster_zone_map(path, col_idx);
-        self.cluster_meta_cache
-            .lock()
-            .unwrap()
-            .put(path.to_path_buf(), col_idx, derived.clone());
+        let derived = self.derive_cluster_zone_map(path, footer_idx);
+        self.cluster_meta_cache.lock().unwrap().put(
+            path.to_path_buf(),
+            footer_idx,
+            derived.clone(),
+        );
         derived
     }
 
+    /// Translate a catalog column index into the segment's footer index by
+    /// name (current name first, then the column's historical names), so
+    /// positional metadata access below lands on the right physical column.
+    fn resolve_footer_column_index(
+        &self,
+        path: &Path,
+        table_schema: &crate::types::batch::Schema,
+        catalog_idx: usize,
+    ) -> Option<usize> {
+        let column = table_schema.columns.get(catalog_idx)?;
+        if let Some(meta) = self.segment_meta(path).ok().flatten() {
+            let mut names = Vec::with_capacity(column.previous_names.len() + 1);
+            names.push(column.name.as_str());
+            names.extend(column.previous_names.iter().map(String::as_str));
+            return names
+                .iter()
+                .find_map(|name| meta.footer_schema().index_of(name));
+        }
+        let reader = self.open_reader_cached(path).ok()?;
+        let mut names = Vec::with_capacity(column.previous_names.len() + 1);
+        names.push(column.name.as_str());
+        names.extend(column.previous_names.iter().map(String::as_str));
+        names.iter().find_map(|name| reader.schema().index_of(name))
+    }
+
+    /// Positional zone-map access in FOOTER space: `footer_idx` must already
+    /// have been translated from the catalog index by name (see
+    /// [`Self::resolve_footer_column_index`]).
     fn derive_cluster_zone_map(
         &self,
         path: &Path,
-        col_idx: usize,
+        footer_idx: usize,
     ) -> Option<crate::storage::partition::pruning::ZoneMap> {
         if let Some(meta) = self.segment_meta(path).ok().flatten() {
-            let zm = meta.segment_zone_maps.get(col_idx)?;
+            let zm = meta.footer_zone_maps().get(footer_idx)?;
             if zm.row_count == 0 || zm.min_value.is_null() || zm.max_value.is_null() {
                 return None;
             }
             return Some(zm.clone());
         }
         let reader = self.open_reader_cached(path).ok()?;
-        let zm = reader.segment_zone_maps().get(col_idx)?;
+        let zm = reader.segment_zone_maps().get(footer_idx)?;
         if zm.row_count == 0 || zm.min_value.is_null() || zm.max_value.is_null() {
             return None;
         }
@@ -1000,7 +1238,27 @@ impl SegmentManager {
         bitmap: &[u8],
         deleted_count: u64,
     ) -> Result<()> {
-        let result = self.rewrite_delete_footer_inner(path, bitmap, deleted_count);
+        self.rewrite_delete_footer_with_mode(
+            path,
+            bitmap,
+            deleted_count,
+            FooterRewriteMode::Immediate,
+        )
+    }
+
+    /// Rewrite a segment's delete footer under the chosen journal lifecycle:
+    /// Immediate (single-leg statements, journal cleared on landing) or
+    /// Deferred (multi-leg statements — the journal also carries the undo
+    /// footer and the image watermark and is cleared by the caller once the
+    /// other legs are durable).
+    pub fn rewrite_delete_footer_with_mode(
+        &self,
+        path: &Path,
+        bitmap: &[u8],
+        deleted_count: u64,
+        mode: FooterRewriteMode,
+    ) -> Result<()> {
+        let result = self.rewrite_delete_footer_inner(path, bitmap, deleted_count, mode);
         if result.is_ok() {
             // Deleted rows changed this segment's visible content: bump the
             // epoch here so no caller can forget (a crash between the
@@ -1017,6 +1275,7 @@ impl SegmentManager {
         path: &Path,
         bitmap: &[u8],
         deleted_count: u64,
+        mode: FooterRewriteMode,
     ) -> Result<()> {
         let mutable = self.is_mutable_segment_path(path);
         self.invalidate_reader(path);
@@ -1029,7 +1288,7 @@ impl SegmentManager {
             // first also guarantees the embedded footer we rewrite from is
             // current.
             let Some(state) = self.state_for_segment_path(path) else {
-                SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
+                SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count, mode)?;
                 remove_sidecar_meta(path)?;
                 return Ok(());
             };
@@ -1045,7 +1304,7 @@ impl SegmentManager {
                     break;
                 }
             }
-            SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
+            SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count, mode.clone())?;
             let footer = read_embedded_footer(path)?;
             append_sidecar_footer(path, footer.data_end, &footer.footer)?;
             for segment in active_guard.values_mut() {
@@ -1058,7 +1317,7 @@ impl SegmentManager {
             }
             return Ok(());
         }
-        SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
+        SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count, mode)?;
         remove_sidecar_meta(path)?;
         Ok(())
     }
@@ -1426,6 +1685,7 @@ impl SegmentManager {
         let mut writer = SegmentWriter::create(path, schema, row_group_size, compression_level)?;
         writer.write_batch(batch)?;
         writer.seal()?;
+        self.note_direct_segment_write(path);
         Ok(())
     }
 
@@ -1437,36 +1697,55 @@ impl SegmentManager {
         batches: &[std::sync::Arc<RecordBatch>],
         compression_level: i32,
     ) -> Result<()> {
-        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
-        let mut combined = RecordBatch::with_capacity(schema.clone(), total_rows);
+        // Validate up front so a malformed batch cannot leave a half-written
+        // segment behind (the merge-based version validated before creating
+        // the file).
         for batch in batches {
-            if batch.num_columns() != combined.num_columns() {
+            if batch.num_columns() != schema.num_columns() {
                 return Err(TaibaiError::Storage(format!(
                     "replacement batch has {} columns, expected {}",
                     batch.num_columns(),
-                    combined.num_columns()
+                    schema.num_columns()
                 )));
             }
-            for column_idx in 0..combined.num_columns() {
-                combined
-                    .column_mut(column_idx)
-                    .expect("validated replacement column")
-                    .extend(
-                        batch
-                            .column(column_idx)
-                            .expect("validated replacement source column"),
-                    )?;
-            }
         }
+        // Feed the batches to the writer one by one: `write_batch` buffers a
+        // partially-filled row group across calls, so the row-group layout is
+        // identical to the old merge-everything-first approach, without the
+        // full-payload copy into a combined batch.
         let mut writer = SegmentWriter::create(path, schema, row_group_size, compression_level)?;
-        if combined.num_rows() > 0 {
-            writer.write_batch(&combined)?;
+        for batch in batches {
+            writer.write_batch(batch)?;
         }
         writer.seal()?;
+        self.note_direct_segment_write(path);
         Ok(())
     }
 
-    fn table_states_snapshot(&self) -> Vec<Arc<TableSegmentState>> {
+    /// A direct segment write bypassed every index-maintenance primitive, so
+    /// unique-index snapshots stamped with the previous epoch are potentially
+    /// INCOMPLETE (they cannot know these rows' keys). Bumping the epoch here
+    /// forces the next probe to refresh from the segments — without it, a
+    /// directly-seeded table's empty-but-"fresh" snapshot wrongly answered
+    /// "key absent" to uniqueness probes.
+    fn note_direct_segment_write(&self, path: &Path) {
+        let Some(table_dir) = path.parent() else {
+            return;
+        };
+        let Ok(relative) = table_dir.strip_prefix(&self.data_dir) else {
+            return;
+        };
+        let mut components = relative.components();
+        let (Some(db), Some(table)) = (components.next(), components.next()) else {
+            return;
+        };
+        self.note_segments_changed(
+            &db.as_os_str().to_string_lossy(),
+            &table.as_os_str().to_string_lossy(),
+        );
+    }
+
+    pub(super) fn table_states_snapshot(&self) -> Vec<Arc<TableSegmentState>> {
         self.tables.read().unwrap().values().cloned().collect()
     }
 
@@ -1641,7 +1920,7 @@ fn acquire_mutation_lock<'a>(
 /// wait. A long-held partition lock (slow partition-scoped mutation) must
 /// surface as an explicit timeout instead of freezing every partition
 /// writer behind the raised gate for the same duration.
-fn acquire_partition_lock_for_wide_gate<'a>(
+pub(super) fn acquire_partition_lock_for_wide_gate<'a>(
     lock: &'a std::sync::Mutex<()>,
     key: &str,
     partition_key: &str,
@@ -1676,7 +1955,7 @@ fn acquire_partition_lock_for_wide_gate<'a>(
 /// Clone (or lazily create) the partition's mutation lock. The Arc is owned
 /// by the caller's scope so the subsequent `MutexGuard` borrows a stable
 /// local instead of registry internals.
-fn partition_mutation_lock_arc(
+pub(super) fn partition_mutation_lock_arc(
     state: &TableSegmentState,
     partition_key: &str,
 ) -> Arc<std::sync::Mutex<()>> {
@@ -1697,7 +1976,7 @@ fn partition_mutation_lock_arc(
 /// mutex the writer re-checks the table's wide-gate flag: a table-wide
 /// mutation operation that has already snapshotted this partition holds the
 /// mutex, so the writer releases and retries until the gate clears.
-fn acquire_partition_mutation_lock<'a>(
+pub(super) fn acquire_partition_mutation_lock<'a>(
     state: &TableSegmentState,
     lock: &'a std::sync::Mutex<()>,
     key: &str,
@@ -1894,16 +2173,6 @@ fn read_replace_journal(journal: &Path) -> Option<Vec<PathBuf>> {
     Some(olds)
 }
 
-/// Test-only re-exports of the replacement journal internals.
-#[cfg(test)]
-pub mod manager_core_test_support {
-    pub(crate) use super::{
-        recover_replace_journals as recover_replace_journals_for_test,
-        replace_journal_path as replace_journal_path_for_test,
-        write_replace_journal as write_replace_journal_for_test,
-    };
-}
-
 /// `<data>/<db>/<table>/<segment>` path -> `(db, table)`.
 fn db_table_from_segment_path(path: &Path) -> Option<(String, String)> {
     let table = path.parent()?.file_name()?.to_string_lossy().to_string();
@@ -1914,4 +2183,15 @@ fn db_table_from_segment_path(path: &Path) -> Option<(String, String)> {
         .to_string_lossy()
         .to_string();
     Some((db, table))
+}
+use crate::storage::segment::reader::FooterRewriteMode;
+
+/// Test-only re-exports of the replacement journal internals.
+#[cfg(test)]
+pub mod manager_core_test_support {
+    pub(crate) use super::{
+        recover_replace_journals as recover_replace_journals_for_test,
+        replace_journal_path as replace_journal_path_for_test,
+        write_replace_journal as write_replace_journal_for_test,
+    };
 }

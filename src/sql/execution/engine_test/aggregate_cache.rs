@@ -144,3 +144,140 @@ fn metadata_aggregates_match_after_add_and_drop_column() -> Result<()> {
     );
     Ok(())
 }
+
+/// Runs a single-scalar COUNT query and returns its value.
+fn count_star(engine: &Engine, session: &mut Session, sql: &str) -> i64 {
+    let r = engine
+        .execute(session, sql)
+        .unwrap_or_else(|error| panic!("count query {sql:?} failed: {error}"));
+    first_i64_ref(&r, 0, 0)
+}
+
+/// Regression: `SELECT COUNT(*) WHERE <added column> = <default>` failed
+/// outright on segments predating the ADD COLUMN ("column not found in
+/// segment schema"). The SELECT scan and value aggregates already apply the
+/// default-fill semantics, so COUNT must too: old rows carry the DEFAULT,
+/// zone maps and projection alignment simply do not apply on those segments.
+/// Covers the single-eq fast path, the multi-predicate path, both with the
+/// new rows resident and after a second flush, the no-default (NULL) case,
+/// and the aggregate-pipeline pruning spot that shared the alignment error.
+#[test]
+fn count_star_with_predicate_on_added_column_matches_default_fill() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")?;
+    let mut sql = String::from("INSERT INTO t (id, v) VALUES ");
+    for i in 0..50i64 {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&format!("({}, {})", i + 1, i + 1));
+    }
+    engine.execute(&mut session, &sql)?;
+    engine.flush_table_buffers("main", "t")?;
+    engine.execute(
+        &mut session,
+        "ALTER TABLE t ADD COLUMN score INT64 DEFAULT 7",
+    )?;
+    // Post-ADD rows stay resident for the first assertions.
+    engine.execute(
+        &mut session,
+        "INSERT INTO t (id, v, score) VALUES (51, 51, 7), (52, 52, 8)",
+    )?;
+
+    // Single-eq fast path over the default-carrying segment.
+    assert_eq!(
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE score = 7"
+        ),
+        51,
+        "50 default rows + 1 new score=7 row"
+    );
+    assert_eq!(
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE score = 8"
+        ),
+        1
+    );
+    assert_eq!(
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE score = 99"
+        ),
+        0
+    );
+
+    // Multi-predicate path over the same segment.
+    assert_eq!(
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE score >= 7 AND id <= 50"
+        ),
+        50,
+        "old rows count through the default; range on id applies per row"
+    );
+
+    // Aggregate pipeline: the metadata segment prune used to fail the same
+    // alignment.
+    assert_eq!(
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(score) FROM t WHERE score = 7"
+        ),
+        51,
+    );
+
+    // After a second flush the new rows live in a segment that HAS the
+    // column, next to the old one that does not.
+    engine.flush_table_buffers("main", "t")?;
+    assert_eq!(
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE score = 7"
+        ),
+        51
+    );
+    assert_eq!(
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE score = 8"
+        ),
+        1
+    );
+    assert_eq!(
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE id <= 50"
+        ),
+        50
+    );
+    assert_eq!(
+        count_star(&engine, &mut session, "SELECT COUNT(*) FROM t"),
+        52
+    );
+
+    // A column added without a DEFAULT carries NULL on old rows, and NULL
+    // never satisfies '='.
+    engine.execute(&mut session, "ALTER TABLE t ADD COLUMN note VARCHAR")?;
+    assert_eq!(
+        count_star(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE note = 'x'"
+        ),
+        0
+    );
+    Ok(())
+}

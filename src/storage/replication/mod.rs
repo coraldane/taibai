@@ -16,8 +16,10 @@
 //!   standby on demand (`REPL_SEGMENT_FETCH`), so the in-memory event ring
 //!   holds metadata only.
 //!
-//! R1 scope cuts (documented in docs/operations/replication.md): DELETE,
-//! UPDATE, compaction, TTL and DDL events land in R2; a primary with
+//! R1 scope cuts (documented in docs/operations/replication.md):
+//! memtable DELETE/UPDATE sidecars ship as [`ReplicationEvent::TailMutation`]
+//! (segment-level tombstones as `DeleteFooterRewrite`, replacements as
+//! `SegmentsReplaced`); TTL and DDL events land in R2; a primary with
 //! `replication.enabled` rejects bulk/RELAXED direct writes (the only WAL
 //! bypass) and a standby engine is read-only.
 
@@ -60,6 +62,26 @@ pub enum ReplicationEvent {
         segment: String,
         kind: SegmentUpdateKind,
         memtable_ids: Vec<Uuid>,
+    },
+    /// A memtable-level mutation shipped as the EXACT sidecar bytes the
+    /// primary wrote (`.del` positions or `.upd` update set). The standby's
+    /// tail file holds the identical frame history, so replaying the same
+    /// sidecar generation applies the mutation to the same rows. Without
+    /// this event a standby kept serving deleted rows from its tail until
+    /// the next flush superseded it.
+    TailMutation {
+        db: String,
+        table: String,
+        memtable_id: Uuid,
+        /// `false` = delete positions, `true` = update set.
+        is_update: bool,
+        /// The primary's sidecar GENERATION SEQUENCE: the standby names its
+        /// copy identically, so a replayed event (crash before the seq
+        /// watermark persists) replaces the file instead of duplicating the
+        /// mutation — delete positions are not idempotent on their own.
+        sequence: u64,
+        /// The primary's encoded sidecar payload, verbatim.
+        payload: Vec<u8>,
     },
     /// DELETE tombstones materialized into a segment footer. The bitmap is
     /// the segment's ABSOLUTE delete state (not a delta), so standby apply
@@ -125,6 +147,7 @@ const TAG_SEGMENTS_REPLACED: u16 = 4;
 const TAG_SEGMENTS_REMOVED: u16 = 5;
 const TAG_CATALOG_SNAPSHOT: u16 = 6;
 const TAG_AUTH_SNAPSHOT: u16 = 7;
+const TAG_TAIL_MUTATION: u16 = 8;
 
 impl ReplicationEvent {
     pub fn encode(&self) -> Vec<u8> {
@@ -148,6 +171,23 @@ impl ReplicationEvent {
                 buf.extend_from_slice(&last_lsn.to_le_bytes());
                 buf.extend_from_slice(&(frames.len() as u32).to_le_bytes());
                 buf.extend_from_slice(frames);
+            }
+            Self::TailMutation {
+                db,
+                table,
+                memtable_id,
+                is_update,
+                sequence,
+                payload,
+            } => {
+                buf.extend_from_slice(&TAG_TAIL_MUTATION.to_le_bytes());
+                put_str(&mut buf, db);
+                put_str(&mut buf, table);
+                buf.extend_from_slice(memtable_id.as_bytes());
+                buf.push(u8::from(*is_update));
+                buf.extend_from_slice(&sequence.to_le_bytes());
+                buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                buf.extend_from_slice(payload);
             }
             Self::SegmentUpdate {
                 db,
@@ -272,6 +312,26 @@ impl ReplicationEvent {
                     memtable_ids,
                 })
             }
+            TAG_TAIL_MUTATION => {
+                let db = decoder.read_str("db")?;
+                let table = decoder.read_str("table")?;
+                let memtable_id =
+                    Uuid::from_slice(decoder.take(16, "memtable id")?).map_err(|error| {
+                        TaibaiError::Storage(format!("invalid memtable id: {error}"))
+                    })?;
+                let is_update = decoder.take(1, "is_update")?[0] != 0;
+                let sequence = decoder.read_u64()?;
+                let payload_len = decoder.read_u32()? as usize;
+                let payload = decoder.take(payload_len, "tail mutation payload")?.to_vec();
+                Ok(Self::TailMutation {
+                    db,
+                    table,
+                    memtable_id,
+                    is_update,
+                    sequence,
+                    payload,
+                })
+            }
             TAG_DELETE_FOOTER_REWRITE => {
                 let db = decoder.read_str("db")?;
                 let table = decoder.read_str("table")?;
@@ -330,6 +390,7 @@ impl ReplicationEvent {
     pub fn topic(&self) -> Option<(&str, &str)> {
         match self {
             Self::TailAppend { db, table, .. }
+            | Self::TailMutation { db, table, .. }
             | Self::SegmentUpdate { db, table, .. }
             | Self::DeleteFooterRewrite { db, table, .. }
             | Self::SegmentsReplaced { db, table, .. }
@@ -597,6 +658,31 @@ impl RepLog {
         if seq > self.persisted_seq.load(Ordering::Acquire) {
             self.persist_seq(seq);
         }
+        // A restart resumes next_seq from the durable file, which can lag a
+        // standby's applied watermark by up to `persist_every` events. Any
+        // events published in that gap carry seqs the standby already
+        // consumed, and every resume filter (events_after, the bridge, the
+        // standby's own dedup) silently drops them — the new data they carry
+        // is lost with no error. Re-stamp the surviving ring entries above
+        // the watermark: they were published after the restart, so they are
+        // causally new even though numerically stale. A standby that was
+        // behind the watermark now fails events_after explicitly and
+        // re-bootstraps instead of silently diverging.
+        let mut state = self.state.lock().unwrap();
+        if seq + 1 > state.next_seq {
+            let mut next = seq + 1;
+            for slot in state.ring.iter_mut() {
+                slot.0 = next;
+                next += 1;
+            }
+            tracing::warn!(
+                standby_applied = seq,
+                renumbered = state.ring.len(),
+                new_next_seq = next,
+                "replication seq fell behind a standby watermark (primary restarted on a stale seq file); ring re-stamped"
+            );
+            state.next_seq = next;
+        }
     }
 
     pub fn current_seq(&self) -> u64 {
@@ -722,119 +808,5 @@ impl AppliedSeqState {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn tail_event(table: &str) -> ReplicationEvent {
-        ReplicationEvent::TailAppend {
-            db: "main".into(),
-            table: table.into(),
-            partition: "2026".into(),
-            memtable_id: Uuid::new_v4(),
-            first_lsn: 1,
-            last_lsn: 2,
-            frames: vec![1, 2, 3, 4],
-        }
-    }
-
-    #[test]
-    fn event_codec_round_trips() {
-        for event in [
-            tail_event("t"),
-            ReplicationEvent::SegmentUpdate {
-                db: "main".into(),
-                table: "t".into(),
-                segment: "seg_00001.dat".into(),
-                kind: SegmentUpdateKind::Prefix,
-                memtable_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
-            },
-            ReplicationEvent::SegmentUpdate {
-                db: "main".into(),
-                table: "t".into(),
-                segment: "p2026_0001.dat".into(),
-                kind: SegmentUpdateKind::Final,
-                memtable_ids: Vec::new(),
-            },
-        ] {
-            let decoded = ReplicationEvent::decode(&event.encode()).unwrap();
-            assert_eq!(decoded, event);
-        }
-    }
-
-    #[test]
-    fn event_decode_rejects_truncated_and_unknown() {
-        let event = tail_event("t");
-        let bytes = event.encode();
-        assert!(ReplicationEvent::decode(&bytes[..bytes.len() - 1]).is_err());
-        let mut unknown = bytes.clone();
-        unknown[0..2].copy_from_slice(&999u16.to_le_bytes());
-        assert!(ReplicationEvent::decode(&unknown).is_err());
-        assert!(ReplicationEvent::decode(&[]).is_err());
-    }
-
-    #[test]
-    fn rep_log_sequences_ring_and_fans_out() {
-        let dir = tempfile::tempdir().unwrap();
-        // Capacity is floored at 16, so push past that to exercise eviction.
-        let log = RepLog::new(16, dir.path()).with_persist_every(u64::MAX);
-        let (tx, rx) = crossbeam_channel::bounded(64);
-        log.register_session(&tx);
-
-        let mut seqs = Vec::new();
-        for i in 0..20 {
-            seqs.push(log.publish(tail_event(&format!("t{i}"))));
-        }
-        assert_eq!(
-            seqs,
-            (1..=20).collect::<Vec<_>>(),
-            "seqs are dense and monotonic"
-        );
-        // Ring capacity 16: only seqs 5..=20 remain.
-        assert_eq!(log.events_after(4).unwrap().len(), 16);
-
-        // Resume inside the ring window works; beyond it errors.
-        assert_eq!(log.events_after(4).unwrap()[0].0, 5);
-        assert!(log.events_after(0).is_err(), "gap older than ring");
-
-        // Session removal, then close the channel: `rx.iter()` blocks until
-        // every sender is gone.
-        log.remove_session(&tx);
-        assert_eq!(log.session_count(), 0);
-        drop(tx);
-        let received: Vec<u64> = rx.iter().map(|(seq, _)| seq).collect();
-        assert_eq!(received, seqs);
-    }
-
-    #[test]
-    fn applied_seq_state_persists_and_advances_monotonically() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let state = AppliedSeqState::load(dir.path());
-            assert_eq!(state.applied(), 0);
-            state.advance(5, false).unwrap();
-            assert_eq!(state.applied(), 5, "force on first advance below threshold");
-            state.advance(7, false).unwrap();
-            assert_eq!(state.applied(), 5, "below persist-every threshold");
-            state.advance(9, true).unwrap();
-            assert_eq!(state.applied(), 9);
-        }
-        let reloaded = AppliedSeqState::load(dir.path());
-        assert_eq!(reloaded.applied(), 9);
-    }
-
-    #[test]
-    fn rep_log_resumes_after_persisted_seq() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let log = RepLog::new(64, dir.path()).with_persist_every(1);
-            log.publish(tail_event("t"));
-            log.publish(tail_event("t"));
-            assert_eq!(log.persisted_seq(), 2);
-            log.flush_seq();
-        }
-        let reopened = RepLog::new(64, dir.path()).with_persist_every(u64::MAX);
-        assert_eq!(reopened.current_seq(), 2, "seq resumes after restart");
-        assert_eq!(reopened.persisted_seq(), 2);
-        assert_eq!(reopened.publish(tail_event("t")), 3);
-    }
-}
+#[path = "replication_test.rs"]
+mod tests;

@@ -400,8 +400,7 @@ fn run_parallel_ingest(
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(PARSE_THREADS_MAX)
-        .max(1);
+        .clamp(1, PARSE_THREADS_MAX);
 
     let (seg_tx, seg_rx) = std::sync::mpsc::sync_channel::<CsvSegment>(4);
     let (batch_tx, batch_rx) = std::sync::mpsc::sync_channel::<IngestMsg>(32);

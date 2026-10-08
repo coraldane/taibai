@@ -139,6 +139,43 @@ fn compact_replace_key_index_drops_entry_on_state_mismatch() {
 }
 
 #[test]
+fn get_flushable_by_table_excludes_transactional_and_pinned_memtables() {
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let manager = MemTableManager::new(10_000, 0, 2, 3600);
+    let registry = Arc::new(crate::storage::core::txn_mutations::TxnMutationRegistry::new());
+    manager.set_txn_mutations(Arc::clone(&registry));
+
+    // Three candidates on one table: a plain committed memtable, an
+    // uncommitted transaction's memtable, and a committed memtable pinned by
+    // a live deferred-DML transaction.
+    let plain = manager.get_or_create("main", "t", "", &schema);
+    plain.append(&batch(&schema, &[1])).unwrap();
+    let txn = manager.get_or_create_with_txn("main", "t", "", &schema, 7);
+    txn.append(&batch(&schema, &[2])).unwrap();
+    let pinned = manager.get_or_create("main", "t", "p1", &schema);
+    pinned.append(&batch(&schema, &[3])).unwrap();
+    registry
+        .register_memtable_tombstones(9, "main", "t", None, Arc::clone(&pinned), [0u32])
+        .unwrap();
+
+    // The shared flush choke point must keep only the plain memtable:
+    // flushing the transactional one would publish uncommitted rows as plain
+    // segment rows (ROLLBACK cannot retract them), and flushing the pinned
+    // one would break that transaction's COMMIT.
+    let flushable = manager.get_flushable_by_table("main", "t");
+    assert_eq!(flushable.len(), 1);
+    assert_eq!(flushable[0].id(), plain.id());
+    assert!(manager.get_flushable_by_table("main", "other").is_empty());
+
+    // FLUSH ALL / shutdown / pressure passes collect through get_all_pending
+    // and must carry the same exclusions.
+    let all = manager.get_all_pending();
+    assert!(all.iter().all(|mt| mt.id() != txn.id()));
+    assert!(all.iter().all(|mt| mt.id() != pinned.id()));
+    assert!(all.iter().any(|mt| mt.id() == plain.id()));
+}
+
+#[test]
 fn low_rate_memtable_uses_extended_age_before_becoming_flushable() {
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
     let manager = MemTableManager::new(10_000, 0, 2, 3600);

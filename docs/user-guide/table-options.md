@@ -112,7 +112,7 @@ CREATE TABLE md_snapshot (
 ) HOT BY (ts) INDEX(symbol) CLOSE AT '15:00';
 ```
 
-`HOT KEEP N DAYS` 语法已不再支持。语义细节见[实时 tick 内存态设计](../design/realtime-tick-inmemory-design.md)。
+`HOT KEEP N DAYS` 语法已不再支持，解析器会明确报错。热存数据在重启后走惰性恢复（只登记索引不物化数据）。
 
 ## DURABILITY
 

@@ -1,5 +1,6 @@
 use crate::sql::planner::*;
 
+use super::join_projection::prune_join_under_filters;
 use super::Rule;
 
 pub struct ColumnPruningRule;
@@ -32,7 +33,18 @@ fn prune_columns(plan: LogicalPlan) -> (LogicalPlan, bool) {
                     (LogicalPlan::Scan(scan), false)
                 }
             } else {
-                prune_columns(*proj.input)
+                // Join-bearing inputs: propagate the required columns into
+                // each join SIDE's scan (plus the condition's own columns),
+                // so both sides decode only what the join and its consumers
+                // reference — previously every join query decoded every
+                // column of every row group on both sides. Falls back to the
+                // generic recursion when no join sits under the filter chain.
+                let (joined, join_changed) = prune_join_under_filters(*proj.input, &all_used);
+                if join_changed {
+                    (joined, true)
+                } else {
+                    prune_columns(joined)
+                }
             };
 
             (
@@ -91,4 +103,10 @@ fn collect_filter_cols(plan: &LogicalPlan, cols: &mut Vec<usize>) {
         LogicalPlan::Project(p) => collect_filter_cols(&p.input, cols),
         _ => {}
     }
+}
+
+/// Test-only entry: the full rule pass over a plan.
+#[cfg(test)]
+pub(crate) fn test_prune(plan: LogicalPlan) -> (LogicalPlan, bool) {
+    prune_columns(plan)
 }

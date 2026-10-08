@@ -49,12 +49,8 @@ fn spawn_test_connection_with_limiter_and_config(
     config: Arc<ServerConfig>,
 ) -> (Framed<DuplexStream, MessageCodec>, JoinHandle<Result<()>>) {
     let (server_stream, client_stream) = tokio::io::duplex(1024 * 1024);
-    let server = tokio::spawn(handle_framed(
-        server_stream,
-        config,
-        engine,
-        request_limiter,
-    ));
+    let limiters = RequestLimiters::from_shared(request_limiter);
+    let server = tokio::spawn(handle_framed(server_stream, config, engine, limiters));
     let client = Framed::new(client_stream, MessageCodec::new(MAX_MESSAGE_SIZE));
     (client, server)
 }
@@ -201,12 +197,14 @@ async fn bulk_import_sessions_survive_the_regular_idle_timeout() {
     config.server.bulk_import_idle_timeout_secs = 0;
     let config = Arc::new(config);
 
-    // 基线：常规连接空闲 1 秒即被断开。
+    // 基线：常规连接空闲 1 秒即被断开。断言窗口放宽到 10s：并行测试
+    // 负载下 tokio 调度饥饿会让 1s 定时器的实际触发漂移好几秒，被测
+    // 契约是"会断开"，不是"恰好在第 N 毫秒断开"。
     let (mut plain, plain_server) =
         spawn_test_connection_with_config(Arc::clone(&engine), Arc::clone(&config));
     login(&mut plain, "root").await;
     tokio::time::sleep(Duration::from_millis(1300)).await;
-    timeout(Duration::from_secs(2), plain_server)
+    timeout(Duration::from_secs(10), plain_server)
         .await
         .expect("regular idle connection should be closed")
         .unwrap()
@@ -217,7 +215,7 @@ async fn bulk_import_sessions_survive_the_regular_idle_timeout() {
     let (mut bulk, bulk_server) = spawn_test_connection_with_config(engine, config);
     login(&mut bulk, "root").await;
     bulk.send(query("START BULK IMPORT")).await.unwrap();
-    let started = timeout(Duration::from_secs(2), bulk.next())
+    let started = timeout(Duration::from_secs(10), bulk.next())
         .await
         .expect("bulk import should start")
         .unwrap()
@@ -234,7 +232,8 @@ async fn bulk_import_sessions_survive_the_regular_idle_timeout() {
     assert_eq!(pong.msg_type, MSG_TYPE_PONG);
 
     bulk.send(query("STOP BULK IMPORT")).await.unwrap();
-    let stopped = timeout(Duration::from_secs(2), bulk.next())
+    // STOP 的处理包含同步 flush/fsync，重负载下回包可能远超 2s。
+    let stopped = timeout(Duration::from_secs(10), bulk.next())
         .await
         .expect("bulk import should stop")
         .unwrap()
@@ -242,7 +241,7 @@ async fn bulk_import_sessions_survive_the_regular_idle_timeout() {
     assert_eq!(stopped.msg_type, MSG_TYPE_OK);
 
     tokio::time::sleep(Duration::from_millis(1300)).await;
-    timeout(Duration::from_secs(2), bulk_server)
+    timeout(Duration::from_secs(10), bulk_server)
         .await
         .expect("idle timeout should apply again after the bulk session ends")
         .unwrap()
@@ -426,4 +425,58 @@ async fn pipelined_backlog_limit_closes_connection() {
         server_result.is_err(),
         "backlog violation should fail the connection"
     );
+}
+
+#[test]
+fn reserved_bulk_slots_cap_query_pool_below_shared_pool() {
+    let limiters = RequestLimiters::new(8, 2);
+    assert_eq!(limiters.shared.available_permits(), 8);
+    assert_eq!(limiters.query.available_permits(), 6);
+}
+
+#[tokio::test]
+async fn saturated_queries_cannot_exhaust_slots_needed_by_bulk() {
+    let limiters = RequestLimiters::new(8, 2);
+    let mut query_permits = Vec::new();
+    for _ in 0..6 {
+        query_permits.push(
+            limiters
+                .query
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("query permit"),
+        );
+    }
+    assert_eq!(limiters.query.available_permits(), 0);
+
+    let bulk_a = limiters
+        .shared
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("bulk permit a");
+    let bulk_b = limiters
+        .shared
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("bulk permit b");
+    assert_eq!(limiters.shared.available_permits(), 6);
+
+    drop((query_permits, bulk_a, bulk_b));
+}
+
+#[test]
+fn zero_reserved_bulk_slots_restores_single_pool_behavior() {
+    let limiters = RequestLimiters::new(8, 0);
+    assert_eq!(limiters.shared.available_permits(), 8);
+    assert_eq!(limiters.query.available_permits(), 8);
+}
+
+#[test]
+fn reserved_bulk_slots_clamped_to_shared_pool() {
+    let limiters = RequestLimiters::new(4, 10);
+    assert_eq!(limiters.shared.available_permits(), 4);
+    assert_eq!(limiters.query.available_permits(), 1);
 }

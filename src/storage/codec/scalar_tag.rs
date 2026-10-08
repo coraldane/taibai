@@ -5,28 +5,10 @@ use crate::protocol::types::DataType;
 use crate::storage::codec::io_util::{read_u32_le, read_u8};
 use crate::types::scalar::ScalarValue;
 
+/// Single source of truth for "NULL of a given type" lives on `ScalarValue`;
+/// this wrapper keeps the codec-local name that the write paths use.
 pub fn null_for_dtype(dtype: DataType) -> ScalarValue {
-    match dtype {
-        DataType::Bool => ScalarValue::Bool(None),
-        DataType::Int8 => ScalarValue::Int8(None),
-        DataType::Int16 => ScalarValue::Int16(None),
-        DataType::Int32 => ScalarValue::Int32(None),
-        DataType::Int64 => ScalarValue::Int64(None),
-        DataType::UInt8 => ScalarValue::UInt8(None),
-        DataType::UInt16 => ScalarValue::UInt16(None),
-        DataType::UInt32 => ScalarValue::UInt32(None),
-        DataType::UInt64 => ScalarValue::UInt64(None),
-        DataType::Float32 => ScalarValue::Float32(None),
-        DataType::Float64 => ScalarValue::Float64(None),
-        DataType::Decimal => ScalarValue::Decimal(None),
-        DataType::Date => ScalarValue::Date(None),
-        DataType::Time => ScalarValue::Time(None),
-        DataType::Timestamp => ScalarValue::Timestamp(None),
-        DataType::Interval => ScalarValue::Interval(None),
-        DataType::VarChar => ScalarValue::VarChar(None),
-        DataType::Blob => ScalarValue::Blob(None),
-        DataType::Vector => ScalarValue::Vector(None),
-    }
+    ScalarValue::null_for_type(dtype)
 }
 
 pub fn encode_scalar_with_tag(buf: &mut Vec<u8>, v: &ScalarValue) {
@@ -70,28 +52,10 @@ pub fn encode_scalar_with_tag(buf: &mut Vec<u8>, v: &ScalarValue) {
     }
 }
 
+/// Storage tag = the protocol `DataType` discriminant (1..=19), high bit set
+/// for NULL. The single tag-number source is `protocol::types::DataType`.
 fn scalar_tag(v: &ScalarValue) -> u8 {
-    let dtype_tag = match v.data_type() {
-        DataType::Bool => 1u8,
-        DataType::Int8 => 2,
-        DataType::Int16 => 3,
-        DataType::Int32 => 4,
-        DataType::Int64 => 5,
-        DataType::UInt8 => 6,
-        DataType::UInt16 => 7,
-        DataType::UInt32 => 8,
-        DataType::UInt64 => 9,
-        DataType::Float32 => 10,
-        DataType::Float64 => 11,
-        DataType::Decimal => 12,
-        DataType::Date => 13,
-        DataType::Time => 14,
-        DataType::Timestamp => 15,
-        DataType::Interval => 16,
-        DataType::VarChar => 17,
-        DataType::Blob => 18,
-        DataType::Vector => 19,
-    };
+    let dtype_tag = v.data_type() as u8;
     if v.is_null() {
         dtype_tag | 0x80
     } else {
@@ -103,34 +67,18 @@ pub fn decode_scalar_with_tag(cursor: &mut std::io::Cursor<&[u8]>) -> Result<Sca
     let tag = read_u8(cursor).map_err(|e| TaibaiError::Storage(format!("read tag: {}", e)))?;
     let is_null = (tag & 0x80) != 0;
     let dtype_tag = tag & 0x7F;
-    let dtype = match dtype_tag {
-        1 => DataType::Bool,
-        2 => DataType::Int8,
-        3 => DataType::Int16,
-        4 => DataType::Int32,
-        5 => DataType::Int64,
-        6 => DataType::UInt8,
-        7 => DataType::UInt16,
-        8 => DataType::UInt32,
-        9 => DataType::UInt64,
-        10 => DataType::Float32,
-        11 => DataType::Float64,
-        12 => DataType::Decimal,
-        13 => DataType::Date,
-        14 => DataType::Time,
-        15 => DataType::Timestamp,
-        16 => DataType::Interval,
-        17 => DataType::VarChar,
-        18 => DataType::Blob,
-        19 => DataType::Vector,
-        other => return Err(TaibaiError::Storage(format!("bad scalar tag: {}", other))),
-    };
+    // from_u8 also accepts wire ASCII aliases; the storage format only ever
+    // stores the raw discriminant, so reject anything that is not one.
+    let dtype = DataType::from_u8(dtype_tag)
+        .ok()
+        .filter(|dtype| *dtype as u8 == dtype_tag)
+        .ok_or_else(|| TaibaiError::Storage(format!("bad scalar tag: {}", dtype_tag)))?;
     if is_null {
         return Ok(null_for_dtype(dtype));
     }
     let v = match dtype {
-        DataType::Bool => ScalarValue::Bool(Some(read_u8(cursor).unwrap_or(0) != 0)),
-        DataType::Int8 => ScalarValue::Int8(Some(read_u8(cursor).unwrap_or(0) as i8)),
+        DataType::Bool => ScalarValue::Bool(Some(read_u8(cursor)? != 0)),
+        DataType::Int8 => ScalarValue::Int8(Some(read_u8(cursor)? as i8)),
         DataType::Int16 => {
             let mut b = [0u8; 2];
             cursor.read_exact(&mut b)?;
@@ -146,7 +94,7 @@ pub fn decode_scalar_with_tag(cursor: &mut std::io::Cursor<&[u8]>) -> Result<Sca
             cursor.read_exact(&mut b)?;
             ScalarValue::Int64(Some(i64::from_le_bytes(b)))
         }
-        DataType::UInt8 => ScalarValue::UInt8(Some(read_u8(cursor).unwrap_or(0))),
+        DataType::UInt8 => ScalarValue::UInt8(Some(read_u8(cursor)?)),
         DataType::UInt16 => {
             let mut b = [0u8; 2];
             cursor.read_exact(&mut b)?;
@@ -199,18 +147,53 @@ pub fn decode_scalar_with_tag(cursor: &mut std::io::Cursor<&[u8]>) -> Result<Sca
         }
         DataType::VarChar => {
             let len = read_u32_le(cursor)? as usize;
+            // Validate before allocating: a corrupt length prefix must not
+            // zero-fill up to 4GB from a truncated stream.
+            if len
+                > cursor
+                    .get_ref()
+                    .len()
+                    .saturating_sub(cursor.position() as usize)
+            {
+                return Err(TaibaiError::Storage(
+                    "scalar varchar: truncated value".into(),
+                ));
+            }
             let mut b = vec![0u8; len];
             cursor.read_exact(&mut b)?;
             ScalarValue::VarChar(Some(String::from_utf8_lossy(&b).into_owned()))
         }
         DataType::Blob => {
             let len = read_u32_le(cursor)? as usize;
+            if len
+                > cursor
+                    .get_ref()
+                    .len()
+                    .saturating_sub(cursor.position() as usize)
+            {
+                return Err(TaibaiError::Storage("scalar blob: truncated value".into()));
+            }
             let mut b = vec![0u8; len];
             cursor.read_exact(&mut b)?;
             ScalarValue::Blob(Some(b))
         }
         DataType::Vector => {
             let len = read_u32_le(cursor)? as usize;
+            // Validate before allocating: a corrupt length prefix must not
+            // preallocate up to 16GB of floats from a truncated stream.
+            let len_bytes = len.checked_mul(4).ok_or_else(|| {
+                TaibaiError::Storage("scalar vector: element count overflow".into())
+            })?;
+            if len_bytes
+                > cursor
+                    .get_ref()
+                    .len()
+                    .saturating_sub(cursor.position() as usize)
+            {
+                return Err(TaibaiError::Storage(
+                    "scalar vector: truncated value".into(),
+                ));
+            }
             let mut v = Vec::with_capacity(len);
             for _ in 0..len {
                 let mut b = [0u8; 4];

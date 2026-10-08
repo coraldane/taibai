@@ -258,6 +258,9 @@ fn decode_key_scalar_round_trips_encode_key_at() {
             vec![
                 ScalarValue::Float32(Some(-1.5)),
                 ScalarValue::Float32(Some(0.25)),
+                // -0.0 encodes as the canonical +0.0 (SQL `=` semantics), and
+                // Rust's f32 equality agrees, so the round trip still holds.
+                ScalarValue::Float32(Some(-0.0)),
             ],
         ),
         (
@@ -455,4 +458,76 @@ fn grouped_sum_overflow_errors_instead_of_wrapping() {
     );
     let error = exec.next_batch().unwrap_err().to_string();
     assert!(error.contains("SUM overflow"), "got: {error}");
+}
+
+#[test]
+fn nan_keys_share_one_canonical_encoding() {
+    use crate::protocol::types::DataType as Dt;
+    use crate::types::array::ColumnArray;
+    let mut col = ColumnArray::empty(Dt::Float64);
+    for v in [f64::NAN, -f64::NAN] {
+        col.push(&crate::types::scalar::ScalarValue::Float64(Some(v)))
+            .unwrap();
+    }
+    let mut k1 = Vec::new();
+    col.encode_key_at(0, &mut k1);
+    let mut k2 = Vec::new();
+    col.encode_key_at(1, &mut k2);
+    assert_eq!(k1, k2, "all NaN payloads must fold to one canonical key");
+}
+
+#[test]
+fn spilled_min_max_merge_orders_bool_states() {
+    // Accumulator::merge (the spill path) used aggregate::compare_scalars,
+    // which had no Bool arm: every Bool pair compared Equal, so the merge
+    // kept the first partial state's value. Feed TRUE then FALSE as separate
+    // spilled states so the merge decides the result.
+    let schema = Schema::new(vec![
+        ColumnDef::new("group_id", DataType::Int64),
+        ColumnDef::new("flag", DataType::Bool),
+    ]);
+    let batch = |group: i64, flag: bool| {
+        let mut groups = ColumnArray::empty(DataType::Int64);
+        let mut flags = ColumnArray::empty(DataType::Bool);
+        groups.push(&ScalarValue::Int64(Some(group))).unwrap();
+        flags.push(&ScalarValue::Bool(Some(flag))).unwrap();
+        RecordBatch::try_new(schema.clone(), vec![groups, flags]).unwrap()
+    };
+    let batches = vec![batch(0, true), batch(0, false)];
+    let aggregates = vec![
+        AggregateExpr {
+            func: AggFunc::Min,
+            arg: Box::new(LogicalExpr::Column(1)),
+            distinct: false,
+        },
+        AggregateExpr {
+            func: AggFunc::Max,
+            arg: Box::new(LogicalExpr::Column(1)),
+            distinct: false,
+        },
+    ];
+    let mut exec = HashAggregateExec::new(
+        vec![LogicalExpr::Column(0)],
+        aggregates,
+        Box::new(ManyBatchExec {
+            batches: batches.into_iter(),
+        }),
+        schema,
+    )
+    .with_memory_limit_bytes(1);
+
+    let mut rows = Vec::new();
+    while let Some(batch) = exec.next_batch().unwrap() {
+        for row in 0..batch.num_rows() {
+            rows.push((
+                batch.scalar(row, 0).unwrap(),
+                batch.scalar(row, 1).unwrap(),
+                batch.scalar(row, 2).unwrap(),
+            ));
+        }
+    }
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, ScalarValue::Int64(Some(0)));
+    assert_eq!(rows[0].1, ScalarValue::Bool(Some(false)), "MIN");
+    assert_eq!(rows[0].2, ScalarValue::Bool(Some(true)), "MAX");
 }

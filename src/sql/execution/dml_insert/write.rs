@@ -1,3 +1,7 @@
+use super::constraints::*;
+use super::fast::*;
+use super::*;
+
 /// The single condition under which an INSERT's rows are mirrored into the
 /// hot store at statement time: auto-commit regular-path writes only.
 /// Transactional rows are mirrored at COMMIT (or accounted as unfed), and
@@ -73,9 +77,11 @@ pub fn exec_replace(
     // Checkpoint large pending tails BEFORE taking the table mutation lock so
     // the flush I/O does not extend the critical section. Rows arriving after
     // the checkpoint are conflict-deleted in place below.
-    engine
-        .batch_writer()
-        .checkpoint_before_rewrite(db, table, physical_insert_rows as usize)?;
+    engine.batch_writer().checkpoint_before_rewrite(
+        db,
+        table,
+        crate::storage::core::batch_writer::RewriteEstimate::Inserts(physical_insert_rows as usize),
+    )?;
 
     // No pre-flush: rows still resident in memtables are conflict-deleted in
     // place below. The delete and the staged insert run under one lock, so
@@ -85,6 +91,11 @@ pub fn exec_replace(
         engine
             .segment_mgr()
             .with_table_mutation_lock(db, table, || {
+                // In-lock re-check (the check at the fn top races a
+                // transaction registering its pin under this same lock):
+                // REPLACE shifts memtable positions, which would make that
+                // transaction's COMMIT delete the wrong rows.
+                crate::sql::execution::txn_dml::refuse_auto_commit_dml_while_pinned(engine, db, table)?;
                 ensure_replace_location_indexes(
                     engine,
                     db,
@@ -93,31 +104,133 @@ pub fn exec_replace(
                     &location_schema,
                     &key_sets,
                 )?;
-                let memtable_plans = super::dml_delete::plan_replace_memtable_conflicts(
+                let memtable_plans = crate::sql::execution::dml_delete::plan_replace_memtable_conflicts(
                     engine, db, table, &key_sets,
                 )?;
-                let mut undo = super::dml_delete::delete_replace_conflicts_under_table_lock(
+
+                // Stage the replacement rows FIRST, into the private
+                // transaction (invisible until commit; nothing durable is
+                // rewritten yet), and collect the durability watermark in the
+                // same step through the shared staging entry — the watermark
+                // is only meaningful after the staging writes created the
+                // transaction's memtables. The delete legs below then rewrite
+                // segment footers under the DEFERRED journal lifecycle,
+                // journaling this staging's watermark, so a crash between a
+                // footer's tombstone fsync and the commit rolls the old rows
+                // back at startup instead of deleting them with no
+                // replacement — the same window UPDATE's stage-first order
+                // closes. (The reverse order — tombstones first, durable
+                // insert second — leaves a crash window of "new row visible
+                // while the old row still exists", which recovery cannot
+                // arbitrate; the staged-then-commit protocol keeps every
+                // crash outcome atomic.)
+                let staged_images = match crate::sql::execution::dml_staging::stage_image_transaction(
+                    engine,
+                    db,
+                    table,
+                    internal_txn_id,
+                    |txn_id| {
+                        exec_materialized_insert_batch(
+                            engine,
+                            db,
+                            table,
+                            &materialized.table_meta,
+                            materialized.schema,
+                            survivors,
+                            txn_id,
+                            false,
+                            false,
+                            false,
+                            true,
+                            materialized.missing_auto_inc,
+                            false,
+                            false,
+                        )
+                        .map(|_| ())
+                    },
+                ) {
+                    Ok(staged) => staged,
+                    Err((txn_id, error)) => {
+                        // Nothing else was mutated yet: discard the invisible
+                        // staged rows and fail. Best-effort cleanup — the
+                        // original error wins.
+                        if let Err(rollback_error) = engine.batch_writer().rollback_txn(txn_id) {
+                            tracing::warn!(
+                                db,
+                                table,
+                                txn_id,
+                                error = %rollback_error,
+                                "REPLACE staged-insert rollback failed; staged rows may linger invisibly"
+                            );
+                        }
+                        let _ = engine.txn_mutations().remove(txn_id);
+                        return Err(error);
+                    }
+                };
+                // Durability watermark for the deferred footer journals: the
+                // staged rows live in the private transaction's memtables;
+                // once their tails are durable, recovery keeps the
+                // tombstones (roll forward), otherwise it restores the
+                // pre-statement footers (roll back).
+                let image_checks = staged_images.watermark;
+
+                let mut undo = match super::replace::delete_replace_conflicts_under_table_lock(
                     engine,
                     db,
                     table,
                     &materialized.table_meta,
                     &key_sets,
-                )?;
+                    image_checks.as_slice(),
+                ) {
+                    Ok(undo) => undo,
+                    Err(error) => {
+                        // The delete leg restored its own partial work
+                        // (immediate footer rewrites, which also clear any
+                        // deferred journal at the same path); discard the
+                        // staged rows. Best-effort — the original error wins.
+                        if let Err(rollback_error) =
+                            engine.batch_writer().rollback_txn(internal_txn_id)
+                        {
+                            tracing::warn!(
+                                db,
+                                table,
+                                txn_id = internal_txn_id,
+                                error = %rollback_error,
+                                "REPLACE staged-insert rollback after failed conflict delete failed"
+                            );
+                        }
+                        let _ = engine.txn_mutations().remove(internal_txn_id);
+                        return Err(error);
+                    }
+                };
                 // The resident hot store is append-only and cannot remove the rows
                 // replaced below. Drop it before filtering so subsequent reads
                 // rebuild from the authoritative segments plus memtables.
                 engine.hot_store_manager().remove(db, table);
-                match super::dml_delete::apply_replace_memtable_conflicts(
+                match crate::sql::execution::dml_delete::apply_replace_memtable_conflicts(
                     engine,
                     db,
                     table,
                     memtable_plans,
+                    image_checks.as_slice(),
                 ) {
                     Ok(memtable_undo) => undo.merge(memtable_undo),
                     Err(error) => {
-                        let _ = super::dml_delete::restore_replace_delete_under_table_lock(
-                            engine, &undo,
-                        );
+                        if let Err(rollback_error) = rollback_replace_under_table_lock(
+                            engine,
+                            db,
+                            table,
+                            &materialized.table_meta,
+                            internal_txn_id,
+                            &undo,
+                        ) {
+                            tracing::warn!(
+                                db,
+                                table,
+                                error = %rollback_error,
+                                "REPLACE rollback after failed memtable conflict delete failed"
+                            );
+                        }
                         return Err(error);
                     }
                 }
@@ -136,34 +249,6 @@ pub fn exec_replace(
                     return Err(TaibaiError::Internal(
                         "forced REPLACE insert failure".to_string(),
                     ));
-                }
-
-                let insert_result = exec_materialized_insert_batch(
-                    engine,
-                    db,
-                    table,
-                    &materialized.table_meta,
-                    materialized.schema,
-                    survivors,
-                    internal_txn_id,
-                    false,
-                    false,
-                    false,
-                    true,
-                    materialized.missing_auto_inc,
-                    false,
-                    false,
-                );
-                if let Err(error) = insert_result {
-                    rollback_replace_under_table_lock(
-                        engine,
-                        db,
-                        table,
-                        &materialized.table_meta,
-                        internal_txn_id,
-                        &undo,
-                    )?;
-                    return Err(error);
                 }
 
                 let finalize_result = engine
@@ -256,7 +341,45 @@ pub fn exec_replace(
         return Err(error);
     }
 
-    super::dml_delete::finalize_replace_delete(engine, db, table, &materialized.table_meta, &undo)?;
+    // The staged replacement rows are durable: the tombstone legs are now
+    // unconditionally correct. Clear the deferred journals under a brief
+    // second table-lock acquisition — journals are only ever written under
+    // this lock, so the ownership-matched clear cannot race a concurrent
+    // statement replacing the same journal path. Best effort: a leftover is
+    // re-judged by startup recovery, which finds the watermark met and rolls
+    // forward.
+    if !undo.segment_footers.is_empty() {
+        let table_dir = engine.data_dir().join(db).join(table);
+        let journal_segments: Vec<(std::path::PathBuf, Vec<u8>, u64)> = undo
+            .segment_footers
+            .iter()
+            .map(|(path, _, _, bitmap, deleted)| (path.clone(), bitmap.clone(), *deleted))
+            .collect();
+        let _ = engine
+            .segment_mgr()
+            .with_table_mutation_lock(db, table, || {
+                for (path, bitmap, deleted) in &journal_segments {
+                    crate::storage::segment::reader::clear_deferred_delete_journal_for_statement(
+                        &table_dir, path, bitmap, *deleted,
+                    );
+                }
+                Ok(())
+            });
+    }
+    // The replacement rows are durable, so the memtable legs' guarded
+    // sidecars are unconditionally correct: drop their guards (a leftover
+    // would needlessly gate the memtable's flush until the next recovery).
+    {
+        let table_dir = engine.data_dir().join(db).join(table);
+        for memtable in undo.guarded_memtables() {
+            crate::storage::core::durable_tail::clear_statement_guards(&table_dir, memtable.id());
+        }
+    }
+    // The internal transaction is terminal — drop its registry entry (same
+    // cleanup as UPDATE's image transaction).
+    let _ = engine.txn_mutations().remove(internal_txn_id);
+
+    super::replace::finalize_replace_delete(engine, db, table, &materialized.table_meta, &undo)?;
     engine.record_inserted_rows(db, table, physical_insert_rows as i64, false, true)?;
     if materialized
         .table_meta
@@ -405,11 +528,15 @@ fn materialize_insert_values(
         for row in values {
             for (col_idx, provided) in provided_by_col.iter().enumerate() {
                 let val_idx = provided.unwrap();
+                let column = &schema.columns[col_idx];
                 push_literal_fast(
                     batch.column_mut(col_idx).unwrap(),
                     &row[val_idx],
-                    schema.columns[col_idx].scale,
+                    column.scale,
                     timezone_offset_hours,
+                    &column.name,
+                    column.primary_key,
+                    column.nullable,
                 )?;
             }
         }
@@ -457,7 +584,7 @@ fn materialize_insert_values(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn exec_materialized_insert_batch(
+pub(super) fn exec_materialized_insert_batch(
     engine: &Engine,
     db: &str,
     table: &str,
@@ -518,12 +645,19 @@ fn exec_materialized_insert_batch(
     let unique_constraints = unique_constraints(table_meta, &schema)?;
     let has_unique_checks = !unique_constraints.is_empty();
     let primary_key_indices = primary_key_indices(&schema);
-    let _pk_guard =
+    let pk_guard =
         if !lock_unique_constraints || (primary_key_indices.is_empty() && !has_unique_checks) {
             None
         } else {
             Some(constraint_insert_lock(db, table).lock().unwrap())
         };
+    // The stripe mutual-excludes the probe→publish window against other
+    // unique-key writers. It does NOT need to cover the durable-tail fsync
+    // wait: the writes below collect their pending tail commits, and the
+    // stripe is dropped before they settle — concurrent same-table INSERTs
+    // then join one fsync group instead of serializing on the stripe across
+    // the full fsync round-trip (which defeated the group committer's
+    // design for every constrained table).
 
     // The bulk/relaxed branch re-runs the full existing-data validation
     // inside `exec_bulk_insert_partitioned`; probing the index here too
@@ -579,10 +713,15 @@ fn exec_materialized_insert_batch(
     } else {
         Vec::new()
     };
-    if publish_unique_index_entries && !primary_key_indices.is_empty() {
+    if publish_unique_index_entries && !primary_keys.is_empty() {
+        // Reuse the once-materialized primary keys instead of re-extracting
+        // them from the batch (C15): PK NULLs were already rejected by the
+        // validation above, so every row yields exactly one entry in batch
+        // order, byte-identical to what `primary_location_entries_for_batch`
+        // produced from a fresh scan.
         unique_index_entries.push((
             crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME.to_string(),
-            primary_location_entries_for_batch(&schema, &batch, &primary_key_indices),
+            primary_location_entries_from_keys(&primary_keys),
         ));
     }
     log_insert_profile(
@@ -622,13 +761,16 @@ fn exec_materialized_insert_batch(
     // deferred bulk/relaxed writes become visible at flush time. The clone is
     // skipped entirely while no client is subscribed.
     let pubsub_batch = if hot_mirror_eligible(txn_id, bulk_import_mode, relaxed_direct_insert)
-        && engine.pubsub().has_any_subscribers()
+        && engine.pubsub().has_table_subscribers(db, table)
     {
         Some(batch.clone())
     } else {
         None
     };
     let write_start = Instant::now();
+    // Pending tail commits of this statement's writes: settled only after
+    // the constraint stripe is dropped (see pk_guard).
+    let mut deferred_commits = Vec::new();
     if bulk_import_mode || relaxed_direct_insert {
         engine.exec_bulk_insert_partitioned(db, table, table_meta, batch, relaxed_direct_insert)?;
     } else {
@@ -636,7 +778,7 @@ fn exec_materialized_insert_batch(
         // reduces to auto-commit: when it holds, every row of the batch is
         // mirrored into the hot store.
         let hot_fed = hot_mirror_eligible(txn_id, bulk_import_mode, relaxed_direct_insert);
-        if let Err(error) = write_batch_by_partition(
+        if let Err(error) = write_batch_by_partition_deferred(
             engine,
             db,
             table,
@@ -646,6 +788,7 @@ fn exec_materialized_insert_batch(
             txn_id,
             table_lock_held,
             hot_fed,
+            &mut deferred_commits,
         ) {
             if hot_fed {
                 // The hot mirror already holds this batch but the
@@ -658,6 +801,12 @@ fn exec_materialized_insert_batch(
                 // rebuild on invalidation.
                 engine.invalidate_hot_store(db, table);
             }
+            // Settle what earlier partitions of this statement submitted:
+            // their fsync failures surface here exactly as the inline
+            // settle would have reported them (the original error wins).
+            let _ = engine
+                .batch_writer()
+                .settle_deferred_tail_commits(db, table, deferred_commits);
             return Err(error);
         }
     }
@@ -678,7 +827,12 @@ fn exec_materialized_insert_batch(
                 .index_manager()
                 .record_txn_published_keys(txn_id, db, table, index_name, keys);
         }
-        if !primary_keys.is_empty() {
+        // The primary location index was already recorded by the loop above
+        // when its entries were published; the standalone record from
+        // primary_keys (one clone instead of two) is only needed by
+        // publish-disabled callers such as REPLACE's internal staging call.
+        // Retraction dedups keys, so recording once is exactly equivalent.
+        if !publish_unique_index_entries && !primary_keys.is_empty() {
             engine.index_manager().record_txn_published_keys(
                 txn_id,
                 db,
@@ -689,7 +843,17 @@ fn exec_materialized_insert_batch(
         }
     }
     if publish_unique_index_entries {
-        append_unique_index_entries_after_insert(engine, db, table, unique_index_entries)?;
+        if let Err(error) =
+            append_unique_index_entries_after_insert(engine, db, table, unique_index_entries)
+        {
+            // The rows are written and visible; settle their fsync before
+            // propagating so the failure picture matches the inline-settle
+            // contract (the original error still wins).
+            let _ = engine
+                .batch_writer()
+                .settle_deferred_tail_commits(db, table, deferred_commits);
+            return Err(error);
+        }
     }
     if !primary_keys.is_empty() {
         let _ = engine
@@ -697,13 +861,38 @@ fn exec_materialized_insert_batch(
             .append_primary_keys(db, table, &primary_keys)?;
     }
 
+    // The probe→publish window is closed: release the constraint stripe
+    // BEFORE the durable-tail fsync wait, so concurrent same-table INSERTs
+    // join this statement's fsync group instead of serializing on the
+    // stripe across the round-trip.
+    drop(pk_guard);
+    engine
+        .batch_writer()
+        .settle_deferred_tail_commits(db, table, deferred_commits)?;
+
     if publish_catalog {
+        // Account BEFORE record_inserted_rows: the catalog row_count
+        // increment happens before its save step, so a save failure must
+        // not strand an unaccounted increment that ROLLBACK would leave
+        // behind (note first, retract even when record errors out).
+        if txn_id > 0 {
+            engine
+                .txn_mutations()
+                .note_inserted_rows(txn_id, db, table, row_count);
+        }
         engine.record_inserted_rows(
             db,
             table,
             row_count as i64,
-            !bulk_import_mode && txn_id > 0,
-            !bulk_import_mode && txn_id == 0,
+            // In-transaction INSERTs take the same throttled deferred catalog
+            // save as auto-commit (C4) instead of serializing the whole
+            // catalog JSON per statement: a crash may lose the last ~1s of
+            // auto-increment-next-value persistence inside an open
+            // transaction, the trade-off auto-commit already makes. Bulk
+            // mode stays excluded from both (bulk flushes its dirty
+            // catalogs at bulk end).
+            false,
+            !bulk_import_mode,
         )?;
         // No follow-up persist_auto_increment_next_value call here:
         // record_inserted_rows already writes the counter into the table
@@ -753,6 +942,24 @@ pub(crate) fn build_unique_index_entries_for_batch(
     Ok(result)
 }
 
+/// Primary-key location entries derived from the keys already materialized by
+/// `primary_keys_for_batch` (C15): one entry per row, `row_id` = batch row
+/// index. Valid by construction — primary-key validation upstream rejects
+/// NULLs, so unlike the batch-scanning twin above no row can be skipped.
+fn primary_location_entries_from_keys(primary_keys: &[Vec<ScalarValue>]) -> Vec<UniqueIndexEntry> {
+    primary_keys
+        .iter()
+        .enumerate()
+        .map(|(row_idx, key)| UniqueIndexEntry {
+            key: key.clone(),
+            location: UniqueRowLocation {
+                segment_path: String::new(),
+                row_id: row_idx as u64,
+            },
+        })
+        .collect()
+}
+
 /// Pseudo existence entries (empty segment_path) for the primary-key
 /// location index. Keeping this index incrementally maintained on INSERT
 /// and REPLACE avoids a full-table rebuild on the next REPLACE conflict
@@ -784,21 +991,30 @@ pub(crate) fn append_unique_index_entries_after_insert(
     table: &str,
     entries_by_index: Vec<(String, Vec<UniqueIndexEntry>)>,
 ) -> Result<()> {
+    // Encode all indexes' entries first, then hand the whole statement to one
+    // batched append: a single shared lock pass and one fsync per delta file
+    // instead of a full lock/write/sync cycle per index (C3).
+    let mut prepared = Vec::with_capacity(entries_by_index.len());
     for (index_name, entries) in entries_by_index {
-        match engine
-            .index_manager()
-            .append_unique_index_entries(db, table, &index_name, entries)
-        {
-            Ok(_) => {}
-            Err(error) => {
-                engine
-                    .index_manager()
-                    .invalidate_unique_index_snapshot(db, table, &index_name);
-                return Err(error);
-            }
+        prepared.push((
+            index_name,
+            engine
+                .index_manager()
+                .prepare_unique_index_entries(entries)?,
+        ));
+    }
+    match engine
+        .index_manager()
+        .append_prepared_unique_index_entries_batch(db, table, prepared)
+    {
+        Ok(()) => Ok(()),
+        Err((index_name, error)) => {
+            engine
+                .index_manager()
+                .invalidate_unique_index_snapshot(db, table, &index_name);
+            Err(error)
         }
     }
-    Ok(())
 }
 
 /// Every location index of a table: named unique indexes plus the implicit
@@ -894,23 +1110,18 @@ pub(crate) fn rebuild_table_location_indexes_from(
     }
     let table_dir = data_dir.join(db).join(table);
     for (index_name, columns, indices) in indexes {
-        let entries = collect_unique_index_entries_from(
-            segment_mgr,
-            memtables,
-            &table_dir,
-            table,
-            &indices,
-            "segment rewrite auto rebuild",
-        )?;
-        index_manager.persist_unique_index_entries(
-            db,
-            table,
-            &index_name,
-            &columns,
-            entries,
-            Some(segment_mgr.memtable_flush_epoch(db, table)),
-            None,
-        )?;
+        index_manager.persist_unique_index_stream(db, table, &index_name, &columns, |visit| {
+            visit_unique_index_entries_from(
+                segment_mgr,
+                memtables,
+                &table_dir,
+                table,
+                schema,
+                &indices,
+                "segment rewrite auto rebuild",
+                visit,
+            )
+        })?;
     }
     index_manager.invalidate_primary_key_cache(db, table);
     Ok(())
@@ -946,21 +1157,23 @@ fn ensure_replace_location_indexes(
         if locations.is_some() {
             continue;
         }
-        let entries = collect_unique_index_entries(
-            engine,
-            db,
-            table,
-            &indices,
-            "replace location index bootstrap",
-        )?;
-        engine.index_manager().persist_unique_index_entries(
+        engine.index_manager().persist_unique_index_stream(
             db,
             table,
             &index_name,
             &columns,
-            entries,
-            Some(engine.segment_mgr().memtable_flush_epoch(db, table)),
-            None,
+            |visit| {
+                visit_unique_index_entries_from(
+                    engine.segment_mgr(),
+                    &engine.memtable_manager().get_by_table(db, table),
+                    &engine.data_dir().join(db).join(table),
+                    table,
+                    schema,
+                    &indices,
+                    "replace location index bootstrap",
+                    visit,
+                )
+            },
         )?;
     }
     Ok(())
@@ -1005,13 +1218,13 @@ fn rollback_replace_under_table_lock(
     table: &str,
     table_meta: &crate::storage::catalog::schema::TableMeta,
     txn_id: u64,
-    undo: &super::dml_delete::ReplaceDeleteUndo,
+    undo: &crate::sql::execution::dml_delete::ReplaceDeleteUndo,
 ) -> Result<()> {
     let mut errors = Vec::new();
     if let Err(error) = engine.batch_writer().rollback_txn(txn_id) {
         errors.push(format!("rollback staged insert: {}", error));
     }
-    if let Err(error) = super::dml_delete::restore_replace_delete_under_table_lock(engine, undo) {
+    if let Err(error) = super::replace::restore_replace_delete_under_table_lock(engine, undo) {
         errors.push(format!("restore deleted rows: {}", error));
     }
 
@@ -1025,6 +1238,9 @@ fn rollback_replace_under_table_lock(
         table,
         crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
     );
+    // The internal transaction is discarded — drop its registry entry (the
+    // txn_id is never reused by the allocator).
+    let _ = engine.txn_mutations().remove(txn_id);
 
     if errors.is_empty() {
         Ok(())
@@ -1100,7 +1316,7 @@ fn collapse_replace_batch(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_batch_by_partition(
+pub(crate) fn write_batch_by_partition(
     engine: &Engine,
     db: &str,
     table: &str,
@@ -1110,6 +1326,40 @@ fn write_batch_by_partition(
     txn_id: u64,
     table_lock_held: bool,
     hot_fed: bool,
+) -> Result<()> {
+    // Transactional staging callers never produce pending tail commits (the
+    // durable tail is written at COMMIT), so the scratch collector stays
+    // empty and settling it is a no-op.
+    let mut scratch = Vec::new();
+    write_batch_by_partition_deferred(
+        engine,
+        db,
+        table,
+        table_meta,
+        batch,
+        schema,
+        txn_id,
+        table_lock_held,
+        hot_fed,
+        &mut scratch,
+    )
+}
+
+/// Deferred-settle core: auto-commit callers that hold the constraint stripe
+/// collect their pending tail commits here and settle them after releasing
+/// the stripe, so the fsync wait never serializes same-table INSERTs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_batch_by_partition_deferred(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    batch: RecordBatch,
+    schema: Schema,
+    txn_id: u64,
+    table_lock_held: bool,
+    hot_fed: bool,
+    deferred: &mut Vec<crate::storage::core::batch_writer::PendingTailCommit>,
 ) -> Result<()> {
     if table_meta.partition_key.is_empty() || batch.num_rows() == 0 {
         write_partition_batch(
@@ -1123,6 +1373,7 @@ fn write_batch_by_partition(
             txn_id,
             table_lock_held,
             hot_fed,
+            Some(&mut *deferred),
         )?;
         return Ok(());
     }
@@ -1146,6 +1397,7 @@ fn write_batch_by_partition(
             txn_id,
             table_lock_held,
             hot_fed,
+            Some(&mut *deferred),
         )?;
         return Ok(());
     }
@@ -1164,6 +1416,7 @@ fn write_batch_by_partition(
                 txn_id,
                 table_lock_held,
                 hot_fed,
+                Some(&mut *deferred),
             )?;
         }
         return Ok(());
@@ -1186,6 +1439,7 @@ fn write_batch_by_partition(
             txn_id,
             table_lock_held,
             hot_fed,
+            Some(&mut *deferred),
         )?;
         return Ok(());
     }
@@ -1203,6 +1457,7 @@ fn write_batch_by_partition(
             txn_id,
             table_lock_held,
             hot_fed,
+            Some(&mut *deferred),
         )?;
     }
     Ok(())
@@ -1220,6 +1475,7 @@ fn write_partition_batch(
     txn_id: u64,
     table_lock_held: bool,
     hot_fed: bool,
+    deferred: Option<&mut Vec<crate::storage::core::batch_writer::PendingTailCommit>>,
 ) -> Result<()> {
     let batch = sort_batch_for_cluster_key(table_meta, batch)?;
     if table_lock_held {
@@ -1234,6 +1490,21 @@ fn write_partition_batch(
                 txn_id,
                 hot_fed,
             )?;
+    } else if let Some(deferred) = deferred {
+        let (_rows, pending) = engine
+            .batch_writer()
+            .write_columns_with_txn_deferred_settle(
+                db,
+                table,
+                partition_key,
+                batch,
+                schema,
+                txn_id,
+                hot_fed,
+            )?;
+        if let Some(pending) = pending {
+            deferred.push(pending);
+        }
     } else {
         engine.batch_writer().write_columns_with_txn(
             db,
@@ -1408,12 +1679,11 @@ fn can_direct_materialize(
     if values.iter().flatten().any(is_default_value_expr) {
         return false;
     }
+    // PK / NOT NULL columns take this path too: `push_literal_fast` rejects
+    // NULL literals for them, which is the only extra validation the slow
+    // materialize path performed here.
     schema.columns.iter().enumerate().all(|(idx, col)| {
-        provided_by_col[idx].is_some()
-            && !is_missing_auto_inc[idx]
-            && col.default_value.is_none()
-            && col.nullable
-            && !col.primary_key
+        provided_by_col[idx].is_some() && !is_missing_auto_inc[idx] && col.default_value.is_none()
     })
 }
 
@@ -1425,22 +1695,50 @@ fn is_default_value_expr(expr: &Expr) -> bool {
     )
 }
 
+/// Same NULL rule the general materialize path enforces via `validate_nullable`:
+/// a PK or NOT NULL column rejects an explicit NULL.
+fn validate_literal_nullness(
+    column_name: &str,
+    primary_key: bool,
+    nullable: bool,
+    scalar: &ScalarValue,
+) -> Result<()> {
+    if (primary_key || !nullable) && scalar.is_null() {
+        return Err(TaibaiError::Sql(format!(
+            "column '{}' cannot be NULL",
+            column_name
+        )));
+    }
+    Ok(())
+}
+
 fn push_literal_fast(
     col: &mut ColumnArray,
     expr: &Expr,
     scale: i32,
     timezone_offset_hours: i32,
+    column_name: &str,
+    primary_key: bool,
+    nullable: bool,
 ) -> Result<()> {
     let Expr::Literal(value) = expr else {
-        return col.push(&eval_expr_to_scalar_with_scale_timezone(
+        let scalar = eval_expr_to_scalar_with_scale_timezone(
             expr,
             &col.data_type(),
             scale,
             timezone_offset_hours,
-        )?);
+        )?;
+        validate_literal_nullness(column_name, primary_key, nullable, &scalar)?;
+        return col.push(&scalar);
     };
 
     if value.is_null() {
+        if primary_key || !nullable {
+            return Err(TaibaiError::Sql(format!(
+                "column '{}' cannot be NULL",
+                column_name
+            )));
+        }
         return col.push(&ScalarValue::null_for_type(col.data_type()));
     }
 
@@ -1464,13 +1762,21 @@ fn push_literal_fast(
             Ok(())
         }
         (ColumnArray::Decimal { data, bitmap }, ScalarValue::Float64(Some(v))) => {
-            let multiplier = decimal_multiplier(scale)?;
-            data.push((*v * multiplier as f64).round() as i64);
+            // Exact-decimal conversion via the shortest round-trip text —
+            // see float_literal_to_decimal_i64; the f64 multiply below is
+            // only the scientific-notation fallback.
+            let scaled = crate::sql::execution::helpers::float_literal_to_decimal_i64(*v, scale)
+                .unwrap_or_else(|| {
+                    let multiplier =
+                        crate::sql::execution::helpers::decimal_multiplier(scale).unwrap_or(1);
+                    (*v * multiplier as f64).round() as i64
+                });
+            data.push(scaled);
             bitmap.push_valid();
             Ok(())
         }
         (ColumnArray::Decimal { data, bitmap }, ScalarValue::Int64(Some(v))) => {
-            let multiplier = decimal_multiplier(scale)?;
+            let multiplier = crate::sql::execution::helpers::decimal_multiplier(scale)?;
             data.push(v.checked_mul(multiplier).ok_or_else(|| {
                 TaibaiError::Sql(format!("decimal value '{}' overflows scale {}", v, scale))
             })?);
@@ -1492,15 +1798,6 @@ fn push_literal_fast(
             timezone_offset_hours,
         )?),
     }
-}
-
-fn decimal_multiplier(scale: i32) -> Result<i64> {
-    if !(0..=18).contains(&scale) {
-        return Err(TaibaiError::Sql(format!("invalid decimal scale {}", scale)));
-    }
-    10_i64
-        .checked_pow(scale as u32)
-        .ok_or_else(|| TaibaiError::Sql(format!("invalid decimal scale {}", scale)))
 }
 
 fn resolve_insert_columns(
@@ -1552,7 +1849,7 @@ fn resolve_insert_columns(
     Ok(indices)
 }
 
-fn materialize_default_value(
+pub(super) fn materialize_default_value(
     default: &ColumnDefaultValue,
     schema: &Schema,
     col_idx: usize,
@@ -1584,7 +1881,11 @@ fn materialize_default_value(
     }
 }
 
-fn validate_nullable(schema: &Schema, col_idx: usize, scalar: &ScalarValue) -> Result<()> {
+pub(super) fn validate_nullable(
+    schema: &Schema,
+    col_idx: usize,
+    scalar: &ScalarValue,
+) -> Result<()> {
     let col = &schema.columns[col_idx];
     if (col.primary_key || !col.nullable) && scalar.is_null() {
         return Err(TaibaiError::Sql(format!(

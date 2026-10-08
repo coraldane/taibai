@@ -1,3 +1,6 @@
+use super::introspection::*;
+use super::*;
+
 #[allow(clippy::too_many_arguments)]
 pub fn exec_create_table(
     engine: &Engine,
@@ -238,7 +241,7 @@ pub fn exec_create_index(
         )));
     }
     if unique {
-        super::dml_insert::validate_unique_key_uniqueness(
+        crate::sql::execution::dml_insert::validate_unique_key_uniqueness(
             engine, db, table, &schema, &indices, index_name, None,
         )?;
         table_meta.add_unique_index(index_name, columns.to_vec())?;
@@ -310,7 +313,7 @@ pub fn exec_show_unique_index_status(engine: &Engine, db: &str, table: &str) -> 
     for index in &table_meta.unique_indexes {
         let indices = resolve_unique_index_columns(&table_schema, &index.columns);
         let status = indices.and_then(|indices| {
-            super::dml_insert::validate_unique_key_uniqueness(
+            crate::sql::execution::dml_insert::validate_unique_key_uniqueness(
                 engine,
                 db,
                 table,
@@ -398,21 +401,23 @@ pub fn exec_rebuild_unique_index(
                     continue;
                 }
                 let indices = resolve_unique_index_columns(&table_schema, &index.columns)?;
-                let entries = super::dml_insert::collect_unique_index_entries(
-                    engine,
-                    db,
-                    table,
-                    &indices,
-                    "REBUILD UNIQUE INDEX statement",
-                )?;
-                engine.index_manager().persist_unique_index_entries(
+                engine.index_manager().persist_unique_index_stream(
                     db,
                     table,
                     &index.name,
                     &index.columns,
-                    entries,
-                    Some(engine.segment_mgr().memtable_flush_epoch(db, table)),
-                    None,
+                    |visit| {
+                        crate::sql::execution::dml_insert::visit_unique_index_entries_from(
+                            engine.segment_mgr(),
+                            &engine.memtable_manager().get_by_table(db, table),
+                            &engine.data_dir().join(db).join(table),
+                            table,
+                            &table_schema,
+                            &indices,
+                            "REBUILD UNIQUE INDEX statement",
+                            visit,
+                        )
+                    },
                 )?;
                 rebuilt += 1;
             }
@@ -514,6 +519,18 @@ pub fn exec_drop_table(
             );
 
             let step_start = Instant::now();
+            // Index states pin open handles into the directory being staged
+            // away; drop them so the staging rename cannot be blocked by an
+            // open handle (Windows). The staged directory keeps the files.
+            engine.index_manager().drop_table_index_states(db, name);
+            tracing::info!(
+                db,
+                table = name,
+                elapsed_ms = step_start.elapsed().as_millis(),
+                "drop table: dropped cached index states"
+            );
+
+            let step_start = Instant::now();
             tracing::info!(db, table = name, path = %table_dir.display(), "drop table: staging table directory");
             let tombstone = stage_table_directory(&table_dir).map_err(|error| {
                 tracing::error!(db, table = name, path = %table_dir.display(), error = %error, elapsed_ms = step_start.elapsed().as_millis(), "drop table: failed to stage table directory");
@@ -524,7 +541,9 @@ pub fn exec_drop_table(
             catalog.drop_table(name)?;
             let meta_dir = engine.data_dir().join("meta");
             if let Err(save_error) = catalog.save(&meta_dir) {
-                catalog.tables.insert(name.to_string(), std::sync::Arc::new(table_meta.clone()));
+                catalog
+                    .tables
+                    .insert(name.to_string(), std::sync::Arc::new(table_meta.clone()));
                 if let Some(tombstone) = tombstone.as_deref() {
                     if let Err(restore_error) =
                         restore_staged_table_directory(tombstone, &table_dir)
@@ -544,12 +563,16 @@ pub fn exec_drop_table(
             }
 
             let step_start = Instant::now();
-            engine.hot_store_manager().remove(db, name);
+            // invalidate (not bare remove): this also clears the memtable
+            // manager's hot_unfed_rows bookkeeping, which otherwise outlived
+            // the DROP and permanently disabled the same-name recreate's
+            // resident fast paths.
+            engine.invalidate_hot_store(db, name);
             tracing::info!(
                 db,
                 table = name,
                 elapsed_ms = step_start.elapsed().as_millis(),
-                "drop table: removed resident hot store"
+                "drop table: invalidated resident hot store"
             );
 
             let step_start = Instant::now();
@@ -566,29 +589,12 @@ pub fn exec_drop_table(
 
             Ok(tombstone)
         };
-        let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
-            Some(
-                engine
-                    .segment_mgr()
-                    .with_table_mutation_lock(db, name, &mut op)?,
-            )
-        } else {
-            engine
-                .segment_mgr()
-                .try_with_table_mutation_lock(db, name, &mut op)?
-        };
+        let attempt = try_or_block_table_mutation_lock(engine, db, name, lock_attempts, &mut op)?;
         match attempt {
             Some(tombstone) => break (tombstone, table_meta),
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
-                    tracing::warn!(
-                        db,
-                        table = name,
-                        lock_attempts,
-                        "drop table: table mutation lock busy; retrying without the catalog lock"
-                    );
-                }
+                warn_table_mutation_lock_busy(db, name, lock_attempts, "drop table");
                 drop(catalogs);
                 thread::sleep(DDL_TABLE_LOCK_RETRY_INTERVAL);
                 catalogs = engine.catalogs().write().unwrap();
@@ -606,6 +612,12 @@ pub fn exec_drop_table(
     engine
         .index_manager()
         .remove_table_unique_index_snapshots(db, name, &unique_index_names);
+    // A same-name CREATE TABLE restarts segment numbering at 1: without this
+    // the sum cache would answer a fresh segment_000001 with the dropped
+    // table's SUM whenever (column, row_count, deleted) collide.
+    crate::sql::execution::scan::aggregate_meta::invalidate_segment_sum_cache_under(
+        &engine.segment_mgr().table_dir(db, name),
+    );
 
     let mut cleanup_error = None;
     if let Some(tombstone) = tombstone {
@@ -702,10 +714,21 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
             }
             engine.batch_writer().drain_table_tail(db, name)?;
             engine.segment_mgr().flush_table_active(db, name)?;
-                engine.segment_mgr().close_table_state_handles(db, name);
+            engine.segment_mgr().close_table_state_handles(db, name);
             engine
                 .segment_mgr()
                 .invalidate_readers_under(&old_table_dir);
+            // Index states pin open handles into the table directory; on
+            // Windows the directory rename below fails while any handle is
+            // still open.
+            engine.index_manager().drop_table_index_states(db, name);
+            engine.invalidate_hot_segment_hint(db, name);
+            // Sum-cache entries keyed under the old path survive the rename;
+            // a future CREATE TABLE reusing this name restarts segment
+            // numbering at 1 and could hit them (see drop table).
+            crate::sql::execution::scan::aggregate_meta::invalidate_segment_sum_cache_under(
+                &old_table_dir,
+            );
 
             std::fs::create_dir_all(&operation_dir)?;
             std::fs::write(operation_dir.join(RENAME_TARGET_FILE), new_name.as_bytes())?;
@@ -746,29 +769,12 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
             );
             Ok(())
         };
-        let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
-            Some(
-                engine
-                    .segment_mgr()
-                    .with_table_mutation_lock(db, name, &mut op)?,
-            )
-        } else {
-            engine
-                .segment_mgr()
-                .try_with_table_mutation_lock(db, name, &mut op)?
-        };
+        let attempt = try_or_block_table_mutation_lock(engine, db, name, lock_attempts, &mut op)?;
         match attempt {
             Some(()) => break catalog_before,
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
-                    tracing::warn!(
-                        db,
-                        table = name,
-                        lock_attempts,
-                        "rename table: table mutation lock busy; retrying without the catalog lock"
-                    );
-                }
+                warn_table_mutation_lock_busy(db, name, lock_attempts, "rename table");
                 drop(catalogs);
                 thread::sleep(DDL_TABLE_LOCK_RETRY_INTERVAL);
                 catalogs = engine.catalogs().write().unwrap();
@@ -820,7 +826,7 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
 
-fn exec_partition_change(
+pub(super) fn exec_partition_change(
     engine: &Engine,
     db: &str,
     name: &str,
@@ -903,7 +909,9 @@ fn exec_partition_change(
 
             let meta_dir = engine.data_dir().join("meta");
             if let Err(error) = catalog.save(&meta_dir) {
-                catalog.tables.insert(name.to_string(), std::sync::Arc::new(before_meta.clone()));
+                catalog
+                    .tables
+                    .insert(name.to_string(), std::sync::Arc::new(before_meta.clone()));
                 restore_partition_files(&operation_dir, &table_dir)?;
                 return Err(error);
             }
@@ -935,29 +943,12 @@ fn exec_partition_change(
             );
             Ok(operation_dir.clone())
         };
-        let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
-            Some(
-                engine
-                    .segment_mgr()
-                    .with_table_mutation_lock(db, name, &mut op)?,
-            )
-        } else {
-            engine
-                .segment_mgr()
-                .try_with_table_mutation_lock(db, name, &mut op)?
-        };
+        let attempt = try_or_block_table_mutation_lock(engine, db, name, lock_attempts, &mut op)?;
         match attempt {
             Some(operation_dir) => break operation_dir,
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
-                    tracing::warn!(
-                        db,
-                        table = name,
-                        lock_attempts,
-                        "partition change: table mutation lock busy; retrying without the catalog lock"
-                    );
-                }
+                warn_table_mutation_lock_busy(db, name, lock_attempts, "partition change");
                 drop(catalogs);
                 thread::sleep(DDL_TABLE_LOCK_RETRY_INTERVAL);
                 catalogs = engine.catalogs().write().unwrap();
@@ -1016,7 +1007,9 @@ fn exec_set_hot(engine: &Engine, db: &str, name: &str, hot: &HotDef) -> Result<E
 
             let meta_dir = engine.data_dir().join("meta");
             if let Err(error) = catalog.save(&meta_dir) {
-                catalog.tables.insert(name.to_string(), std::sync::Arc::new(before_meta.clone()));
+                catalog
+                    .tables
+                    .insert(name.to_string(), std::sync::Arc::new(before_meta.clone()));
                 return Err(error);
             }
 
@@ -1025,29 +1018,12 @@ fn exec_set_hot(engine: &Engine, db: &str, name: &str, hot: &HotDef) -> Result<E
             engine.hot_store_manager().remove(db, name);
             Ok(())
         };
-        let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
-            Some(
-                engine
-                    .segment_mgr()
-                    .with_table_mutation_lock(db, name, &mut op)?,
-            )
-        } else {
-            engine
-                .segment_mgr()
-                .try_with_table_mutation_lock(db, name, &mut op)?
-        };
+        let attempt = try_or_block_table_mutation_lock(engine, db, name, lock_attempts, &mut op)?;
         match attempt {
             Some(()) => break,
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
-                    tracing::warn!(
-                        db,
-                        table = name,
-                        lock_attempts,
-                        "set hot: table mutation lock busy; retrying without the catalog lock"
-                    );
-                }
+                warn_table_mutation_lock_busy(db, name, lock_attempts, "set hot");
                 drop(catalogs);
                 thread::sleep(DDL_TABLE_LOCK_RETRY_INTERVAL);
                 catalogs = engine.catalogs().write().unwrap();
@@ -1097,6 +1073,60 @@ pub fn exec_alter_table(
         }
     }
 
+    // Width-changing column operations move data layout: hot state (resident
+    // memtables, durable tails, hot mirror) must converge to the new catalog
+    // layout inside the table mutation lock that excludes appenders, BEFORE
+    // the catalog file flips. The save is the atomic commit point; a crash
+    // anywhere in the section leaves the consistent pre-DDL state on disk —
+    // the flush protocol retires tails and folds pending sidecars with its
+    // own crash safety, so no stale-layout hot state can outlive the ALTER.
+    //
+    // Replication inherits the same ordering: the flush's segment-retirement
+    // events enqueue during execute_stmt, and the CatalogSnapshot event is
+    // enqueued only after the statement succeeds (engine execute), so a
+    // standby retires the stale tails before it reloads the new catalog.
+    let width_changing = operations.iter().any(|operation| {
+        matches!(
+            operation,
+            AlterOperation::AddColumn { .. } | AlterOperation::DropColumn { .. }
+        )
+    });
+    if !width_changing {
+        return alter_column_catalog_only(engine, db, name, operations, false);
+    }
+    engine.segment_mgr().with_table_mutation_lock(db, name, || {
+        // Flushing skips transactional memtables (their rows reach segments
+        // only at COMMIT), and deferred-DML pins make memtable positions
+        // load-bearing: the layout flip must not run under either.
+        let has_open_txn_writes = engine
+            .memtable_manager()
+            .get_by_table(db, name)
+            .iter()
+            .any(|mt| mt.is_transactional())
+            || engine.txn_mutations().table_has_pins(db, name);
+        if has_open_txn_writes {
+            return Err(TaibaiError::Sql(format!(
+                "cannot ALTER the column layout of '{}.{}' while a transaction has written to it; commit or rollback first",
+                db, name
+            )));
+        }
+        engine.batch_writer().flush_table_under_table_lock(db, name)?;
+        engine.invalidate_hot_store(db, name);
+        alter_column_catalog_only(engine, db, name, operations, true)
+    })
+}
+
+/// The catalog-side ALTER (column add/drop/rename, TTL, compression, unique
+/// keys) under the catalog write lock. `width_changing` callers have already
+/// converged hot state under the table mutation lock; the flag publishes the
+/// post-ALTER layout for new memtables before the lock releases.
+fn alter_column_catalog_only(
+    engine: &Engine,
+    db: &str,
+    name: &str,
+    operations: &[AlterOperation],
+    width_changing: bool,
+) -> Result<ExecResult> {
     let mut catalogs = engine.catalogs().write().unwrap();
     let catalog = catalogs
         .get_mut(db)
@@ -1125,7 +1155,10 @@ pub fn exec_alter_table(
                     .with_default_value(default_value);
                 // Pin CURRENT_TIMESTAMP backfill at ALTER time: pre-existing
                 // rows must read a stable value, not the query instant.
-                if matches!(col_def.default_value, Some(ColumnDefaultValue::CurrentTimestamp)) {
+                if matches!(
+                    col_def.default_value,
+                    Some(ColumnDefaultValue::CurrentTimestamp)
+                ) {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -1198,7 +1231,7 @@ pub fn exec_alter_table(
                     .clone()
                     .unwrap_or_else(|| format!("uk_{}", table_meta.unique_indexes.len() + 1));
                 let indices = resolve_unique_index_columns(&schema, &key.columns)?;
-                super::dml_insert::validate_unique_key_uniqueness(
+                crate::sql::execution::dml_insert::validate_unique_key_uniqueness(
                     engine,
                     db,
                     name,
@@ -1310,12 +1343,24 @@ pub fn exec_alter_table(
                 meta.clear_ttl();
             }
             AlterOperation::SetCompressionLevel { level } => {
-                validate_compression_level(&level)?;
+                validate_compression_level(level)?;
                 let meta = catalog.get_table_mut(name).ok_or_else(|| {
                     TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name))
                 })?;
                 meta.compression_level = *level;
             }
+        }
+    }
+
+    // Publish the authoritative layout for new memtables while still under
+    // the table mutation lock: statements queued on it create memtables with
+    // this schema, and the append site aligns in-flight batches that planned
+    // against the pre-ALTER schema (added columns take their DEFAULT).
+    if width_changing {
+        if let Some(meta) = catalog.get_table(name) {
+            engine
+                .memtable_manager()
+                .set_table_schema(db, name, Schema::new(meta.columns.clone()));
         }
     }
 
@@ -1479,7 +1524,7 @@ fn normalize_default_value(
         }
         ColumnDefaultValue::Literal(value) => {
             let expr = crate::sql::parser::ast::Expr::Literal(value);
-            let scalar = super::helpers::eval_expr_to_scalar_with_scale_timezone(
+            let scalar = crate::sql::execution::helpers::eval_expr_to_scalar_with_scale_timezone(
                 &expr, &data_type, scale, 0,
             )?;
             if !scalar.is_null() && scalar.data_type() != data_type {
@@ -1525,8 +1570,12 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
 
         let mut op = || {
             engine.batch_writer().drain_table_tail(db, table)?;
-                engine.segment_mgr().close_table_state_handles(db, table);
+            engine.segment_mgr().close_table_state_handles(db, table);
             engine.segment_mgr().invalidate_readers_under(&table_dir);
+            // Index states pin open handles into the directory being staged
+            // away; drop them so the rename below cannot be blocked by an
+            // open handle (Windows) — the staged directory keeps the files.
+            engine.index_manager().drop_table_index_states(db, table);
 
             write_before_meta(&operation_dir, &before_meta)?;
             let fresh_data = operation_dir.join(FRESH_DATA_DIR);
@@ -1567,6 +1616,12 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
             engine.batch_writer().clear_memtables(db, table);
             engine.segment_mgr().remove_table_state(db, table);
             engine.hot_store_manager().remove(db, table);
+            engine.invalidate_hot_segment_hint(db, table);
+            // Reloaded data reuses segment paths from position 1; drop the
+            // previous incarnation's cached SUMs (see drop table).
+            crate::sql::execution::scan::aggregate_meta::invalidate_segment_sum_cache_under(
+                &table_dir,
+            );
             let unique_index_names = before_meta
                 .unique_indexes
                 .iter()
@@ -1579,29 +1634,12 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
             );
             Ok(operation_dir.clone())
         };
-        let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
-            Some(
-                engine
-                    .segment_mgr()
-                    .with_table_mutation_lock(db, table, &mut op)?,
-            )
-        } else {
-            engine
-                .segment_mgr()
-                .try_with_table_mutation_lock(db, table, &mut op)?
-        };
+        let attempt = try_or_block_table_mutation_lock(engine, db, table, lock_attempts, &mut op)?;
         match attempt {
             Some(operation_dir) => break operation_dir,
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
-                    tracing::warn!(
-                        db,
-                        table,
-                        lock_attempts,
-                        "truncate table: table mutation lock busy; retrying without the catalog lock"
-                    );
-                }
+                warn_table_mutation_lock_busy(db, table, lock_attempts, "truncate table");
                 drop(catalogs);
                 thread::sleep(DDL_TABLE_LOCK_RETRY_INTERVAL);
                 catalogs = engine.catalogs().write().unwrap();
@@ -1628,4 +1666,46 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
     }
 
     Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+/// One escalating attempt to run `op` under the table mutation lock: try-lock
+/// first, and once `DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS` busy rounds have
+/// passed, switch to a blocking acquire. `Some(value)` means the op ran; the
+/// caller owns the catalog write guard and drops it across the retry sleep.
+///
+/// The DDL paths that need catalog-meta + table-lock atomicity (drop, rename,
+/// partition change, set hot, truncate) share this loop tail; the guard dance
+/// stays at the call sites because each site's `op` borrows the catalog.
+fn try_or_block_table_mutation_lock<T>(
+    engine: &Engine,
+    db: &str,
+    name: &str,
+    lock_attempts: u32,
+    op: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
+    if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
+        Ok(Some(
+            engine
+                .segment_mgr()
+                .with_table_mutation_lock(db, name, op)?,
+        ))
+    } else {
+        engine
+            .segment_mgr()
+            .try_with_table_mutation_lock(db, name, op)
+    }
+}
+
+/// Warn cadence for a busy table mutation lock: first failure, then every
+/// 200th, so a stuck writer shows up in the log without flooding it.
+fn warn_table_mutation_lock_busy(db: &str, name: &str, lock_attempts: u32, label: &str) {
+    if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
+        tracing::warn!(
+            db,
+            table = name,
+            lock_attempts,
+            "{}: table mutation lock busy; retrying without the catalog lock",
+            label
+        );
+    }
 }

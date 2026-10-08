@@ -81,20 +81,23 @@ fn find_unsealed_skips_paths_mid_seal() {
     let manager = SegmentManager::new(dir.path()).unwrap();
     let state = table_state(&manager);
     let table_dir = dir.path().join("main").join("t");
+    // `find_unsealed_segment` serves the unpartitioned bucket, so the
+    // resumable target must be a regular segment (empty partition key);
+    // partition files are that search's explicit non-goals now.
     manager
-        .bulk_insert_batch_with_partition("main", "t", "p1", text_batch(8))
+        .bulk_insert_batch_with_partition("main", "t", "", text_batch(8))
         .unwrap();
 
     let active_path = {
         let guard = state.active_segments.lock().unwrap();
-        guard.get("p1").expect("active segment").path.clone()
+        guard.get("").expect("active segment").path.clone()
     };
 
     let empty = HashSet::new();
     let found = SegmentManager::find_unsealed_segment(&table_dir, u64::MAX, &empty).unwrap();
     assert!(found.is_some(), "sanity: the small segment is resumable");
 
-    state.register_sealing_segment("p1", active_path.clone());
+    state.register_sealing_segment("", active_path.clone());
     let found = SegmentManager::find_unsealed_segment(&table_dir, u64::MAX, &state.sealing_paths())
         .unwrap();
     assert!(

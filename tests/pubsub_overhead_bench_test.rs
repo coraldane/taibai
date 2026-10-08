@@ -7,10 +7,10 @@
 //! 1. `pubsub_disabled`  — master switch off (the floor).
 //! 2. `no_subscribers`   — pubsub enabled, nobody listening (the common case).
 //! 3. `v2_capture_only`  — a reliable-subscription channel exists but no
-//!                         subscriber is attached: every commit is cloned and
-//!                         mirrored into the retention log.
+//!    subscriber is attached: every commit is cloned and
+//!    mirrored into the retention log.
 //! 4. `hub_draining`     — a SUBSCRIBE (notification) subscriber draining in
-//!                         lockstep.
+//!    lockstep.
 //! 5. `v2_draining`      — a reliable subscriber draining and acking.
 //!
 //! The engine runs with async tail fsync so the numbers show pub/sub cost

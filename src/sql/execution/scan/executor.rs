@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use super::cluster_prune;
-use super::count;
+use super::fast_path::FastPathOutcome;
 use super::memtable;
 use super::partition;
 use super::row_filter;
@@ -29,6 +29,11 @@ pub struct ScanExecutor<'a> {
     /// regular aggregate pipeline over the raw scan batches instead of
     /// treating them as the answer.
     metadata_answered: bool,
+    /// The fast-path chain's query-level answer (`FinalAnswer` outcome):
+    /// `execute_scan_into` stashes it here and `execute_scan` unwraps it as
+    /// the complete result, bypassing the sink exactly as the pre-chain
+    /// routing did.
+    final_answer: Option<RecordBatch>,
 }
 
 impl<'a> ScanExecutor<'a> {
@@ -47,6 +52,7 @@ impl<'a> ScanExecutor<'a> {
             db,
             stats: None,
             metadata_answered: false,
+            final_answer: None,
         }
     }
 
@@ -65,6 +71,7 @@ impl<'a> ScanExecutor<'a> {
             db,
             stats: None,
             metadata_answered: false,
+            final_answer: None,
         }
     }
 
@@ -84,246 +91,21 @@ impl<'a> ScanExecutor<'a> {
         let segment_mgr = self.runtime.segment_mgr().clone();
         let db = self.db.to_string();
         let table = self.spec.table_name.clone();
-        segment_mgr.with_table_flush_read_lock(&db, &table, || self.execute_unlocked())
-    }
-
-    fn execute_unlocked(&mut self) -> Result<Vec<RecordBatch>> {
-        // Metadata fast paths (DISTINCT / simple aggregates) fold zone maps
-        // and footers directly and never apply the read-time TTL filter, so
-        // a table with an active TTL must take the regular scan path.
-        let ttl_active = self.table_meta.ttl.is_some();
-        if let Some(column) = self.spec.distinct_column.clone() {
-            if !ttl_active {
-                if let Some(batch) = self.execute_distinct_metadata(&column)? {
-                    self.metadata_answered = true;
-                    return Ok(vec![batch]);
-                }
-            }
-        }
-        if let Some(aggs) = self.spec.simple_metadata_aggregates.clone() {
-            if !ttl_active {
-                return self.execute_simple_metadata_aggregate(&aggs);
-            }
-        }
-        if self.spec.is_count_star {
-            return self.execute_count_star();
-        }
-        self.execute_scan()
-    }
-
-    /// Wrap a row count as the single-batch COUNT(*) reply.
-    fn count_star_batches(count: u64) -> Result<Vec<RecordBatch>> {
-        let result = count::build_count_star_result(count);
-        Ok(match result {
-            crate::sql::execution::engine::ExecResult::Query { batches, .. } => batches,
-            _ => Vec::new(),
-        })
-    }
-
-    /// Rows visible in live memtables, preferring the hot-mirror-aware count
-    /// (`None` means the hot store cannot prove coverage for this shape, so
-    /// the plain memtable count answers).
-    fn live_memtable_rows(&self) -> u64 {
-        memtable::count_hot_memtable_rows(
-            self.runtime.memtable_manager(),
-            self.runtime.hot_store_manager(),
-            self.db,
-            &self.spec.table_name,
-            &self.spec,
-        )
-        .unwrap_or_else(|| {
-            memtable::count_memtable_rows(
-                self.runtime.memtable_manager(),
-                self.db,
-                &self.spec.table_name,
-                &self.spec,
-            )
-        })
-    }
-
-    /// COUNT(*) resolves through a chain of increasingly general strategies;
-    /// the first that applies answers. Each is guarded by its own
-    /// eligibility, so a later strategy never runs when an earlier one
-    /// engaged.
-    fn execute_count_star(&mut self) -> Result<Vec<RecordBatch>> {
-        // 1. Hybrid partial residency: the hot mirror covers rows above its
-        //    coverage bound; the complementary range is counted through
-        //    segments and memtables.
-        if let Some((mirror_count, pk_idx, covers)) = memtable::hybrid_hot_mirror_count(
-            self.runtime.hot_store_manager(),
-            self.runtime.memtable_manager(),
-            self.db,
-            &self.table_meta,
-            &self.spec,
-        ) {
-            return self.execute_hybrid_count_star(mirror_count, pk_idx, covers);
-        }
-
-        // 2. Fully resident: the hot store answers alone.
-        if let Some(count) = self.try_resident_hot_count()? {
-            return Self::count_star_batches(count);
-        }
-
-        // 3. Active TTL: visibility is row-dependent, so COUNT(*) must scan
-        //    (only) the TTL column and count the rows that survive it.
-        if self.table_meta.ttl.is_some() {
-            let mut ttl_spec = self.spec.clone();
-            ttl_spec.is_count_star = false;
-            ttl_spec.projection = self
-                .table_meta
-                .get_ttl_column_index_cached()
-                .map(|idx| vec![idx]);
-            let mut executor = ScanExecutor::from_runtime(
-                &ttl_spec,
-                self.runtime.clone(),
-                self.table_schema.clone(),
-                self.table_meta.clone(),
-                self.db,
-            );
-            let count = executor
-                .execute_scan()?
-                .iter()
-                .map(|batch| batch.num_rows() as u64)
-                .sum();
-            return Self::count_star_batches(count);
-        }
-
-        // 4. No segment directory yet: only live memtable rows exist.
-        let table_dir = self
-            .runtime
-            .data_dir()
-            .join(self.db)
-            .join(&self.spec.table_name);
-        if !table_dir.exists() {
-            return Self::count_star_batches(self.live_memtable_rows());
-        }
-
-        // 5. General: segments plus live memtables.
-        let count = count::count_star(
-            &self.spec,
-            &self.table_meta,
-            &table_dir,
-            self.runtime.segment_mgr(),
-            self.runtime.memtable_manager(),
-            self.db,
-            self.stats.as_deref_mut(),
-        )?;
-        Self::count_star_batches(count)
-    }
-
-    /// Hybrid partial-residency count: the mirror answered the rows above the
-    /// coverage bound (`mirror_count`); count the complementary
-    /// `partition_column <= covers` range through the regular segment and
-    /// memtable paths. The added range clause keeps zone-map pruning effective
-    /// (date-pure row groups above the bound prune to nothing).
-    fn execute_hybrid_count_star(
-        &mut self,
-        mirror_count: u64,
-        pk_idx: usize,
-        covers: crate::types::scalar::ScalarValue,
-    ) -> Result<Vec<RecordBatch>> {
-        self.spec
-            .range_predicates
-            .push(crate::storage::partition::pruning::RangeClause {
-                column_index: pk_idx,
-                op: crate::storage::partition::pruning::RangeOp::Le,
-                value: covers,
-            });
-        let table_dir = self
-            .runtime
-            .data_dir()
-            .join(self.db)
-            .join(&self.spec.table_name);
-        let count = if !table_dir.exists() {
-            self.live_memtable_rows()
-        } else {
-            count::count_star(
-                &self.spec,
-                &self.table_meta,
-                &table_dir,
-                self.runtime.segment_mgr(),
-                self.runtime.memtable_manager(),
-                self.db,
-                self.stats.as_deref_mut(),
-            )?
-        };
-        let total = mirror_count.saturating_add(count);
-        Self::count_star_batches(total)
-    }
-
-    /// Metadata-driven fast path for simple aggregate queries (no GROUP BY,
-    /// select list is only COUNT/MIN/MAX). Answers from row-group zone maps /
-    /// footers without streaming the data.
-    /// Single-column DISTINCT answered from row-group zone maps. Returns
-    /// `None` when the fast path declines (caller falls back to the normal
-    /// scan + DistinctExec pipeline).
-    fn execute_distinct_metadata(&mut self, column: &str) -> Result<Option<RecordBatch>> {
-        let table_dir = self
-            .runtime
-            .data_dir()
-            .join(self.db)
-            .join(&self.spec.table_name);
-        super::aggregate_meta::compute_distinct_column(
-            &self.spec,
-            &self.table_meta,
-            &self.table_schema,
-            &table_dir,
-            self.runtime.segment_mgr(),
-            self.runtime.memtable_manager(),
-            self.runtime.hot_store_manager(),
-            self.db,
-            column,
-        )
-    }
-
-    fn execute_simple_metadata_aggregate(
-        &mut self,
-        aggs: &[crate::sql::planner::AggregateExpr],
-    ) -> Result<Vec<RecordBatch>> {
-        let table_dir = self
-            .runtime
-            .data_dir()
-            .join(self.db)
-            .join(&self.spec.table_name);
-        let batch = if table_dir.exists() {
-            super::aggregate_meta::compute_simple_aggregate(
-                &self.spec,
-                aggs,
-                &self.table_meta,
-                &self.table_schema,
-                &table_dir,
-                self.runtime.segment_mgr(),
-                self.runtime.memtable_manager(),
-                self.runtime.hot_store_manager(),
-                self.db,
-            )?
-        } else {
-            // No persisted segments; only memtable/hot store rows.
-            super::aggregate_meta::compute_simple_aggregate(
-                &self.spec,
-                aggs,
-                &self.table_meta,
-                &self.table_schema,
-                std::path::Path::new(""),
-                self.runtime.segment_mgr(),
-                self.runtime.memtable_manager(),
-                self.runtime.hot_store_manager(),
-                self.db,
-            )?
-        };
-        let Some(batch) = batch else {
-            // Sum over a column the metadata path cannot answer: return the
-            // raw scan batches and let the caller run the regular aggregate
-            // pipeline over them (`metadata_answered()` stays false).
-            return self.execute_scan();
-        };
-        self.metadata_answered = true;
-        Ok(vec![batch])
+        segment_mgr.with_table_flush_read_lock(&db, &table, || self.execute_scan())
     }
 
     fn execute_scan(&mut self) -> Result<Vec<RecordBatch>> {
         let mut output = LimitedBatchSink::new(None);
         self.execute_scan_into(&mut output)?;
+        if output.over_cap {
+            return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
+                "scan input materialization exceeded the query memory budget ({} > {} bytes); raise query_memory_limit_mb",
+                output.bytes, output.byte_cap
+            )));
+        }
+        if let Some(batch) = self.final_answer.take() {
+            return Ok(vec![batch]);
+        }
         Ok(output.finish())
     }
 
@@ -339,9 +121,7 @@ impl<'a> ScanExecutor<'a> {
                 .build();
         let mut scan_limit = plan.scan_limit;
 
-        if let Some(batch) = self.try_resident_hot_scan(&plan)? {
-            output.set_limit(scan_limit);
-            output.push(batch);
+        if self.try_fast_paths(&plan, output)? {
             return Ok(());
         }
 
@@ -445,39 +225,18 @@ impl<'a> ScanExecutor<'a> {
             } else {
                 for seg_path in &filtered_segments {
                     crate::common::query_cancel::check()?;
-                    let meta = mgr.segment_meta(seg_path).ok().flatten();
-                    let meta_candidate_indices = meta.as_ref().map(|meta| {
-                        let pred = self.spec.to_row_group_predicate();
-                        if !super::row_group::prune_segment_by_zone_map(
-                            &pred,
-                            &meta.segment_zone_maps,
-                        ) {
-                            return Vec::new();
-                        }
-                        super::row_group::prune_row_group_meta(
-                            &meta.row_groups,
-                            &pred,
-                            &super::row_group::build_bloom_check_list(&self.spec),
-                            &super::row_group::build_in_check_list(&self.spec),
-                            &super::row_group::build_set_check_list(&self.spec),
-                            &super::row_group::build_set_in_check_list(&self.spec),
-                        )
-                        .candidate_indices
-                    });
-                    if meta_candidate_indices
-                        .as_ref()
-                        .is_some_and(|candidates| candidates.is_empty())
-                    {
-                        continue;
-                    }
-
-                    let reader = match mgr.open_scan_reader(seg_path, self.spec.reader_txn_id) {
-                        Ok(r) => r,
+                    // Shared candidate enumeration: sidecar meta prune first
+                    // (skips the segment without opening it when nothing
+                    // survives), reader prune on fallback. A concurrent
+                    // compaction may legitimately remove a segment mid-scan;
+                    // anything else must fail the query instead of silently
+                    // skipping the whole segment's rows.
+                    let opened = match super::candidates::open_segment_with_candidates(
+                        &mgr, seg_path, &self.spec,
+                    ) {
+                        Ok(Some(opened)) => opened,
+                        Ok(None) => continue,
                         Err(error) => {
-                            // A concurrent compaction may legitimately remove
-                            // a segment mid-scan; anything else (IO error,
-                            // corrupt footer) must fail the query instead of
-                            // silently skipping the whole segment's rows.
                             if !seg_path.exists() {
                                 tracing::warn!(
                                     segment = %seg_path.display(),
@@ -488,23 +247,14 @@ impl<'a> ScanExecutor<'a> {
                             return Err(error);
                         }
                     };
+                    let reader = opened.reader;
+                    let candidate_indices = opened.indices;
 
                     if let Some(s) = self.stats.as_deref_mut() {
                         s.entry(self.spec.table_name.clone())
                             .or_default()
                             .segments_opened += 1;
                     }
-
-                    let candidate_indices = if let Some(candidates) = meta_candidate_indices {
-                        candidates
-                    } else {
-                        let Some(prune_result) =
-                            super::strategy::prune_segment(&self.spec, &reader)
-                        else {
-                            continue;
-                        };
-                        prune_result.candidate_indices
-                    };
 
                     if let Some(s) = self.stats.as_deref_mut() {
                         let stats_entry = s.entry(self.spec.table_name.clone()).or_default();
@@ -691,28 +441,105 @@ impl<'a> ScanExecutor<'a> {
         Ok(())
     }
 
-    fn try_resident_hot_scan(
-        &self,
+    /// The unified fast-path chain. Order mirrors the historic routing:
+    /// DISTINCT zone-map answer, metadata-folded aggregate, resident
+    /// hot-store shortcut; anything declined reaches the hybrid mirror leg
+    /// and the general scan below.
+    ///
+    /// The universal TTL gate runs here once, before any node: every chain
+    /// node declines TTL tables (truncation-style gathers would collect at
+    /// the pushed LIMIT before TTL filtering runs and return fewer live rows
+    /// than exist), so a new node cannot forget the gate. The nodes keep
+    /// their internal gates as defense in depth for direct callers.
+    ///
+    /// Returns `true` when the chain answered and the general legs must not
+    /// run. Stats recording uses direct field access on purpose: the context
+    /// borrows `spec`/`table_meta`/`table_schema`/`runtime` immutably, so a
+    /// `&mut self` helper would fight the borrow checker.
+    fn try_fast_paths<S: BatchSink>(
+        &mut self,
         plan: &super::strategy::ScanPlan,
-    ) -> Result<Option<RecordBatch>> {
-        let mut hot_spec = self.spec.clone();
-        hot_spec.projection = Some(plan.projection_cols.clone());
-        let Some(batch) = memtable::scan_resident_hot_store(
-            self.runtime.hot_store_manager(),
-            self.runtime.memtable_manager(),
+        output: &mut S,
+    ) -> Result<bool> {
+        if super::fast_path::ttl_blocks(&self.spec, &self.table_meta) {
+            self.record_fast_path_decline(super::fast_path::TTL_GATE_NODE);
+            return Ok(false);
+        }
+        let ctx = super::fast_path::FastPathContext::from_runtime(
+            &self.spec,
+            &self.table_meta,
+            &self.table_schema,
             self.db,
-            &self.table_meta,
-            &hot_spec,
-        ) else {
-            return Ok(None);
+            &self.runtime,
+        );
+        let distinct = super::fast_path::DistinctMetadataFastPath;
+        let folded = self
+            .spec
+            .metadata_fold
+            .as_ref()
+            .map(super::fast_path::FoldedAggregateFastPath::from_fold);
+        let resident = super::fast_path::ResidentHotFastPath {
+            projection_cols: &plan.projection_cols,
+            strip_ttl_column: plan.strip_ttl_column,
         };
-        let batch = super::strategy::apply_ttl_filter_and_projection(
-            batch,
-            &self.table_meta,
-            &plan.projection_cols,
-            plan.strip_ttl_column,
-        )?;
-        Ok(Some(batch))
+        let mut nodes: Vec<&dyn super::fast_path::ScanFastPath> = vec![&distinct];
+        if let Some(node) = folded.as_ref() {
+            nodes.push(node);
+        }
+        nodes.push(&resident);
+
+        let mut declined_nodes: Vec<&'static str> = Vec::new();
+        for node in nodes {
+            match node.try_answer(&ctx)? {
+                FastPathOutcome::FinalAnswer(batch) => {
+                    self.final_answer = Some(batch);
+                    self.metadata_answered = true;
+                    if let Some(s) = self.stats.as_deref_mut() {
+                        s.entry(self.spec.table_name.clone())
+                            .or_default()
+                            .fast_path_answered = Some(node.name());
+                    }
+                    return Ok(true);
+                }
+                FastPathOutcome::ScanRows(batch) => {
+                    output.set_limit(plan.scan_limit);
+                    output.push(batch);
+                    if let Some(s) = self.stats.as_deref_mut() {
+                        s.entry(self.spec.table_name.clone())
+                            .or_default()
+                            .fast_path_answered = Some(node.name());
+                    }
+                    return Ok(true);
+                }
+                FastPathOutcome::Declined(decline) => {
+                    // A shape the node does not apply to was never a
+                    // fast-path attempt; only record real declines.
+                    if decline.reason != super::fast_path::DeclineReason::NotApplicable {
+                        declined_nodes.push(decline.node);
+                    }
+                }
+            }
+        }
+        // Recorded after the loop: the chain context borrows several fields
+        // of self immutably, so stats writes wait until the borrows end.
+        if !declined_nodes.is_empty() {
+            if let Some(s) = self.stats.as_deref_mut() {
+                s.entry(self.spec.table_name.clone())
+                    .or_default()
+                    .fast_path_declined
+                    .extend(declined_nodes);
+            }
+        }
+        Ok(false)
+    }
+
+    fn record_fast_path_decline(&mut self, node: &'static str) {
+        if let Some(s) = self.stats.as_deref_mut() {
+            s.entry(self.spec.table_name.clone())
+                .or_default()
+                .fast_path_declined
+                .push(node);
+        }
     }
 
     fn scan_segments_parallel(
@@ -728,6 +555,14 @@ impl<'a> ScanExecutor<'a> {
         // Rayon lanes do not inherit the ambient cancellation context, so
         // capture the flag and let lane closures stop starting new reads.
         let cancel_flag = crate::common::query_cancel::current_flag();
+        // Budget is enforced DURING collection, not after: the sink at the
+        // call site only noticed the overrun once every segment had already
+        // been decoded into memory.
+        let byte_cap = {
+            let mb = crate::common::config::query_limits().query_memory_limit_mb;
+            mb.saturating_mul(1024 * 1024)
+        };
+        let mut output_bytes = 0u64;
         let mut output = Vec::new();
         for (chunk_index, chunk) in paths.chunks(max_parallel).enumerate() {
             crate::common::query_cancel::check()?;
@@ -763,25 +598,26 @@ impl<'a> ScanExecutor<'a> {
                             }
                         }
                     };
-                    let candidates = if let Ok(Some(meta)) = manager.segment_meta(path) {
-                        let predicate = self.spec.to_row_group_predicate();
-                        if !super::row_group::prune_segment_by_zone_map(
-                            &predicate,
-                            &meta.segment_zone_maps,
-                        ) {
-                            return Some(Ok((base + position, Vec::new())));
+                    let candidates = match manager.segment_meta(path) {
+                        Ok(Some(meta)) => {
+                            // Gateway prune: catalog-space spec aligned onto
+                            // the footer's own column order first. An empty
+                            // result means the zone maps pruned the whole
+                            // segment; `Unaligned` falls back to the reader.
+                            match super::row_filter::meta_prune_row_groups(&meta, &self.spec) {
+                                Ok(super::row_filter::MetaPrune::Candidates(indices))
+                                    if indices.is_empty() =>
+                                {
+                                    return Some(Ok((base + position, Vec::new())));
+                                }
+                                Ok(super::row_filter::MetaPrune::Candidates(indices)) => indices,
+                                Ok(super::row_filter::MetaPrune::Unaligned) | Err(_) => {
+                                    super::strategy::prune_segment(&self.spec, &reader)?
+                                        .candidate_indices
+                                }
+                            }
                         }
-                        super::row_group::prune_row_group_meta(
-                            &meta.row_groups,
-                            &predicate,
-                            &super::row_group::build_bloom_check_list(&self.spec),
-                            &super::row_group::build_in_check_list(&self.spec),
-                            &super::row_group::build_set_check_list(&self.spec),
-                            &super::row_group::build_set_in_check_list(&self.spec),
-                        )
-                        .candidate_indices
-                    } else {
-                        super::strategy::prune_segment(&self.spec, &reader)?.candidate_indices
+                        _ => super::strategy::prune_segment(&self.spec, &reader)?.candidate_indices,
                     };
                     // Row groups inside a segment decode in parallel as
                     // well; actual concurrency is bounded by the global
@@ -838,20 +674,19 @@ impl<'a> ScanExecutor<'a> {
             });
             for outcome in scanned {
                 let (_, mut batches) = outcome?;
-                output.append(&mut batches);
+                for batch in batches.drain(..) {
+                    output_bytes = output_bytes.saturating_add(batch.estimated_size_bytes() as u64);
+                    if output_bytes > byte_cap {
+                        return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
+                            "parallel scan materialization exceeded the query memory budget ({} > {} bytes); raise query_memory_limit_mb",
+                            output_bytes, byte_cap
+                        )));
+                    }
+                    output.push(batch);
+                }
             }
         }
         Ok(output)
-    }
-
-    fn try_resident_hot_count(&self) -> Result<Option<u64>> {
-        Ok(memtable::count_resident_hot_store(
-            self.runtime.hot_store_manager(),
-            self.runtime.memtable_manager(),
-            self.db,
-            &self.table_meta,
-            &self.spec,
-        ))
     }
 
     fn ordered_cluster_segments_are_monotonic(&self, segments: &[PathBuf], col_idx: usize) -> bool {
@@ -859,6 +694,7 @@ impl<'a> ScanExecutor<'a> {
             || cluster_prune::cluster_segment_zone_maps_are_monotonic(
                 segments,
                 self.runtime.segment_mgr(),
+                &self.spec.table_schema,
                 col_idx,
             )
     }
@@ -875,9 +711,12 @@ impl<'a> ScanExecutor<'a> {
             return segments;
         };
 
-        let Some((start, end)) =
-            cluster_prune::cluster_segment_range(&segments, self.runtime.segment_mgr(), bounds)
-        else {
+        let Some((start, end)) = cluster_prune::cluster_segment_range(
+            &segments,
+            self.runtime.segment_mgr(),
+            &self.spec.table_schema,
+            bounds,
+        ) else {
             return segments;
         };
         if start > end {
@@ -953,14 +792,32 @@ struct LimitedBatchSink {
     batches: Vec<RecordBatch>,
     limit: Option<usize>,
     rows_emitted: usize,
+    /// Bytes accumulated by the sink. The streaming cursor covers nearly
+    /// every query shape now; what still lands here (COUNT fast paths,
+    /// cursor-declined shapes) must not materialize past the query budget
+    /// — 0 disables the cap.
+    bytes: u64,
+    byte_cap: u64,
+    over_cap: bool,
 }
 
 impl LimitedBatchSink {
     fn new(limit: Option<usize>) -> Self {
+        let byte_cap = {
+            let mb = crate::common::config::query_limits().query_memory_limit_mb;
+            if mb == 0 {
+                u64::MAX
+            } else {
+                mb.saturating_mul(1024 * 1024)
+            }
+        };
         Self {
             batches: Vec::new(),
             limit,
             rows_emitted: 0,
+            bytes: 0,
+            byte_cap,
+            over_cap: false,
         }
     }
 
@@ -977,6 +834,16 @@ impl BatchSink for LimitedBatchSink {
     fn push(&mut self, batch: RecordBatch) -> bool {
         if batch.num_rows() == 0 {
             return true;
+        }
+
+        self.bytes = self
+            .bytes
+            .saturating_add(batch.estimated_size_bytes() as u64);
+        if self.bytes > self.byte_cap {
+            // Remember and keep collecting would only deepen the overrun;
+            // the executor turns this into a clean budget error.
+            self.over_cap = true;
+            return false;
         }
 
         let Some(limit) = self.limit else {
@@ -1016,9 +883,18 @@ fn reverse_batch(batch: &RecordBatch) -> Result<RecordBatch> {
 }
 
 fn reverse_column(col: &ColumnArray) -> Result<ColumnArray> {
-    let mut out = ColumnArray::with_capacity(col.data_type(), col.len());
-    for row_idx in (0..col.len()).rev() {
-        out.push(&col.scalar(row_idx))?;
-    }
-    Ok(out)
+    // One bulk gather instead of a per-row scalar() + push() round-trip,
+    // which cloned every VarChar cell of the row group being reversed.
+    // View shapes (Selected/Rle/Dictionary) have no arm in gather_into, so
+    // they are flattened once first.
+    let flattened;
+    let col = match col {
+        ColumnArray::Selected { .. } | ColumnArray::Rle { .. } | ColumnArray::Dictionary { .. } => {
+            flattened = col.flattened();
+            flattened
+        }
+        other => other,
+    };
+    let rows: Vec<u32> = (0..col.len() as u32).rev().collect();
+    Ok(col.take(&rows))
 }

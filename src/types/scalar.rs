@@ -112,6 +112,47 @@ impl ScalarValue {
         }
     }
 
+    /// Total order over scalars for sorting and merging: ORDER BY, TopN,
+    /// spill-merge cursors, min/max folds, zone maps and sort keys.
+    ///
+    /// NULLs are placed by `null_order` (`Greater` = nulls last in ascending
+    /// order, `Less` = nulls first). Numeric pairs — integers, decimals and
+    /// floats in any mix — compare by value promotion. Remaining same-type
+    /// pairs compare naturally; anything else falls back to comparing Display
+    /// text, which keeps the result a deterministic total order (NaN vs any
+    /// number also lands here and sorts after it, like `"NaN" > "1"`).
+    ///
+    /// This is the single implementation behind the former four drifting
+    /// copies (`sort_key::compare_scalars_for_sort`, `sort::
+    /// compare_scalars_null_last`, `aggregate::compare_scalars`,
+    /// `query::union_scalar_cmp`).
+    pub fn compare_ordered(
+        &self,
+        other: &Self,
+        null_order: std::cmp::Ordering,
+    ) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self.is_null(), other.is_null()) {
+            (true, true) => return Ordering::Equal,
+            (true, false) => return null_order,
+            (false, true) => return null_order.reverse(),
+            (false, false) => {}
+        }
+        if let Some(ord) = self.numeric_cmp(other) {
+            return ord;
+        }
+        match (self, other) {
+            (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) => l.cmp(r),
+            (ScalarValue::Bool(Some(l)), ScalarValue::Bool(Some(r))) => l.cmp(r),
+            (ScalarValue::Timestamp(Some(l)), ScalarValue::Timestamp(Some(r))) => l.cmp(r),
+            (ScalarValue::Date(Some(l)), ScalarValue::Date(Some(r))) => l.cmp(r),
+            (ScalarValue::Time(Some(l)), ScalarValue::Time(Some(r))) => l.cmp(r),
+            (ScalarValue::Interval(Some(l)), ScalarValue::Interval(Some(r))) => l.cmp(r),
+            (ScalarValue::Blob(Some(l)), ScalarValue::Blob(Some(r))) => l.cmp(r),
+            _ => self.to_string().cmp(&other.to_string()),
+        }
+    }
+
     /// Returns true if this value is NULL.
     pub fn is_null(&self) -> bool {
         match self {
@@ -256,6 +297,31 @@ impl fmt::Display for ScalarValue {
             ScalarValue::Vector(Some(v)) => write!(f, "{:?}", v),
             ScalarValue::Vector(None) => write!(f, "NULL"),
         }
+    }
+}
+
+/// Canonical bit pattern for using a float as an equality/hash key (hot-store
+/// point lookup, join and GROUP BY keys). SQL `=` treats `-0.0 == 0.0`, so the
+/// sign bit of zero is folded away; every NaN payload folds to the canonical
+/// quiet NaN so NaN rows group together instead of splitting per bit pattern.
+/// Raw `to_bits()` keys made `WHERE k = 0.0` miss `-0.0` rows in the hot store.
+#[inline]
+pub fn float_key_bits(v: f64) -> u64 {
+    if v.is_nan() {
+        0x7ff8_0000_0000_0000
+    } else {
+        (v + 0.0).to_bits()
+    }
+}
+
+/// f32-domain twin of [`float_key_bits`] for 4-byte key formats (the
+/// `encode_key_at` payload width must stay f32-sized for Float32 columns).
+#[inline]
+pub fn float32_key_bits(v: f32) -> u32 {
+    if v.is_nan() {
+        0x7fc0_0000
+    } else {
+        (v + 0.0).to_bits()
     }
 }
 

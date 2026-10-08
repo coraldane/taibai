@@ -54,6 +54,11 @@ pub struct TableTxnMutations {
     /// Rows this transaction deleted or replaced; the catalog `row_count`
     /// decrement is deferred to COMMIT with this value.
     pub deleted_rows: u64,
+    /// Rows this transaction's INSERT statements already added to the
+    /// catalog `row_count` at statement time; ROLLBACK retracts exactly this
+    /// much (COMMIT does nothing here — the statement-time increment is
+    /// already final).
+    pub inserted_rows: u64,
     /// Change-feed Delete events (pre-delete row images), published at COMMIT.
     pub deferred_delete_batches: Vec<RecordBatch>,
     /// Change-feed Update events (post-update row images), published at COMMIT.
@@ -69,6 +74,7 @@ impl TableTxnMutations {
             segments: Vec::new(),
             memtables: Vec::new(),
             deleted_rows: 0,
+            inserted_rows: 0,
             deferred_delete_batches: Vec::new(),
             deferred_update_batches: Vec::new(),
         }
@@ -100,9 +106,25 @@ pub struct TxnMutations {
     mutation_bytes: u64,
 }
 
+// Shared with set_txn_mutation_budget_for_tests; see that function.
+#[cfg(test)]
+thread_local! {
+    static TEST_BUDGET_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// Deferred-mutation budget per transaction (row ids, tombstone positions,
 /// deferred change-event batches). Overridable for large-import workloads.
 pub fn txn_mutation_budget_bytes() -> u64 {
+    // Tests drive the budget down without env vars (the OnceLock below is
+    // process-global and `cargo test --lib` runs threads in parallel). Every
+    // charge site runs on the session thread, so a thread-local override
+    // cannot leak into other tests.
+    #[cfg(test)]
+    {
+        if let Some(bytes) = TEST_BUDGET_OVERRIDE.with(|override_| override_.get()) {
+            return bytes;
+        }
+    }
     static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
         std::env::var("TAIBAI_TXN_MUTATION_BUDGET_BYTES")
@@ -113,9 +135,24 @@ pub fn txn_mutation_budget_bytes() -> u64 {
     })
 }
 
+/// Test-only budget override for the current thread; `None` restores the
+/// configured/env value. Tests must reset to `None` before returning.
+#[cfg(test)]
+pub fn set_txn_mutation_budget_for_tests(bytes: Option<u64>) {
+    TEST_BUDGET_OVERRIDE.with(|override_| override_.set(bytes));
+}
+
 /// Rough per-entry cost of a BTreeSet row id / tombstone position (key bytes
 /// plus tree-node overhead).
 const POSITION_CHARGE_BYTES: u64 = 48;
+
+/// Statement-staging charge estimate: one tombstone position or row id per
+/// entry, mirroring what `register_memtable_tombstones` and
+/// `register_segment_tombstones` will charge when the staged effects are
+/// applied.
+pub fn estimate_position_charge(entries: usize) -> u64 {
+    (entries as u64).saturating_mul(POSITION_CHARGE_BYTES)
+}
 
 /// Shared registry hanging off the engine, segment manager (scan lookup) and
 /// memtable manager (flush pin). All methods take the single lock; entries
@@ -144,7 +181,26 @@ impl TxnMutationRegistry {
             .iter()
             .position(|entry| entry.db == db && entry.table == table)
         {
-            return &mut txn.tables[index];
+            let entry = &mut txn.tables[index];
+            // The recorded scope drives the COMMIT mutation-lock breadth, so a
+            // later statement must widen it to cover its own tombstones: a
+            // table-wide statement (`None`) makes the COMMIT take the whole
+            // table lock, and two different narrow partitions union their
+            // keys. Keeping the first statement's narrow scope would let
+            // COMMIT rewrite another partition's segments while that
+            // partition's flush runs concurrently.
+            match (&mut entry.partitions, partitions) {
+                (_, None) => entry.partitions = None,
+                (None, Some(_)) => {}
+                (Some(existing), Some(new_parts)) => {
+                    for part in new_parts {
+                        if !existing.iter().any(|key| key == part) {
+                            existing.push(part.clone());
+                        }
+                    }
+                }
+            }
+            return entry;
         }
         let mut entry = TableTxnMutations::new(db, table, None);
         if let Some(parts) = partitions {
@@ -154,6 +210,7 @@ impl TxnMutationRegistry {
         txn.tables.last_mut().expect("just pushed")
     }
 
+    #[allow(clippy::too_many_arguments)]
     /// Record newly deleted segment rows for `txn_id`. `footer_bitmap` is the
     /// segment's current footer bitmap; the composed reader bitmap is
     /// recomputed as footer ∪ existing entry ∪ `newly_deleted`.
@@ -180,21 +237,36 @@ impl TxnMutationRegistry {
             entry.segments.last_mut().expect("just pushed")
         };
         let mut new_row_ids: u64 = 0;
+        // Incremental composition instead of replaying the whole history:
+        // row ids are recorded once and never removed, so folding the current
+        // footer once per statement (O(footer bytes)) plus the new ids
+        // (O(new ids)) reproduces the replay's footer ∪ all-ids recomputation
+        // without its O(all recorded ids) term — the quadratic cost of
+        // repeated small DELETEs inside one transaction. Folding the footer
+        // EVERY statement (not just at composition start) keeps the result
+        // byte-identical to the replay even if the segment's footer gained
+        // bits in the already-composed range; bits are never cleared here.
+        let composed = Arc::make_mut(&mut entry.composed);
+        if composed.len() < footer_bitmap.len() {
+            composed.resize(footer_bitmap.len(), 0);
+        }
+        for (dst, src) in composed.iter_mut().zip(footer_bitmap.iter()) {
+            *dst |= src;
+        }
         for row_id in newly_deleted {
             if entry.row_ids.insert(row_id) {
                 new_row_ids += 1;
+                let byte = (row_id / 8) as usize;
+                let bit = (row_id % 8) as u8;
+                if byte >= composed.len() {
+                    composed.resize(byte + 1, 0);
+                }
+                composed[byte] |= 1u8 << bit;
             }
         }
-        let mut composed = footer_bitmap.to_vec();
-        for &row_id in &entry.row_ids {
-            let byte = (row_id / 8) as usize;
-            let bit = (row_id % 8) as u8;
-            if byte >= composed.len() {
-                composed.resize(byte + 1, 0);
-            }
-            composed[byte] |= 1u8 << bit;
-        }
-        entry.composed = Arc::new(composed);
+        // `Arc::make_mut` mutated the existing allocation in place when the
+        // Arc was unique (the common case); when a reader still held the old
+        // snapshot it cloned once — the same cost the full replay always paid.
         // Charge after the `entry` borrow ends; `charge` re-borrows `inner`.
         let txn = inner.get_mut(&txn_id).expect("entry just created");
         txn.charge(new_row_ids.saturating_mul(POSITION_CHARGE_BYTES))?;
@@ -223,10 +295,17 @@ impl TxnMutationRegistry {
             });
             entry.memtables.last_mut().expect("just pushed")
         };
-        let mut merged = (*Arc::clone(&entry.positions)).clone();
-        merged.extend(positions);
-        let new_positions = merged.len().saturating_sub(entry.positions.len()) as u64;
-        entry.positions = Arc::new(merged);
+        // Differential merge instead of clone-then-extend: insert each
+        // incoming position straight into the set (O(log n) per position,
+        // duplicate positions are the no-op they already were), cloning the
+        // stored set only when a reader still holds the old `Arc` snapshot.
+        let positions_set = Arc::make_mut(&mut entry.positions);
+        let mut new_positions = 0u64;
+        for position in positions {
+            if positions_set.insert(position) {
+                new_positions += 1;
+            }
+        }
         let txn = inner.get_mut(&txn_id).expect("entry just created");
         txn.charge(new_positions.saturating_mul(POSITION_CHARGE_BYTES))?;
         Ok(())
@@ -252,6 +331,236 @@ impl TxnMutationRegistry {
         txn.charge_insert(bytes)
     }
 
+    /// Transfer only buffered image charges from a private statement staging
+    /// transaction. Validate before mutation so a failed transfer is inert.
+    pub(crate) fn adopt_staged_insert_bytes(
+        &self,
+        staged: u64,
+        owner: u64,
+        db: &str,
+        table: &str,
+        view_bytes: u64,
+    ) -> crate::common::error::Result<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        let bytes = inner
+            .get(&staged)
+            .map_or(0, |txn| txn.mutation_bytes)
+            .saturating_add(view_bytes);
+        Self::table_entry(&mut inner, owner, db, table, None);
+        inner.get_mut(&owner).unwrap().charge(bytes)?;
+        inner.remove(&staged);
+        Ok(bytes)
+    }
+
+    pub(crate) fn release_insert_bytes(&self, txn_id: u64, bytes: u64) {
+        if let Some(txn) = self.inner.lock().unwrap().get_mut(&txn_id) {
+            txn.mutation_bytes = txn.mutation_bytes.saturating_sub(bytes);
+        }
+    }
+
+    /// Charge and install a statement's events together. No partial append
+    /// survives a budget failure.
+    pub(crate) fn defer_update_events(
+        &self,
+        txn_id: u64,
+        db: &str,
+        table: &str,
+        batches: Vec<RecordBatch>,
+    ) -> crate::common::error::Result<()> {
+        let bytes = batches
+            .iter()
+            .map(|b| b.estimated_size_bytes() as u64)
+            .sum();
+        let mut inner = self.inner.lock().unwrap();
+        Self::table_entry(&mut inner, txn_id, db, table, None);
+        inner.get_mut(&txn_id).unwrap().charge(bytes)?;
+        Self::table_entry(&mut inner, txn_id, db, table, None)
+            .deferred_update_batches
+            .extend(batches);
+        Ok(())
+    }
+
+    pub(crate) fn defer_delete_events(
+        &self,
+        txn_id: u64,
+        db: &str,
+        table: &str,
+        batches: Vec<RecordBatch>,
+    ) -> crate::common::error::Result<()> {
+        let bytes = batches
+            .iter()
+            .map(|b| b.estimated_size_bytes() as u64)
+            .sum();
+        let mut inner = self.inner.lock().unwrap();
+        Self::table_entry(&mut inner, txn_id, db, table, None);
+        inner.get_mut(&txn_id).unwrap().charge(bytes)?;
+        Self::table_entry(&mut inner, txn_id, db, table, None)
+            .deferred_delete_batches
+            .extend(batches);
+        Ok(())
+    }
+
+    /// Bytes this transaction has already charged. Statement planners use it
+    /// to pre-check that ALL of a statement's upcoming charges fit the
+    /// budget before the first side effect — a mid-statement budget failure
+    /// after registrations used to leave tombstones that COMMIT materialized
+    /// without their replacement images.
+    pub fn mutation_bytes_of(&self, txn_id: u64) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&txn_id)
+            .map(|txn| txn.mutation_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Pre-check that a statement's staged charges fit the transaction's
+    /// remaining mutation budget BEFORE the first staged effect is applied,
+    /// so the apply phase cannot fail midway on a budget charge (the same
+    /// class of half-statement gap `mutation_bytes_of` exists to close).
+    pub fn precheck_statement_charge(
+        &self,
+        txn_id: u64,
+        staged_bytes: u64,
+    ) -> crate::common::error::Result<()> {
+        let total = self.mutation_bytes_of(txn_id).saturating_add(staged_bytes);
+        let budget = txn_mutation_budget_bytes();
+        if total > budget {
+            return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
+                "transaction deferred mutations would charge {total} bytes against the {budget} byte in-memory mutation budget; commit or roll back and split the work"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Statement-scope undo of [`Self::register_segment_tombstones`]: a
+    /// failed statement must not leave tombstones behind that a later COMMIT
+    /// would materialize. Registered row ids never coincide with
+    /// footer-deleted rows (the DML scan skips them), so clearing their bits
+    /// from the composed bitmap leaves exactly footer ∪ other-statements'
+    /// ids. Charges are refunded; an emptied segment entry is dropped.
+    pub fn unregister_segment_tombstones(
+        &self,
+        txn_id: u64,
+        db: &str,
+        table: &str,
+        path: &Path,
+        row_ids: &[u64],
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(txn) = inner.get_mut(&txn_id) else {
+            return;
+        };
+        let Some(entry) = txn
+            .tables
+            .iter_mut()
+            .find(|entry| entry.db == db && entry.table == table)
+        else {
+            return;
+        };
+        let Some(index) = entry.segments.iter().position(|seg| seg.path == path) else {
+            return;
+        };
+        let mut removed = 0u64;
+        {
+            let segment = &mut entry.segments[index];
+            let composed = std::sync::Arc::make_mut(&mut segment.composed);
+            for &row_id in row_ids {
+                if segment.row_ids.remove(&row_id) {
+                    removed += 1;
+                    let byte = (row_id / 8) as usize;
+                    if byte < composed.len() {
+                        composed[byte] &= !(1u8 << (row_id % 8));
+                    }
+                }
+            }
+        }
+        if entry.segments[index].row_ids.is_empty() {
+            entry.segments.swap_remove(index);
+        }
+        if removed > 0 {
+            let txn = inner.get_mut(&txn_id).expect("entry borrowed above");
+            txn.mutation_bytes = txn
+                .mutation_bytes
+                .saturating_sub(removed.saturating_mul(POSITION_CHARGE_BYTES));
+        }
+    }
+
+    /// Statement-scope undo of [`Self::register_memtable_tombstones`],
+    /// mirroring [`Self::unregister_segment_tombstones`].
+    pub fn unregister_memtable_tombstones(
+        &self,
+        txn_id: u64,
+        db: &str,
+        table: &str,
+        memtable_id: Uuid,
+        positions: &[u32],
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(txn) = inner.get_mut(&txn_id) else {
+            return;
+        };
+        let Some(entry) = txn
+            .tables
+            .iter_mut()
+            .find(|entry| entry.db == db && entry.table == table)
+        else {
+            return;
+        };
+        let Some(index) = entry
+            .memtables
+            .iter()
+            .position(|entry| entry.memtable.id() == memtable_id)
+        else {
+            return;
+        };
+        let mut removed = 0u64;
+        {
+            let set = std::sync::Arc::make_mut(&mut entry.memtables[index].positions);
+            for &position in positions {
+                if set.remove(&position) {
+                    removed += 1;
+                }
+            }
+        }
+        if entry.memtables[index].positions.is_empty() {
+            entry.memtables.swap_remove(index);
+        }
+        if removed > 0 {
+            let txn = inner.get_mut(&txn_id).expect("entry borrowed above");
+            txn.mutation_bytes = txn
+                .mutation_bytes
+                .saturating_sub(removed.saturating_mul(POSITION_CHARGE_BYTES));
+        }
+    }
+
+    /// Account one INSERT statement's catalog `row_count` increment so
+    /// ROLLBACK can retract it. The entry already exists: every
+    /// transactional INSERT goes through [`Self::charge_txn_insert_bytes`].
+    pub fn note_inserted_rows(&self, txn_id: u64, db: &str, table: &str, rows: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        let entry = Self::table_entry(&mut inner, txn_id, db, table, None);
+        entry.inserted_rows = entry.inserted_rows.saturating_add(rows);
+    }
+
+    /// Drain the transaction's per-table inserted-row deltas for ROLLBACK
+    /// retraction (zeroes the counters, so a double rollback is a no-op).
+    pub fn take_inserted_rows_by_table(&self, txn_id: u64) -> Vec<(String, String, u64)> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(txn) = inner.get_mut(&txn_id) else {
+            return Vec::new();
+        };
+        txn.tables
+            .iter_mut()
+            .filter(|entry| entry.inserted_rows > 0)
+            .map(|entry| {
+                let rows = entry.inserted_rows;
+                entry.inserted_rows = 0;
+                (entry.db.clone(), entry.table.clone(), rows)
+            })
+            .collect()
+    }
+
     pub fn add_deleted_rows(&self, txn_id: u64, db: &str, table: &str, count: u64) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(txn) = inner.get_mut(&txn_id) {
@@ -274,10 +583,15 @@ impl TxnMutationRegistry {
     ) -> crate::common::error::Result<()> {
         let bytes = batch.estimated_size_bytes() as u64;
         let mut inner = self.inner.lock().unwrap();
-        let entry = Self::table_entry(&mut inner, txn_id, db, table, None);
-        entry.deferred_delete_batches.push(batch);
-        let txn = inner.get_mut(&txn_id).expect("entry just created");
-        txn.charge(bytes)
+        Self::table_entry(&mut inner, txn_id, db, table, None);
+        inner
+            .get_mut(&txn_id)
+            .expect("entry just created")
+            .charge(bytes)?;
+        Self::table_entry(&mut inner, txn_id, db, table, None)
+            .deferred_delete_batches
+            .push(batch);
+        Ok(())
     }
 
     pub fn defer_update_event(
@@ -289,10 +603,15 @@ impl TxnMutationRegistry {
     ) -> crate::common::error::Result<()> {
         let bytes = batch.estimated_size_bytes() as u64;
         let mut inner = self.inner.lock().unwrap();
-        let entry = Self::table_entry(&mut inner, txn_id, db, table, None);
-        entry.deferred_update_batches.push(batch);
-        let txn = inner.get_mut(&txn_id).expect("entry just created");
-        txn.charge(bytes)
+        Self::table_entry(&mut inner, txn_id, db, table, None);
+        inner
+            .get_mut(&txn_id)
+            .expect("entry just created")
+            .charge(bytes)?;
+        Self::table_entry(&mut inner, txn_id, db, table, None)
+            .deferred_update_batches
+            .push(batch);
+        Ok(())
     }
 
     /// Composed delete bitmap for one of the transaction's pinned segments.
@@ -352,7 +671,7 @@ impl TxnMutationRegistry {
                 let keep: Vec<u32> = (0..original.num_rows() as u32)
                     .filter(|row| !positions.contains(row))
                     .collect();
-                let filtered = filter_batch_excluding_positions(original, &positions)?;
+                let filtered = original.take_rows_shared(keep.clone().into())?;
                 Ok((Arc::new(filtered), Some(keep)))
             }
             _ => Ok((Arc::clone(original), None)),
@@ -437,14 +756,15 @@ impl TxnMutations {
     }
 
     fn charge(&mut self, bytes: u64) -> crate::common::error::Result<()> {
-        self.mutation_bytes = self.mutation_bytes.saturating_add(bytes);
+        let next_bytes = self.mutation_bytes.saturating_add(bytes);
         let budget = txn_mutation_budget_bytes();
-        if self.mutation_bytes > budget {
+        if next_bytes > budget {
             return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
                 "transaction in-memory mutation budget exceeded: {} bytes charged against a {} byte limit (deferred DML plans plus buffered transactional inserts); the transaction is too large to keep in memory - commit or roll back and split the work",
-                self.mutation_bytes, budget
+                next_bytes, budget
             )));
         }
+        self.mutation_bytes = next_bytes;
         Ok(())
     }
 }
@@ -474,76 +794,5 @@ pub fn filter_batch_excluding_positions(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Transactional INSERT memtable bytes count against the same per-
-    /// transaction in-memory budget as deferred DML, and the charged entry
-    /// disappears on the usual rollback cleanup.
-    #[test]
-    fn txn_insert_bytes_count_against_mutation_budget() {
-        let registry = TxnMutationRegistry::new();
-        let budget = txn_mutation_budget_bytes();
-
-        // Exactly at budget is fine; one more byte trips it.
-        registry
-            .charge_txn_insert_bytes(9, "db", "t", budget)
-            .expect("at-budget charge must pass");
-        let err = registry
-            .charge_txn_insert_bytes(9, "db", "t", 1)
-            .expect_err("over-budget charge must fail");
-        assert!(err.to_string().contains("budget exceeded"), "{err}");
-
-        // Other transactions are unaffected.
-        registry
-            .charge_txn_insert_bytes(10, "db", "t", 1024)
-            .expect("other txn unaffected");
-
-        // Rollback cleanup drops the charged entry; the next transaction
-        // with the same id starts from a fresh budget.
-        registry.remove(9);
-        registry
-            .charge_txn_insert_bytes(9, "db", "t", 1)
-            .expect("cleaned entry starts fresh");
-    }
-
-    #[test]
-    fn segment_tombstones_merge_and_compose() {
-        let registry = TxnMutationRegistry::new();
-        registry
-            .register_segment_tombstones(7, "db", "t", None, Path::new("s1"), &[], [3, 9])
-            .unwrap();
-        registry
-            .register_segment_tombstones(7, "db", "t", None, Path::new("s1"), &[], [3, 20])
-            .unwrap();
-        let composed = registry.segment_overlay(7, Path::new("s1")).unwrap();
-        assert!(composed.len() >= 3);
-        let is_set = |row: u64| composed[(row / 8) as usize] & (1u8 << (row % 8)) != 0;
-        for row in [3u64, 9, 20] {
-            assert!(is_set(row), "row {row} must be set");
-        }
-        assert!(!is_set(4));
-        assert_eq!(registry.segment_row_ids(7, Path::new("s1")), vec![3, 9, 20]);
-    }
-
-    #[test]
-    fn take_remove_and_pins() {
-        let registry = TxnMutationRegistry::new();
-        registry
-            .register_segment_tombstones(1, "db", "t", None, Path::new("s"), &[], [0])
-            .unwrap();
-        assert!(registry.table_has_pins("db", "t"));
-        assert!(!registry.table_has_pins("db", "other"));
-        let taken = registry.take(1).unwrap();
-        assert!(!registry.table_has_pins("db", "t"));
-        registry.put_back(1, taken);
-        assert!(registry.table_has_pins("db", "t"));
-        registry
-            .register_segment_tombstones(2, "db", "t", None, Path::new("s2"), &[], [1])
-            .unwrap();
-        assert_eq!(registry.remove(1), 0);
-        assert!(registry.table_has_pins("db", "t"), "txn 2 still pins");
-        registry.remove(2);
-        assert!(!registry.table_has_pins("db", "t"));
-    }
-}
+#[path = "txn_mutations_test.rs"]
+mod tests;
