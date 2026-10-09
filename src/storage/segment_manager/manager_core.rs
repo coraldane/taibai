@@ -1774,6 +1774,30 @@ impl SegmentManager {
             .collect()
     }
 
+    /// Per-partition row counts still resident in active writers, live rows
+    /// only (`total_rows` minus deleted, plus buffered rows awaiting their
+    /// row group). SHOW PARTITIONS merges this with the sealed-segment scan
+    /// so an unflushed partition is listed, not invisible.
+    pub fn active_partition_live_rows(&self, db: &str, table: &str) -> Vec<(String, u64)> {
+        let key = table_key(db, table);
+        let state = self.tables.read().unwrap().get(&key).cloned();
+        let Some(state) = state else {
+            return Vec::new();
+        };
+        let active_segments = state.active_segments.lock().unwrap();
+        active_segments
+            .iter()
+            .filter(|(_, segment)| segment.total_rows > 0 || segment.buffered_rows > 0)
+            .map(|(partition_key, segment)| {
+                let live = segment
+                    .total_rows
+                    .saturating_sub(segment.deleted_row_count)
+                    .saturating_add(segment.buffered_rows as u64);
+                (partition_key.clone(), live)
+            })
+            .collect()
+    }
+
     pub fn remove_table_state(&self, db: &str, table: &str) {
         let key = table_key(db, table);
         let state = self.tables.write().unwrap().remove(&key);

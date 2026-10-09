@@ -1260,6 +1260,29 @@ impl MemTableManager {
             .collect()
     }
 
+    /// Per-partition row counts pending in this table's flushable memtables,
+    /// for SHOW PARTITIONS. Mirrors `get_flushable_by_table`'s exclusions so
+    /// another session's uncommitted transactional rows are never listed.
+    pub fn flushable_partition_rows(&self, db: &str, table: &str) -> Vec<(String, u64)> {
+        let memtables = self.memtables.read().unwrap();
+        let pinned = self.txn_mutations.read().unwrap();
+        let mut rows_by_key: std::collections::BTreeMap<String, u64> = Default::default();
+        for mt in memtables.iter() {
+            if mt.db() != db
+                || mt.table() != table
+                || mt.state() != MemTableState::Pending
+                || mt.is_transactional()
+                || pinned
+                    .as_ref()
+                    .is_some_and(|registry| registry.is_memtable_pinned(mt.id()))
+            {
+                continue;
+            }
+            *rows_by_key.entry(mt.partition_key().to_string()).or_insert(0) += mt.row_count();
+        }
+        rows_by_key.into_iter().collect()
+    }
+
     /// Drop memtables that have reached the `Archived` state for a table. Called
     /// at close-of-day after the data is safely archived to history segments.
     pub fn remove_archived(&self, db: &str, table: &str) {
