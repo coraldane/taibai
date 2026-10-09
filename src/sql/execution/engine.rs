@@ -462,6 +462,13 @@ fn start_auto_compaction_thread(
                             }
                         }
                         Err(err) => {
+                            adjust_row_count_for_ttl_drops(
+                                &catalogs,
+                                &data_dir,
+                                &db,
+                                &table,
+                                compactor.committed_stats().rows_dropped_ttl,
+                            );
                             tracing::warn!(db, table, error = %err, "auto compact failed");
                         }
                     }
@@ -512,6 +519,13 @@ fn start_auto_compaction_thread(
                             }
                         }
                         Err(err) => {
+                            adjust_row_count_for_ttl_drops(
+                                &catalogs,
+                                &data_dir,
+                                &db,
+                                &table,
+                                compactor.committed_stats().rows_dropped_ttl,
+                            );
                             tracing::warn!(db, table, error = %err, "fragmentation auto compact failed");
                         }
                     }

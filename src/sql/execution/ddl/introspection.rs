@@ -454,7 +454,10 @@ pub fn exec_show_partitions(
             .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
         match table {
             Some(table_name) => {
-                if catalog.get_table(table_name).is_some_and(|meta| meta.is_partitioned()) {
+                if catalog
+                    .get_table(table_name)
+                    .is_some_and(|meta| meta.is_partitioned())
+                {
                     vec![table_name.clone()]
                 } else {
                     Vec::new()
@@ -463,7 +466,11 @@ pub fn exec_show_partitions(
             None => catalog
                 .table_names()
                 .into_iter()
-                .filter(|name| catalog.get_table(name).is_some_and(|meta| meta.is_partitioned()))
+                .filter(|name| {
+                    catalog
+                        .get_table(name)
+                        .is_some_and(|meta| meta.is_partitioned())
+                })
                 .map(|name| name.to_string())
                 .collect(),
         }
@@ -484,11 +491,10 @@ pub fn exec_show_partitions(
         // are exactly the names ON PARTITION accepts.
         let mut partitions: std::collections::BTreeMap<String, (i64, i64)> = Default::default();
         let table_dir = engine.data_dir().join(db).join(&table_name);
-        for path in engine.segment_mgr().discover_inactive_segments(
-            db,
-            &table_name,
-            &table_dir,
-        )? {
+        for path in engine
+            .segment_mgr()
+            .discover_inactive_segments(db, &table_name, &table_dir)?
+        {
             let Some(key) = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -500,9 +506,9 @@ pub fn exec_show_partitions(
             entry.1 += 1;
             match crate::storage::segment::meta::read_embedded_segment_meta(&path) {
                 Ok(meta) => {
-                    entry.0 = entry
-                        .0
-                        .saturating_add(meta.row_count.saturating_sub(meta.deleted_row_count) as i64);
+                    entry.0 = entry.0.saturating_add(
+                        meta.row_count.saturating_sub(meta.deleted_row_count) as i64,
+                    );
                 }
                 Err(error) => tracing::warn!(
                     db,
@@ -513,7 +519,10 @@ pub fn exec_show_partitions(
                 ),
             }
         }
-        for (key, rows) in engine.segment_mgr().active_partition_live_rows(db, &table_name) {
+        for (key, rows) in engine
+            .segment_mgr()
+            .active_partition_live_rows(db, &table_name)
+        {
             // Empty key is the unpartitioned bucket (NULL / unparseable
             // partition values); it has no name OPTIMIZE could target.
             if key.is_empty() {
@@ -753,11 +762,12 @@ pub fn exec_optimize_table(
         engine.data_dir().to_path_buf(),
     );
 
-    let stats = if let Some(partition) = partition {
-        compactor.optimize_partition(db, table, &table_meta, partition)?
+    let result = if let Some(partition) = partition {
+        compactor.optimize_partition(db, table, &table_meta, partition)
     } else {
-        compactor.optimize_table(db, table, &table_meta)?
+        compactor.optimize_table(db, table, &table_meta)
     };
+    let stats = compactor.committed_stats();
 
     // Compaction frees segment path numbers the next writer may reuse; the
     // sum-cache key cannot tell incarnations apart (see drop table).
@@ -778,10 +788,25 @@ pub fn exec_optimize_table(
         }
     }
 
-    // The rewrite moved rows to new segment locations, so rebuild the
-    // location-index snapshots eagerly instead of invalidating them for a
-    // lazy rebuild on the next probe. Skip when compaction was a no-op.
-    if stats.segments_written > 0 || stats.rows_dropped > 0 {
+    // Full-table maintenance preserves eager index rebuilding. A partition
+    // operation refreshes on demand so its finishing phase does not take the
+    // table gate for a scan of every historical partition.
+    if (stats.segments_written > 0 || stats.rows_dropped > 0) && partition.is_some() {
+        // Partition maintenance must not rebuild every index over all historical
+        // partitions under the table gate. Epoch validation already rejects old
+        // locations; invalidate the key cache and refresh snapshots on demand.
+        engine
+            .index_manager()
+            .invalidate_primary_key_cache(db, table);
+        let names = table_meta
+            .unique_indexes
+            .iter()
+            .map(|i| i.name.clone())
+            .collect::<Vec<_>>();
+        engine
+            .index_manager()
+            .invalidate_table_unique_index_snapshots(db, table, &names);
+    } else if stats.segments_written > 0 || stats.rows_dropped > 0 {
         let schema = Schema::new(table_meta.columns.clone());
         let rebuilt = engine
             .segment_mgr()
@@ -812,6 +837,7 @@ pub fn exec_optimize_table(
         }
     }
 
+    result?;
     tracing::info!(
         db,
         table,

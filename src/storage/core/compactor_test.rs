@@ -846,3 +846,6 @@ fn noncluster_compaction_keeps_ttl_segment_with_visible_rows() -> Result<()> {
 
 #[path = "compactor/budget_test.rs"]
 mod budget;
+
+#[path = "compactor/audit_test.rs"]
+mod audit;
