@@ -450,10 +450,23 @@ fn eval_column_literal_comparison(
 }
 
 fn eval_comparison(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> bool {
+    // BETWEEN / IN reach this evaluator with raw operands; apply the same
+    // temporal literal coercion as the binary comparison path.
+    let coerced = coerce_temporal_comparison(left, right);
+    let (left, right): (&ScalarValue, &ScalarValue) = (coerced.0.as_ref(), coerced.1.as_ref());
     if left.is_null() || right.is_null() {
         return false;
     }
-    if let Some(ordering) = left.numeric_cmp(right) {
+    // numeric_cmp covers numeric mixes only; temporal pairs (and strings)
+    // compare by their natural raw order here, mirroring eval_binary_scalar.
+    let ordering = left.numeric_cmp(right).or_else(|| match (left, right) {
+        (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) => Some(l.cmp(r)),
+        (ScalarValue::Timestamp(Some(l)), ScalarValue::Timestamp(Some(r))) => Some(l.cmp(r)),
+        (ScalarValue::Date(Some(l)), ScalarValue::Date(Some(r))) => Some(l.cmp(r)),
+        (ScalarValue::Time(Some(l)), ScalarValue::Time(Some(r))) => Some(l.cmp(r)),
+        _ => None,
+    });
+    if let Some(ordering) = ordering {
         return match op {
             BinOp::Eq => ordering == std::cmp::Ordering::Equal,
             BinOp::Neq => ordering != std::cmp::Ordering::Equal,
@@ -759,6 +772,37 @@ pub fn eval_expr_column_with(
 /// filter path and the DML row-wise evaluator (helpers::eval_expr_for_row) —
 /// a previous private copy in helpers silently returned the left operand for
 /// every uncovered arithmetic shape, mis-filtering UPDATE/DELETE rows.
+/// Coerce one side of a comparison when a temporal column value meets a
+/// string literal. Timestamps parse via the same smart parser INSERT uses;
+/// dates via the micros→days converter. Timezone offset 0 (UTC), matching
+/// the server's default session.
+fn coerce_temporal_comparison<'a>(
+    left: &'a ScalarValue,
+    right: &'a ScalarValue,
+) -> (std::borrow::Cow<'a, ScalarValue>, std::borrow::Cow<'a, ScalarValue>) {
+    use crate::sql::execution::functions::date::{datetime_string_to_days, parse_timestamp_smart};
+    use std::borrow::Cow;
+    match (left, right) {
+        (ScalarValue::Timestamp(_), ScalarValue::VarChar(Some(s))) => (
+            Cow::Borrowed(left),
+            Cow::Owned(ScalarValue::Timestamp(parse_timestamp_smart(s, 0))),
+        ),
+        (ScalarValue::VarChar(Some(s)), ScalarValue::Timestamp(_)) => (
+            Cow::Owned(ScalarValue::Timestamp(parse_timestamp_smart(s, 0))),
+            Cow::Borrowed(right),
+        ),
+        (ScalarValue::Date(_), ScalarValue::VarChar(Some(s))) => (
+            Cow::Borrowed(left),
+            Cow::Owned(ScalarValue::Date(datetime_string_to_days(s, 0))),
+        ),
+        (ScalarValue::VarChar(Some(s)), ScalarValue::Date(_)) => (
+            Cow::Owned(ScalarValue::Date(datetime_string_to_days(s, 0))),
+            Cow::Borrowed(right),
+        ),
+        _ => (Cow::Borrowed(left), Cow::Borrowed(right)),
+    }
+}
+
 pub(crate) fn eval_binary_scalar(
     left: &ScalarValue,
     op: &BinOp,
@@ -793,6 +837,13 @@ pub(crate) fn eval_binary_scalar(
             }
         }
         Eq | Neq | Lt | Gt | Lte | Gte => {
+            // A string literal compared against a temporal column coerces to
+            // the column's type (same literal grammar as INSERT), so
+            // `WHERE ts >= '2024-02-01'` matches rows instead of comparing
+            // mismatched raw types and silently dropping every row.
+            let coerced = coerce_temporal_comparison(left, right);
+            let (left, right): (&ScalarValue, &ScalarValue) =
+                (coerced.0.as_ref(), coerced.1.as_ref());
             let matched = match (left, right) {
                 (ScalarValue::Bool(Some(l)), ScalarValue::Bool(Some(r))) => Some(if l == r {
                     std::cmp::Ordering::Equal
@@ -903,5 +954,62 @@ fn as_bool(value: &ScalarValue) -> Option<bool> {
     match value {
         ScalarValue::Bool(Some(b)) => Some(*b),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod temporal_compare_tests {
+    use super::*;
+    use crate::sql::execution::functions::date::parse_timestamp_smart;
+
+    #[test]
+    fn timestamp_column_compared_to_string_literal_matches() {
+        let micros = parse_timestamp_smart("2024-02-10 10:00:00", 0).unwrap();
+        let ts = ScalarValue::Timestamp(Some(micros));
+        let lit = ScalarValue::VarChar(Some("2024-02-10 10:00:00".into()));
+
+        let eq = eval_binary_scalar(&ts, &BinOp::Eq, &lit);
+        assert!(matches!(eq, ScalarValue::Bool(Some(true))), "eq: {:?}", eq);
+
+        let ge = eval_binary_scalar(&ts, &BinOp::Gte, &ScalarValue::VarChar(Some("2024-02-01 00:00:00".into())));
+        assert!(matches!(ge, ScalarValue::Bool(Some(true))), "ge: {:?}", ge);
+
+        let lt = eval_binary_scalar(&ts, &BinOp::Lt, &ScalarValue::VarChar(Some("2024-03-01 00:00:00".into())));
+        assert!(matches!(lt, ScalarValue::Bool(Some(true))), "lt: {:?}", lt);
+
+        // Reversed literal side.
+        let rev = eval_binary_scalar(&ScalarValue::VarChar(Some("2024-01-01 00:00:00".into())), &BinOp::Lt, &ts);
+        assert!(matches!(rev, ScalarValue::Bool(Some(true))), "rev: {:?}", rev);
+    }
+}
+
+#[cfg(test)]
+mod between_temporal_tests {
+    use super::*;
+    use crate::protocol::types::DataType;
+    use crate::sql::execution::functions::date::parse_timestamp_smart;
+    use crate::sql::planner::LogicalExpr;
+    use crate::types::batch::{ColumnDef, RecordBatch, Schema};
+    use crate::types::scalar::ScalarValue;
+
+    #[test]
+    fn between_with_string_literals_matches_timestamp_rows() {
+        let micros = parse_timestamp_smart("2024-01-05 10:00:00", 0).unwrap();
+        let schema = Schema::new(vec![ColumnDef::new("ts", DataType::Timestamp)]);
+        let mut batch = RecordBatch::new(schema);
+        batch.column_mut(0).unwrap().push(&ScalarValue::Timestamp(Some(micros))).unwrap();
+
+        let expr = LogicalExpr::Between {
+            expr: Box::new(LogicalExpr::Column(0)),
+            low: Box::new(LogicalExpr::Literal(ScalarValue::VarChar(Some(
+                "2024-01-01 00:00:00".into(),
+            )))),
+            high: Box::new(LogicalExpr::Literal(ScalarValue::VarChar(Some(
+                "2024-03-01 00:00:00".into(),
+            )))),
+            negated: false,
+        };
+        let mask = eval_filter(&expr, &batch).unwrap();
+        assert_eq!(mask, vec![true], "between must match with string bounds");
     }
 }

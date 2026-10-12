@@ -135,9 +135,14 @@ fn drop_table_removes_two_hundred_partition_files() {
     assert!(!table_dir.exists());
     assert!(engine.get_table_meta("main", "partitioned_drop").is_none());
     assert!(
-        !database_dir.join(DROP_TOMBSTONE_DIR).exists(),
-        "drop tombstone should be removed after a successful cleanup"
+        !database_dir
+            .join(DROP_TOMBSTONE_DIR)
+            .join("partitioned_drop")
+            .exists(),
+        "drop tombstone entry should be removed after a successful cleanup"
     );
+    // The tombstone ROOT persists: removing it races with concurrent DROPs
+    // that are between create_dir_all and their staging rename.
     engine.segment_mgr().shutdown();
 }
 
@@ -248,7 +253,14 @@ fn drop_database_reports_cleanup_failure_and_retry_finishes_cleanup() {
     engine
         .execute(&mut session, "DROP DATABASE doomed")
         .expect("retry pending cleanup");
-    assert!(!temp_dir.path().join(DATABASE_DROP_TOMBSTONE_DIR).exists());
+    assert!(
+        !temp_dir
+            .path()
+            .join(DATABASE_DROP_TOMBSTONE_DIR)
+            .join("doomed")
+            .exists(),
+        "database tombstone entry should be removed after the retry"
+    );
     engine.segment_mgr().shutdown();
 }
 

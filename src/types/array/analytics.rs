@@ -1397,6 +1397,12 @@ impl ColumnArray {
     /// A NULL literal yields an all-NULL Int64 column, exactly like the
     /// scalar path's early return.
     pub fn arith_scalar(&self, op: ArithOp, literal: &ScalarValue) -> Option<ColumnArray> {
+        if matches!(self, ColumnArray::Decimal { .. }) {
+            // Decimal arithmetic is scale-aware and belongs to the projection
+            // operator (it owns the operand schema); raw integer math here
+            // would silently drop the scale.
+            return None;
+        }
         if literal.is_null() {
             return Some(ColumnArray::Int64 {
                 data: vec![0; self.len()],

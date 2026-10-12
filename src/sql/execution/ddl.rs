@@ -158,6 +158,22 @@ fn remove_committed_operation_directory(path: &Path) -> io::Result<()> {
     remove_dir_all_with_retry(path)
 }
 
+/// Rename `source` into `root/..` for tombstone staging. The tombstone root
+/// is shared by every concurrent DDL op in the database; if a racing cleanup
+/// (or an operator) removed it between our create_dir_all and the rename,
+/// recreate it and retry once instead of failing the whole statement.
+fn rename_into_tombstone_root(source: &Path, root: &Path, destination: &Path) -> io::Result<()> {
+    if let Err(error) = rename_directory_with_retry(source, destination) {
+        if error.kind() == io::ErrorKind::NotFound {
+            std::fs::create_dir_all(root)?;
+            rename_directory_with_retry(source, destination)?;
+        } else {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn stage_table_directory(path: &Path) -> io::Result<Option<std::path::PathBuf>> {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -189,15 +205,12 @@ fn stage_table_directory(path: &Path) -> io::Result<Option<std::path::PathBuf>> 
     if tombstone.exists() {
         remove_dir_all_with_retry(&tombstone)?;
     }
-    rename_directory_with_retry(path, &tombstone)?;
+    rename_into_tombstone_root(path, &tombstone_root, &tombstone)?;
     Ok(Some(tombstone))
 }
 
 fn restore_staged_table_directory(tombstone: &Path, table_dir: &Path) -> io::Result<()> {
     std::fs::rename(tombstone, table_dir)?;
-    if let Some(root) = tombstone.parent() {
-        let _ = std::fs::remove_dir(root);
-    }
     Ok(())
 }
 
@@ -215,9 +228,6 @@ fn cleanup_pending_table_drop(data_dir: &Path, db: &str, table: &str) -> Result<
             error
         ))
     })?;
-    if let Some(root) = tombstone.parent() {
-        let _ = std::fs::remove_dir(root);
-    }
     Ok(true)
 }
 
@@ -243,15 +253,12 @@ fn stage_database_directory(data_dir: &Path, name: &str) -> io::Result<Option<st
     if tombstone.exists() {
         remove_dir_all_with_retry(&tombstone)?;
     }
-    std::fs::rename(&database_dir, &tombstone)?;
+    rename_into_tombstone_root(&database_dir, &root, &tombstone)?;
     Ok(Some(tombstone))
 }
 
 fn restore_staged_database_directory(tombstone: &Path, database_dir: &Path) -> io::Result<()> {
     std::fs::rename(tombstone, database_dir)?;
-    if let Some(root) = tombstone.parent() {
-        let _ = std::fs::remove_dir(root);
-    }
     Ok(())
 }
 
@@ -303,9 +310,6 @@ fn rollback_staged_table_data(operation_dir: &Path, table_dir: &Path) -> Result<
     }
     let _ = std::fs::remove_file(operation_dir.join(BEFORE_META_FILE));
     let _ = std::fs::remove_dir(operation_dir);
-    if let Some(root) = operation_dir.parent() {
-        let _ = std::fs::remove_dir(root);
-    }
     Ok(())
 }
 
@@ -329,9 +333,6 @@ fn restore_partition_files(operation_dir: &Path, table_dir: &Path) -> Result<()>
     }
     let _ = std::fs::remove_file(operation_dir.join(BEFORE_META_FILE));
     let _ = std::fs::remove_dir(operation_dir);
-    if let Some(root) = operation_dir.parent() {
-        let _ = std::fs::remove_dir(root);
-    }
     Ok(())
 }
 

@@ -328,6 +328,27 @@ pub(crate) fn column_literal_mask(
     op: BinOp,
     literal: &ScalarValue,
 ) -> Option<Vec<bool>> {
+    // The raw kernels below compare wire representations. A string literal
+    // against a temporal column must coerce to the column's type first —
+    // a VarChar compared raw against Timestamp data silently dropped every
+    // row of `WHERE ts >= '2024-02-01'`. Time (and other temporals without
+    // a string parser here) decline and fall back to the scalar path.
+    let coerced;
+    let literal = match (column, literal) {
+        (ColumnArray::Timestamp { .. }, ScalarValue::VarChar(Some(text))) => {
+            coerced = ScalarValue::Timestamp(crate::sql::execution::functions::date::parse_timestamp_smart(
+                text, 0,
+            ));
+            &coerced
+        }
+        (ColumnArray::Date { .. }, ScalarValue::VarChar(Some(text))) => {
+            coerced = ScalarValue::Date(crate::sql::execution::functions::date::datetime_string_to_days(text, 0));
+            &coerced
+        }
+        (ColumnArray::Time { .. }, ScalarValue::VarChar(Some(_)))
+        | (ColumnArray::Interval { .. }, ScalarValue::VarChar(Some(_))) => return None,
+        _ => literal,
+    };
     match op {
         BinOp::Eq => Some(column.eq_vec(literal)),
         BinOp::Neq => Some(
