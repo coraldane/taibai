@@ -28,7 +28,7 @@ fn disconnect_flag() -> Arc<AtomicBool> {
 #[test]
 fn table_mutation_lock_waiter_aborts_when_client_disconnects() {
     let state = Arc::new(TableSegmentState::new(1));
-    let held = state.mutation_lock.lock().unwrap();
+    let held = state.mutation_lock.lock_for_test();
 
     let flag = disconnect_flag();
     let waiter_flag = Arc::clone(&flag);
@@ -64,7 +64,7 @@ fn table_mutation_lock_waiter_aborts_when_client_disconnects() {
 fn partition_mutation_lock_waiter_aborts_when_client_disconnects() {
     let state = Arc::new(TableSegmentState::new(1));
     let lock = manager_core::partition_mutation_lock_arc(&state, "p0");
-    let held = lock.lock().unwrap();
+    let held = lock.lock_for_test();
 
     let flag = disconnect_flag();
     let waiter_flag = Arc::clone(&flag);
@@ -99,7 +99,7 @@ fn partition_mutation_lock_waiter_aborts_when_client_disconnects() {
 #[test]
 fn waiter_without_context_still_acquires_once_released() {
     let state = Arc::new(TableSegmentState::new(1));
-    let held = state.mutation_lock.lock().unwrap();
+    let held = state.mutation_lock.lock_for_test();
 
     let waiter_state = Arc::clone(&state);
     let handle = std::thread::spawn(move || {

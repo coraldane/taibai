@@ -944,9 +944,7 @@ pub fn exec_delete(
     // the global order constraint_insert_lock → mutation lock identical to
     // the INSERT path; REPLACE holds the same lock across its own body and
     // never re-enters exec_delete, so the mutex stays acquirable.
-    let _constraint_guard = super::dml_insert::constraint_insert_lock(db, table)
-        .lock()
-        .unwrap();
+    let _constraint_guard = super::dml_insert::acquire_constraint_insert_lock(db, table)?;
 
     let table_dir = engine.data_dir().join(db).join(table);
     let mgr = engine.segment_mgr();

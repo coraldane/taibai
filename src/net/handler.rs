@@ -70,6 +70,14 @@ impl Drop for Handler {
         // block compaction/flush for the whole table, and transactional
         // memtables are only removable via commit/rollback.
         self.rollback_open_txn_on_disconnect();
+        // Cleanup can time out waiting for a request permit or unwind. Do not
+        // leave the global bulk-mode count elevated after this session dies.
+        if let Some(session) = self.session.as_mut() {
+            if session.bulk_import_mode {
+                session.bulk_import_mode = false;
+                self.engine.end_bulk_import();
+            }
+        }
     }
 }
 
@@ -333,7 +341,7 @@ impl Handler {
         session.streaming_results = streaming_results;
         session.timezone_offset_hours = timezone_offset_hours;
         let session_id = session.session_id_string();
-        tracing::info!(username, session_id = %session_id, timezone_offset_hours, "login success");
+        tracing::info!(username, database = %session.database, session_id = %session_id, timezone_offset_hours, "login success");
         self.session = Some(session);
 
         Ok(vec![build_auth_ok(&session_id)])
@@ -639,7 +647,7 @@ impl Handler {
         match outcome {
             Ok(row_count) => Ok(vec![build_ok(row_count)]),
             Err(e) => {
-                tracing::warn!(error = %e, "bulk insert error");
+                tracing::warn!(db = %db, session_id = ?self.session.as_ref().map(|s| &s.id), error = %e, "bulk insert error");
                 Ok(vec![build_error(&e.to_string())])
             }
         }
@@ -1498,6 +1506,19 @@ pub(crate) fn is_heavy_request(msg_type: u8) -> bool {
             | MSG_TYPE_ROLLBACK_TXN
             | MSG_TYPE_CURSOR
             | MSG_TYPE_REPL_SEGMENT_FETCH
+    )
+}
+
+/// Only a single administrative statement gets the independent control slot.
+/// The normal handler still performs authentication and authorization checks.
+pub(crate) fn is_control_request(msg: &Message) -> bool {
+    if msg.msg_type != MSG_TYPE_QUERY || msg.payload.len() > 4096 {
+        return false;
+    }
+    let sql = message_sql_snippet(&msg.payload);
+    matches!(
+        Parser::parse(&sql).as_deref(),
+        Ok([Statement::KillQuery { .. } | Statement::ShowProcesslist { .. }])
     )
 }
 

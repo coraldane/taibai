@@ -489,6 +489,13 @@ impl Engine {
         // payload, so keeping it alive is free; re-parsing the payload inside
         // the hot feed used to decode the whole frame a second time.
         let req = crate::storage::bulk_payload::parse_direct_bulk_payload(payload)?;
+        // Validate before indexing payload columns for constraints or auto-increment.
+        // Malformed requests must return a protocol error, never panic or mutate indexes.
+        let table_meta = catalog.get_table(&table_name).ok_or_else(|| {
+            TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table_name))
+        })?;
+        self.segment_mgr
+            .validate_direct_bulk_request(&req, &Schema::new(table_meta.columns.clone()))?;
         let mut explicit_auto_increment_max = None;
         let mut unique_index_entries = Vec::new();
         let mut primary_keys = Vec::new();
@@ -503,11 +510,13 @@ impl Engine {
         let has_unique_constraints = table_meta_for_hot.as_ref().is_some_and(|meta| {
             !meta.unique_indexes.is_empty() || meta.columns.iter().any(|column| column.primary_key)
         });
-        let _constraint_guard = has_unique_constraints.then(|| {
-            crate::sql::execution::dml_insert::constraint_insert_lock(db, &table_name)
-                .lock()
-                .unwrap()
-        });
+        let _constraint_guard = if has_unique_constraints {
+            Some(
+                crate::sql::execution::dml_insert::acquire_constraint_insert_lock(db, &table_name)?,
+            )
+        } else {
+            None
+        };
         if let Some(table_meta) = catalog.get_table(&table_name) {
             if !table_meta.unique_indexes.is_empty()
                 || table_meta.has_auto_increment()

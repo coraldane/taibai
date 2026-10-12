@@ -1150,3 +1150,23 @@ impl Handler {
         )
     }
 }
+
+#[test]
+fn dropped_bulk_handler_releases_session_without_disconnect_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let mut handler = logged_in_handler(
+        Arc::new(ServerConfig::default()),
+        Arc::clone(&engine),
+        "root",
+    );
+    ok_rows(
+        &handler
+            .handle_start_bulk_import("START BULK IMPORT")
+            .unwrap(),
+    );
+    assert_eq!(engine.bulk_mode_session_count(), 1);
+    drop(handler);
+    assert_eq!(engine.bulk_mode_session_count(), 0);
+    engine.segment_mgr().shutdown();
+}

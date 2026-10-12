@@ -20,7 +20,7 @@ SHOW FULL PROCESSLIST;
 | `State` | 查询阶段：`Planning`（规划）、`Executing`（执行）、`Committing`（提交）或 `Killed`（已请求终止） |
 | `Info` | SQL 文本；超过 100 字符时默认截断，`SHOW FULL PROCESSLIST` 显示完整语句 |
 
-查询在开始执行前（排队等待执行槽位时）不会出现在列表中；语句结束（完成、报错或被终止）后立即从列表移除。
+已登录连接的重请求在排队等待执行槽位时就会出现在列表中；语句结束（完成、报错或被终止）后立即从列表移除。
 
 ## 终止查询
 
@@ -34,6 +34,14 @@ KILL QUERY <query_id>;
 - `query_id` 不存在或已结束时返回错误 `query <id> is not running`。
 - 被 `KILL` 的查询在消失前于 `SHOW PROCESSLIST` 中显示 `State = Killed`。
 
+单独发送的 `KILL QUERY` 和 `SHOW [FULL] PROCESSLIST` 使用独立的 2 个管理请求槽位，
+普通请求池满时仍可执行；权限检查保持不变。为限制分类开销，仅对载荷不超过 4096 字节、
+且只包含一条上述语句的 QUERY 请求使用该通道。请使用另一条可用连接发送管理命令。
+此通道不绕过 TCP 连接数上限，也不能中断已经进入提交阶段的写入。
+
+约束锁等待（INSERT/REPLACE/UPDATE/DELETE/bulk）会轮询取消标志。
+普通 INSERT 完成约束检查后才进入提交阶段，排队和校验期间仍可取消。
+
 ## 语句超时
 
 `server.statement_timeout_secs` 为单条语句设置最长执行时间（墙钟），超时的语句在下一个安全点被取消，返回错误 `query exceeded the statement timeout`：
@@ -45,7 +53,7 @@ server:
 ```
 
 - 超时与 `KILL QUERY` 走同一取消机制：`Committing` 阶段不受超时打断，保证已开始提交的数据要么完整落盘、要么整体不生效。
-- 计时覆盖语句的规划与执行全程，从语句开始执行时起算。
+- 计时覆盖语句的规划与执行全程，从收到请求并创建取消上下文时起算，包含请求槽位排队。
 
 ## 相关的服务端限流配置
 
@@ -59,7 +67,7 @@ server:
 | `max_concurrent_requests` | 8 | CPU/磁盘重请求的最大并发数 |
 | `reserved_bulk_slots` | 2 | 为 bulk 写入保留的重请求槽位数：查询类请求（`MSG_TYPE_QUERY`）最多占用 `max_concurrent_requests - reserved_bulk_slots` 个槽，bulk 写入始终使用完整池。查询风暴期间 bulk 导入的提交不会再被排队超时拒绝（0 关闭保留） |
 
-过载与超时错误会返回给客户端，应用侧应将其视为可重试信号。
+过载与超时错误会返回给客户端。重试应有退避和次数上限；写入遇到网络断开时，应先核对提交结果或使用幂等键，避免盲目重试重复写入。
 
 ## 代码索引
 

@@ -40,7 +40,7 @@ pub fn exec_replace(
         )));
     }
 
-    let _unique_guard = constraint_insert_lock(db, table).lock().unwrap();
+    let _unique_guard = acquire_constraint_insert_lock(db, table)?;
     let materialized =
         materialize_insert_values(engine, db, table, columns, values, timezone_offset_hours)?;
     let constraints = replace_constraint_indices(&materialized.table_meta, &materialized.schema)?;
@@ -600,9 +600,6 @@ pub(super) fn exec_materialized_insert_batch(
     publish_unique_index_entries: bool,
     publish_catalog: bool,
 ) -> Result<ExecResult> {
-    // Values are materialized; from here on the statement installs rows into
-    // memtables and indexes, which cannot be undone by cancellation.
-    crate::common::query_cancel::enter_committing_phase();
     let auto_inc_cols: Vec<usize> = schema
         .columns
         .iter()
@@ -649,7 +646,7 @@ pub(super) fn exec_materialized_insert_batch(
         if !lock_unique_constraints || (primary_key_indices.is_empty() && !has_unique_checks) {
             None
         } else {
-            Some(constraint_insert_lock(db, table).lock().unwrap())
+            Some(acquire_constraint_insert_lock(db, table)?)
         };
     // The stripe mutual-excludes the probe→publish window against other
     // unique-key writers. It does NOT need to cover the durable-tail fsync
@@ -694,6 +691,10 @@ pub(super) fn exec_materialized_insert_batch(
             )?;
         }
     }
+    // Lock waits and constraint scans above are still cancellable. Only now
+    // enter the irreversible phase, before publishing counters/rows/indexes.
+    crate::common::query_cancel::check()?;
+    crate::common::query_cancel::enter_committing_phase();
     advance_explicit_auto_increment_counters(
         engine,
         db,

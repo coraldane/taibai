@@ -16,7 +16,7 @@ WARN taibai::storage::segment_manager: table mutation lock acquisition was slow 
 
 ### 分区锁（窄锁）
 
-`TableSegmentState` 新增 `partition_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>`，按分区键惰性登记每分区一把互斥锁。单分区操作只获取自己分区的锁：
+`TableSegmentState` 新增 `partition_locks: RwLock<HashMap<String, Arc<FairMutex>>>`，按分区键惰性登记每分区一把带 FIFO 排队的互斥锁（`FairMutex`）。单分区操作只获取自己分区的锁：
 
 - 普通 INSERT（`write_columns_with_txn` → `with_partition_mutation_lock`）；
 - 非事务提交的 durable tail 发布（`commit_txn_submit_inner`，逐分区加锁）；
@@ -27,6 +27,17 @@ WARN taibai::storage::segment_manager: table mutation lock acquisition was slow 
 
 分区锁的获取复用表级锁的超时语义：等待 ≥ `storage.mutation_lock_warn_secs`（默认 1s）打 WARN，≥ `storage.mutation_lock_timeout_secs`（默认 60s）返回 `ResourceBusy`，锁排队同样在日志可见。
 
+### 公平排队（FairMutex）
+
+裸 `std::sync::Mutex` 的 `try_lock` 轮询没有先来后到：谁恰好在锁空闲的瞬间轮询谁就拿到，持续到来的新写者可以把老等待者一路顶到超时。表级 `mutation_lock` 与每把分区锁因此都包成 `FairMutex`——保留原 `Mutex` 与其 `MutexGuard`，外加一个取号队列：
+
+1. **空队快速路径**：队列非空时新到达者不得尝试 `try_lock`，直接取号入队；队列空时一次 `try_lock` 即返回，无争用路径保持单次原子开销；
+2. **仅队头轮询**：只有最老号票的等待者轮询 `try_lock`（退避 ≤16ms，与原实现一致），后来者睡眠等待，不可能越过头号；头号获锁后先让出队头（`QueuedTicket::release`）再返回 guard，后继在持锁期间即开始轮询，锁释放后一个轮询周期内交接；
+3. **弃等让位**：取消（`query_cancel::check`）与超时路径经 `QueuedTicket` 的 Drop 出队，票据不残留，后继接管队头；panic 展开同样兜底；
+4. **try 变体仍可插队**：`try_with_*` 一次性尝试者在锁空闲瞬间仍可抢先——它们从不等待、占用有界，不会饿死队头，故不纳入队列。
+
+表级 `mutation_lock`（`acquire_mutation_lock`）与分区锁（`acquire_partition_mutation_lock`）共用该协议；宽锁收集路径是唯一的例外（见下）。
+
 ### 表级宽锁（gate 协议）
 
 `with_table_mutation_lock` / `with_database_mutation_locks` 保持表级（跨表时按表名排序）互斥，供必须看全表一致状态的操作使用：REPLACE、UPDATE / DELETE 的 segment 重写、compaction 的分区发现与提交、DDL、跨分区 DML。宽锁的获取协议：
@@ -34,13 +45,13 @@ WARN taibai::storage::segment_manager: table mutation lock acquisition was slow 
 1. 获取表 `mutation_lock`（排除其他宽锁持有者）；
 2. 置原子标志 `partition_gate = true`；
 3. 短暂持有 `partition_locks` **写闸**，对已登记分区按分区名**排序**快照出锁的 `Arc` 列表，随即释放写闸；
-4. 依序以**有界等待**锁定全部快照锁（`acquire_partition_lock_for_wide_gate`，复用 `storage.mutation_lock_timeout_secs` 超时语义）：超时返回 `ResourceBusy` 并释放已收集的分区锁与 gate，绝不无限制阻塞；
+4. 依序以**有界等待**锁定全部快照锁（`acquire_partition_lock_for_wide_gate`，复用 `storage.mutation_lock_timeout_secs` 超时语义）：超时返回 `ResourceBusy` 并释放已收集的分区锁与 gate，绝不无限制阻塞；**该路径刻意绕过分区锁的 FIFO 队列**——gate 置位后排队中的分区写者在轮询前先查 gate、全程不碰互斥锁，收集者总能在一个轮询周期内拿到锁；若收集者也排队，队头等 gate、gate 等收集者完成、收集者又等队头的锁，三方互等死锁；
 5. 执行临界区 `f`；
 6. 释放分区锁、`partition_gate = false`。
 
 gate 复位由 drop 守卫（`PartitionGateReset` / `DatabaseGatesReset`）完成：无论 `f` 正常返回、返回错误还是 panic 展开，gate 都会被清零，分区写者不会因一次被线程层捕获的 panic 而永久饥饿。
 
-分区写路径在拿到分区锁后**复查 gate 标志**：若宽锁正在收集中（本分区锁已被快照进宽锁持有者的集合，或自己晚于快照创建），写者释放锁并退避重试，直到 gate 清除。该协议保证：
+分区写路径在拿到分区锁后**复查 gate 标志**：若宽锁正在收集中（本分区锁已被快照进宽锁持有者的集合，或自己晚于快照创建），写者释放锁并退避重试，直到 gate 清除。gate 置位期间，FIFO 队列中的等待者在轮询互斥锁**之前**先查 gate，置位时整体驻停（不触碰互斥锁），gate 清除后按队列顺序恢复。该协议保证：
 
 - **宽锁等待者不会饿死**：gate 置位后新到达的分区写者全部自旋等待；
 - **写闸不长时间持有**：注册表读路径（新分区创建）不会被宽锁收集中卡死，新分区的写者通过 gate 标志自冻结；
@@ -141,14 +152,24 @@ seal 出锁回归位于 `src/storage/segment_manager/seal_outside_lock_test.rs`�
 
 既有 `lock_tests::blocked_table_state_does_not_block_global_registry` 继续覆盖全局注册表不被阻塞表拖垮的行为。
 
+公平排队回归位于 `src/storage/segment_manager/mutation_lock_fairness_test.rs`（挂载为 `segment_manager::mutation_lock_fairness_tests`），取消让位回归位于同目录 `mutation_lock_cancel_test.rs`：
+
+| 测试 | 锁定行为 |
+|------|----------|
+| `table_mutation_lock_wakes_waiters_in_arrival_order` | 三个错峰入队的等待者在持锁者释放后严格按到达顺序获锁（新到者不得越过头号） |
+| `cancelled_table_waiter_hands_its_queue_position_to_the_next` | 取消的等待者出队让位，后继不被弃等票据阻塞 |
+| `queued_partition_writer_parks_while_wide_gate_is_raised` | gate 置位时排队中的分区写者驻停不碰互斥锁，绕队的宽锁收集者必能取锁（防三方互等死锁），gate 清除后写者按队列恢复 |
+| `table/partition_mutation_lock_waiter_aborts_when_client_disconnects` | 断连/KILL 的排队者在下一轮询出队，不占用票据到锁超时 |
+| `waiter_without_context_still_acquires_once_released` | 无取消上下文的后台调用者照常排队、释放后获锁 |
+
 ## 代码索引
 
 | 行为 | 位置 |
 |------|------|
-| 分区锁注册表与 gate 标志 | `src/storage/segment_manager/state.rs`（`TableSegmentState`） |
+| 分区锁注册表、gate 标志与 FIFO 排队 | `src/storage/segment_manager/state.rs`（`TableSegmentState` / `FairMutex` / `QueuedTicket`） |
 | 宽锁 gate 协议、分区锁 API | `src/storage/segment_manager/manager_core.rs`（`with_table_mutation_lock` / `with_partition_mutation_lock` / `with_partition_set_mutation_lock` / `with_state_table_mutation_lock`） |
-| 有界等待、慢锁 WARN、超时 | 同上（`acquire_mutation_lock` / `acquire_partition_mutation_lock`） |
+| 有界等待、慢锁 WARN、超时、队列准入 | 同上（`acquire_mutation_lock` / `acquire_partition_mutation_lock`；宽锁收集绕队的 `acquire_partition_lock_for_wide_gate`） |
 | 写路径迁移 | `src/storage/core/batch_writer.rs`、`src/storage/segment_manager/buffered_write.rs`、`src/storage/segment_manager/direct_bulk.rs` |
 | seal 出锁与 sealing 注册表 | `src/storage/segment_manager/state.rs`（`sealing_segments` / `wait_sealing_segments_drained`）、`direct_bulk.rs` / `buffered_write.rs`（`PendingSeal` / `SealingToken`）、`manager_core.rs`（宽锁排空、try 让位、读者等待、发现过滤） |
 | 宽锁调用点收窄 | `src/storage/core/compactor.rs`（`compact_table` / `optimize_partition`）、`src/sql/execution/dml_delete.rs`、`src/sql/execution/dml_update.rs`、`src/sql/execution/ttl_purge.rs`、`src/sql/execution/engine.rs`（健康统计） |
-| 并发回归 | `src/storage/partition_lock_test.rs`、`src/sql/execution/engine_test/lifecycle.rs` |
+| 并发回归 | `src/storage/partition_lock_test.rs`、`src/sql/execution/engine_test/lifecycle.rs`、`src/storage/segment_manager/mutation_lock_fairness_test.rs`、`src/storage/segment_manager/mutation_lock_cancel_test.rs` |

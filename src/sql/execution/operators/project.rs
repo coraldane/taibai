@@ -6,8 +6,8 @@ use crate::sql::execution::subquery_runtime::SubqueryRegistry;
 use crate::sql::parser::ast::BinOp;
 use crate::sql::planner::LogicalExpr;
 use crate::types::array::ColumnArray;
-use crate::types::bitmap::NullBitmap;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
+use crate::types::bitmap::NullBitmap;
 
 use super::ExecutionOp;
 
@@ -84,12 +84,9 @@ impl ProjectExec {
         col_def: &ColumnDef,
     ) -> Result<ColumnArray> {
         if col_def.data_type == DataType::Decimal {
-            if let Some(column) = eval_decimal_arithmetic(
-                expr,
-                batch,
-                &batch.schema,
-                self.subqueries.as_ref(),
-            )? {
+            if let Some(column) =
+                eval_decimal_arithmetic(expr, batch, &batch.schema, self.subqueries.as_ref())?
+            {
                 return Ok(column);
             }
         }
@@ -373,9 +370,7 @@ fn eval_decimal_arithmetic(
     schema: &Schema,
     subqueries: Option<&SubqueryRegistry>,
 ) -> Result<Option<ColumnArray>> {
-    let Some((raws, _scale)) =
-        eval_decimal_operand(expr, batch, schema, subqueries)?
-    else {
+    let Some((raws, _scale)) = eval_decimal_operand(expr, batch, schema, subqueries)? else {
         return Ok(None);
     };
     // The result column's scale is set separately by decimal_result_scale.
@@ -450,30 +445,34 @@ fn eval_decimal_operand(
                     )
                 }
             };
+            // Multiplication produces raw values at ls + rs decimal places.
+            // If the result scale is capped, shrink the raw value as well;
+            // changing only metadata would multiply the numeric result.
+            let product_divisor = if matches!(op, BinOp::Mul) {
+                10_i128.pow((ls + rs - scale) as u32)
+            } else {
+                1
+            };
             let mut out = Vec::with_capacity(lraws.len());
             for (l, r) in lraws.into_iter().zip(rraws) {
                 let value = if l == i128::MIN || r == i128::MIN {
                     None
                 } else {
                     match op {
-                        BinOp::Mul => l.checked_mul(r),
-                        BinOp::Add => l.checked_mul(align_l).and_then(|l| {
-                            r.checked_mul(align_r)
-                                .and_then(|r| l.checked_add(r))
+                        BinOp::Mul => l.checked_mul(r).map(|raw| raw / product_divisor),
+                        BinOp::Add => l
+                            .checked_mul(align_l)
+                            .and_then(|l| r.checked_mul(align_r).and_then(|r| l.checked_add(r))),
+                        BinOp::Sub => l
+                            .checked_mul(align_l)
+                            .and_then(|l| r.checked_mul(align_r).and_then(|r| l.checked_sub(r))),
+                        BinOp::Mod => r.checked_mul(align_r).and_then(|r| {
+                            if r == 0 {
+                                None
+                            } else {
+                                l.checked_mul(align_l).and_then(|l| l.checked_rem(r))
+                            }
                         }),
-                        BinOp::Sub => l.checked_mul(align_l).and_then(|l| {
-                            r.checked_mul(align_r)
-                                .and_then(|r| l.checked_sub(r))
-                        }),
-                        BinOp::Mod => r
-                            .checked_mul(align_r)
-                            .and_then(|r| {
-                                if r == 0 {
-                                    None
-                                } else {
-                                    l.checked_mul(align_l).and_then(|l| l.checked_rem(r))
-                                }
-                            }),
                         _ => None,
                     }
                 };
@@ -507,16 +506,10 @@ fn eval_decimal_operand(
             }
             Ok(Some((raws, scale)))
         }
-        _ => {
-            // Non-decimal sub-expressions (functions, CASE, ...): fall back
-            // to the scalar path and treat the values as scale-0 integers.
-            let scalar = eval_expr_column_with(expr, batch, subqueries)?;
-            let mut raws = Vec::with_capacity(scalar.len());
-            for value in &scalar {
-                raws.push(literal_raw(value));
-            }
-            Ok(Some((raws, 0)))
-        }
+        // CASE/functions may return a mixture of integers and already-scaled
+        // decimals. Without branch scale metadata, treating their raw values
+        // as scale 0 bypasses the projection's required decimal coercion.
+        _ => Ok(None),
     }
 }
 
@@ -524,19 +517,6 @@ fn float_literal_scale(v: f64) -> i32 {
     match format!("{}", v).split_once('.') {
         Some((_, frac)) => frac.len().min(9) as i32,
         None => 0,
-    }
-}
-
-fn literal_raw(value: &crate::types::scalar::ScalarValue) -> i128 {
-    use crate::types::scalar::ScalarValue;
-    if value.is_null() {
-        return i128::MIN;
-    }
-    match value {
-        ScalarValue::Decimal(Some(raw)) => *raw as i128,
-        ScalarValue::Float32(Some(v)) => (*v as f64).round() as i128,
-        ScalarValue::Float64(Some(v)) => v.round() as i128,
-        other => other.integer_i128().unwrap_or(i128::MIN),
     }
 }
 

@@ -43,6 +43,29 @@ pub(super) fn constraint_insert_lock(db: &str, table: &str) -> &'static Mutex<()
     &CONSTRAINT_INSERT_LOCKS[hasher.finish() as usize % CONSTRAINT_INSERT_LOCK_STRIPES]
 }
 
+/// Keep queued writers cancellable before they publish any rows. Constraint
+/// stripes can be held by a full index scan, including for another table.
+pub(super) fn acquire_constraint_insert_lock(
+    db: &str,
+    table: &str,
+) -> Result<std::sync::MutexGuard<'static, ()>> {
+    let lock = constraint_insert_lock(db, table);
+    loop {
+        crate::common::query_cancel::check()?;
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(TaibaiError::Internal(
+                    "constraint insert lock poisoned".into(),
+                ));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static FORCE_REPLACE_INSERT_FAILURE: Cell<bool> = const { Cell::new(false) };

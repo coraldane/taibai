@@ -574,3 +574,49 @@ fn flush_under_lock_skips_transactional_and_pinned_memtables() -> Result<()> {
     writer.stop();
     Ok(())
 }
+
+#[test]
+fn clear_tombstones_do_not_force_unrelated_memtables_to_flush() -> Result<()> {
+    use crate::storage::core::durable_tail;
+    let temp = tempfile::tempdir()?;
+    let table_dir = temp.path().join(TEST_DB).join(TEST_TABLE);
+    std::fs::create_dir_all(&table_dir)?;
+    let schema = test_schema();
+    // Simulate repeatedly deleting a short-lived monitor row. Recovery markers
+    // remain, but no live rows from these generations can be flushed.
+    for _ in 0..4 {
+        let id = uuid::Uuid::new_v4();
+        durable_tail::persist(&table_dir, id, "", &make_batch(&schema, 0, 1)?)?;
+        durable_tail::clear(&table_dir, id)?;
+    }
+    let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
+    writer.write_columns(
+        TEST_DB,
+        TEST_TABLE,
+        "",
+        make_batch(&schema, 42, 1)?,
+        schema.clone(),
+        true,
+    )?;
+    assert_eq!(durable_tail::generation_file_count(&table_dir)?, 5);
+    assert_eq!(
+        BatchWriter::flush_tail_file_pressure(
+            &segment_mgr,
+            writer.memtable_manager(),
+            &writer.tail_committer,
+            writer.flush_gate_for_test(),
+            4,
+        )?,
+        0
+    );
+    assert_eq!(total_segment_rows(&table_dir), 0);
+    let recovered = durable_tail::recover(&table_dir, &schema)?;
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(
+        recovered[0].batch.scalar(0, 0),
+        Some(ScalarValue::Int64(Some(42)))
+    );
+    writer.stop();
+    Ok(())
+}

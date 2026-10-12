@@ -121,6 +121,11 @@ impl Parser {
                 self.advance();
                 Ok(Statement::ShowEngines)
             }
+            Token::Full => {
+                self.advance();
+                self.expect(&Token::Processlist)?;
+                Ok(Statement::ShowProcesslist { full: true })
+            }
             Token::Processlist => {
                 self.advance();
                 let full = self.peek() == &Token::Full;

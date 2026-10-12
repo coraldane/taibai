@@ -1416,7 +1416,8 @@ impl BatchWriter {
         let mut flushed_tables = 0usize;
         for (db, table) in tables {
             let table_dir = segment_mgr.table_dir(&db, &table);
-            let file_count = crate::storage::core::durable_tail::generation_file_count(&table_dir)?;
+            let file_count =
+                crate::storage::core::durable_tail::flushable_generation_file_count(&table_dir)?;
             if file_count < max_files_per_table {
                 continue;
             }

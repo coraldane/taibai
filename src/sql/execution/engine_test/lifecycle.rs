@@ -230,7 +230,7 @@ fn optimize_partition_does_not_freeze_other_partitions() -> Result<()> {
     let held = engine
         .segment_mgr()
         .partition_lock_arc_for_tests("main", "opt_freeze", "1");
-    let held_guard = held.lock().unwrap();
+    let held_guard = held.lock_for_test();
 
     let (done_tx, done_rx) = mpsc::channel::<bool>();
     let optimize_engine = Arc::clone(&engine);
@@ -386,7 +386,7 @@ fn delete_partition_eq_does_not_freeze_other_partitions() -> Result<()> {
     let held = engine
         .segment_mgr()
         .partition_lock_arc_for_tests("main", "del_freeze", "1");
-    let held_guard = held.lock().unwrap();
+    let held_guard = held.lock_for_test();
 
     let (done_tx, done_rx) = mpsc::channel::<bool>();
     let delete_engine = Arc::clone(&engine);

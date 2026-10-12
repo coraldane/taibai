@@ -644,14 +644,14 @@ fn dispose_tail_file_archives_only_when_enabled() -> Result<()> {
     let tail_file = live_tail_path(&table_dir, id)?.expect("tail should exist");
 
     // Disabled: the tail is deleted (historic behavior).
-    dispose_tail_file(&tail_dir, &tail_file, false);
+    dispose_tail_file(&tail_dir, &tail_file, false)?;
     assert!(!tail_file.exists());
 
     // Re-create and dispose with archive enabled: the file moves under
     // <data>/wal/<db>/<table>/memtable_tail/.
     persist(&table_dir, id, "", &test_batch(&schema, &[2])?)?;
     let tail_file = live_tail_path(&table_dir, id)?.expect("tail should exist");
-    dispose_tail_file(&tail_dir, &tail_file, true);
+    dispose_tail_file(&tail_dir, &tail_file, true)?;
     assert!(!tail_file.exists(), "moved out of the tail dir");
     // db dir inside tempdir = temp/<db>; persist created temp path directly,
     // so the archive layout derives the db name from the parent chain.
@@ -1622,5 +1622,35 @@ fn replicated_sidecar_rejects_corrupt_payload() -> Result<()> {
         &[0xDE, 0xAD, 0xBE, 0xEF],
     )
     .is_err());
+    Ok(())
+}
+
+#[test]
+fn failed_flush_cleanup_keeps_recovery_marker() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "", &test_batch(&schema, &[1])?)?;
+    let intent = begin_flush(temp.path(), id, "seg_00001.dat", 1)?;
+    let tail_dir = temp.path().join("memtable_tail");
+    // A directory in place of a generation deterministically makes remove_file
+    // fail, without relying on permissions (which root can bypass).
+    let blocked = tail_dir.join(format!("{}.1.del", id.simple()));
+    fs::create_dir(&blocked)?;
+    let result = finish_flush_batch(temp.path(), vec![intent]);
+    assert!(
+        result.is_err(),
+        "cleanup failure must be returned to the caller"
+    );
+    assert!(
+        fs::read_dir(&tail_dir)?.any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "flush")
+        }),
+        "the recovery marker must survive incomplete cleanup"
+    );
     Ok(())
 }

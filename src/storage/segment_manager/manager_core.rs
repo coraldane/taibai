@@ -33,7 +33,7 @@ impl SegmentManager {
         db: &str,
         table: &str,
         partition_key: &str,
-    ) -> Arc<std::sync::Mutex<()>> {
+    ) -> Arc<FairMutex> {
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
         partition_mutation_lock_arc(&state, partition_key)
@@ -1513,7 +1513,7 @@ impl SegmentManager {
             Some(lock) => lock,
             None => partition_mutation_lock_arc(&state, partition_key),
         };
-        let _guard = match try_lock_or_none(&lock, "partition mutation lock") {
+        let _guard = match lock.try_lock_or_none("partition mutation lock") {
             Some(guard) if !state.partition_gate.load(Ordering::Acquire) => guard,
             Some(_) => return Ok(None),
             None => return Ok(None),
@@ -1535,7 +1535,7 @@ impl SegmentManager {
     ) -> Result<Option<T>> {
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
-        let _mutation_guard = match try_lock_or_none(&state.mutation_lock, "table mutation lock") {
+        let _mutation_guard = match state.mutation_lock.try_lock_or_none("table mutation lock") {
             Some(guard) => guard,
             None => return Ok(None),
         };
@@ -1546,7 +1546,7 @@ impl SegmentManager {
         let (_partition_keys, partition_locks) = sorted_partition_locks(&registry);
         let mut partition_guards = Vec::with_capacity(partition_locks.len());
         for lock in &partition_locks {
-            match try_lock_or_none(lock, "partition mutation lock") {
+            match lock.try_lock_or_none("partition mutation lock") {
                 Some(guard) => partition_guards.push(guard),
                 None => return Ok(None),
             }
@@ -1585,11 +1585,11 @@ impl SegmentManager {
         let mut registries = Vec::with_capacity(states.len());
         let mut partition_arc_sets = Vec::with_capacity(states.len());
         for (_key, state) in keys.iter().zip(states.iter()) {
-            let mutation_guard = match try_lock_or_none(&state.mutation_lock, "table mutation lock")
-            {
-                Some(guard) => guard,
-                None => return Ok(None),
-            };
+            let mutation_guard =
+                match state.mutation_lock.try_lock_or_none("table mutation lock") {
+                    Some(guard) => guard,
+                    None => return Ok(None),
+                };
             let registry = match state.partition_locks.try_write() {
                 Ok(registry) => registry,
                 Err(_) => return Ok(None),
@@ -1603,7 +1603,7 @@ impl SegmentManager {
         for partition_locks in &partition_arc_sets {
             let mut guards = Vec::new();
             for lock in partition_locks {
-                match try_lock_or_none(lock, "partition mutation lock") {
+                match lock.try_lock_or_none("partition mutation lock") {
                     Some(guard) => guards.push(guard),
                     None => return Ok(None),
                 }
@@ -1877,11 +1877,8 @@ impl Drop for DatabaseGatesReset {
 /// before running `f` (the gate flag freezes new partitions instead),
 /// while the try variants keep it held through `f`.
 fn sorted_partition_locks(
-    registry: &std::sync::RwLockWriteGuard<
-        '_,
-        std::collections::HashMap<String, Arc<std::sync::Mutex<()>>>,
-    >,
-) -> (Vec<String>, Vec<Arc<std::sync::Mutex<()>>>) {
+    registry: &std::sync::RwLockWriteGuard<'_, std::collections::HashMap<String, Arc<FairMutex>>>,
+) -> (Vec<String>, Vec<Arc<FairMutex>>) {
     let mut partition_keys: Vec<String> = registry.keys().cloned().collect();
     partition_keys.sort();
     let partition_locks = partition_keys
@@ -1889,22 +1886,6 @@ fn sorted_partition_locks(
         .map(|partition| Arc::clone(&registry[partition]))
         .collect::<Vec<_>>();
     (partition_keys, partition_locks)
-}
-
-/// Try-lock for the lock-free mutation attempts: `None` means busy (the
-/// caller reports "not now" and retries later); a poisoned lock still
-/// panics so the failure stays loud instead of being silently skipped.
-fn try_lock_or_none<'a, T>(
-    lock: &'a std::sync::Mutex<T>,
-    what: &str,
-) -> Option<std::sync::MutexGuard<'a, T>> {
-    match lock.try_lock() {
-        Ok(guard) => Some(guard),
-        Err(std::sync::TryLockError::WouldBlock) => None,
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-            panic!("{} poisoned: {}", what, poisoned)
-        }
-    }
 }
 
 pub(super) fn acquire_mutation_lock<'a>(
@@ -1916,40 +1897,57 @@ pub(super) fn acquire_mutation_lock<'a>(
     let warn_after = Duration::from_secs(timeouts.mutation_lock_warn_secs.max(1));
     let start = Instant::now();
     let mut backoff = Duration::from_millis(1);
+    // Uncontended fast path: taken only while no waiter is queued, so a
+    // fresh arrival cannot barge ahead of the queue head.
+    if state.mutation_lock.queue_empty() {
+        if let Ok(guard) = state.mutation_lock.try_lock() {
+            return Ok(guard);
+        }
+    }
+    let mut ticket = state.mutation_lock.enter_queue();
     loop {
-        match state.mutation_lock.try_lock() {
-            Ok(guard) => {
-                let waited = start.elapsed();
-                if waited >= warn_after {
-                    tracing::warn!(
-                        table = key,
-                        wait_ms = waited.as_millis() as u64,
-                        "table mutation lock acquisition was slow"
-                    );
+        // Only the queue head polls the mutex; later arrivals sleep until
+        // the head acquires or abandons the wait, so they cannot overtake
+        // it no matter how long the contention lasts.
+        if ticket.is_head() {
+            match state.mutation_lock.try_lock() {
+                Ok(guard) => {
+                    let waited = start.elapsed();
+                    if waited >= warn_after {
+                        tracing::warn!(
+                            table = key,
+                            wait_ms = waited.as_millis() as u64,
+                            "table mutation lock acquisition was slow"
+                        );
+                    }
+                    // Hand the head position over before returning: the
+                    // successor starts polling while this guard is still
+                    // held, picking the mutex up within one poll tick of
+                    // the release.
+                    ticket.release();
+                    return Ok(guard);
                 }
-                return Ok(guard);
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {
-                if start.elapsed() >= timeout {
-                    return Err(TaibaiError::ResourceBusy(format!(
-                        "table mutation lock timeout after {}ms waiting on {}",
-                        timeout.as_millis(),
-                        key
-                    )));
+                Err(std::sync::TryLockError::WouldBlock) => {}
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    panic!("table mutation lock poisoned: {}", poisoned)
                 }
-                // A queued writer whose client disconnected (or whose
-                // statement deadline expired) must leave the queue at the
-                // next poll instead of occupying it until the lock timeout.
-                // Background callers (flusher/compactor) run without an
-                // ambient context, where this check is a no-op.
-                crate::common::query_cancel::check()?;
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_millis(16));
-            }
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                panic!("table mutation lock poisoned: {}", poisoned)
             }
         }
+        if start.elapsed() >= timeout {
+            return Err(TaibaiError::ResourceBusy(format!(
+                "table mutation lock timeout after {}ms waiting on {}",
+                timeout.as_millis(),
+                key
+            )));
+        }
+        // A queued writer whose client disconnected (or whose
+        // statement deadline expired) must leave the queue at the
+        // next poll instead of occupying it until the lock timeout.
+        // Background callers (flusher/compactor) run without an
+        // ambient context, where this check is a no-op.
+        crate::common::query_cancel::check()?;
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(16));
     }
 }
 
@@ -1960,8 +1958,17 @@ pub(super) fn acquire_mutation_lock<'a>(
 /// wait. A long-held partition lock (slow partition-scoped mutation) must
 /// surface as an explicit timeout instead of freezing every partition
 /// writer behind the raised gate for the same duration.
+///
+/// This path deliberately bypasses the partition mutex's FIFO queue: the
+/// gate already parks every queued partition writer (they re-check
+/// `partition_gate` before polling and never touch the mutex while it is
+/// raised), so the collector can always win the mutex within one poll tick.
+/// Going through the queue instead would deadlock — the queue head would
+/// park on the gate while the gate holder waits behind that same head for
+/// the mutex. Fresh partition writers cannot starve the collector either:
+/// the gate flag keeps them out of the fast path entirely.
 pub(super) fn acquire_partition_lock_for_wide_gate<'a>(
-    lock: &'a std::sync::Mutex<()>,
+    lock: &'a FairMutex,
     key: &str,
     partition_key: &str,
     timeout: Duration,
@@ -1999,7 +2006,7 @@ pub(super) fn acquire_partition_lock_for_wide_gate<'a>(
 pub(super) fn partition_mutation_lock_arc(
     state: &TableSegmentState,
     partition_key: &str,
-) -> Arc<std::sync::Mutex<()>> {
+) -> Arc<FairMutex> {
     if let Some(lock) = state.partition_locks.read().unwrap().get(partition_key) {
         return Arc::clone(lock);
     }
@@ -2007,19 +2014,27 @@ pub(super) fn partition_mutation_lock_arc(
     Arc::clone(
         registry
             .entry(partition_key.to_string())
-            .or_insert_with(|| Arc::new(std::sync::Mutex::new(()))),
+            .or_insert_with(|| Arc::new(FairMutex::new())),
     )
 }
 
 /// Acquire a partition mutation lock with the same bounded wait, slow-lock
 /// warning, and timeout error as the table-wide mutation lock, so partition
-/// lock queueing is equally visible in the server log. After acquiring the
-/// mutex the writer re-checks the table's wide-gate flag: a table-wide
-/// mutation operation that has already snapshotted this partition holds the
-/// mutex, so the writer releases and retries until the gate clears.
+/// lock queueing is equally visible in the server log. Admission goes
+/// through the partition mutex's FIFO queue: the oldest queued writer polls
+/// the mutex, later arrivals wait behind it, and an abandoned wait (cancel
+/// or timeout) leaves the ticket so the successor takes over. After
+/// acquiring the mutex the writer re-checks the table's wide-gate flag: a
+/// table-wide mutation operation that has already snapshotted this
+/// partition holds the mutex, so the writer releases and retries until the
+/// gate clears. While the gate is raised a queued writer stays parked
+/// without touching the mutex, which is what lets the wide-gate collector
+/// (which bypasses the queue, see
+/// [`acquire_partition_lock_for_wide_gate`]) take the mutex instead of
+/// deadlocking against the queue head.
 pub(super) fn acquire_partition_mutation_lock<'a>(
     state: &TableSegmentState,
-    lock: &'a std::sync::Mutex<()>,
+    lock: &'a FairMutex,
     key: &str,
     partition_key: &str,
 ) -> Result<std::sync::MutexGuard<'a, ()>> {
@@ -2028,26 +2043,48 @@ pub(super) fn acquire_partition_mutation_lock<'a>(
     let warn_after = Duration::from_secs(timeouts.mutation_lock_warn_secs.max(1));
     let start = Instant::now();
     let mut backoff = Duration::from_millis(1);
-    loop {
-        match lock.try_lock() {
-            Ok(guard) => {
-                if !state.partition_gate.load(Ordering::Acquire) {
-                    let waited = start.elapsed();
-                    if waited >= warn_after {
-                        tracing::warn!(
-                            table = key,
-                            partition = partition_key,
-                            wait_ms = waited.as_millis() as u64,
-                            "partition mutation lock acquisition was slow"
-                        );
-                    }
-                    return Ok(guard);
-                }
-                drop(guard);
+    // Uncontended fast path: only while no waiter is queued and the wide
+    // gate is clear, so a fresh arrival can neither barge ahead of the
+    // queue head nor slip under the gate.
+    if lock.queue_empty() && !state.partition_gate.load(Ordering::Acquire) {
+        if let Ok(guard) = lock.try_lock() {
+            if !state.partition_gate.load(Ordering::Acquire) {
+                return Ok(guard);
             }
-            Err(std::sync::TryLockError::WouldBlock) => {}
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                panic!("partition mutation lock poisoned: {}", poisoned)
+            drop(guard);
+        }
+    }
+    let mut ticket = lock.enter_queue();
+    loop {
+        // While the wide gate is raised, stay parked without polling the
+        // mutex: the gate holder collects partition mutexes through the
+        // queue-bypassing path above, and a queued head that kept polling
+        // could hold the admission against the very operation the gate is
+        // freezing the table for.
+        if !state.partition_gate.load(Ordering::Acquire) && ticket.is_head() {
+            match lock.try_lock() {
+                Ok(guard) => {
+                    if !state.partition_gate.load(Ordering::Acquire) {
+                        let waited = start.elapsed();
+                        if waited >= warn_after {
+                            tracing::warn!(
+                                table = key,
+                                partition = partition_key,
+                                wait_ms = waited.as_millis() as u64,
+                                "partition mutation lock acquisition was slow"
+                            );
+                        }
+                        ticket.release();
+                        return Ok(guard);
+                    }
+                    // The gate rose between the checks: release the mutex
+                    // and stay queued until it clears.
+                    drop(guard);
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    panic!("partition mutation lock poisoned: {}", poisoned)
+                }
             }
         }
         if start.elapsed() >= timeout {

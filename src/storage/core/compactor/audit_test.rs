@@ -348,7 +348,7 @@ fn partition_optimize_with_unique_index_does_not_wait_for_sibling_lock() -> Resu
     let sibling = engine
         .segment_mgr()
         .partition_lock_arc_for_tests("default", "t", "2");
-    let held = sibling.lock().unwrap();
+    let held = sibling.lock_for_test();
     let (tx, rx) = std::sync::mpsc::channel();
     let other = engine.clone();
     let worker = std::thread::spawn(move || {

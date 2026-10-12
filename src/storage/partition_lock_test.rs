@@ -64,7 +64,7 @@ fn wide_gate_collection_is_bounded_while_partition_lock_held() {
     let dir = tempfile::tempdir().unwrap();
     let manager = SegmentManager::new(dir.path()).unwrap();
     let held = manager.partition_lock_arc_for_tests(TEST_DB, TEST_TABLE, "p1");
-    let _held_guard = held.lock().unwrap();
+    let _held_guard = held.lock_for_test();
 
     // A wide-gate holder must not block indefinitely behind one long-held
     // partition lock: the collection wait is bounded and surfaces as an
@@ -106,7 +106,7 @@ fn partition_locks_are_independent() {
     let dir = tempfile::tempdir().unwrap();
     let manager = SegmentManager::new(dir.path()).unwrap();
     let held = manager.partition_lock_arc_for_tests(TEST_DB, TEST_TABLE, "20250101");
-    let _held_guard = held.lock().unwrap();
+    let _held_guard = held.lock_for_test();
 
     let blocked =
         manager.try_with_partition_mutation_lock(TEST_DB, TEST_TABLE, "20250101", || Ok(()));
@@ -121,7 +121,7 @@ fn wide_gate_waits_for_partition_writers() {
     let dir = tempfile::tempdir().unwrap();
     let manager = Arc::new(SegmentManager::new(dir.path()).unwrap());
     let held = manager.partition_lock_arc_for_tests(TEST_DB, TEST_TABLE, "p1");
-    let _held_guard = held.lock().unwrap();
+    let _held_guard = held.lock_for_test();
 
     let gate_manager = Arc::clone(&manager);
     let (tx, rx) = mpsc::channel::<()>();
@@ -190,7 +190,7 @@ fn writes_to_other_partitions_proceed_while_partition_locked() -> Result<()> {
     let mut writer = BatchWriter::new(test_writer_config(), Arc::clone(&segment_mgr), None);
 
     let held = segment_mgr.partition_lock_arc_for_tests(TEST_DB, TEST_TABLE, "p1");
-    let held_guard = held.lock().unwrap();
+    let held_guard = held.lock_for_test();
 
     let free_schema = schema.clone();
     let free_manager = Arc::clone(&segment_mgr);
@@ -258,7 +258,7 @@ fn flush_table_avoids_other_partitions_locks() -> Result<()> {
     )?;
 
     let held = segment_mgr.partition_lock_arc_for_tests(TEST_DB, TEST_TABLE, "p1");
-    let held_guard = held.lock().unwrap();
+    let held_guard = held.lock_for_test();
 
     let (flush_tx, flush_rx) = mpsc::channel::<Result<()>>();
     let flush = std::thread::spawn(move || {
@@ -282,7 +282,7 @@ fn partition_set_lock_leaves_other_partitions_free() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let manager = SegmentManager::new(dir.path())?;
     let held = manager.partition_lock_arc_for_tests(TEST_DB, TEST_TABLE, "20250101");
-    let _held_guard = held.lock().unwrap();
+    let _held_guard = held.lock_for_test();
 
     let outcome =
         manager.try_with_partition_mutation_lock(TEST_DB, TEST_TABLE, "20250102", || Ok(()));
@@ -298,7 +298,7 @@ fn partition_set_lock_waits_for_held_member_partition() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let manager = Arc::new(SegmentManager::new(dir.path())?);
     let held = manager.partition_lock_arc_for_tests(TEST_DB, TEST_TABLE, "20250101");
-    let held_guard = held.lock().unwrap();
+    let held_guard = held.lock_for_test();
 
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let set_manager = Arc::clone(&manager);

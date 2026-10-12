@@ -45,7 +45,7 @@ use helpers::{
 };
 use reader_cache::ReaderCache;
 use segment_meta_cache::SegmentMetaCache;
-use state::TableSegmentState;
+use state::{FairMutex, TableSegmentState};
 
 fn same_segment_path(a: &Path, b: &Path) -> bool {
     a == b || a.to_string_lossy().replace('\\', "/") == b.to_string_lossy().replace('\\', "/")
@@ -197,3 +197,7 @@ mod seq_allocation_tests;
 #[cfg(test)]
 #[path = "segment_manager/mutation_lock_cancel_test.rs"]
 mod mutation_lock_cancel_tests;
+
+#[cfg(test)]
+#[path = "segment_manager/mutation_lock_fairness_test.rs"]
+mod mutation_lock_fairness_tests;
