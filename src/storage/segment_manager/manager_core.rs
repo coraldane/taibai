@@ -1907,7 +1907,7 @@ fn try_lock_or_none<'a, T>(
     }
 }
 
-fn acquire_mutation_lock<'a>(
+pub(super) fn acquire_mutation_lock<'a>(
     state: &'a TableSegmentState,
     key: &str,
 ) -> Result<std::sync::MutexGuard<'a, ()>> {
@@ -1937,6 +1937,12 @@ fn acquire_mutation_lock<'a>(
                         key
                     )));
                 }
+                // A queued writer whose client disconnected (or whose
+                // statement deadline expired) must leave the queue at the
+                // next poll instead of occupying it until the lock timeout.
+                // Background callers (flusher/compactor) run without an
+                // ambient context, where this check is a no-op.
+                crate::common::query_cancel::check()?;
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(Duration::from_millis(16));
             }
@@ -1981,6 +1987,7 @@ pub(super) fn acquire_partition_lock_for_wide_gate<'a>(
                 partition_key
             )));
         }
+        crate::common::query_cancel::check()?;
         std::thread::sleep(backoff);
         backoff = (backoff * 2).min(Duration::from_millis(16));
     }
@@ -2051,6 +2058,7 @@ pub(super) fn acquire_partition_mutation_lock<'a>(
                 partition_key
             )));
         }
+        crate::common::query_cancel::check()?;
         std::thread::sleep(backoff);
         backoff = (backoff * 2).min(Duration::from_millis(16));
     }
@@ -2227,5 +2235,9 @@ pub mod manager_core_test_support {
         recover_replace_journals as recover_replace_journals_for_test,
         replace_journal_path as replace_journal_path_for_test,
         write_replace_journal as write_replace_journal_for_test,
+    };
+    pub(in crate::storage::segment_manager) use super::{
+        acquire_mutation_lock as acquire_mutation_lock_for_test,
+        acquire_partition_mutation_lock as acquire_partition_mutation_lock_for_test,
     };
 }

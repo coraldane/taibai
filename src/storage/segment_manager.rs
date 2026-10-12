@@ -193,3 +193,7 @@ mod seal_outside_lock_tests;
 #[cfg(test)]
 #[path = "segment_manager/seq_allocation_test.rs"]
 mod seq_allocation_tests;
+
+#[cfg(test)]
+#[path = "segment_manager/mutation_lock_cancel_test.rs"]
+mod mutation_lock_cancel_tests;
