@@ -593,6 +593,8 @@ impl SegmentManager {
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
         let _guard = state.flush_visibility.read().unwrap();
+        let _segments =
+            crate::storage::segment::snapshot::pin_directory(&self.data_dir.join(db).join(table));
         f()
     }
 
@@ -1172,57 +1174,51 @@ impl SegmentManager {
         final_path: &Path,
         old_segments: &[PathBuf],
     ) -> Result<()> {
-        if final_path.exists() {
-            return Err(TaibaiError::Storage(format!(
-                "segment target already exists: {}",
-                final_path.display()
-            )));
-        }
-
-        let final_meta = sidecar_meta_path(final_path);
-        if final_meta.exists() {
-            return Err(TaibaiError::Storage(format!(
-                "segment meta target already exists: {}",
-                final_meta.display()
-            )));
-        }
-        // Compaction output is sealed and self-contained. Validate its embedded
-        // footer before replacing any source segment; no sidecar is required.
-        read_embedded_segment_meta(tmp_path)?;
-
-        // Two-phase commit: the journal records which old segments the
-        // replacement must retire. A crash between the rename and the old
-        // file removals used to leave the new AND old segments on disk, and
-        // every scan then counted those rows twice. Startup recovery
-        // (`recover_replace_journals`) finishes the retirement.
-        let journal = replace_journal_path(final_path);
-        write_replace_journal(&journal, old_segments)?;
-
-        if let Err(error) = std::fs::rename(tmp_path, final_path) {
-            let _ = std::fs::remove_file(&journal);
-            return Err(error.into());
-        }
-        // From here on the replacement is in effect: keep removing the old
-        // segments even after an individual failure (the journal lets
-        // startup recovery finish), and report the first error.
-        let mut first_removal_error = None;
-        for old_seg in old_segments {
-            if old_seg != final_path {
-                if let Err(error) = self.remove_segment_file(old_seg) {
-                    tracing::warn!(
-                        old_segment = %old_seg.display(),
-                        error = %error,
-                        "old segment removal failed; startup recovery will retry"
-                    );
-                    first_removal_error = first_removal_error.or(Some(error));
-                }
+        let table_dir = final_path
+            .parent()
+            .ok_or_else(|| TaibaiError::Storage("segment has no parent directory".into()))?;
+        crate::storage::segment::snapshot::with_directory(table_dir, |directory| {
+            if final_path.exists() {
+                return Err(TaibaiError::Storage(format!(
+                    "segment target already exists: {}",
+                    final_path.display()
+                )));
             }
-        }
-        if first_removal_error.is_none() {
-            let _ = std::fs::remove_file(&journal);
-        }
 
-        remove_sidecar_meta(tmp_path)?;
+            let final_meta = sidecar_meta_path(final_path);
+            if final_meta.exists() {
+                return Err(TaibaiError::Storage(format!(
+                    "segment meta target already exists: {}",
+                    final_meta.display()
+                )));
+            }
+            // Compaction output is sealed and self-contained. Validate its embedded
+            // footer before replacing any source segment; no sidecar is required.
+            read_embedded_segment_meta(tmp_path)?;
+
+            // Two-phase commit: the journal records which old segments the
+            // replacement must retire. A crash between the rename and the old
+            // file removals used to leave the new AND old segments on disk, and
+            // every scan then counted those rows twice. Startup recovery
+            // (`recover_replace_journals`) finishes the retirement.
+            let journal = replace_journal_path(final_path);
+            write_replace_journal(&journal, old_segments)?;
+
+            if let Err(error) = std::fs::rename(tmp_path, final_path) {
+                let _ = std::fs::remove_file(&journal);
+                return Err(error.into());
+            }
+            // The journal now retires the old paths for discovery. Existing
+            // leases retain their files; failed physical deletion remains
+            // recoverable without exposing duplicate rows to new scans.
+            for old_seg in old_segments {
+                self.invalidate_reader(old_seg);
+            }
+            directory.retire(journal, old_segments.to_vec());
+            Ok(())
+        })?;
+
+        let _ = remove_sidecar_meta(tmp_path);
         let _ = self.open_reader_cached(final_path);
         // The replacement changed this table's on-disk content: bump the
         // epoch here so no caller can forget (persisted unique-index
@@ -1230,6 +1226,20 @@ impl SegmentManager {
         self.bump_flush_epoch_for_segment(final_path);
         self.emit_segments_replaced(final_path, old_segments);
         Ok(())
+    }
+
+    /// Logical retirement is atomic for discovery; physical deletion waits
+    /// for existing scans and can be retried from the durable journal.
+    pub(crate) fn retire_segments(&self, table_dir: &Path, paths: &[PathBuf]) -> Result<()> {
+        crate::storage::segment::snapshot::with_directory(table_dir, |directory| {
+            let journal = table_dir.join(format!("{}.retire", uuid::Uuid::new_v4()));
+            write_replace_journal(&journal, paths)?;
+            for path in paths {
+                self.invalidate_reader(path);
+            }
+            directory.retire(journal, paths.to_vec());
+            Ok(())
+        })
     }
 
     pub fn rewrite_delete_footer(
@@ -2107,12 +2117,16 @@ pub(crate) fn recover_replace_journals(table_dir: &Path) {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let Some(final_name) = name.strip_suffix(".replace") else {
+        let Some(final_name) = name
+            .strip_suffix(".replace")
+            .or_else(|| name.strip_suffix(".retire"))
+        else {
             continue;
         };
         let final_path = table_dir.join(final_name);
+        let committed = name.ends_with(".retire") || final_path.exists();
         let Some(olds) = read_replace_journal(&path) else {
-            if final_path.exists() {
+            if committed {
                 // The journal is written BEFORE the rename, so a journal whose
                 // final segment exists means the replacement committed — but an
                 // unreadable journal (torn write / CRC mismatch) leaves the old
@@ -2122,9 +2136,6 @@ pub(crate) fn recover_replace_journals(table_dir: &Path) {
                 // every startup instead.
                 let corrupt = path.with_extension("replace.corrupt");
                 let preserved = std::fs::rename(&path, &corrupt).is_ok();
-                if !preserved {
-                    let _ = std::fs::remove_file(&path);
-                }
                 tracing::error!(
                     journal = %path.display(),
                     preserved_as = %corrupt.display(),
@@ -2145,23 +2156,22 @@ pub(crate) fn recover_replace_journals(table_dir: &Path) {
             }
             continue;
         };
-        if final_path.exists() {
-            for old in &olds {
-                if old != &final_path && old.exists() {
-                    tracing::warn!(
-                        old_segment = %old.display(),
-                        "startup recovery: retiring old segment left by interrupted replacement"
-                    );
-                    let _ = std::fs::remove_file(old);
-                    let _ = remove_sidecar_meta(old);
-                }
-            }
+        if committed {
+            // Table/database renames move journals with the directory. Never
+            // let their old absolute paths retire a newly recreated table at
+            // the former location.
+            let olds = olds.iter().filter_map(|old| old.file_name().map(|name| table_dir.join(name))).collect();
+            let _ = crate::storage::segment::snapshot::with_directory(table_dir, |directory| {
+                directory.retire(path.clone(), olds);
+                Ok(())
+            });
+        } else {
+            let _ = std::fs::remove_file(&path);
         }
-        let _ = std::fs::remove_file(&path);
     }
 }
 
-fn read_replace_journal(journal: &Path) -> Option<Vec<PathBuf>> {
+pub(crate) fn read_replace_journal(journal: &Path) -> Option<Vec<PathBuf>> {
     let bytes = std::fs::read(journal).ok()?;
     if bytes.len() < 8 + 4 + 4 || !bytes.starts_with(REPLACE_JOURNAL_MAGIC) {
         return None;

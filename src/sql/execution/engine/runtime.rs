@@ -842,15 +842,30 @@ impl Engine {
         let mut stats = crate::storage::core::compactor::CompactStats::default();
         if table_meta.is_partitioned() {
             for partition_key in &dirty_partitions {
-                let partition_stats =
-                    compactor.optimize_partition(db, table, &table_meta, partition_key)?;
+                let result = compactor.optimize_partition(db, table, &table_meta, partition_key);
+                super::adjust_row_count_for_ttl_drops(
+                    &self.catalogs,
+                    &self.data_dir,
+                    db,
+                    table,
+                    compactor.committed_stats().rows_dropped_ttl,
+                );
+                let partition_stats = result?;
                 stats.segments_read += partition_stats.segments_read;
                 stats.segments_written += partition_stats.segments_written;
                 stats.rows_written += partition_stats.rows_written;
                 stats.rows_dropped += partition_stats.rows_dropped;
             }
         } else if !dirty_partitions.is_empty() {
-            stats = compactor.optimize_table(db, table, &table_meta)?;
+            let result = compactor.optimize_table(db, table, &table_meta);
+            super::adjust_row_count_for_ttl_drops(
+                &self.catalogs,
+                &self.data_dir,
+                db,
+                table,
+                compactor.committed_stats().rows_dropped_ttl,
+            );
+            stats = result?;
         }
         if stats.segments_written > 0 {
             // Compaction freed segment path numbers that later writers can

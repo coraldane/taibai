@@ -3,172 +3,6 @@
 use super::*;
 
 impl Compactor {
-    /// K-way merge of sorted run files into `writer`, gathering rows through
-    /// a bounded row-group cache.
-    pub(super) fn merge_runs_into_writer(
-        &self,
-        run_paths: &[PathBuf],
-        schema: &Schema,
-        sort_key_indices: &[usize],
-        output_row_group_rows: usize,
-        writer: &mut SegmentWriter,
-    ) -> Result<usize> {
-        // Streams are files; each file's row groups occupy contiguous slots
-        // in source_row_groups, so (source_idx, row_idx) ordering matches the
-        // original global row order for stable tie-breaks.
-        let mut source_row_groups: Vec<SourceRowGroup> = Vec::new();
-        let mut rows_per_source: Vec<usize> = Vec::new();
-        let mut file_bounds: Vec<(usize, usize)> = Vec::new(); // [start, end) source slots
-        for path in run_paths {
-            let reader = self.segment_mgr.open_reader(path)?;
-            let start = source_row_groups.len();
-            for rg_idx in 0..reader.num_row_groups() {
-                source_row_groups.push(SourceRowGroup {
-                    segment_path: path.clone(),
-                    row_group_idx: rg_idx,
-                });
-                rows_per_source.push(reader.row_group_rows(rg_idx) as usize);
-            }
-            file_bounds.push((start, source_row_groups.len()));
-        }
-
-        let mut cache = RowGroupCache::new(32, schema.clone());
-
-        struct MergeHead<'k> {
-            keys: Vec<crate::types::scalar::ScalarValue>,
-            source_idx: usize,
-            row_idx: usize,
-            sort_keys: &'k [usize],
-        }
-        impl PartialEq for MergeHead<'_> {
-            fn eq(&self, other: &Self) -> bool {
-                self.cmp(other) == std::cmp::Ordering::Equal
-            }
-        }
-        impl Eq for MergeHead<'_> {}
-        impl PartialOrd for MergeHead<'_> {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for MergeHead<'_> {
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                for (col, _key_idx) in self.sort_keys.iter().enumerate() {
-                    let Some(left) = self.keys.get(col) else {
-                        continue;
-                    };
-                    let Some(right) = other.keys.get(col) else {
-                        continue;
-                    };
-                    let ord =
-                        crate::storage::index::sort_key::compare_scalars_for_sort(left, right);
-                    if ord != std::cmp::Ordering::Equal {
-                        return ord
-                            // Stable, deterministic tie-break: original row
-                            // order.
-                            .then(self.source_idx.cmp(&other.source_idx))
-                            .then(self.row_idx.cmp(&other.row_idx));
-                    }
-                }
-                self.source_idx
-                    .cmp(&other.source_idx)
-                    .then(self.row_idx.cmp(&other.row_idx))
-            }
-        }
-
-        // BinaryHeap is a max-heap; reverse for smallest-first.
-        use std::cmp::Reverse;
-        use std::collections::BinaryHeap;
-        let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
-
-        let materialize_keys = |cache: &mut RowGroupCache,
-                                source_idx: usize,
-                                row_idx: usize|
-         -> Result<Vec<crate::types::scalar::ScalarValue>> {
-            let source = &source_row_groups[source_idx];
-            let batch = cache.get(source, &self.segment_mgr)?;
-            Ok(sort_key_indices
-                .iter()
-                .map(|&col| {
-                    batch
-                        .column(col)
-                        .map(|column| column.scalar(row_idx))
-                        .unwrap_or(crate::types::scalar::ScalarValue::Int64(None))
-                })
-                .collect())
-        };
-
-        for &(start, end) in &file_bounds {
-            // First NON-EMPTY row group of the file (a leading empty row
-            // group must not hide the rest of the file).
-            let mut first_source = start;
-            while first_source < end && rows_per_source[first_source] == 0 {
-                first_source += 1;
-            }
-            if first_source >= end {
-                continue;
-            }
-            let keys = materialize_keys(&mut cache, first_source, 0)?;
-            heap.push(Reverse(MergeHead {
-                keys,
-                source_idx: first_source,
-                row_idx: 0,
-                sort_keys: sort_key_indices,
-            }));
-        }
-
-        let output_row_group_rows = output_row_group_rows.max(1);
-        let mut chunk: Vec<RowRef> = Vec::with_capacity(output_row_group_rows);
-        let mut rows_written = 0usize;
-        while let Some(Reverse(head)) = heap.pop() {
-            chunk.push(RowRef {
-                batch_idx: head.source_idx,
-                row_idx: head.row_idx,
-            });
-            rows_written += 1;
-            if chunk.len() >= output_row_group_rows {
-                let batch =
-                    self.gather_cached_chunk(schema, &source_row_groups, &chunk, &mut cache)?;
-                writer.write_batch_parallel(&batch)?;
-                chunk.clear();
-            }
-            // Advance this stream: next row in the same row group, else the
-            // next NON-EMPTY row group of the same file (empty row groups
-            // must be skipped forward, not abandon the file).
-            let mut next_source = head.source_idx;
-            let mut next_row = head.row_idx + 1;
-            if next_row >= rows_per_source[next_source] {
-                next_row = 0;
-                let file = file_bounds
-                    .iter()
-                    .find(|&&(start, end)| head.source_idx >= start && head.source_idx < end);
-                let end = match file {
-                    Some(&(_start, end)) => end,
-                    None => source_row_groups.len(),
-                };
-                next_source += 1;
-                while next_source < end && rows_per_source[next_source] == 0 {
-                    next_source += 1;
-                }
-                if next_source >= end {
-                    continue; // file exhausted
-                }
-            }
-            let keys = materialize_keys(&mut cache, next_source, next_row)?;
-            heap.push(Reverse(MergeHead {
-                keys,
-                source_idx: next_source,
-                row_idx: next_row,
-                sort_keys: sort_key_indices,
-            }));
-        }
-        if !chunk.is_empty() {
-            let batch = self.gather_cached_chunk(schema, &source_row_groups, &chunk, &mut cache)?;
-            writer.write_batch_parallel(&batch)?;
-        }
-        Ok(rows_written)
-    }
-
     pub(super) fn gather_cached_chunk(
         &self,
         schema: &Schema,
@@ -195,6 +29,7 @@ impl Compactor {
             .iter()
             .map(|col| GatherColumn::new(col.data_type, row_refs.len()))
             .collect::<Vec<_>>();
+        let mut gathered_bytes = 0usize;
 
         for (source_idx, positions) in positions_by_source {
             if positions.is_empty() {
@@ -204,6 +39,15 @@ impl Compactor {
                 TaibaiError::Storage(format!("missing source row group {}", source_idx))
             })?;
             let src_batch = row_group_cache.get(source, &self.segment_mgr)?;
+            for &(_, row) in &positions {
+                gathered_bytes = gathered_bytes
+                    .saturating_add(super::runs::row_allocation_bytes(src_batch, row));
+            }
+            ensure_compaction_memory(
+                gathered_bytes,
+                (clustered_merge_budget_bytes() / 4).max(4096),
+                "output gather",
+            )?;
 
             for col_idx in 0..schema.columns.len() {
                 let src_col = src_batch.column(col_idx).ok_or_else(|| {
@@ -230,6 +74,7 @@ pub(super) struct RowGroupCache {
     pub(super) order: VecDeque<(PathBuf, usize)>,
     pub(super) hits: usize,
     pub(super) misses: usize,
+    bytes: usize,
 }
 
 impl RowGroupCache {
@@ -241,6 +86,7 @@ impl RowGroupCache {
             order: VecDeque::new(),
             hits: 0,
             misses: 0,
+            bytes: 0,
         }
     }
 
@@ -270,6 +116,13 @@ impl RowGroupCache {
         // segments because their footer can be almost as large as the data.
         let reader = segment_mgr.open_reader_cached(&source.segment_path)?;
         let batch = reader.read_row_group_columns_aligned(source.row_group_idx, &self.schema)?;
+        let bytes = batch.estimated_size_bytes();
+        ensure_compaction_memory(
+            bytes,
+            (clustered_merge_budget_bytes() / 4).max(4096),
+            "cached row group",
+        )?;
+        self.bytes = self.bytes.saturating_add(bytes);
         self.batches.insert(key.clone(), batch);
         self.order.push_back(key.clone());
         self.evict_if_needed();
@@ -284,9 +137,14 @@ impl RowGroupCache {
     }
 
     pub(super) fn evict_if_needed(&mut self) {
-        while self.batches.len() > self.capacity {
+        while self.batches.len() > self.capacity
+            || (self.bytes > (clustered_merge_budget_bytes() / 8).max(4096)
+                && self.batches.len() > 1)
+        {
             if let Some(old_key) = self.order.pop_front() {
-                self.batches.remove(&old_key);
+                if let Some(batch) = self.batches.remove(&old_key) {
+                    self.bytes -= batch.estimated_size_bytes();
+                }
             } else {
                 break;
             }

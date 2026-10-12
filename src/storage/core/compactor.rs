@@ -25,8 +25,11 @@ use crate::types::bitmap::NullBitmap;
 mod clustered;
 mod merge;
 mod rewrite;
+mod runs;
+mod stream_merge;
 use clustered::*;
 use merge::*;
+use stream_merge::ensure_compaction_memory;
 
 #[derive(Debug, Clone, Copy)]
 struct RowRef {
@@ -99,12 +102,22 @@ const CLUSTERED_MERGE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// Test hook: when non-zero, overrides the in-memory budget so the external
 /// merge path can be exercised on small data sets.
 #[cfg(test)]
-pub(crate) static CLUSTERED_MERGE_BUDGET_OVERRIDE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+pub(crate) static CLUSTERED_MERGE_BUDGET_OVERRIDE: TestBudgetOverride = TestBudgetOverride;
+
+#[cfg(test)]
+thread_local! { static TEST_BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(crate) struct TestBudgetOverride;
+#[cfg(test)]
+impl TestBudgetOverride {
+    pub(crate) fn store(&self, value: usize, _: AtomicOrdering) {
+        TEST_BUDGET.with(|b| b.set(value));
+    }
+}
 
 #[cfg(test)]
 fn clustered_merge_budget_bytes() -> usize {
-    let override_value = CLUSTERED_MERGE_BUDGET_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    let override_value = TEST_BUDGET.with(|b| b.get());
     if override_value > 0 {
         override_value
     } else {
@@ -143,6 +156,7 @@ enum PreparedCompaction {
     /// Replacement segment written to a non-discoverable tmp path; commit
     /// re-validates the inputs and atomically swaps it in.
     Replacement {
+        _cleanup: runs::TempRuns,
         segment_files: Vec<PathBuf>,
         identities: Vec<SegmentFileIdentity>,
         tmp_path: PathBuf,
@@ -173,6 +187,15 @@ fn compaction_inputs_unchanged(
     files: &[PathBuf],
     identities: &[SegmentFileIdentity],
 ) -> bool {
+    if let Some(parent) = files.first().and_then(|p| p.parent()) {
+        let Ok(live) = store::discover_segments(parent) else {
+            return false;
+        };
+        let live: std::collections::HashSet<_> = live.into_iter().collect();
+        if files.iter().any(|p| !live.contains(p)) {
+            return false;
+        }
+    }
     files
         .iter()
         .zip(identities.iter())
@@ -231,6 +254,7 @@ fn segment_ttl_fully_expired(
 pub struct Compactor {
     segment_mgr: Arc<SegmentManager>,
     data_dir: PathBuf,
+    committed: std::sync::Mutex<CompactStats>,
 }
 
 impl Compactor {
@@ -238,7 +262,13 @@ impl Compactor {
         Self {
             segment_mgr,
             data_dir,
+            committed: std::sync::Mutex::new(CompactStats::default()),
         }
+    }
+
+    /// Includes successful partitions even when a later partition fails.
+    pub fn committed_stats(&self) -> CompactStats {
+        *self.committed.lock().unwrap()
     }
 
     /// See `COMPACTION_HEAVY_DELAY_MS`.
@@ -294,6 +324,7 @@ impl Compactor {
         sort_by_cluster_key: bool,
         seal_active: bool,
     ) -> Result<CompactStats> {
+        *self.committed.lock().unwrap() = CompactStats::default();
         let start_time = Instant::now();
         let table_dir = self.data_dir.join(db).join(table);
 
@@ -346,6 +377,7 @@ impl Compactor {
         if seal_active {
             self.segment_mgr.seal_table_active(db, table)?;
         }
+        let _input_snapshot = crate::storage::segment::snapshot::pin_directory(&table_dir);
         let partition_groups = self.segment_mgr.with_table_mutation_lock(db, table, || {
             let segment_files = self
                 .segment_mgr
@@ -378,7 +410,7 @@ impl Compactor {
 
         let partition_count = partition_groups.len();
         let partition_stats = partition_groups
-            .into_par_iter()
+            .into_iter()
             .map(|(partition_key, files)| -> Result<CompactStats> {
                 let lock_key = partition_key.as_deref().unwrap_or("");
                 // Permits are acquired BEFORE the partition lock, in the same
@@ -386,6 +418,7 @@ impl Compactor {
                 // work limiter while holding the partition lock would freeze
                 // that partition's INSERTs for the whole queue delay.
                 let prepared = {
+                    let _memory = compaction_memory_gate();
                     let _cpu_permit = crate::common::work_limiter::acquire_cpu();
                     let _io_permit = crate::common::work_limiter::acquire_io();
                     self.prepare_compact_segment_group(
@@ -451,6 +484,7 @@ impl Compactor {
         table_meta: &TableMeta,
         partition_key: &str,
     ) -> Result<CompactStats> {
+        *self.committed.lock().unwrap() = CompactStats::default();
         if !table_meta.is_partitioned() {
             return Err(TaibaiError::Sql(format!(
                 "table '{}.{}' is not partitioned",
@@ -483,44 +517,51 @@ impl Compactor {
             table_meta.compression_level,
         );
         let output_row_group_rows = self.segment_mgr.row_group_target_rows();
-        let matched = self.segment_mgr.with_table_mutation_lock(db, table, || {
-            for candidate in &candidates {
-                self.segment_mgr
-                    .seal_partition_active_under_table_lock(db, table, candidate)?;
-            }
-            let segment_files = self
-                .segment_mgr
-                .discover_inactive_segments(db, table, &table_dir)?;
-            let groups = group_segments_by_partition(segment_files);
-            let matched_key = candidates
-                .iter()
-                .find(|candidate| groups.contains_key(&Some((*candidate).clone())))
-                .cloned();
-            let Some(matched_key) = matched_key else {
-                let available = groups
-                    .keys()
-                    .filter_map(|key| key.as_deref())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(TaibaiError::Sql(format!(
-                    "partition '{}' not found for table '{}.{}'{}",
-                    partition_key,
-                    db,
-                    table,
-                    if available.is_empty() {
-                        String::new()
-                    } else {
-                        format!("; available partitions: {}", available)
-                    }
-                )));
-            };
+        for candidate in &candidates {
+            self.segment_mgr
+                .seal_partition_active(db, table, candidate)?;
+        }
+        let _input_snapshot = crate::storage::segment::snapshot::pin_directory(&table_dir);
+        let candidate_refs = candidates.iter().map(String::as_str).collect::<Vec<_>>();
+        let matched = self.segment_mgr.with_partition_set_mutation_lock(
+            db,
+            table,
+            &candidate_refs,
+            || {
+                let segment_files = self
+                    .segment_mgr
+                    .discover_inactive_segments(db, table, &table_dir)?;
+                let groups = group_segments_by_partition(segment_files);
+                let matched_key = candidates
+                    .iter()
+                    .find(|candidate| groups.contains_key(&Some((*candidate).clone())))
+                    .cloned();
+                let Some(matched_key) = matched_key else {
+                    let available = groups
+                        .keys()
+                        .filter_map(|key| key.as_deref())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(TaibaiError::Sql(format!(
+                        "partition '{}' not found for table '{}.{}'{}",
+                        partition_key,
+                        db,
+                        table,
+                        if available.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; available partitions: {}", available)
+                        }
+                    )));
+                };
 
-            let files = groups
-                .get(&Some(matched_key.clone()))
-                .cloned()
-                .unwrap_or_default();
-            Ok(Some((matched_key, files)))
-        })?;
+                let files = groups
+                    .get(&Some(matched_key.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                Ok(Some((matched_key, files)))
+            },
+        )?;
         let Some((matched_key, files)) = matched else {
             return Ok(CompactStats::default());
         };
@@ -529,6 +570,7 @@ impl Compactor {
         // it — same split as `compact_table`'s partition workers.
         let stats = {
             let prepared = {
+                let _memory = compaction_memory_gate();
                 let _cpu_permit = crate::common::work_limiter::acquire_cpu();
                 let _io_permit = crate::common::work_limiter::acquire_io();
                 self.prepare_compact_segment_group(
@@ -630,6 +672,25 @@ impl Compactor {
         partition_key: Option<&str>,
         prepared: PreparedCompaction,
     ) -> Result<CompactStats> {
+        let stats =
+            self.commit_prepared_compaction_inner(db, table, table_dir, partition_key, prepared)?;
+        let mut committed = self.committed.lock().unwrap();
+        committed.segments_read += stats.segments_read;
+        committed.segments_written += stats.segments_written;
+        committed.rows_written += stats.rows_written;
+        committed.rows_dropped += stats.rows_dropped;
+        committed.rows_dropped_ttl += stats.rows_dropped_ttl;
+        Ok(stats)
+    }
+
+    fn commit_prepared_compaction_inner(
+        &self,
+        db: &str,
+        table: &str,
+        table_dir: &Path,
+        partition_key: Option<&str>,
+        prepared: PreparedCompaction,
+    ) -> Result<CompactStats> {
         let partition_label = partition_key.unwrap_or("<unpartitioned>");
         match prepared {
             PreparedCompaction::Skipped => Ok(CompactStats::default()),
@@ -653,9 +714,8 @@ impl Compactor {
                         ..CompactStats::default()
                     });
                 }
-                for old_seg in &segment_files {
-                    self.segment_mgr.remove_segment_file(old_seg)?;
-                }
+                self.segment_mgr
+                    .retire_segments(table_dir, &segment_files)?;
                 // Persisted unique-index snapshots still point at the removed
                 // segments. Bump the content epoch so every probe refreshes
                 // (or falls back) instead of trusting locations that no longer
@@ -680,6 +740,7 @@ impl Compactor {
                 })
             }
             PreparedCompaction::Replacement {
+                _cleanup,
                 segment_files,
                 identities,
                 tmp_path,
@@ -710,15 +771,11 @@ impl Compactor {
                 // inputs survived validation only when the sets were
                 // disjoint, so re-target a free final name instead of
                 // failing the rename.
-                let mut tmp_path = tmp_path;
                 let mut final_path = final_path;
                 if final_path.exists() {
                     final_path = self
                         .segment_mgr
                         .next_replacement_segment_path(table_dir, partition_key)?;
-                    let retargeted_tmp = store::replacement_tmp_path(&final_path, "compact_tmp");
-                    std::fs::rename(&tmp_path, &retargeted_tmp)?;
-                    tmp_path = retargeted_tmp;
                 }
                 self.segment_mgr.replace_segments_with_tmp(
                     &tmp_path,
@@ -768,6 +825,14 @@ impl Compactor {
         }
         Ok(indices)
     }
+}
+
+/// Heavy rewrites share one process-wide memory allowance. Acquire on the
+/// calling thread, before CPU/IO permits and outside mutation locks; columns
+/// still decode/compress in parallel without blocking Rayon workers on permits.
+fn compaction_memory_gate() -> std::sync::MutexGuard<'static, ()> {
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn group_segments_by_partition(

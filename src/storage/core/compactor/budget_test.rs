@@ -2,6 +2,35 @@
 
 use super::*;
 
+fn run_external_for_test(c: &Compactor, dir: &Path, schema: &Schema) -> Result<CompactStats> {
+    let files = SegmentManager::discover_segments(dir)?;
+    let final_path = c.segment_mgr.next_replacement_segment_path(dir, None)?;
+    let tmp = store::replacement_tmp_path(&final_path, "compact_tmp");
+    let (rows, dropped, ttl) = c.prepare_clustered_external(
+        "default",
+        "t",
+        "none",
+        &tmp,
+        &final_path,
+        schema,
+        &[0],
+        &[0],
+        &files,
+        None,
+        TEST_ROW_GROUP_SIZE,
+        3,
+    )?;
+    c.segment_mgr
+        .replace_segments_with_tmp(&tmp, &final_path, &files)?;
+    Ok(CompactStats {
+        segments_read: files.len(),
+        segments_written: 1,
+        rows_written: rows as u64,
+        rows_dropped: dropped,
+        rows_dropped_ttl: ttl,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // External merge sort (bounded-memory clustered optimization)
 // ---------------------------------------------------------------------------
@@ -25,17 +54,9 @@ fn external_merge_sort_matches_in_memory_result() -> Result<()> {
         &[(8, "h"), (2, "b"), (7, "g"), (4, "d"), (6, "f")],
     )?;
 
-    // Force the external path with a tiny budget so the data spills into
-    // multiple sorted runs (and force small run chunks so more than one run
-    // is produced).
-    CLUSTERED_MERGE_BUDGET_OVERRIDE.store(
-        estimated_row_width_bytes(&schema) * 2,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-
     let segment_mgr = Arc::new(SegmentManager::new(tmp.path())?);
     let compactor = Compactor::new(segment_mgr, tmp.path().to_path_buf());
-    let stats = compactor.optimize_table("default", "t", &test_meta(&schema))?;
+    let stats = run_external_for_test(&compactor, &table_dir, &schema)?;
 
     CLUSTERED_MERGE_BUDGET_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
 
@@ -83,13 +104,9 @@ fn external_merge_sort_drops_deleted_rows() -> Result<()> {
         )?;
     }
 
-    CLUSTERED_MERGE_BUDGET_OVERRIDE.store(
-        estimated_row_width_bytes(&schema) * 2,
-        std::sync::atomic::Ordering::Relaxed,
-    );
     let segment_mgr = Arc::new(SegmentManager::new(tmp.path())?);
     let compactor = Compactor::new(segment_mgr, tmp.path().to_path_buf());
-    let stats = compactor.optimize_table("default", "t", &test_meta(&schema))?;
+    let stats = run_external_for_test(&compactor, &table_dir, &schema)?;
     CLUSTERED_MERGE_BUDGET_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
 
     assert_eq!(stats.rows_written, 2);

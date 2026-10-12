@@ -7,6 +7,7 @@ pub mod footer_ext;
 pub mod meta;
 pub mod migrate;
 pub mod reader;
+pub mod snapshot;
 pub mod store;
 pub mod writer;
 
