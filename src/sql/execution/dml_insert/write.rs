@@ -24,6 +24,7 @@ pub fn exec_replace(
     txn_id: u64,
     _bulk_import_mode: bool,
 ) -> Result<ExecResult> {
+    let mut profile = super::replace_profile::ReplaceProfile::new(db, table, values.len());
     if txn_id > 0 {
         return Err(TaibaiError::Sql(
             "REPLACE is not supported inside an explicit transaction".to_string(),
@@ -40,7 +41,9 @@ pub fn exec_replace(
         )));
     }
 
+    profile.phase("constraint_wait");
     let _unique_guard = acquire_constraint_insert_lock(db, table)?;
+    profile.phase("materialize");
     let materialized =
         materialize_insert_values(engine, db, table, columns, values, timezone_offset_hours)?;
     let constraints = replace_constraint_indices(&materialized.table_meta, &materialized.schema)?;
@@ -73,30 +76,63 @@ pub fn exec_replace(
         ));
     }
     let internal_txn_id = engine.alloc_txn_id();
+    profile.txn_id = internal_txn_id;
 
-    // Checkpoint large pending tails BEFORE taking the table mutation lock so
-    // the flush I/O does not extend the critical section. Rows arriving after
-    // the checkpoint are conflict-deleted in place below.
-    engine.batch_writer().checkpoint_before_rewrite(
-        db,
-        table,
-        crate::storage::core::batch_writer::RewriteEstimate::Inserts(physical_insert_rows as usize),
-    )?;
+    // Select only large, sparsely conflicting memtables. A new key must not
+    // flush unrelated pending data. Selection is read-only under the table
+    // lock; flush I/O happens after release, and the main lock below resolves
+    // conflicts afresh rather than trusting preflight row positions.
+    profile.phase("checkpoint_candidates");
+    let checkpoint_candidates = if key_sets.is_empty() {
+        Vec::new()
+    } else {
+        engine
+            .memtable_manager()
+            .get_flushable_by_table(db, table)
+            .into_iter()
+            .filter(|mt| mt.row_count() >= super::replace::REPLACE_CHECKPOINT_MIN_ROWS)
+            .collect::<Vec<_>>()
+    };
+    if !checkpoint_candidates.is_empty() {
+        profile.phase("checkpoint_wait");
+        let selected = engine
+            .segment_mgr()
+            .with_table_mutation_lock(db, table, || {
+                profile.phase("checkpoint_probe");
+                crate::sql::execution::txn_dml::refuse_auto_commit_dml_while_pinned(
+                    engine, db, table,
+                )?;
+                super::replace::select_replace_checkpoint_memtables(
+                    engine,
+                    &checkpoint_candidates,
+                    &key_sets,
+                )
+            })?;
+        profile.phase("checkpoint_flush");
+        engine
+            .batch_writer()
+            .checkpoint_selected_memtables(db, table, &selected)?;
+        tracing::debug!(
+            db,
+            table,
+            candidate_memtables = checkpoint_candidates.len(),
+            selected_memtables = selected.len(),
+            "REPLACE checkpoint selection"
+        );
+    }
 
-    // No pre-flush: rows still resident in memtables are conflict-deleted in
-    // place below. The delete and the staged insert run under one lock, so
-    // DELETE/UPDATE cannot interleave.
-    let lock_start = Instant::now();
+    profile.phase("table_wait");
     let (deleted, undo, pending_commits) =
         engine
             .segment_mgr()
             .with_table_mutation_lock(db, table, || {
+                profile.table_acquired();
                 // In-lock re-check (the check at the fn top races a
                 // transaction registering its pin under this same lock):
                 // REPLACE shifts memtable positions, which would make that
                 // transaction's COMMIT delete the wrong rows.
                 crate::sql::execution::txn_dml::refuse_auto_commit_dml_while_pinned(engine, db, table)?;
-                ensure_replace_location_indexes(
+                let conflict_locations = ensure_replace_location_indexes(
                     engine,
                     db,
                     table,
@@ -104,6 +140,7 @@ pub fn exec_replace(
                     &location_schema,
                     &key_sets,
                 )?;
+                profile.phase("memtable_plan");
                 let memtable_plans = crate::sql::execution::dml_delete::plan_replace_memtable_conflicts(
                     engine, db, table, &key_sets,
                 )?;
@@ -124,6 +161,7 @@ pub fn exec_replace(
                 // while the old row still exists", which recovery cannot
                 // arbitrate; the staged-then-commit protocol keeps every
                 // crash outcome atomic.)
+                profile.phase("stage_images");
                 let staged_images = match crate::sql::execution::dml_staging::stage_image_transaction(
                     engine,
                     db,
@@ -174,12 +212,14 @@ pub fn exec_replace(
                 // pre-statement footers (roll back).
                 let image_checks = staged_images.watermark;
 
+                profile.phase("segment_delete");
                 let mut undo = match super::replace::delete_replace_conflicts_under_table_lock(
                     engine,
                     db,
                     table,
                     &materialized.table_meta,
                     &key_sets,
+                    conflict_locations,
                     image_checks.as_slice(),
                 ) {
                     Ok(undo) => undo,
@@ -206,6 +246,7 @@ pub fn exec_replace(
                 // The resident hot store is append-only and cannot remove the rows
                 // replaced below. Drop it before filtering so subsequent reads
                 // rebuild from the authoritative segments plus memtables.
+                profile.phase("memtable_delete");
                 engine.hot_store_manager().remove(db, table);
                 match crate::sql::execution::dml_delete::apply_replace_memtable_conflicts(
                     engine,
@@ -251,6 +292,7 @@ pub fn exec_replace(
                     ));
                 }
 
+                profile.phase("commit_submit");
                 let finalize_result = engine
                     .batch_writer()
                     .commit_txn_submit_under_table_lock(internal_txn_id);
@@ -269,6 +311,7 @@ pub fn exec_replace(
                     }
                 };
 
+                profile.phase("index_publish");
                 // Publish existence markers for the committed replacement rows.
                 // Failure only downgrades later validation to a full scan; the
                 // statement is already committed and must not fail here.
@@ -298,22 +341,9 @@ pub fn exec_replace(
                 Ok((deleted, undo, pending_commits))
             })?;
 
-    let lock_elapsed = lock_start.elapsed();
-    let lock_warn_after = std::time::Duration::from_secs(
-        crate::common::config::storage_timeouts()
-            .mutation_lock_warn_secs
-            .max(1),
-    );
-    if lock_elapsed >= lock_warn_after {
-        tracing::warn!(
-            db,
-            table,
-            hold_ms = lock_elapsed.as_millis() as u64,
-            inserted_rows = physical_insert_rows,
-            "REPLACE held the table mutation lock for a long critical section"
-        );
-    }
+    profile.table_released();
 
+    profile.phase("commit_wait");
     if let Err(error) = engine
         .batch_writer()
         .wait_pending_tail_commits(pending_commits)
@@ -341,6 +371,7 @@ pub fn exec_replace(
         return Err(error);
     }
 
+    profile.phase("cleanup");
     // The staged replacement rows are durable: the tombstone legs are now
     // unconditionally correct. Clear the deferred journals under a brief
     // second table-lock acquisition — journals are only ever written under
@@ -379,7 +410,9 @@ pub fn exec_replace(
     // cleanup as UPDATE's image transaction).
     let _ = engine.txn_mutations().remove(internal_txn_id);
 
+    profile.phase("finalize_delete");
     super::replace::finalize_replace_delete(engine, db, table, &materialized.table_meta, &undo)?;
+    profile.phase("catalog_insert");
     engine.record_inserted_rows(db, table, physical_insert_rows as i64, false, true)?;
     if materialized
         .table_meta
@@ -394,6 +427,7 @@ pub fn exec_replace(
     // than risk stale rows surviving in the mirror.
     engine.invalidate_hot_store(db, table);
 
+    profile.success = true;
     Ok(ExecResult::Ok {
         rows_affected: deleted + affected_insert_rows + replaced_inside_batch,
     })
@@ -1135,14 +1169,18 @@ fn ensure_replace_location_indexes(
     table_meta: &crate::storage::catalog::schema::TableMeta,
     schema: &Schema,
     key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
-) -> Result<()> {
+) -> Result<super::replace::ReplaceConflictLocations> {
     let indexes = location_indexes_for_table(table_meta, schema)?;
+    let mut resolved = super::replace::ReplaceConflictLocations {
+        direct: Vec::new(),
+        fallback: vec![false; key_sets.len()],
+    };
     for (index_name, columns, indices) in indexes {
         let key_set = key_sets
             .iter()
             .find(|(key_indices, _)| *key_indices == indices)
             .map(|(_, keys)| keys);
-        let locations = match key_set {
+        let mut locations = match key_set {
             Some(keys) => {
                 engine
                     .index_manager()
@@ -1155,29 +1193,43 @@ fn ensure_replace_location_indexes(
                 std::iter::empty::<&Vec<ScalarValue>>(),
             )?,
         };
-        if locations.is_some() {
-            continue;
+        if locations.is_none() {
+            engine.index_manager().persist_unique_index_stream(
+                db,
+                table,
+                &index_name,
+                &columns,
+                |visit| {
+                    visit_unique_index_entries_from(
+                        engine.segment_mgr(),
+                        &engine.memtable_manager().get_by_table(db, table),
+                        &engine.data_dir().join(db).join(table),
+                        table,
+                        schema,
+                        &indices,
+                        "replace location index bootstrap",
+                        visit,
+                    )
+                },
+            )?;
+            if let Some(keys) = key_set {
+                locations =
+                    engine
+                        .index_manager()
+                        .unique_key_locations(db, table, &index_name, keys)?;
+            }
         }
-        engine.index_manager().persist_unique_index_stream(
-            db,
-            table,
-            &index_name,
-            &columns,
-            |visit| {
-                visit_unique_index_entries_from(
-                    engine.segment_mgr(),
-                    &engine.memtable_manager().get_by_table(db, table),
-                    &engine.data_dir().join(db).join(table),
-                    table,
-                    schema,
-                    &indices,
-                    "replace location index bootstrap",
-                    visit,
-                )
-            },
-        )?;
+        if let Some(offset) = key_sets
+            .iter()
+            .position(|(key_indices, _)| *key_indices == indices)
+        {
+            match locations {
+                Some(found) => resolved.direct.extend(found),
+                None => resolved.fallback[offset] = true,
+            }
+        }
     }
-    Ok(())
+    Ok(resolved)
 }
 
 fn replace_constraint_indices(

@@ -892,3 +892,188 @@ fn replace_clears_statement_journals_after_durable_commit() -> Result<()> {
     );
     Ok(())
 }
+
+fn replace_checkpoint_fixture() -> Result<(tempfile::TempDir, Engine, Session)> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(&mut session,
+        "CREATE TABLE checkpoint_t (id INT64, d INT64, code INT64, v INT64, PRIMARY KEY (id, d), UNIQUE KEY uk (code)) PARTITION BY DAY(d)")?;
+    for (d, base) in [(20261012, 0), (20261013, 4096)] {
+        let values = (0..4096)
+            .map(|i| format!("({i}, {d}, {}, 1)", base + i))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine.execute(
+            &mut session,
+            &format!("INSERT INTO checkpoint_t VALUES {values}"),
+        )?;
+    }
+    let mts = engine
+        .memtable_manager()
+        .get_flushable_by_table("main", "checkpoint_t");
+    assert_eq!(mts.len(), 2);
+    assert!(mts.iter().all(|mt| mt.row_count() == 4096));
+    assert!(SegmentManager::discover_segments(&dir.path().join("main/checkpoint_t"))?.is_empty());
+    Ok((dir, engine, session))
+}
+
+#[test]
+fn replace_checkpoint_skips_large_tails_without_conflicts() -> Result<()> {
+    let (dir, engine, mut session) = replace_checkpoint_fixture()?;
+    let originals = engine
+        .memtable_manager()
+        .get_flushable_by_table("main", "checkpoint_t");
+    engine.execute(
+        &mut session,
+        "REPLACE INTO checkpoint_t VALUES (90000, 20261013, 90000, 9)",
+    )?;
+    assert!(SegmentManager::discover_segments(&dir.path().join("main/checkpoint_t"))?.is_empty());
+    assert!(originals.iter().all(|mt| mt.state()
+        == crate::storage::core::memtable::MemTableState::Pending
+        && mt.row_count() == 4096));
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM checkpoint_t")?,
+            0,
+            0
+        ),
+        8193
+    );
+    Ok(())
+}
+
+#[test]
+fn replace_checkpoint_flushes_only_conflicting_memtable_across_partitions() -> Result<()> {
+    let (_dir, engine, mut session) = replace_checkpoint_fixture()?;
+    let originals = engine
+        .memtable_manager()
+        .get_flushable_by_table("main", "checkpoint_t");
+    // Input belongs to the second day, but its unique key conflicts on the first.
+    engine.execute(
+        &mut session,
+        "REPLACE INTO checkpoint_t VALUES (90000, 20261013, 0, 9)",
+    )?;
+    for mt in originals {
+        let expected = if mt.partition_key() == "20261012" {
+            crate::storage::core::memtable::MemTableState::Flushed
+        } else {
+            crate::storage::core::memtable::MemTableState::Pending
+        };
+        assert_eq!(mt.state(), expected);
+    }
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM checkpoint_t")?,
+            0,
+            0
+        ),
+        8192
+    );
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT id FROM checkpoint_t WHERE code = 0")?,
+            0,
+            0
+        ),
+        90000
+    );
+    assert_eq!(
+        first_i64(
+            engine.execute(
+                &mut session,
+                "SELECT COUNT(*) FROM checkpoint_t WHERE id = 0 AND d = 20261012"
+            )?,
+            0,
+            0
+        ),
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn replace_checkpoint_keeps_dense_conflicts_in_memory() -> Result<()> {
+    let (dir, engine, mut session) = replace_checkpoint_fixture()?;
+    let values = (0..2048)
+        .map(|i| format!("({i}, 20261012, {i}, 9)"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine.execute(
+        &mut session,
+        &format!("REPLACE INTO checkpoint_t VALUES {values}"),
+    )?;
+    assert!(SegmentManager::discover_segments(&dir.path().join("main/checkpoint_t"))?.is_empty());
+    assert_eq!(
+        first_i64(
+            engine.execute(
+                &mut session,
+                "SELECT COUNT(*) FROM checkpoint_t WHERE v = 9"
+            )?,
+            0,
+            0
+        ),
+        2048
+    );
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM checkpoint_t")?,
+            0,
+            0
+        ),
+        8192
+    );
+    Ok(())
+}
+
+#[test]
+fn replace_checkpoint_failure_restores_old_rows_after_restart() -> Result<()> {
+    let (dir, mut engine, mut session) = replace_checkpoint_fixture()?;
+    crate::sql::execution::dml_insert::force_next_replace_insert_failure();
+    assert!(engine
+        .execute(
+            &mut session,
+            "REPLACE INTO checkpoint_t VALUES (90000, 20261013, 0, 9)"
+        )
+        .is_err());
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT id FROM checkpoint_t WHERE code = 0")?,
+            0,
+            0
+        ),
+        0
+    );
+    engine.shutdown()?;
+    drop(engine);
+    let mut engine = Engine::new(dir.path(), "main")?;
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM checkpoint_t")?,
+            0,
+            0
+        ),
+        8192
+    );
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT id FROM checkpoint_t WHERE code = 0")?,
+            0,
+            0
+        ),
+        0
+    );
+    assert_eq!(
+        first_i64(
+            engine.execute(
+                &mut session,
+                "SELECT COUNT(*) FROM checkpoint_t WHERE v = 9"
+            )?,
+            0,
+            0
+        ),
+        0
+    );
+    engine.shutdown()?;
+    Ok(())
+}

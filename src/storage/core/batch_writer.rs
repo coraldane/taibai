@@ -193,9 +193,9 @@ pub(crate) struct PendingTailCommit {
 /// `affected_rows = 1`) made every small mutation look like a point rewrite
 /// and flushed whole tables on single-row statements.
 pub enum RewriteEstimate {
-    /// The statement will append ~`rows` new rows (REPLACE's staged insert).
-    /// A pre-checkpoint can save the coming tail work when the pending tail
-    /// dwarfs it.
+    /// Legacy input-row estimate for callers without conflict information.
+    /// REPLACE now selects sparse conflicts with checkpoint_selected_memtables
+    /// instead, so unrelated pending data does not trigger a whole-table flush.
     Inserts(usize),
     /// The statement mutates existing rows through O(affected) sidecars
     /// (UPDATE's `.upd`, DELETE/REPLACE's guarded `.del`): it never rewrites
@@ -918,6 +918,38 @@ impl BatchWriter {
                 &self.flush_gate,
             )?;
         }
+        Ok(())
+    }
+
+    /// Flush only the memtables selected by a REPLACE conflict preflight.
+    /// Caller must release the table mutation lock first. Re-read eligibility
+    /// here; the freeze phase also rechecks transaction pins under its lock.
+    pub(crate) fn checkpoint_selected_memtables(
+        &self,
+        db: &str,
+        table: &str,
+        selected: &std::collections::HashSet<uuid::Uuid>,
+    ) -> Result<()> {
+        if selected.is_empty() {
+            return Ok(());
+        }
+        self.wait_out_table_flush_io(db, table);
+        let mts = self
+            .memtable_mgr
+            .get_flushable_by_table(db, table)
+            .into_iter()
+            .filter(|mt| selected.contains(&mt.id()))
+            .collect::<Vec<_>>();
+        for group in Self::group_memtables_for_flush(mts) {
+            Self::flush_memtable_group(
+                &self.segment_mgr,
+                &group,
+                false,
+                &self.tail_committer,
+                &self.flush_gate,
+            )?;
+        }
+        self.memtable_mgr.remove_flushed();
         Ok(())
     }
 

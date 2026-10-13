@@ -93,6 +93,7 @@ struct MaterializedInsert {
 mod constraints;
 mod fast;
 mod replace;
+mod replace_profile;
 mod write;
 
 pub use constraints::{
