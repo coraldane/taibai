@@ -13,6 +13,55 @@ use crate::storage::catalog::schema::TableMeta;
 use crate::storage::index::sort_key::compare_scalars_for_sort;
 use crate::storage::partition::pruning::ZoneMap;
 use crate::storage::segment::delete_bitmap;
+
+/// Retain the previous minimum size; small batches skip checkpoint preflight.
+pub(super) const REPLACE_CHECKPOINT_MIN_ROWS: u64 = 4096;
+
+/// Preflight only: never filter batches or modify rows. The caller holds the
+/// table mutation lock; after checkpointing it must resolve conflicts again,
+/// because concurrent mutations and flushes may change the physical layout.
+pub(super) fn select_replace_checkpoint_memtables(
+    engine: &Engine,
+    candidates: &[Arc<crate::storage::core::memtable::MemTable>],
+    key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+) -> Result<HashSet<uuid::Uuid>> {
+    use crate::storage::core::memtable::{MemTableState, TxnVisibility};
+    let mut selected = HashSet::new();
+    for mt in candidates {
+        crate::common::query_cancel::check()?;
+        if mt.state() != MemTableState::Pending
+            || mt.is_transactional()
+            || mt.visibility() != TxnVisibility::Committed
+            || mt.row_count() < REPLACE_CHECKPOINT_MIN_ROWS
+        {
+            continue;
+        }
+        // Surface a spill load error instead of treating it as no conflict.
+        let batch = mt.read_snapshot_arc().ok_or_else(|| {
+            TaibaiError::Storage(format!(
+                "cannot read memtable {} for REPLACE checkpoint",
+                mt.id()
+            ))
+        })?;
+        let conflicts = engine
+            .memtable_manager()
+            .replace_key_conflicts(mt, key_sets, &batch);
+        if !conflicts.is_empty()
+            && (conflicts.len() as u64).saturating_mul(4) < batch.num_rows() as u64
+        {
+            selected.insert(mt.id());
+        }
+    }
+    Ok(selected)
+}
+
+/// Resolved while holding the same table lock as conflict removal. Staging
+/// private replacement rows does not change committed segment locations.
+pub(super) struct ReplaceConflictLocations {
+    pub direct: Vec<UniqueRowLocation>,
+    pub fallback: Vec<bool>,
+}
+
 /// Delete rows conflicting with the REPLACE key sets. Segment legs rewrite
 /// footers under the DEFERRED journal lifecycle: the caller passes the
 /// durability watermark of the REPLACE's staged replacement rows, so a crash
@@ -28,6 +77,7 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
     table: &str,
     table_meta: &TableMeta,
     key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+    locations: ReplaceConflictLocations,
     image_checks: &[crate::storage::segment::reader::ImageDurabilityCheck],
 ) -> Result<ReplaceDeleteUndo> {
     let table_dir = engine.data_dir().join(db).join(table);
@@ -36,63 +86,18 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
         return Ok(undo);
     }
 
-    let primary_key_indices = table_meta
-        .columns
-        .iter()
-        .enumerate()
-        .filter_map(|(index, column)| column.primary_key.then_some(index))
-        .collect::<Vec<_>>();
-    let mut fallback = vec![false; key_sets.len()];
+    let ReplaceConflictLocations {
+        direct: direct_locations,
+        fallback,
+    } = locations;
     let schema = Schema::new(table_meta.columns.clone());
-    let mut direct_locations = Vec::new();
-    if !primary_key_indices.is_empty() {
-        if let Some((key_set_offset, (_, keys))) = key_sets
-            .iter()
-            .enumerate()
-            .find(|(_, (indices, _))| *indices == primary_key_indices)
-        {
-            match engine.index_manager().unique_key_locations(
-                db,
-                table,
-                crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
-                keys,
-            )? {
-                Some(locations) => direct_locations.extend(locations),
-                None => fallback[key_set_offset] = true,
-            }
-        }
-    }
-    for index in &table_meta.unique_indexes {
-        let indices = index
-            .columns
-            .iter()
-            .map(|column| {
-                schema.index_of(column).ok_or_else(|| {
-                    TaibaiError::Internal(format!("unique index column '{}' is missing", column))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let Some((key_set_offset, (_, keys))) = key_sets
-            .iter()
-            .enumerate()
-            .find(|(_, (key_indices, _))| *key_indices == indices)
-        else {
-            continue;
-        };
-        match engine
-            .index_manager()
-            .unique_key_locations(db, table, &index.name, keys)?
-        {
-            Some(locations) => direct_locations.extend(locations),
-            None => fallback[key_set_offset] = true,
-        }
-    }
     let fallback_key_sets = key_sets
         .iter()
         .zip(&fallback)
         .filter_map(|(key_set, fallback)| fallback.then_some(key_set))
         .collect::<Vec<_>>();
-    let projected_indices = fallback_key_sets
+    // Mixed fallback and direct verification must share the same projection.
+    let projected_indices = key_sets
         .iter()
         .flat_map(|(indices, _)| indices.iter().copied())
         .collect::<HashSet<_>>()
@@ -133,12 +138,7 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
     // Direct index locations are trusted only after verifying the physical row
     // still carries a conflicting key: a stale or misaligned location must
     // never delete an unrelated live row.
-    let verify_indices = key_sets
-        .iter()
-        .flat_map(|(indices, _)| indices.iter().copied())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
+    let verify_indices = &projected_indices;
     let verify_positions = key_sets
         .iter()
         .map(|(indices, keys)| {
@@ -170,39 +170,27 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
         new_bitmap.resize(total_rows.div_ceil(8) as usize, 0);
         let mut newly_deleted = 0u64;
         let segment_name = seg_path.to_string_lossy().to_string();
-        let direct_rows_in_segment = direct_rows.get(&seg_path);
-        // HashSet: the fallback scan below probes this set for EVERY row of
-        // EVERY row group, and the old Vec::contains made that O(rows ×
-        // direct candidates) — 10^10 comparisons at 1M rows × 10k candidates,
-        // under the table mutation lock.
-        let direct_rows_in_segment = direct_rows_in_segment.map(|rows| {
-            rows.iter()
-                .copied()
-                .filter(|row_id| *row_id < total_rows)
-                .collect::<std::collections::HashSet<u64>>()
-        });
-        let direct_row_sets = direct_rows_in_segment
-            .as_ref()
-            .map(|rows| (rows, &verify_positions));
+        // Sort once, then slice each row group's candidates by binary search.
+        // This replaces the O(row_groups * candidates) repeated HashSet walk.
+        let mut candidates = direct_rows
+            .remove(&seg_path)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row_id| *row_id < total_rows)
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
         for rg_idx in 0..reader.num_row_groups() {
             let rg_start = reader.row_group_start_row(rg_idx);
             let rg_rows = reader.row_group_rows(rg_idx);
+            let group_candidates = replace_candidates_in_range(&candidates, rg_start, rg_rows);
             if fallback_key_sets.is_empty() {
-                let Some((candidate_rows, positions)) = direct_row_sets.as_ref() else {
-                    break;
-                };
-                let candidates = candidate_rows
-                    .iter()
-                    .copied()
-                    .filter(|row_id| *row_id >= rg_start && *row_id < rg_start + rg_rows)
-                    .collect::<Vec<_>>();
-                if candidates.is_empty() {
+                if group_candidates.is_empty() {
                     continue;
                 }
-                let batch = reader.read_row_group_columns(rg_idx, &schema, &verify_indices)?;
-                for row_id in candidates {
+                let batch = reader.read_row_group_columns(rg_idx, &schema, verify_indices)?;
+                for &row_id in group_candidates {
                     let row_idx = (row_id - rg_start) as usize;
-                    if !replace_row_conflicts(&batch, row_idx, positions) {
+                    if !replace_row_conflicts(&batch, row_idx, &verify_positions) {
                         tracing::warn!(
                             db,
                             table,
@@ -226,32 +214,24 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
                 reader.zone_maps(rg_idx),
                 &fallback_key_sets,
                 &key_envelopes,
-            ) && direct_row_sets.is_none()
+            ) && group_candidates.is_empty()
             {
                 continue;
             }
             let batch = reader.read_row_group_columns(rg_idx, &schema, &projected_indices)?;
+            let mut direct_candidates = group_candidates.iter().copied().peekable();
             for row_idx in 0..batch.num_rows() {
                 let absolute_row = rg_start + row_idx as u64;
+                let is_direct = direct_candidates.next_if_eq(&absolute_row).is_some();
                 if delete_bitmap::is_deleted(&new_bitmap, absolute_row) {
                     continue;
                 }
-                let conflicts = replace_row_conflicts(&batch, row_idx, &projected_positions);
+                let conflicts = replace_row_conflicts(&batch, row_idx, &projected_positions)
+                    || (is_direct && replace_row_conflicts(&batch, row_idx, &verify_positions));
                 if !conflicts {
-                    if let Some((candidate_rows, positions)) = direct_row_sets.as_ref() {
-                        if candidate_rows.contains(&absolute_row)
-                            && replace_row_conflicts(&batch, row_idx, positions)
-                            && delete_bitmap::mark_deleted(&mut new_bitmap, absolute_row)
-                        {
-                            newly_deleted += 1;
-                            undo.deleted_locations.push(UniqueRowLocation {
-                                segment_path: segment_name.clone(),
-                                row_id: absolute_row,
-                            });
-                        }
-                    }
                     continue;
                 }
+
                 if delete_bitmap::mark_deleted(&mut new_bitmap, absolute_row) {
                     newly_deleted += 1;
                     undo.deleted_locations.push(UniqueRowLocation {
@@ -289,6 +269,12 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
         undo.deleted_rows += newly_deleted;
     }
     Ok(undo)
+}
+
+fn replace_candidates_in_range(candidates: &[u64], start: u64, rows: u64) -> &[u64] {
+    let first = candidates.partition_point(|row| *row < start);
+    let last = candidates.partition_point(|row| *row < start.saturating_add(rows));
+    &candidates[first..last]
 }
 
 type ReplaceKeyEnvelope = (Vec<usize>, Vec<(ScalarValue, ScalarValue)>);

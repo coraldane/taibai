@@ -1158,15 +1158,12 @@ fn materialize_tables(
             // supports them.
             engine.invalidate_hot_store(db, table);
             if table_mutations.deleted_rows > 0 {
-                let mut catalogs = engine.catalogs().write().unwrap();
-                if let Some(catalog) = catalogs.get_mut(db) {
-                    if let Some(meta) = catalog.get_table_mut(table) {
-                        meta.row_count =
-                            (meta.row_count - table_mutations.deleted_rows as i64).max(0);
-                        let meta_dir = engine.data_dir().join("meta");
-                        catalog.save(&meta_dir)?;
-                    }
-                }
+                // Same C22 ordering as auto-commit DELETE: the in-memory
+                // decrement runs under the catalog write lock inside the
+                // transaction's table mutation lock, and the save shares the
+                // debounced stats gate instead of serializing the whole
+                // catalog per table per COMMIT.
+                engine.retract_deleted_rows(db, table, table_mutations.deleted_rows, true)?;
             }
             Ok(())
         };

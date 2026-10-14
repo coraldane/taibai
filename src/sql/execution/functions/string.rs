@@ -51,15 +51,14 @@ pub fn substring(args: &[ScalarValue]) -> Result<ScalarValue> {
     let start = args_to_i64(args, 1);
     match (s, start) {
         (Some(s), Some(start)) if start > 0 => {
-            let len = args_to_i64(args, 2).unwrap_or(s.len() as i64);
+            let len = args_to_i64(args, 2);
             let start_idx = (start - 1) as usize;
-            if start_idx >= s.len() {
-                return Ok(ScalarValue::VarChar(Some(String::new())));
-            }
-            let end_idx = (start_idx + len as usize).min(s.len());
-            Ok(ScalarValue::VarChar(Some(
-                s[start_idx..end_idx].to_string(),
-            )))
+            let take = match len {
+                Some(l) => start_idx.saturating_add(l.max(0) as usize) - start_idx,
+                None => usize::MAX,
+            };
+            let result: String = s.chars().skip(start_idx).take(take).collect();
+            Ok(ScalarValue::VarChar(Some(result)))
         }
         _ => Ok(ScalarValue::VarChar(None)),
     }
@@ -108,6 +107,10 @@ pub fn replace(args: &[ScalarValue]) -> Result<ScalarValue> {
         _ => Ok(ScalarValue::VarChar(None)),
     }
 }
+
+#[cfg(test)]
+#[path = "string_test.rs"]
+mod string_function_tests;
 
 pub fn reverse(args: &[ScalarValue]) -> Result<ScalarValue> {
     match args_to_string(args, 0) {

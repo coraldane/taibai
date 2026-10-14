@@ -189,6 +189,39 @@ pub(crate) fn flushable_generation_file_count(table_dir: &Path) -> Result<usize>
     Ok(count)
 }
 
+/// Histogram of tail generation kinds in the table's tail dir. Used by the
+/// durable-tail pressure path: when a forced flush fails to bring the
+/// generation count under the cap, the kind distribution identifies which
+/// subsystem keeps appending (live-memtable spill vs orphaned flush intents
+/// vs delete sidecars), turning the next production day into a diagnosis
+/// instead of a mystery.
+pub(crate) fn generation_kind_histogram(table_dir: &Path) -> Result<Vec<(&'static str, usize)>> {
+    let tail_dir = table_dir.join(TAIL_DIR);
+    let mut histogram = vec![
+        ("tail", 0usize),
+        ("clear", 0usize),
+        ("flush", 0usize),
+        ("del", 0usize),
+        ("upd", 0usize),
+    ];
+    if !tail_dir.exists() {
+        return Ok(histogram);
+    }
+    for entry in fs::read_dir(tail_dir)? {
+        if let Some((_, generation)) = parse_generation(&entry?.path()) {
+            let slot = match generation.kind {
+                GenerationKind::Tail => 0,
+                GenerationKind::Clear => 1,
+                GenerationKind::Flush => 2,
+                GenerationKind::Delete => 3,
+                GenerationKind::Update => 4,
+            };
+            histogram[slot].1 += 1;
+        }
+    }
+    Ok(histogram)
+}
+
 /// Batch form of `has_tail`: a single directory scan answers for every
 /// requested id, applying the same generation arbitration (newest tail wins,
 /// clear tombstones, flush intents). With thousands of live tails, per-id

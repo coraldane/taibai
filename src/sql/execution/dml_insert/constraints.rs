@@ -169,6 +169,7 @@ pub(crate) fn collect_unique_index_entries_from(
     Ok(entries)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn visit_unique_index_entries_from(
     segment_mgr: &SegmentManager,
     memtables: &[std::sync::Arc<crate::storage::core::memtable::MemTable>],
@@ -182,47 +183,91 @@ pub(crate) fn visit_unique_index_entries_from(
     let started = std::time::Instant::now();
     let mut count = 0usize;
     if table_dir.exists() {
-        for seg_path in SegmentManager::discover_segments(table_dir)? {
-            let reader = segment_mgr.open_reader_cached(&seg_path)?;
-            // Name-based read: catalog indices hit the wrong physical column
-            // on segments whose footer predates a DROP/RENAME COLUMN.
-            let batch_per_rg = |rg_idx: usize| -> Result<crate::types::batch::RecordBatch> {
-                reader.read_row_group_columns(rg_idx, table_schema, indices)
-            };
-            for rg_idx in 0..reader.num_row_groups() {
-                let batch = batch_per_rg(rg_idx)?;
-                let rg_start = reader.row_group_start_row(rg_idx);
-                let delete_bitmap = reader.delete_bitmap();
-                let projected_indices: Vec<usize> = (0..batch.num_columns()).collect();
-                for row_idx in 0..batch.num_rows() {
-                    if row_idx % 1024 == 0 {
-                        crate::common::query_cancel::check()?;
-                    }
-                    let row_id = rg_start + row_idx as u64;
-                    if crate::storage::segment::delete_bitmap::is_deleted(delete_bitmap, row_id) {
-                        continue;
-                    }
-                    let Some(key) =
-                        unique_key_for_row(&batch, row_idx, &projected_indices, &batch.schema)
-                    else {
-                        continue;
-                    };
-                    visit(UniqueIndexEntry {
-                        key,
-                        location: UniqueRowLocation {
-                            segment_path: seg_path.to_string_lossy().to_string(),
-                            row_id,
-                        },
-                    })?;
-                    count += 1;
+        let segments = SegmentManager::discover_segments(table_dir)?;
+        count += visit_unique_index_entries_in_segments(
+            segment_mgr,
+            &segments,
+            table_schema,
+            indices,
+            visit,
+        )?;
+    }
+    count += visit_unique_index_entries_in_memtables(memtables, table_schema, indices, visit)?;
+    tracing::warn!(
+        table,
+        key_columns = indices.len(),
+        entries = count,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        reason,
+        "unique index snapshot rebuild from full-table scan"
+    );
+    Ok(())
+}
+
+/// Stream unique-index entries from an explicit segment list. Callers decide
+/// which segments are safe to read outside the table mutation lock (the
+/// two-phase rebuild passes immutable segments only); the readers themselves
+/// are stable snapshots because delete rewrites invalidate and reopen the
+/// cache instead of mutating it in place.
+pub(crate) fn visit_unique_index_entries_in_segments(
+    segment_mgr: &SegmentManager,
+    segments: &[std::path::PathBuf],
+    table_schema: &crate::types::batch::Schema,
+    indices: &[usize],
+    visit: &mut dyn FnMut(UniqueIndexEntry) -> Result<()>,
+) -> Result<usize> {
+    let mut count = 0usize;
+    for seg_path in segments {
+        let reader = segment_mgr.open_reader_cached(seg_path)?;
+        // Name-based read: catalog indices hit the wrong physical column
+        // on segments whose footer predates a DROP/RENAME COLUMN.
+        let batch_per_rg = |rg_idx: usize| -> Result<crate::types::batch::RecordBatch> {
+            reader.read_row_group_columns(rg_idx, table_schema, indices)
+        };
+        for rg_idx in 0..reader.num_row_groups() {
+            let batch = batch_per_rg(rg_idx)?;
+            let rg_start = reader.row_group_start_row(rg_idx);
+            let delete_bitmap = reader.delete_bitmap();
+            let projected_indices: Vec<usize> = (0..batch.num_columns()).collect();
+            for row_idx in 0..batch.num_rows() {
+                if row_idx % 1024 == 0 {
+                    crate::common::query_cancel::check()?;
                 }
+                let row_id = rg_start + row_idx as u64;
+                if crate::storage::segment::delete_bitmap::is_deleted(delete_bitmap, row_id) {
+                    continue;
+                }
+                let Some(key) =
+                    unique_key_for_row(&batch, row_idx, &projected_indices, &batch.schema)
+                else {
+                    continue;
+                };
+                visit(UniqueIndexEntry {
+                    key,
+                    location: UniqueRowLocation {
+                        segment_path: seg_path.to_string_lossy().to_string(),
+                        row_id,
+                    },
+                })?;
+                count += 1;
             }
         }
     }
+    Ok(count)
+}
+
+/// Stream unique-index entries from the given live memtables. Memtable
+/// batches keep their insert-time layout, so key columns resolve by name
+/// against each batch's own schema.
+pub(crate) fn visit_unique_index_entries_in_memtables(
+    memtables: &[std::sync::Arc<crate::storage::core::memtable::MemTable>],
+    table_schema: &crate::types::batch::Schema,
+    indices: &[usize],
+    visit: &mut dyn FnMut(UniqueIndexEntry) -> Result<()>,
+) -> Result<usize> {
+    let mut count = 0usize;
     for memtable in memtables {
         if let Some(batch) = memtable.read_snapshot_arc() {
-            // Memtable batches keep their insert-time layout; resolve the key
-            // columns by name against the batch's own schema.
             let local_indices: Vec<usize> = indices
                 .iter()
                 .filter_map(|&catalog_idx| {
@@ -254,15 +299,7 @@ pub(crate) fn visit_unique_index_entries_from(
             }
         }
     }
-    tracing::warn!(
-        table,
-        key_columns = indices.len(),
-        entries = count,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        reason,
-        "unique index snapshot rebuild from full-table scan"
-    );
-    Ok(())
+    Ok(count)
 }
 
 /// Historical duplicate keys among themselves do not violate the statement

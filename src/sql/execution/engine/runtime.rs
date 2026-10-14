@@ -575,9 +575,14 @@ impl Engine {
         // Retract the catalog row_count of rows INSERT statements already
         // counted at statement time. Without this, a rolled-back
         // transaction's rows stayed in the stats forever (only DELETE's
-        // COMMIT path ever decremented).
+        // COMMIT path ever decremented). The retractions are memory-only
+        // inside the loop; one forced save per touched database afterwards
+        // persists all of them — a rollback is rare and can retract a large
+        // count, while saving per table would re-serialize the whole catalog
+        // JSON once per table for the same bytes.
+        let mut retracted_dbs: Vec<String> = Vec::new();
         for (db, table, rows) in self.txn_mutations().take_inserted_rows_by_table(txn_id) {
-            if let Err(error) = self.record_inserted_rows(&db, &table, -(rows as i64), true, false)
+            if let Err(error) = self.record_inserted_rows(&db, &table, -(rows as i64), false, false)
             {
                 tracing::warn!(
                     db,
@@ -586,7 +591,27 @@ impl Engine {
                     error = %error,
                     "failed to retract rolled-back rows from catalog row_count"
                 );
+                continue;
             }
+            if !retracted_dbs.iter().any(|seen| seen == &db) {
+                retracted_dbs.push(db);
+            }
+        }
+        for db in &retracted_dbs {
+            let mut catalogs = self.catalogs.write().unwrap();
+            if let Some(catalog) = catalogs.get_mut(db) {
+                let meta_dir = self.data_dir.join("meta");
+                if let Err(error) = catalog.save(&meta_dir) {
+                    tracing::warn!(
+                        db,
+                        error = %error,
+                        "failed to persist rolled-back row_count retraction"
+                    );
+                }
+            }
+        }
+        if !retracted_dbs.is_empty() {
+            self.mark_catalog_stats_saved();
         }
         // Deferred DML plans are dropped first: no durable state was
         // written at statement time, so discarding them restores the
@@ -710,11 +735,7 @@ impl Engine {
                 let _ = catalog.save(&meta_dir);
             }
         }
-        {
-            let mut state = self.catalog_save_state.lock().unwrap();
-            state.pending_insert_rows = 0;
-            state.last_save_at = Instant::now();
-        }
+        self.mark_catalog_stats_saved();
 
         let elapsed = start.elapsed();
         if elapsed >= SLOW_TABLE_FLUSH_WARN {
@@ -745,6 +766,8 @@ impl Engine {
         if let Some(catalog) = catalogs.get_mut(db) {
             catalog.save(&self.data_dir.join("meta"))?;
         }
+        drop(catalogs);
+        self.mark_catalog_stats_saved();
         Ok(rows)
     }
 
@@ -760,11 +783,7 @@ impl Engine {
                 let _ = catalog.save(&meta_dir);
             }
         }
-        {
-            let mut state = self.catalog_save_state.lock().unwrap();
-            state.pending_insert_rows = 0;
-            state.last_save_at = Instant::now();
-        }
+        self.mark_catalog_stats_saved();
 
         Ok(0)
     }
