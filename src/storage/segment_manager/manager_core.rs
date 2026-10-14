@@ -1366,6 +1366,33 @@ impl SegmentManager {
         f: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         let _mutation_guard = acquire_mutation_lock(state, key)?;
+        let critical_started = Instant::now();
+        let result = self.run_under_table_wide_gate(state, key, f);
+        let held = critical_started.elapsed();
+        let warn_after = Duration::from_secs(
+            crate::common::config::storage_timeouts()
+                .mutation_lock_warn_secs
+                .max(1),
+        );
+        if held >= warn_after {
+            // 2026-10-13 生产事故教训：等待侧有 slow-acquisition 告警，持有侧却
+            // 全程静默，刷盘/压缩/重建等后台持有者无法归因。持锁超过告警阈值
+            // 时在这里留下持有方证据（表、持锁时长）。
+            tracing::warn!(
+                table = key,
+                hold_ms = held.as_millis() as u64,
+                "table mutation lock held for a long critical section"
+            );
+        }
+        result
+    }
+
+    fn run_under_table_wide_gate<T>(
+        &self,
+        state: &Arc<TableSegmentState>,
+        key: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         state.partition_gate.store(true, Ordering::Release);
         let _gate_reset = PartitionGateReset(Arc::clone(state));
         let registry = state.partition_locks.write().unwrap();
@@ -1585,11 +1612,10 @@ impl SegmentManager {
         let mut registries = Vec::with_capacity(states.len());
         let mut partition_arc_sets = Vec::with_capacity(states.len());
         for (_key, state) in keys.iter().zip(states.iter()) {
-            let mutation_guard =
-                match state.mutation_lock.try_lock_or_none("table mutation lock") {
-                    Some(guard) => guard,
-                    None => return Ok(None),
-                };
+            let mutation_guard = match state.mutation_lock.try_lock_or_none("table mutation lock") {
+                Some(guard) => guard,
+                None => return Ok(None),
+            };
             let registry = match state.partition_locks.try_write() {
                 Ok(registry) => registry,
                 Err(_) => return Ok(None),
@@ -2205,7 +2231,10 @@ pub(crate) fn recover_replace_journals(table_dir: &Path) {
             // Table/database renames move journals with the directory. Never
             // let their old absolute paths retire a newly recreated table at
             // the former location.
-            let olds = olds.iter().filter_map(|old| old.file_name().map(|name| table_dir.join(name))).collect();
+            let olds = olds
+                .iter()
+                .filter_map(|old| old.file_name().map(|name| table_dir.join(name)))
+                .collect();
             let _ = crate::storage::segment::snapshot::with_directory(table_dir, |directory| {
                 directory.retire(path.clone(), olds);
                 Ok(())
@@ -2268,13 +2297,13 @@ use crate::storage::segment::reader::FooterRewriteMode;
 /// Test-only re-exports of the replacement journal internals.
 #[cfg(test)]
 pub mod manager_core_test_support {
+    pub(in crate::storage::segment_manager) use super::{
+        acquire_mutation_lock as acquire_mutation_lock_for_test,
+        acquire_partition_mutation_lock as acquire_partition_mutation_lock_for_test,
+    };
     pub(crate) use super::{
         recover_replace_journals as recover_replace_journals_for_test,
         replace_journal_path as replace_journal_path_for_test,
         write_replace_journal as write_replace_journal_for_test,
-    };
-    pub(in crate::storage::segment_manager) use super::{
-        acquire_mutation_lock as acquire_mutation_lock_for_test,
-        acquire_partition_mutation_lock as acquire_partition_mutation_lock_for_test,
     };
 }

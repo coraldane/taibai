@@ -1468,6 +1468,29 @@ impl BatchWriter {
                 max_files_per_table,
                 "forced memtable flush to bound durable tail file count"
             );
+            let remaining =
+                crate::storage::core::durable_tail::flushable_generation_file_count(&table_dir)?;
+            if remaining >= max_files_per_table {
+                let histogram = match crate::storage::core::durable_tail::generation_kind_histogram(
+                    &table_dir,
+                ) {
+                    Ok(histogram) => histogram
+                        .into_iter()
+                        .map(|(kind, count)| format!("{kind}={count}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    Err(_) => "unavailable".to_string(),
+                };
+                tracing::warn!(
+                    db,
+                    table,
+                    remaining,
+                    max_files_per_table,
+                    histogram,
+                    "forced flush did not reclaim durable tail generations; \
+                     generation kinds identify the appending subsystem"
+                );
+            }
         }
         if flushed_tables > 0 {
             memtable_mgr.remove_flushed();

@@ -808,17 +808,16 @@ pub fn exec_optimize_table(
             .invalidate_table_unique_index_snapshots(db, table, &names);
     } else if stats.segments_written > 0 || stats.rows_dropped > 0 {
         let schema = Schema::new(table_meta.columns.clone());
-        let rebuilt = engine
-            .segment_mgr()
-            .with_table_mutation_lock(db, table, || {
-                crate::sql::execution::dml_insert::rebuild_table_location_indexes(
-                    engine,
-                    db,
-                    table,
-                    &table_meta,
-                    &schema,
-                )
-            });
+        let rebuilt = crate::sql::execution::dml_insert::rebuild_table_location_indexes_two_phase(
+            engine.index_manager(),
+            engine.segment_mgr(),
+            engine.memtable_manager(),
+            engine.data_dir(),
+            db,
+            table,
+            &table_meta,
+            &schema,
+        );
         if let Err(error) = rebuilt {
             tracing::warn!(
                 db,

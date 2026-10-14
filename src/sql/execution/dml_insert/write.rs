@@ -1162,6 +1162,150 @@ pub(crate) fn rebuild_table_location_indexes_from(
     Ok(())
 }
 
+/// Fingerprint of an immutable segment at scan time: row count plus live
+/// deletions. A segment whose fingerprint changed between the unlocked scan
+/// and the locked publish had rows deleted (or was rewritten) meanwhile, so
+/// entries streamed from it may name dead rows.
+type SegmentFingerprints = std::collections::HashMap<String, (u64, u64)>;
+
+pub(crate) fn segment_fingerprints(
+    segment_mgr: &SegmentManager,
+    segments: &[std::path::PathBuf],
+) -> Result<SegmentFingerprints> {
+    let mut prints = SegmentFingerprints::new();
+    for path in segments {
+        let reader = segment_mgr.open_reader_cached(path)?;
+        prints.insert(
+            path.to_string_lossy().to_string(),
+            (reader.row_count(), reader.deleted_row_count()),
+        );
+    }
+    Ok(prints)
+}
+
+/// Verify that every scanned segment is still present among the inactive
+/// segments with an unchanged fingerprint. A vanished or changed segment
+/// means a DELETE/rewrite/compaction raced the unlocked phase; callers fall
+/// back to the classic locked full scan.
+pub(crate) fn fingerprints_stable(
+    before: &SegmentFingerprints,
+    segment_mgr: &SegmentManager,
+    inactive_now: &[std::path::PathBuf],
+) -> Result<bool> {
+    for (path, (rows, deleted)) in before {
+        let Some(current) = inactive_now
+            .iter()
+            .find(|p| p.to_string_lossy().as_ref() == path.as_str())
+        else {
+            return Ok(false);
+        };
+        let reader = segment_mgr.open_reader_cached(current)?;
+        if reader.row_count() != *rows || reader.deleted_row_count() != *deleted {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Two-phase location-index rebuild for callers that do NOT hold the table
+/// mutation lock (background compaction, OPTIMIZE TABLE): phase one streams
+/// every immutable segment outside the lock — historically the 29 s bulk of
+/// a 9.7 M-entry rebuild — and the locked phase only rescans the active
+/// segment, segments that appeared meanwhile, and the live memtables before
+/// publishing. Any interference (delete, rewrite, compaction, memtable
+/// flush epoch drift) aborts to the classic full scan under the lock, so
+/// correctness never depends on the race-free fast path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rebuild_table_location_indexes_two_phase(
+    index_manager: &crate::storage::index::index_manager::IndexManager,
+    segment_mgr: &SegmentManager,
+    memtable_manager: &crate::storage::core::memtable::MemTableManager,
+    data_dir: &std::path::Path,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    schema: &Schema,
+) -> Result<()> {
+    let indexes = location_indexes_for_table(table_meta, schema)?;
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    let table_dir = data_dir.join(db).join(table);
+    let phase1_segments = segment_mgr.discover_inactive_segments(db, table, &table_dir)?;
+    let prints = segment_fingerprints(segment_mgr, &phase1_segments)?;
+    let mut builds = Vec::with_capacity(indexes.len());
+    for (index_name, columns, indices) in &indexes {
+        let mut build = index_manager.unique_index_stream_begin(db, table, index_name)?;
+        crate::sql::execution::dml_insert::constraints::visit_unique_index_entries_in_segments(
+            segment_mgr,
+            &phase1_segments,
+            schema,
+            indices,
+            &mut |entry| index_manager.unique_index_stream_push(&mut build, entry),
+        )?;
+        builds.push((index_name.clone(), columns.clone(), indices.clone(), build));
+    }
+    let epoch_before = segment_mgr.memtable_flush_epoch(db, table);
+    segment_mgr.with_table_mutation_lock(db, table, || {
+        let inactive_now = segment_mgr.discover_inactive_segments(db, table, &table_dir)?;
+        let stable = fingerprints_stable(&prints, segment_mgr, &inactive_now)?;
+        let flush_epoch_unchanged = segment_mgr.memtable_flush_epoch(db, table) == epoch_before;
+        if !stable || !flush_epoch_unchanged {
+            drop(builds);
+            let memtables = memtable_manager.get_by_table(db, table);
+            return rebuild_table_location_indexes_from(
+                index_manager,
+                segment_mgr,
+                &memtables,
+                data_dir,
+                db,
+                table,
+                table_meta,
+                schema,
+            );
+        }
+        let inactive_keys: std::collections::HashSet<String> = inactive_now
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let new_segments: Vec<std::path::PathBuf> = inactive_now
+            .iter()
+            .filter(|p| !prints.contains_key(p.to_string_lossy().as_ref()))
+            .cloned()
+            .collect();
+        let active_segments: Vec<std::path::PathBuf> =
+            SegmentManager::discover_segments(&table_dir)?
+                .into_iter()
+                .filter(|p| !inactive_keys.contains(p.to_string_lossy().as_ref()))
+                .collect();
+        let memtables = memtable_manager.get_by_table(db, table);
+        while let Some((index_name, columns, indices, mut build)) = builds.pop() {
+            crate::sql::execution::dml_insert::constraints::visit_unique_index_entries_in_segments(
+                segment_mgr,
+                &new_segments,
+                schema,
+                &indices,
+                &mut |entry| index_manager.unique_index_stream_push(&mut build, entry),
+            )?;
+            crate::sql::execution::dml_insert::constraints::visit_unique_index_entries_in_segments(
+                segment_mgr,
+                &active_segments,
+                schema,
+                &indices,
+                &mut |entry| index_manager.unique_index_stream_push(&mut build, entry),
+            )?;
+            crate::sql::execution::dml_insert::constraints::visit_unique_index_entries_in_memtables(
+                &memtables,
+                schema,
+                &indices,
+                &mut |entry| index_manager.unique_index_stream_push(&mut build, entry),
+            )?;
+            index_manager.unique_index_stream_publish(db, table, &index_name, &columns, build)?;
+        }
+        Ok(())
+    })
+}
+
 fn ensure_replace_location_indexes(
     engine: &Engine,
     db: &str,

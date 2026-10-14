@@ -281,25 +281,22 @@ fn rebuild_compacted_location_indexes(
     table_meta: &crate::storage::catalog::schema::TableMeta,
 ) {
     let schema = Schema::new(table_meta.columns.clone());
-    let memtables = memtable_manager.get_by_table(db, table);
     // Compaction frees segment path numbers the next writer may reuse; the
     // (path, column, rows, deleted) sum-cache key cannot tell incarnations
     // apart, so clear the table's entries up front.
     crate::sql::execution::scan::aggregate_meta::invalidate_segment_sum_cache_under(
         &data_dir.join(db).join(table),
     );
-    let result = segment_mgr.with_table_mutation_lock(db, table, || {
-        super::dml_insert::rebuild_table_location_indexes_from(
-            index_manager,
-            segment_mgr,
-            &memtables,
-            data_dir,
-            db,
-            table,
-            table_meta,
-            &schema,
-        )
-    });
+    let result = super::dml_insert::rebuild_table_location_indexes_two_phase(
+        index_manager,
+        segment_mgr,
+        memtable_manager,
+        data_dir,
+        db,
+        table,
+        table_meta,
+        &schema,
+    );
     match result {
         Ok(()) => {}
         Err(error) => {

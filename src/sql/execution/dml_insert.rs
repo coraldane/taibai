@@ -108,10 +108,14 @@ pub use fast::{set_fast_insert_disabled_for_tests, try_exec_fast_insert_sql};
 pub(crate) use write::{
     append_unique_index_entries_after_insert, build_unique_index_entries_for_batch,
     primary_location_entries_for_batch, rebuild_table_location_indexes,
-    rebuild_table_location_indexes_from, write_batch_by_partition,
+    rebuild_table_location_indexes_two_phase, write_batch_by_partition,
 };
 pub use write::{exec_insert, exec_replace};
 
 #[cfg(test)]
 #[path = "dml_insert/lock_order_test.rs"]
 mod lock_order_tests;
+
+#[cfg(test)]
+#[path = "dml_insert/write_two_phase_test.rs"]
+mod write_two_phase_tests;
