@@ -239,6 +239,7 @@ impl Engine {
             catalogs,
             catalog_save_state: Mutex::new(CatalogSaveState {
                 pending_insert_rows: 0,
+                pending_delete_rows: 0,
                 last_save_at: Instant::now(),
             }),
             segment_mgr,

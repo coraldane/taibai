@@ -159,6 +159,7 @@ enum HotResidentMark {
 
 struct CatalogSaveState {
     pending_insert_rows: u64,
+    pending_delete_rows: u64,
     last_save_at: Instant,
 }
 

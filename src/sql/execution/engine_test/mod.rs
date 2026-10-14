@@ -8,6 +8,7 @@ mod aggregate_cache;
 mod amplification_regressions;
 mod audit_regression;
 mod bulk_payload;
+mod catalog_stats;
 mod cancellation;
 mod crud_root_regressions;
 mod dml;

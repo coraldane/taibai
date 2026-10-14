@@ -1176,15 +1176,20 @@ pub fn exec_delete(
                 // The successfully rewritten segments and the memtable removal
                 // are durable even though the statement reports an error; the
                 // catalog must reflect them or row_count drifts upward forever
-                // (the success-path decrement below is skipped on Err).
+                // (the success-path decrement below is skipped on Err). The
+                // save stays best-effort: failing the statement here would
+                // skip index maintenance and the invalidation fallback
+                // entirely, and a missed save only falls behind on disk until
+                // the next due save or flush checkpoint.
                 engine.invalidate_hot_store(db, table);
-                let mut catalogs = engine.catalogs().write().unwrap();
-                if let Some(catalog) = catalogs.get_mut(db) {
-                    if let Some(meta) = catalog.get_table_mut(table) {
-                        meta.row_count = (meta.row_count - total_deleted as i64).max(0);
-                        let meta_dir = engine.data_dir().join("meta");
-                        let _ = catalog.save(&meta_dir);
-                    }
+                if let Err(error) = engine.retract_deleted_rows(db, table, total_deleted, true)
+                {
+                    tracing::warn!(
+                        db,
+                        table,
+                        error = %error,
+                        "catalog row_count save after DELETE deferred (best-effort)"
+                    );
                 }
             }
             return Err(error);
@@ -1208,33 +1213,17 @@ pub fn exec_delete(
             }
         }
 
-        // C22: the catalog row_count decrement + save runs INSIDE the table
+        // C22: the catalog row_count decrement runs INSIDE the table
         // mutation lock (same order as the partial-error path above: table
         // lock → catalog write lock), after every segment/memtable operation
         // of the statement. Doing it after releasing the lock raced DDL's
         // catalog save — a lost update let row_count drift upward forever.
+        // The save itself shares the INSERT path's debounce gate: a burst of
+        // DELETEs serializes the catalog JSON once per window, and every
+        // later save (flush checkpoint, DDL, next due DML) is a full
+        // snapshot of current memory, so deferral cannot lose the decrement.
         if total_deleted > 0 {
-            let mut catalogs = engine.catalogs().write().unwrap();
-            if let Some(catalog) = catalogs.get_mut(db) {
-                if let Some(meta) = catalog.get_table_mut(table) {
-                    meta.row_count = (meta.row_count - total_deleted as i64).max(0);
-                    let meta_dir = engine.data_dir().join("meta");
-                    // Best-effort persistence (same contract as the partial
-                    // error path above): failing the statement here would
-                    // skip index maintenance and the invalidation fallback
-                    // entirely, leaving unique-index snapshots pointing at
-                    // deleted rows. A missed save only falls behind on disk
-                    // until the next successful one.
-                    if let Err(error) = catalog.save(&meta_dir) {
-                        tracing::warn!(
-                            db,
-                            table,
-                            error = %error,
-                            "catalog row_count save after DELETE deferred (best-effort)"
-                        );
-                    }
-                }
-            }
+            engine.retract_deleted_rows(db, table, total_deleted, true)?;
         }
 
         Ok(index_maintenance.apply(engine, db, table))
