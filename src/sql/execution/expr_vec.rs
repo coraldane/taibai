@@ -336,13 +336,15 @@ pub(crate) fn column_literal_mask(
     let coerced;
     let literal = match (column, literal) {
         (ColumnArray::Timestamp { .. }, ScalarValue::VarChar(Some(text))) => {
-            coerced = ScalarValue::Timestamp(crate::sql::execution::functions::date::parse_timestamp_smart(
-                text, 0,
-            ));
+            coerced = ScalarValue::Timestamp(
+                crate::sql::execution::functions::date::parse_timestamp_smart(text, 0),
+            );
             &coerced
         }
         (ColumnArray::Date { .. }, ScalarValue::VarChar(Some(text))) => {
-            coerced = ScalarValue::Date(crate::sql::execution::functions::date::datetime_string_to_days(text, 0));
+            coerced = ScalarValue::Date(
+                crate::sql::execution::functions::date::datetime_string_to_days(text, 0),
+            );
             &coerced
         }
         (ColumnArray::Time { .. }, ScalarValue::VarChar(Some(_)))

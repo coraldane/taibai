@@ -65,7 +65,11 @@ fn table_mutation_lock_wakes_waiters_in_arrival_order() {
     for handle in handles {
         handle.join().unwrap();
     }
-    assert_eq!(order, vec![1, 2, 3], "waiters must acquire in arrival order");
+    assert_eq!(
+        order,
+        vec![1, 2, 3],
+        "waiters must acquire in arrival order"
+    );
 }
 
 #[test]

@@ -20,7 +20,8 @@ pub(crate) fn discover_segments_unlocked(table_dir: &Path) -> Result<Vec<PathBuf
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
             if name.ends_with(".retire.corrupt") || name.ends_with(".replace.corrupt") {
                 return Err(crate::common::error::TaibaiError::Storage(format!(
-                    "unresolved corrupt segment retirement journal: {}", path.display()
+                    "unresolved corrupt segment retirement journal: {}",
+                    path.display()
                 )));
             }
             let committed = name.ends_with(".retire")

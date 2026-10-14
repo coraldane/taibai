@@ -29,7 +29,9 @@ fn delete_retract_survives_flush_and_restart() -> Result<()> {
     let mut sess = session();
     engine.execute(&mut sess, "CREATE TABLE t (id INT64)")?;
     insert_rows(&engine, &mut sess, "t", 3)?;
-    let ExecResult::Ok { rows_affected } = engine.execute(&mut sess, "DELETE FROM t WHERE id = 2")? else {
+    let ExecResult::Ok { rows_affected } =
+        engine.execute(&mut sess, "DELETE FROM t WHERE id = 2")?
+    else {
         panic!("expected ok result");
     };
     assert_eq!(rows_affected, 1);
@@ -43,11 +45,7 @@ fn delete_retract_survives_flush_and_restart() -> Result<()> {
     let mut sess = session();
     assert_eq!(table_row_count(&engine, "main", "t"), 2);
     assert_eq!(
-        first_i64(
-            engine.execute(&mut sess, "SELECT COUNT(*) FROM t")?,
-            0,
-            0
-        ),
+        first_i64(engine.execute(&mut sess, "SELECT COUNT(*) FROM t")?, 0, 0),
         2
     );
     Ok(())
@@ -99,7 +97,8 @@ fn concurrent_deletes_and_ddl_keep_row_count_consistent() -> Result<()> {
             let ExecResult::Ok { rows_affected } = engine.execute(
                 &mut sess,
                 &format!("DELETE FROM t WHERE id >= {lower} AND id < {upper}"),
-            )? else {
+            )?
+            else {
                 panic!("expected ok result");
             };
             Ok(rows_affected)
@@ -112,7 +111,10 @@ fn concurrent_deletes_and_ddl_keep_row_count_consistent() -> Result<()> {
     let ddl_handle = std::thread::spawn(move || -> Result<()> {
         let mut sess = session();
         for round in 0..8 {
-            ddl_engine.execute(&mut sess, &format!("CREATE TABLE ddl_churn_{round} (id INT64)"))?;
+            ddl_engine.execute(
+                &mut sess,
+                &format!("CREATE TABLE ddl_churn_{round} (id INT64)"),
+            )?;
         }
         Ok(())
     });
@@ -133,11 +135,7 @@ fn concurrent_deletes_and_ddl_keep_row_count_consistent() -> Result<()> {
     let mut sess = session();
     assert_eq!(table_row_count(&engine, "main", "t"), 0);
     assert_eq!(
-        first_i64(
-            engine.execute(&mut sess, "SELECT COUNT(*) FROM t")?,
-            0,
-            0
-        ),
+        first_i64(engine.execute(&mut sess, "SELECT COUNT(*) FROM t")?, 0, 0),
         0
     );
     Ok(())

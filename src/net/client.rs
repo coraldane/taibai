@@ -304,22 +304,7 @@ impl Client {
             loop {
                 match current.msg_type {
                     MSG_TYPE_RESULT_CHUNK => {
-                        let QueryResult::Rows {
-                            schema, batches, ..
-                        } = parse_binary_result(&current.payload)?
-                        else {
-                            unreachable!()
-                        };
-                        if let Some(expected) = &streamed_schema {
-                            if expected != &schema {
-                                return Err(TaibaiError::Protocol(
-                                    "query stream schema changed between chunks".into(),
-                                ));
-                            }
-                        } else {
-                            streamed_schema = Some(schema);
-                        }
-                        streamed_batches.extend(batches);
+                        merge_result_chunk(&current, &mut streamed_schema, &mut streamed_batches)?;
                     }
                     MSG_TYPE_RESULT_END | MSG_TYPE_ERROR => break current,
                     other => {
@@ -1072,7 +1057,7 @@ impl Client {
     }
 }
 
-fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
+pub(crate) fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
     if payload.len() < 4 {
         return Err(TaibaiError::Protocol(
             "binary result payload too short".into(),
@@ -1468,3 +1453,41 @@ fn sub_event_from_message(msg_type: u8, payload: &[u8]) -> Result<SubEvent> {
         ))),
     }
 }
+
+/// Merge one `MSG_TYPE_RESULT_CHUNK` payload into the accumulated stream
+/// state. Split out of `query_once` so the chunk rules (schema must stay
+/// stable across the stream; a non-rows payload is a protocol error rather
+/// than a panic) are unit-testable without a live connection.
+fn merge_result_chunk(
+    message: &Message,
+    streamed_schema: &mut Option<Schema>,
+    streamed_batches: &mut Vec<RecordBatch>,
+) -> Result<()> {
+    let QueryResult::Rows {
+        schema, batches, ..
+    } = parse_binary_result(&message.payload)?
+    else {
+        return Err(TaibaiError::Protocol(
+            "result chunk payload did not decode to rows".into(),
+        ));
+    };
+    if let Some(expected) = streamed_schema {
+        if expected != &schema {
+            return Err(TaibaiError::Protocol(
+                "query stream schema changed between chunks".into(),
+            ));
+        }
+    } else {
+        *streamed_schema = Some(schema);
+    }
+    streamed_batches.extend(batches);
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "client_retry_test.rs"]
+mod retry_tests;
+
+#[cfg(test)]
+#[path = "client_test.rs"]
+mod client_tests;

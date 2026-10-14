@@ -74,8 +74,12 @@ fn partition_mutation_lock_waiter_aborts_when_client_disconnects() {
         let context = Arc::new(QueryContext::new(waiter_flag));
         let _guard = QueryCancellationGuard::enter(context);
         let started = Instant::now();
-        let result = manager_core::manager_core_test_support::acquire_partition_mutation_lock_for_test(
-                &waiter_state, &waiter_lock, "main.t", "p0",
+        let result =
+            manager_core::manager_core_test_support::acquire_partition_mutation_lock_for_test(
+                &waiter_state,
+                &waiter_lock,
+                "main.t",
+                "p0",
             )
             .map(|_| ());
         (result, started.elapsed())

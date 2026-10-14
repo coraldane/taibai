@@ -1182,8 +1182,7 @@ pub fn exec_delete(
                 // entirely, and a missed save only falls behind on disk until
                 // the next due save or flush checkpoint.
                 engine.invalidate_hot_store(db, table);
-                if let Err(error) = engine.retract_deleted_rows(db, table, total_deleted, true)
-                {
+                if let Err(error) = engine.retract_deleted_rows(db, table, total_deleted, true) {
                     tracing::warn!(
                         db,
                         table,

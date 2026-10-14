@@ -23,7 +23,9 @@ fn directory(path: &Path) -> Arc<Directory> {
     let mut missing = Vec::new();
     let key = loop {
         if let Ok(mut resolved) = std::fs::canonicalize(ancestor) {
-            for component in missing.iter().rev() { resolved.push(component); }
+            for component in missing.iter().rev() {
+                resolved.push(component);
+            }
             break resolved;
         }
         let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name()) else {

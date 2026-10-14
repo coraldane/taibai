@@ -779,7 +779,10 @@ pub fn eval_expr_column_with(
 fn coerce_temporal_comparison<'a>(
     left: &'a ScalarValue,
     right: &'a ScalarValue,
-) -> (std::borrow::Cow<'a, ScalarValue>, std::borrow::Cow<'a, ScalarValue>) {
+) -> (
+    std::borrow::Cow<'a, ScalarValue>,
+    std::borrow::Cow<'a, ScalarValue>,
+) {
     use crate::sql::execution::functions::date::{datetime_string_to_days, parse_timestamp_smart};
     use std::borrow::Cow;
     match (left, right) {
@@ -971,15 +974,31 @@ mod temporal_compare_tests {
         let eq = eval_binary_scalar(&ts, &BinOp::Eq, &lit);
         assert!(matches!(eq, ScalarValue::Bool(Some(true))), "eq: {:?}", eq);
 
-        let ge = eval_binary_scalar(&ts, &BinOp::Gte, &ScalarValue::VarChar(Some("2024-02-01 00:00:00".into())));
+        let ge = eval_binary_scalar(
+            &ts,
+            &BinOp::Gte,
+            &ScalarValue::VarChar(Some("2024-02-01 00:00:00".into())),
+        );
         assert!(matches!(ge, ScalarValue::Bool(Some(true))), "ge: {:?}", ge);
 
-        let lt = eval_binary_scalar(&ts, &BinOp::Lt, &ScalarValue::VarChar(Some("2024-03-01 00:00:00".into())));
+        let lt = eval_binary_scalar(
+            &ts,
+            &BinOp::Lt,
+            &ScalarValue::VarChar(Some("2024-03-01 00:00:00".into())),
+        );
         assert!(matches!(lt, ScalarValue::Bool(Some(true))), "lt: {:?}", lt);
 
         // Reversed literal side.
-        let rev = eval_binary_scalar(&ScalarValue::VarChar(Some("2024-01-01 00:00:00".into())), &BinOp::Lt, &ts);
-        assert!(matches!(rev, ScalarValue::Bool(Some(true))), "rev: {:?}", rev);
+        let rev = eval_binary_scalar(
+            &ScalarValue::VarChar(Some("2024-01-01 00:00:00".into())),
+            &BinOp::Lt,
+            &ts,
+        );
+        assert!(
+            matches!(rev, ScalarValue::Bool(Some(true))),
+            "rev: {:?}",
+            rev
+        );
     }
 }
 
@@ -997,7 +1016,11 @@ mod between_temporal_tests {
         let micros = parse_timestamp_smart("2024-01-05 10:00:00", 0).unwrap();
         let schema = Schema::new(vec![ColumnDef::new("ts", DataType::Timestamp)]);
         let mut batch = RecordBatch::new(schema);
-        batch.column_mut(0).unwrap().push(&ScalarValue::Timestamp(Some(micros))).unwrap();
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Timestamp(Some(micros)))
+            .unwrap();
 
         let expr = LogicalExpr::Between {
             expr: Box::new(LogicalExpr::Column(0)),

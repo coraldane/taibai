@@ -65,11 +65,7 @@ impl FairMutex {
     }
 
     pub(super) fn is_queue_head(&self, queued: &QueuedTicket<'_>) -> bool {
-        self.queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .first()
-            == Some(&queued.ticket)
+        self.queue.lock().unwrap_or_else(|e| e.into_inner()).first() == Some(&queued.ticket)
     }
 
     pub(super) fn try_lock(&self) -> std::sync::TryLockResult<MutexGuard<'_, ()>> {

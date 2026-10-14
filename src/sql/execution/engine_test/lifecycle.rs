@@ -463,7 +463,10 @@ fn optimize_partition_accepts_quoted_key_and_reports_granularity() -> Result<()>
         day_style
     );
 
-    engine.execute(&mut session, "OPTIMIZE TABLE t_stock_minute ON PARTITION '2026'")?;
+    engine.execute(
+        &mut session,
+        "OPTIMIZE TABLE t_stock_minute ON PARTITION '2026'",
+    )?;
     assert_eq!(
         first_i64(
             engine.execute(&mut session, "SELECT COUNT(*) FROM t_stock_minute")?,
@@ -485,10 +488,7 @@ fn show_partitions_lists_sealed_and_active_partitions() -> Result<()> {
         &mut session,
         "CREATE TABLE minute_year (security_id STRING, deal_date INT64) PARTITION BY YEAR(deal_date)",
     )?;
-    engine.execute(
-        &mut session,
-        "CREATE TABLE unpartitioned (id INT64)",
-    )?;
+    engine.execute(&mut session, "CREATE TABLE unpartitioned (id INT64)")?;
 
     // Rows still in the active writer must already show up, so the user can
     // discover the partition name before any flush.
@@ -531,7 +531,11 @@ fn show_partitions_lists_sealed_and_active_partitions() -> Result<()> {
     assert_eq!(text(0, 2), "1");
     assert_eq!(text(1, 1), "2026");
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM minute_year")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM minute_year")?,
+            0,
+            0
+        ),
         2
     );
 

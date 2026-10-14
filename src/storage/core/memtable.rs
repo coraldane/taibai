@@ -1278,7 +1278,9 @@ impl MemTableManager {
             {
                 continue;
             }
-            *rows_by_key.entry(mt.partition_key().to_string()).or_insert(0) += mt.row_count();
+            *rows_by_key
+                .entry(mt.partition_key().to_string())
+                .or_insert(0) += mt.row_count();
         }
         rows_by_key.into_iter().collect()
     }

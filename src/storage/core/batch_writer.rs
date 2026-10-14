@@ -1471,16 +1471,16 @@ impl BatchWriter {
             let remaining =
                 crate::storage::core::durable_tail::flushable_generation_file_count(&table_dir)?;
             if remaining >= max_files_per_table {
-                let histogram = match crate::storage::core::durable_tail::generation_kind_histogram(
-                    &table_dir,
-                ) {
-                    Ok(histogram) => histogram
-                        .into_iter()
-                        .map(|(kind, count)| format!("{kind}={count}"))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    Err(_) => "unavailable".to_string(),
-                };
+                let histogram =
+                    match crate::storage::core::durable_tail::generation_kind_histogram(&table_dir)
+                    {
+                        Ok(histogram) => histogram
+                            .into_iter()
+                            .map(|(kind, count)| format!("{kind}={count}"))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        Err(_) => "unavailable".to_string(),
+                    };
                 tracing::warn!(
                     db,
                     table,

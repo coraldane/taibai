@@ -17,6 +17,7 @@ use crate::sql::parser::ast::Statement;
 use crate::sql::parser::parser::Parser;
 use crate::storage::catalog::auth::{PermissionObjectType, PermissionType};
 use crate::storage::core::pubsub::{PublishedFrame, SubscribeMode, SubscribeRequest};
+use crate::types::batch::RecordBatch;
 use crate::types::scalar::ScalarValue;
 
 pub struct Handler {
@@ -401,6 +402,22 @@ impl Handler {
             let result = self.handle_stop_bulk_import();
             return result;
         }
+        match parse_streaming_results_set(sql) {
+            StreamingResultsSet::NotASetStatement => {}
+            StreamingResultsSet::Enable => {
+                session.streaming_results = true;
+                return Ok(vec![build_ok(0)]);
+            }
+            StreamingResultsSet::Disable => {
+                session.streaming_results = false;
+                return Ok(vec![build_ok(0)]);
+            }
+            StreamingResultsSet::Invalid => {
+                return Ok(vec![build_error(
+                    "unsupported SET statement; usage: SET streaming_results = {true|false|on|off|1|0}",
+                )]);
+            }
+        }
 
         let original_database = session.database.clone();
         let has_query_database = !database.is_empty();
@@ -418,19 +435,31 @@ impl Handler {
         if session.streaming_results {
             if let Some(sender) = self.stream_sender.clone() {
                 let max_message_size = self.config.server.max_message_size;
+                // Half the frame cap per chunk: encoded bytes can exceed the
+                // pre-encode estimate, and each chunk carries its own copy of
+                // the schema header.
+                let chunk_budget = max_message_size / 2;
                 match self.engine.execute_streaming_query(session, sql, |batch| {
-                    let payload = crate::protocol::result::encode_binary_result(&batch);
-                    if payload.len() > max_message_size {
-                        return Err(TaibaiError::ResourceBusy(format!(
-                            "query result chunk exceeded maximum message size of {} MB",
-                            max_message_size / (1024 * 1024)
-                        )));
+                    for part in split_batch_for_chunks(batch, chunk_budget)? {
+                        let payload = crate::protocol::result::encode_binary_result(&part);
+                        if payload.len() > max_message_size {
+                            return Err(TaibaiError::ResourceBusy(format!(
+                                "query result chunk exceeded maximum message size of {} MB",
+                                max_message_size / (1024 * 1024)
+                            )));
+                        }
+                        sender
+                            .blocking_send(Message::new(
+                                MSG_TYPE_RESULT_CHUNK,
+                                Bytes::from(payload),
+                            ))
+                            .map_err(|_| {
+                                TaibaiError::Network(
+                                    "client disconnected during query stream".into(),
+                                )
+                            })?;
                     }
-                    sender
-                        .blocking_send(Message::new(MSG_TYPE_RESULT_CHUNK, Bytes::from(payload)))
-                        .map_err(|_| {
-                            TaibaiError::Network("client disconnected during query stream".into())
-                        })
+                    Ok(())
                 }) {
                     Ok(Some(_)) => {
                         if has_query_database {
@@ -534,7 +563,7 @@ impl Handler {
         let payload_limit = max_bytes.saturating_sub(28);
         if msg.payload.len() > payload_limit {
             return Err(TaibaiError::ResourceBusy(format!(
-                "query response exceeded maximum message size of {} MB; add filters or LIMIT",
+                "query response exceeded maximum message size of {} MB; add filters or LIMIT, or SET streaming_results = true to stream the result in chunks",
                 max_bytes / (1024 * 1024)
             )));
         }
@@ -1844,10 +1873,13 @@ pub fn build_error(msg: &str) -> Message {
 /// `MSG_TYPE_EXECUTE`). The wire protocol carries error payloads as plain
 /// text with no error-code or classification field, so transient
 /// resource-busy conditions (concurrent DML inside the ALTER convergence
-/// window, hot-store backpressure, join/semi-join budget) get the stable
+/// window, hot-store backpressure) get the stable
 /// [`RETRYABLE_ERROR_PREFIX`] marker instead — the minimal extension that
 /// lets clients distinguish "back off and re-issue" from "fail the
-/// statement". Everything else keeps the plain one-shot error text.
+/// statement". Deterministic overruns (query/transaction memory budgets,
+/// result-set and input-materialization limits) keep the plain one-shot
+/// error text: retrying reproduces the same failure. Everything else keeps
+/// the plain one-shot error text.
 /// Connection-layer and authentication errors intentionally do NOT pass
 /// through here: they are not transient.
 fn build_query_error(error: &TaibaiError) -> Message {
@@ -1855,10 +1887,16 @@ fn build_query_error(error: &TaibaiError) -> Message {
         TaibaiError::ResourceBusy(message) => {
             // Budget overruns are DETERMINISTIC: retrying just redoes the
             // same doomed work four times over. Only contention-shaped
-            // busy (lock windows, backpressure) is transient.
+            // busy (lock windows, backpressure) is transient. Result-set
+            // and input-materialization overruns ("exceeded memory limit")
+            // are deterministic in the same sense — the same query against
+            // the same data fails identically — so they must not advertise
+            // retry.
             let budget_error = message.contains("memory budget")
                 || message.contains("transaction budget")
-                || message.contains("exceeded the budget");
+                || message.contains("exceeded the budget")
+                || message.contains("exceeded memory limit")
+                || message.contains("exceeded maximum message size");
             if budget_error {
                 build_error(&format!("resource busy: {message}"))
             } else {
@@ -1871,6 +1909,79 @@ fn build_query_error(error: &TaibaiError) -> Message {
         }
         other => build_error(&other.to_string()),
     }
+}
+
+/// Outcome of parsing a `SET STREAMING_RESULTS` statement.
+enum StreamingResultsSet {
+    NotASetStatement,
+    Enable,
+    Disable,
+    Invalid,
+}
+
+/// `SET STREAMING_RESULTS = {TRUE|FALSE|ON|OFF|1|0}` (optionally
+/// `SET SESSION ...`, case-insensitive, `=` optional): switch the session
+/// between single-message results (default, bounded by the wire frame cap)
+/// and chunked streaming results (bounded by the query memory budgets
+/// instead). Only `SET` statements naming this variable are recognized; any
+/// other `SET ...` reports Invalid with usage guidance instead of reaching
+/// the SQL engine.
+fn parse_streaming_results_set(sql: &str) -> StreamingResultsSet {
+    let mut tokens = sql.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return StreamingResultsSet::NotASetStatement;
+    };
+    if !first.eq_ignore_ascii_case("SET") {
+        return StreamingResultsSet::NotASetStatement;
+    }
+    let mut name = tokens.next().unwrap_or("");
+    let mut inline_value: Option<&str> = None;
+    if let Some((prefix, value)) = name.split_once('=') {
+        name = prefix;
+        inline_value = Some(value);
+    }
+    if name.eq_ignore_ascii_case("SESSION") && inline_value.is_none() {
+        name = tokens.next().unwrap_or("");
+        if let Some((prefix, value)) = name.split_once('=') {
+            name = prefix;
+            inline_value = Some(value);
+        }
+    }
+    if !name.eq_ignore_ascii_case("STREAMING_RESULTS") {
+        return StreamingResultsSet::Invalid;
+    }
+    let value = match (inline_value, tokens.collect::<Vec<_>>().as_slice()) {
+        (Some(value), []) => value,
+        (None, ["=", value]) | (None, [value]) => value,
+        _ => return StreamingResultsSet::Invalid,
+    };
+    match value.to_ascii_uppercase().as_str() {
+        "TRUE" | "ON" | "1" => StreamingResultsSet::Enable,
+        "FALSE" | "OFF" | "0" => StreamingResultsSet::Disable,
+        _ => StreamingResultsSet::Invalid,
+    }
+}
+
+/// Split an oversized result batch into row slices that fit the per-chunk
+/// budget. A single scan batch can exceed the wire frame cap (wide rows at
+/// row-group sizes) and would otherwise abort the whole stream mid-flight.
+/// Slice rows via `take_rows` using the estimated-size ratio; every emitted
+/// slice is re-checked against the hard frame cap after encoding.
+fn split_batch_for_chunks(batch: RecordBatch, chunk_budget: usize) -> Result<Vec<RecordBatch>> {
+    let estimate = batch.estimated_size_bytes().max(1);
+    let total_rows = batch.num_rows();
+    if estimate <= chunk_budget || total_rows <= 1 {
+        return Ok(vec![batch]);
+    }
+    let rows_per_chunk = ((chunk_budget as u128 * total_rows as u128) / estimate as u128) as usize;
+    let rows_per_chunk = rows_per_chunk.clamp(1, total_rows);
+    let mut parts = Vec::new();
+    for start in (0..total_rows).step_by(rows_per_chunk) {
+        let end = (start + rows_per_chunk).min(total_rows);
+        let indices: Vec<u32> = (start as u32..end as u32).collect();
+        parts.push(batch.take_rows(&indices)?);
+    }
+    Ok(parts)
 }
 
 fn append_server_timings(msg: Message, timings: ServerTimings) -> Message {

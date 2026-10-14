@@ -61,8 +61,17 @@
 
 ### P1：大批量回填错峰与限流
 
-- 回填类任务（ricequant 历史分钟线）避开 15:10–15:45 盘后 padding 窗口；
-  caravan 侧给回填 writer 增加批间 sleep 配置，把表变更锁让给实时链路。
+- 已核实并落地：ricequant 分钟线抓取的调度方是 data-synchro
+  `VendorFetchTask`（cron 可配），生产实际在跑（10/13 日志：15:20 抓取
+  STOCK_MINUTE 1,250,880 行，写入 `t_stock_minute_ricequant` 的行重写
+  15:22–15:35 与盘后 padding 窗口完全重叠）。已把权益分钟抓取默认 cron
+  从 `0 20 15` 改为 `0 55 15`：padding 日线批 15:43 收尾后、16:25 期货
+  抓取前、16:40 归并前完成。
+- 注意：仓库内 `application-prod.yml` 无 `project.vendor` 配置（默认
+  `enabled:false`），但生产实际已启用——**生产服务器的生效配置与仓库
+  不一致**，发布时需核对该环境的 application.yml，确保新 cron 真正生效。
+- close-of-day 错峰不再需要：29s 锁持有的根因已由两阶段重建根治
+  （见上文 P0）。
 - bulk 写入单次 apply 行数维持 ≤25 万行（`PipelineColumnarWriter` 已有注释
   说明 25 万行 apply 可能超过服务端 60s 锁超时），回填路径如有更大批次需要收敛。
 

@@ -110,11 +110,14 @@ fn coerce_literal_for_column(
         }
         (DataType::Decimal, ScalarValue::Int64(Some(raw))) => {
             let multiplier = 10_i64.checked_pow(column.scale.max(0) as u32)?;
-            raw.checked_mul(multiplier).map(|v| ScalarValue::Decimal(Some(v)))
+            raw.checked_mul(multiplier)
+                .map(|v| ScalarValue::Decimal(Some(v)))
         }
         (DataType::Decimal, ScalarValue::Float64(Some(v))) => {
             let multiplier = 10_i64.checked_pow(column.scale.max(0) as u32)?;
-            Some(ScalarValue::Decimal(Some((*v * multiplier as f64).round() as i64)))
+            Some(ScalarValue::Decimal(Some(
+                (*v * multiplier as f64).round() as i64
+            )))
         }
         // Integer-family widening: an Int64 predicate bound on an Int32
         // partition column (and vice versa) is exact whenever the value fits.
@@ -130,8 +133,12 @@ fn coerce_literal_for_column(
             ScalarValue::Int64(Some(v)),
         ) if matches!(
             value,
-            ScalarValue::Int64(_) | ScalarValue::Int32(_) | ScalarValue::Int16(_) | ScalarValue::Int8(_)
-        ) => {
+            ScalarValue::Int64(_)
+                | ScalarValue::Int32(_)
+                | ScalarValue::Int16(_)
+                | ScalarValue::Int8(_)
+        ) =>
+        {
             let raw = *v;
             let fits = match target {
                 DataType::Int8 => i8::try_from(raw).is_ok(),
@@ -258,8 +265,10 @@ fn extract_partition_filter(expr: &LogicalExpr, schema: &Schema) -> Option<Parti
         } => {
             if let LogicalExpr::Column(idx) = **expr {
                 let col_name = schema.columns.get(idx)?.name.clone();
-                let coerced: Option<Vec<ScalarValue>> =
-                    values.iter().map(|v| coerce_literal_for_column(v, schema, idx)).collect();
+                let coerced: Option<Vec<ScalarValue>> = values
+                    .iter()
+                    .map(|v| coerce_literal_for_column(v, schema, idx))
+                    .collect();
                 return Some(PartitionFilter {
                     column: col_name,
                     values: coerced?,

@@ -69,6 +69,24 @@ server:
 
 过载与超时错误会返回给客户端。重试应有退避和次数上限；写入遇到网络断开时，应先核对提交结果或使用幂等键，避免盲目重试重复写入。
 
+## 查询结果内存上限
+
+结果集在服务端缓冲后以单条消息发回。缓冲上限为：
+
+```text
+min(buffer.query_memory_limit_mb / 2, server.max_message_size / 2)
+```
+
+默认配置（4096 MB / 64 MB）下即 **32 MB**，由 `server.max_message_size` 决定——即使把 `query_memory_limit_mb` 调到再大也不会放宽结果集上限。
+
+超限报 `query result exceeded memory limit of ... (bounded by <配置键> = ...)`。这是**确定性错误**：同样的查询对同样的数据重试必然复现，服务端不会标记 `[RETRYABLE]`，内置客户端也不会自动重试。处理方式按优先级：
+
+1. 加 WHERE 过滤或 LIMIT 分页，减少单次返回的数据量；
+2. 会话内执行 `SET streaming_results = true` 切换为**分块流式结果**：结果按批次以 `RESULT_CHUNK` 消息逐块发送、以 `RESULT_END` 收尾，单批超过帧上限一半时自动按行切片。结果集不再受 64 MB 单消息上限约束，只受查询内存预算（聚合/连接/排序算子内部预算与 `buffer.query_memory_limit_mb`）约束。内置客户端已支持聚合分块；`SET streaming_results = false`（或重连）恢复默认单消息模式。流式路径仅覆盖无子查询/派生表的普通 SELECT，其余语句自动回落单消息路径；
+3. 确需更大的单消息结果时，同步调大 `server.max_message_size` **和所有客户端的接收上限**（内置客户端与 JDBC 客户端均硬编码 64 MB），缺一会导致大结果在客户端解码阶段报协议错误；`max_bulk_message_size` 是 bulk 导入独立上限，与结果集无关。
+
+注意：JDBC / Go 等未改造的客户端不会发送 `SET streaming_results`，行为完全不变；流式模式是会话级显式选择。
+
 ## 代码索引
 
 | 行为 | 位置 |
