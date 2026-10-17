@@ -63,12 +63,13 @@ impl Compactor {
             }
         }
 
-        // Parallelize by column, like the Go ReadColumnsDirect path. Each
-        // worker builds one contiguous destination column and moves decoded
-        // variable-width buffers into it without cloning strings.
+        // Account decoded columns incrementally; the first over-budget column
+        // aborts this attempt before more columns allocate, and the caller
+        // falls back to external runs. Variable-width buffers move into place.
+        let mut decoded_bytes = sorted_indices.capacity() * std::mem::size_of::<u32>();
         let columns = schema
             .columns
-            .par_iter()
+            .iter()
             .enumerate()
             .map(|(column_idx, column_def)| -> Result<ColumnArray> {
                 let mut destination =
@@ -79,8 +80,16 @@ impl Compactor {
                         schema,
                         column_idx,
                     )?;
+                    ensure_compaction_memory(
+                        decoded_bytes
+                            .saturating_add(destination.estimated_size_bytes())
+                            .saturating_add(decoded.estimated_size_bytes().saturating_mul(2)),
+                        clustered_merge_budget_bytes() / 2,
+                        "in-memory decode",
+                    )?;
                     destination.append_owned(decoded)?;
                 }
+                decoded_bytes = decoded_bytes.saturating_add(destination.estimated_size_bytes());
                 Ok(destination)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -198,7 +207,7 @@ impl Compactor {
         table: &str,
         partition_label: &str,
         tmp_path: &Path,
-        final_path: &Path,
+        _final_path: &Path,
         schema: &Schema,
         sort_key_indices: &[usize],
         bloom_column_indices: &[usize],
@@ -207,122 +216,22 @@ impl Compactor {
         output_row_group_rows: usize,
         compression_level: i32,
     ) -> Result<(usize, u64, u64)> {
-        let estimated_width = estimated_row_width_bytes(schema);
-        // Bound the run to the budget (no row-group-multiplier floor: wide
-        // rows must not lift the run past it). A small floor keeps the run
-        // count sane for very narrow rows.
-        let run_rows = (clustered_merge_budget_bytes() / estimated_width)
-            .max(4096)
-            .max(1);
-
-        // ---- Pass A: bounded chunks, each sorted and spilled to a run ----
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as i64;
-        let duration = ttl.map(|(_, secs)| secs.saturating_mul(1_000_000));
-
-        let mut source_row_groups: Vec<SourceRowGroup> = Vec::new();
-        let mut rows_per_source: Vec<usize> = Vec::new();
-        // Segment-local start row of each source row group, computed during
-        // the same discovery pass (recomputing it per source below made the
-        // row-ref loop quadratic in a segment's row-group count).
-        let mut row_base_per_source: Vec<u64> = Vec::new();
-        for seg_path in segment_files {
-            let reader = self.segment_mgr.open_reader(seg_path)?;
-            let mut segment_row_base = 0u64;
-            for rg_idx in 0..reader.num_row_groups() {
-                source_row_groups.push(SourceRowGroup {
-                    segment_path: seg_path.clone(),
-                    row_group_idx: rg_idx,
-                });
-                rows_per_source.push(reader.row_group_rows(rg_idx) as usize);
-                row_base_per_source.push(segment_row_base);
-                segment_row_base += reader.row_group_rows(rg_idx);
-            }
-        }
-
-        let mut cache = RowGroupCache::new(16, schema.clone());
-        let mut refs: Vec<RowRef> = Vec::with_capacity(run_rows);
-        let mut run_paths: Vec<PathBuf> = Vec::new();
-        let mut run_seq = 0usize;
-        let mut dropped = 0u64;
-        let mut dropped_ttl = 0u64;
-
-        let run_cleanup = |paths: &[PathBuf]| {
-            for path in paths {
-                let _ = std::fs::remove_file(path);
-                let _ = crate::storage::segment::meta::remove_sidecar_meta(path);
-            }
-        };
-        let flush_run = |cache: &mut RowGroupCache,
-                         run_paths: &mut Vec<PathBuf>,
-                         run_seq: &mut usize,
-                         refs: &mut Vec<RowRef>|
-         -> Result<()> {
-            if refs.is_empty() {
-                return Ok(());
-            }
-            let batch = self.gather_cached_chunk(schema, &source_row_groups, refs, cache)?;
-            let mut indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
-            sort_clustered_row_indices(&mut indices, &batch, sort_key_indices);
-            let sorted = gather_global_chunk(schema, &batch, &indices)?;
-            let run_path = merge_run_path(final_path, *run_seq);
-            *run_seq += 1;
-            let written = (|| -> Result<()> {
-                let mut writer = SegmentWriter::create(&run_path, schema.clone(), run_rows, 0)?;
-                writer.write_batch_parallel(&sorted)?;
-                writer.seal()?;
-                Ok(())
-            })();
-            if written.is_err() {
-                let _ = std::fs::remove_file(&run_path);
-                let _ = crate::storage::segment::meta::remove_sidecar_meta(&run_path);
-                return written;
-            }
-            run_paths.push(run_path);
-            refs.clear();
-            Ok(())
-        };
-
-        for (source_idx, source) in source_row_groups.iter().enumerate() {
-            let row_count = rows_per_source[source_idx];
-            let reader = self.segment_mgr.open_reader(&source.segment_path)?;
-            let segment_row_base = row_base_per_source[source_idx];
-            let ttl_col = ttl
-                .map(|(idx, _)| reader.read_catalog_column(source.row_group_idx, schema, idx))
-                .transpose()?;
-            for row_idx in 0..row_count {
-                let row_id = segment_row_base + row_idx as u64;
-                if reader.is_row_deleted(row_id) {
-                    dropped += 1;
-                    continue;
-                }
-                if let (Some(col), Some(duration)) = (&ttl_col, duration) {
-                    if !ttl_row_visible(&col.scalar(row_idx), duration, now) {
-                        dropped += 1;
-                        dropped_ttl += 1;
-                        continue;
-                    }
-                }
-                refs.push(RowRef {
-                    batch_idx: source_idx,
-                    row_idx,
-                });
-                if refs.len() >= run_rows {
-                    flush_run(&mut cache, &mut run_paths, &mut run_seq, &mut refs)?;
-                }
-            }
-        }
-        if let Err(error) = flush_run(&mut cache, &mut run_paths, &mut run_seq, &mut refs) {
-            run_cleanup(&run_paths);
-            return Err(error);
-        }
-
+        let mut scratch = super::runs::TempRuns::default();
+        let (run_paths, dropped, dropped_ttl) = self.build_clustered_runs(
+            db,
+            table,
+            partition_label,
+            tmp_path,
+            schema,
+            sort_key_indices,
+            segment_files,
+            ttl,
+            output_row_group_rows,
+            &mut scratch,
+        )?;
         if run_paths.is_empty() {
             return Ok((0, dropped, dropped_ttl));
         }
-
         // ---- Pass B: k-way merge (waves when runs exceed the fan-in) ----
         let cleanup_runs = |paths: &[PathBuf]| {
             for path in paths {
@@ -332,13 +241,15 @@ impl Compactor {
         };
         let mut wave = 0usize;
         let mut current_runs = run_paths;
+        let mut fan_in = self.merge_fan_in(&current_runs, schema)?;
         let mut created_in_round: Vec<PathBuf> = Vec::new();
         let result = (|| -> Result<usize> {
-            while current_runs.len() > CLUSTERED_MERGE_MAX_RUNS {
+            while current_runs.len() > fan_in {
                 wave += 1;
                 let mut next_runs = Vec::new();
-                for (next_seq, group) in current_runs.chunks(CLUSTERED_MERGE_MAX_RUNS).enumerate() {
-                    let merged_path = merge_wave_path(final_path, wave, next_seq);
+                for (next_seq, group) in current_runs.chunks(fan_in).enumerate() {
+                    let merged_path = merge_wave_path(tmp_path, wave, next_seq);
+                    scratch.0.push(merged_path.clone());
                     let mut writer = SegmentWriter::create(
                         &merged_path,
                         schema.clone(),
@@ -358,6 +269,7 @@ impl Compactor {
                 }
                 cleanup_runs(&current_runs);
                 current_runs = next_runs;
+                fan_in = self.merge_fan_in(&current_runs, schema)?;
             }
 
             let mut writer = SegmentWriter::create_with_bloom_columns(
@@ -379,9 +291,11 @@ impl Compactor {
         })();
         cleanup_runs(&current_runs);
         if result.is_err() {
-            run_cleanup(&created_in_round);
+            cleanup_runs(&created_in_round);
         }
         let written = result?;
+        #[cfg(test)]
+        EXTERNAL_MERGE_WAVES.with(|n| n.set(wave));
         tracing::info!(
             db,
             table,
@@ -394,6 +308,9 @@ impl Compactor {
         Ok((written, dropped, dropped_ttl))
     }
 }
+
+#[cfg(test)]
+thread_local! { pub(super) static EXTERNAL_MERGE_WAVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 pub(super) fn estimated_row_width_bytes(schema: &Schema) -> usize {
     schema

@@ -130,25 +130,22 @@ fn flush_chunk(chunk: &mut Vec<Entry>, runs: &mut Runs) -> Result<()> {
     runs.add(path)
 }
 impl IndexManager {
-    /// Scan entries once into bounded sorted runs, merge with bounded fan-in,
-    /// and publish the normal on-demand base. Producer errors/collisions leave
-    /// the old index intact; the RAII run directory removes all scratch files.
-    pub(crate) fn persist_unique_index_stream<F>(
+    /// Begin a bounded external construction of a location-index base:
+    /// allocate the scratch run directory and memory budget. Entries are
+    /// fed with [`Self::unique_index_stream_push`], possibly in several
+    /// phases, and the base is installed with
+    /// [`Self::unique_index_stream_publish`].
+    pub(crate) fn unique_index_stream_begin(
         &self,
         db: &str,
         table: &str,
-        index_name: &str,
-        columns: &[String],
-        producer: F,
-    ) -> Result<()>
-    where
-        F: FnOnce(&mut dyn FnMut(UniqueIndexEntry) -> Result<()>) -> Result<()>,
-    {
+        _index_name: &str,
+    ) -> Result<UniqueIndexStreamBuild> {
         let dir = self.unique_index_dir(db, table);
         std::fs::create_dir_all(&dir)?;
         let scratch = dir.join(format!(".build-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&scratch)?;
-        let mut runs = Runs {
+        let runs = Runs {
             dir: scratch,
             next: 0,
             levels: Vec::new(),
@@ -158,34 +155,65 @@ impl IndexManager {
             .saturating_mul(1024 * 1024)
             .min(usize::MAX as u64) as usize;
         let chunk_limit = (limit / 4).max(1).min(4 * 1024 * 1024);
-        let mut memory = crate::sql::execution::spill::OperatorMemory::new("index build", limit);
-        let mut chunk = Vec::new();
-        let mut bytes = 0usize;
-        producer(&mut |entry| {
-            let key = encode_unique_key(&entry.key)?;
-            let size = key
-                .len()
-                .saturating_mul(2)
-                .saturating_add(entry.location.segment_path.len())
-                .saturating_add(128);
-            if size > chunk_limit {
-                return Err(TaibaiError::ResourceBusy(
-                    "one unique index entry exceeds the index build memory budget".into(),
-                ));
-            }
-            if bytes.saturating_add(size) > chunk_limit {
-                flush_chunk(&mut chunk, &mut runs)?;
-                bytes = 0;
-            }
-            bytes = bytes.saturating_add(size);
-            memory.reserve(bytes.saturating_mul(2))?;
-            chunk.push((key, entry.location));
-            Ok(())
-        })?;
-        flush_chunk(&mut chunk, &mut runs)?;
-        let run = runs.finish()?;
+        let memory = crate::sql::execution::spill::OperatorMemory::new("index build", limit);
+        Ok(UniqueIndexStreamBuild {
+            runs,
+            memory,
+            chunk_limit,
+            chunk: Vec::new(),
+            bytes: 0,
+        })
+    }
+
+    /// Feed one entry into the pending stream. Entries over the per-entry
+    /// memory budget abort the build; overflowing chunks spill to sorted
+    /// runs on disk.
+    pub(crate) fn unique_index_stream_push(
+        &self,
+        build: &mut UniqueIndexStreamBuild,
+        entry: UniqueIndexEntry,
+    ) -> Result<()> {
+        let key = encode_unique_key(&entry.key)?;
+        let size = key
+            .len()
+            .saturating_mul(2)
+            .saturating_add(entry.location.segment_path.len())
+            .saturating_add(128);
+        if size > build.chunk_limit {
+            return Err(TaibaiError::ResourceBusy(
+                "one unique index entry exceeds the index build memory budget".into(),
+            ));
+        }
+        if build.bytes.saturating_add(size) > build.chunk_limit {
+            flush_chunk(&mut build.chunk, &mut build.runs)?;
+            build.bytes = 0;
+        }
+        build.bytes = build.bytes.saturating_add(size);
+        build.memory.reserve(build.bytes.saturating_mul(2))?;
+        build.chunk.push((key, entry.location));
+        Ok(())
+    }
+
+    /// Merge the pending runs into the on-disk base, publish it atomically,
+    /// and swap the in-memory snapshot. Must be called while holding the
+    /// table mutation lock so the recorded flush epoch and segment
+    /// watermarks describe the state the base covers. Duplicate keys across
+    /// runs keep the last occurrence: two-phase builds can transiently hold
+    /// a row at both its old and new location, and the later scan is the
+    /// authoritative one.
+    pub(crate) fn unique_index_stream_publish(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        columns: &[String],
+        mut build: UniqueIndexStreamBuild,
+    ) -> Result<()> {
+        let dir = self.unique_index_dir(db, table);
+        flush_chunk(&mut build.chunk, &mut build.runs)?;
+        let run = build.runs.finish()?;
         let data_path = dir.join(format!("{}.keys.tbi", sanitize_file_component(index_name)));
-        let tmp = runs.dir.join("base.tmp");
+        let tmp = build.runs.dir.join("base.tmp");
         let mut writer = UniqueIndexBaseWriter::new(
             BufWriter::new(std::fs::File::create(&tmp)?),
             db,
@@ -193,30 +221,47 @@ impl IndexManager {
             index_name,
             columns.to_vec(),
         )?;
+        let mut held: Option<Entry> = None;
         if let Some(run) = run {
             let mut reader = BufReader::new(std::fs::File::open(run)?);
             let mut count = 0usize;
-            while let Some((key, location)) = read_entry(&mut reader)? {
+            loop {
+                let next = read_entry(&mut reader)?;
+                let had_next = next.is_some();
+                let same_as_held = matches!(
+                    (&held, &next),
+                    (Some((hkey, _)), Some((nkey, _))) if hkey == nkey
+                );
+                match held.take() {
+                    None => held = next,
+                    Some((pkey, ploc)) => {
+                        if same_as_held {
+                            held = next;
+                        } else {
+                            reserve_base_entry(
+                                &mut build.memory,
+                                &build.chunk,
+                                &writer,
+                                &pkey,
+                                &ploc,
+                            )?;
+                            writer.push_entry(&pkey, &ploc)?;
+                            held = next;
+                        }
+                    }
+                }
+                if !had_next {
+                    break;
+                }
+                count += 1;
                 if count % 1024 == 0 {
                     crate::common::query_cancel::check()?;
                 }
-                count += 1;
-                // Reserve directory, current block, serialized footer and
-                // entry growth before the base writer allocates them.
-                memory.reserve(
-                    chunk
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<Entry>())
-                        .saturating_add(writer.resident_build_bytes().saturating_mul(3))
-                        .saturating_add(
-                            key.len()
-                                .saturating_add(location.segment_path.len())
-                                .saturating_add(256)
-                                .saturating_mul(4),
-                        ),
-                )?;
-                writer.push_entry(&key, &location)?;
             }
+        }
+        if let Some((key, location)) = held {
+            reserve_base_entry(&mut build.memory, &build.chunk, &writer, &key, &location)?;
+            writer.push_entry(&key, &location)?;
         }
         let watermarks = self.current_segment_watermarks(db, table)?;
         let file = writer
@@ -242,4 +287,54 @@ impl IndexManager {
         );
         Ok(())
     }
+
+    /// Scan entries once into bounded sorted runs, merge with bounded fan-in,
+    /// and publish the normal on-demand base. Producer errors/collisions leave
+    /// the old index intact; the RAII run directory removes all scratch files.
+    pub(crate) fn persist_unique_index_stream<F>(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        columns: &[String],
+        producer: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut dyn FnMut(UniqueIndexEntry) -> Result<()>) -> Result<()>,
+    {
+        let mut build = self.unique_index_stream_begin(db, table, index_name)?;
+        producer(&mut |entry| self.unique_index_stream_push(&mut build, entry))?;
+        self.unique_index_stream_publish(db, table, index_name, columns, build)
+    }
+}
+
+fn reserve_base_entry<W: std::io::Write>(
+    memory: &mut crate::sql::execution::spill::OperatorMemory,
+    chunk: &Vec<Entry>,
+    writer: &UniqueIndexBaseWriter<W>,
+    key: &[u8],
+    location: &UniqueRowLocation,
+) -> Result<()> {
+    // Reserve directory, current block, serialized footer and entry growth
+    // before the base writer allocates them.
+    memory.reserve(
+        chunk
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Entry>())
+            .saturating_add(writer.resident_build_bytes().saturating_mul(3))
+            .saturating_add(
+                key.len()
+                    .saturating_add(location.segment_path.len())
+                    .saturating_add(256)
+                    .saturating_mul(4),
+            ),
+    )
+}
+
+pub(crate) struct UniqueIndexStreamBuild {
+    runs: Runs,
+    memory: crate::sql::execution::spill::OperatorMemory,
+    chunk_limit: usize,
+    chunk: Vec<Entry>,
+    bytes: usize,
 }

@@ -33,7 +33,7 @@ impl SegmentManager {
         db: &str,
         table: &str,
         partition_key: &str,
-    ) -> Arc<std::sync::Mutex<()>> {
+    ) -> Arc<FairMutex> {
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
         partition_mutation_lock_arc(&state, partition_key)
@@ -593,6 +593,8 @@ impl SegmentManager {
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
         let _guard = state.flush_visibility.read().unwrap();
+        let _segments =
+            crate::storage::segment::snapshot::pin_directory(&self.data_dir.join(db).join(table));
         f()
     }
 
@@ -1172,57 +1174,51 @@ impl SegmentManager {
         final_path: &Path,
         old_segments: &[PathBuf],
     ) -> Result<()> {
-        if final_path.exists() {
-            return Err(TaibaiError::Storage(format!(
-                "segment target already exists: {}",
-                final_path.display()
-            )));
-        }
-
-        let final_meta = sidecar_meta_path(final_path);
-        if final_meta.exists() {
-            return Err(TaibaiError::Storage(format!(
-                "segment meta target already exists: {}",
-                final_meta.display()
-            )));
-        }
-        // Compaction output is sealed and self-contained. Validate its embedded
-        // footer before replacing any source segment; no sidecar is required.
-        read_embedded_segment_meta(tmp_path)?;
-
-        // Two-phase commit: the journal records which old segments the
-        // replacement must retire. A crash between the rename and the old
-        // file removals used to leave the new AND old segments on disk, and
-        // every scan then counted those rows twice. Startup recovery
-        // (`recover_replace_journals`) finishes the retirement.
-        let journal = replace_journal_path(final_path);
-        write_replace_journal(&journal, old_segments)?;
-
-        if let Err(error) = std::fs::rename(tmp_path, final_path) {
-            let _ = std::fs::remove_file(&journal);
-            return Err(error.into());
-        }
-        // From here on the replacement is in effect: keep removing the old
-        // segments even after an individual failure (the journal lets
-        // startup recovery finish), and report the first error.
-        let mut first_removal_error = None;
-        for old_seg in old_segments {
-            if old_seg != final_path {
-                if let Err(error) = self.remove_segment_file(old_seg) {
-                    tracing::warn!(
-                        old_segment = %old_seg.display(),
-                        error = %error,
-                        "old segment removal failed; startup recovery will retry"
-                    );
-                    first_removal_error = first_removal_error.or(Some(error));
-                }
+        let table_dir = final_path
+            .parent()
+            .ok_or_else(|| TaibaiError::Storage("segment has no parent directory".into()))?;
+        crate::storage::segment::snapshot::with_directory(table_dir, |directory| {
+            if final_path.exists() {
+                return Err(TaibaiError::Storage(format!(
+                    "segment target already exists: {}",
+                    final_path.display()
+                )));
             }
-        }
-        if first_removal_error.is_none() {
-            let _ = std::fs::remove_file(&journal);
-        }
 
-        remove_sidecar_meta(tmp_path)?;
+            let final_meta = sidecar_meta_path(final_path);
+            if final_meta.exists() {
+                return Err(TaibaiError::Storage(format!(
+                    "segment meta target already exists: {}",
+                    final_meta.display()
+                )));
+            }
+            // Compaction output is sealed and self-contained. Validate its embedded
+            // footer before replacing any source segment; no sidecar is required.
+            read_embedded_segment_meta(tmp_path)?;
+
+            // Two-phase commit: the journal records which old segments the
+            // replacement must retire. A crash between the rename and the old
+            // file removals used to leave the new AND old segments on disk, and
+            // every scan then counted those rows twice. Startup recovery
+            // (`recover_replace_journals`) finishes the retirement.
+            let journal = replace_journal_path(final_path);
+            write_replace_journal(&journal, old_segments)?;
+
+            if let Err(error) = std::fs::rename(tmp_path, final_path) {
+                let _ = std::fs::remove_file(&journal);
+                return Err(error.into());
+            }
+            // The journal now retires the old paths for discovery. Existing
+            // leases retain their files; failed physical deletion remains
+            // recoverable without exposing duplicate rows to new scans.
+            for old_seg in old_segments {
+                self.invalidate_reader(old_seg);
+            }
+            directory.retire(journal, old_segments.to_vec());
+            Ok(())
+        })?;
+
+        let _ = remove_sidecar_meta(tmp_path);
         let _ = self.open_reader_cached(final_path);
         // The replacement changed this table's on-disk content: bump the
         // epoch here so no caller can forget (persisted unique-index
@@ -1230,6 +1226,20 @@ impl SegmentManager {
         self.bump_flush_epoch_for_segment(final_path);
         self.emit_segments_replaced(final_path, old_segments);
         Ok(())
+    }
+
+    /// Logical retirement is atomic for discovery; physical deletion waits
+    /// for existing scans and can be retried from the durable journal.
+    pub(crate) fn retire_segments(&self, table_dir: &Path, paths: &[PathBuf]) -> Result<()> {
+        crate::storage::segment::snapshot::with_directory(table_dir, |directory| {
+            let journal = table_dir.join(format!("{}.retire", uuid::Uuid::new_v4()));
+            write_replace_journal(&journal, paths)?;
+            for path in paths {
+                self.invalidate_reader(path);
+            }
+            directory.retire(journal, paths.to_vec());
+            Ok(())
+        })
     }
 
     pub fn rewrite_delete_footer(
@@ -1356,6 +1366,33 @@ impl SegmentManager {
         f: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         let _mutation_guard = acquire_mutation_lock(state, key)?;
+        let critical_started = Instant::now();
+        let result = self.run_under_table_wide_gate(state, key, f);
+        let held = critical_started.elapsed();
+        let warn_after = Duration::from_secs(
+            crate::common::config::storage_timeouts()
+                .mutation_lock_warn_secs
+                .max(1),
+        );
+        if held >= warn_after {
+            // 2026-10-13 生产事故教训：等待侧有 slow-acquisition 告警，持有侧却
+            // 全程静默，刷盘/压缩/重建等后台持有者无法归因。持锁超过告警阈值
+            // 时在这里留下持有方证据（表、持锁时长）。
+            tracing::warn!(
+                table = key,
+                hold_ms = held.as_millis() as u64,
+                "table mutation lock held for a long critical section"
+            );
+        }
+        result
+    }
+
+    fn run_under_table_wide_gate<T>(
+        &self,
+        state: &Arc<TableSegmentState>,
+        key: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         state.partition_gate.store(true, Ordering::Release);
         let _gate_reset = PartitionGateReset(Arc::clone(state));
         let registry = state.partition_locks.write().unwrap();
@@ -1503,7 +1540,7 @@ impl SegmentManager {
             Some(lock) => lock,
             None => partition_mutation_lock_arc(&state, partition_key),
         };
-        let _guard = match try_lock_or_none(&lock, "partition mutation lock") {
+        let _guard = match lock.try_lock_or_none("partition mutation lock") {
             Some(guard) if !state.partition_gate.load(Ordering::Acquire) => guard,
             Some(_) => return Ok(None),
             None => return Ok(None),
@@ -1525,7 +1562,7 @@ impl SegmentManager {
     ) -> Result<Option<T>> {
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
-        let _mutation_guard = match try_lock_or_none(&state.mutation_lock, "table mutation lock") {
+        let _mutation_guard = match state.mutation_lock.try_lock_or_none("table mutation lock") {
             Some(guard) => guard,
             None => return Ok(None),
         };
@@ -1536,7 +1573,7 @@ impl SegmentManager {
         let (_partition_keys, partition_locks) = sorted_partition_locks(&registry);
         let mut partition_guards = Vec::with_capacity(partition_locks.len());
         for lock in &partition_locks {
-            match try_lock_or_none(lock, "partition mutation lock") {
+            match lock.try_lock_or_none("partition mutation lock") {
                 Some(guard) => partition_guards.push(guard),
                 None => return Ok(None),
             }
@@ -1575,8 +1612,7 @@ impl SegmentManager {
         let mut registries = Vec::with_capacity(states.len());
         let mut partition_arc_sets = Vec::with_capacity(states.len());
         for (_key, state) in keys.iter().zip(states.iter()) {
-            let mutation_guard = match try_lock_or_none(&state.mutation_lock, "table mutation lock")
-            {
+            let mutation_guard = match state.mutation_lock.try_lock_or_none("table mutation lock") {
                 Some(guard) => guard,
                 None => return Ok(None),
             };
@@ -1593,7 +1629,7 @@ impl SegmentManager {
         for partition_locks in &partition_arc_sets {
             let mut guards = Vec::new();
             for lock in partition_locks {
-                match try_lock_or_none(lock, "partition mutation lock") {
+                match lock.try_lock_or_none("partition mutation lock") {
                     Some(guard) => guards.push(guard),
                     None => return Ok(None),
                 }
@@ -1774,6 +1810,30 @@ impl SegmentManager {
             .collect()
     }
 
+    /// Per-partition row counts still resident in active writers, live rows
+    /// only (`total_rows` minus deleted, plus buffered rows awaiting their
+    /// row group). SHOW PARTITIONS merges this with the sealed-segment scan
+    /// so an unflushed partition is listed, not invisible.
+    pub fn active_partition_live_rows(&self, db: &str, table: &str) -> Vec<(String, u64)> {
+        let key = table_key(db, table);
+        let state = self.tables.read().unwrap().get(&key).cloned();
+        let Some(state) = state else {
+            return Vec::new();
+        };
+        let active_segments = state.active_segments.lock().unwrap();
+        active_segments
+            .iter()
+            .filter(|(_, segment)| segment.total_rows > 0 || segment.buffered_rows > 0)
+            .map(|(partition_key, segment)| {
+                let live = segment
+                    .total_rows
+                    .saturating_sub(segment.deleted_row_count)
+                    .saturating_add(segment.buffered_rows as u64);
+                (partition_key.clone(), live)
+            })
+            .collect()
+    }
+
     pub fn remove_table_state(&self, db: &str, table: &str) {
         let key = table_key(db, table);
         let state = self.tables.write().unwrap().remove(&key);
@@ -1843,11 +1903,8 @@ impl Drop for DatabaseGatesReset {
 /// before running `f` (the gate flag freezes new partitions instead),
 /// while the try variants keep it held through `f`.
 fn sorted_partition_locks(
-    registry: &std::sync::RwLockWriteGuard<
-        '_,
-        std::collections::HashMap<String, Arc<std::sync::Mutex<()>>>,
-    >,
-) -> (Vec<String>, Vec<Arc<std::sync::Mutex<()>>>) {
+    registry: &std::sync::RwLockWriteGuard<'_, std::collections::HashMap<String, Arc<FairMutex>>>,
+) -> (Vec<String>, Vec<Arc<FairMutex>>) {
     let mut partition_keys: Vec<String> = registry.keys().cloned().collect();
     partition_keys.sort();
     let partition_locks = partition_keys
@@ -1857,23 +1914,7 @@ fn sorted_partition_locks(
     (partition_keys, partition_locks)
 }
 
-/// Try-lock for the lock-free mutation attempts: `None` means busy (the
-/// caller reports "not now" and retries later); a poisoned lock still
-/// panics so the failure stays loud instead of being silently skipped.
-fn try_lock_or_none<'a, T>(
-    lock: &'a std::sync::Mutex<T>,
-    what: &str,
-) -> Option<std::sync::MutexGuard<'a, T>> {
-    match lock.try_lock() {
-        Ok(guard) => Some(guard),
-        Err(std::sync::TryLockError::WouldBlock) => None,
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-            panic!("{} poisoned: {}", what, poisoned)
-        }
-    }
-}
-
-fn acquire_mutation_lock<'a>(
+pub(super) fn acquire_mutation_lock<'a>(
     state: &'a TableSegmentState,
     key: &str,
 ) -> Result<std::sync::MutexGuard<'a, ()>> {
@@ -1882,34 +1923,57 @@ fn acquire_mutation_lock<'a>(
     let warn_after = Duration::from_secs(timeouts.mutation_lock_warn_secs.max(1));
     let start = Instant::now();
     let mut backoff = Duration::from_millis(1);
+    // Uncontended fast path: taken only while no waiter is queued, so a
+    // fresh arrival cannot barge ahead of the queue head.
+    if state.mutation_lock.queue_empty() {
+        if let Ok(guard) = state.mutation_lock.try_lock() {
+            return Ok(guard);
+        }
+    }
+    let mut ticket = state.mutation_lock.enter_queue();
     loop {
-        match state.mutation_lock.try_lock() {
-            Ok(guard) => {
-                let waited = start.elapsed();
-                if waited >= warn_after {
-                    tracing::warn!(
-                        table = key,
-                        wait_ms = waited.as_millis() as u64,
-                        "table mutation lock acquisition was slow"
-                    );
+        // Only the queue head polls the mutex; later arrivals sleep until
+        // the head acquires or abandons the wait, so they cannot overtake
+        // it no matter how long the contention lasts.
+        if ticket.is_head() {
+            match state.mutation_lock.try_lock() {
+                Ok(guard) => {
+                    let waited = start.elapsed();
+                    if waited >= warn_after {
+                        tracing::warn!(
+                            table = key,
+                            wait_ms = waited.as_millis() as u64,
+                            "table mutation lock acquisition was slow"
+                        );
+                    }
+                    // Hand the head position over before returning: the
+                    // successor starts polling while this guard is still
+                    // held, picking the mutex up within one poll tick of
+                    // the release.
+                    ticket.release();
+                    return Ok(guard);
                 }
-                return Ok(guard);
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {
-                if start.elapsed() >= timeout {
-                    return Err(TaibaiError::ResourceBusy(format!(
-                        "table mutation lock timeout after {}ms waiting on {}",
-                        timeout.as_millis(),
-                        key
-                    )));
+                Err(std::sync::TryLockError::WouldBlock) => {}
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    panic!("table mutation lock poisoned: {}", poisoned)
                 }
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_millis(16));
-            }
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                panic!("table mutation lock poisoned: {}", poisoned)
             }
         }
+        if start.elapsed() >= timeout {
+            return Err(TaibaiError::ResourceBusy(format!(
+                "table mutation lock timeout after {}ms waiting on {}",
+                timeout.as_millis(),
+                key
+            )));
+        }
+        // A queued writer whose client disconnected (or whose
+        // statement deadline expired) must leave the queue at the
+        // next poll instead of occupying it until the lock timeout.
+        // Background callers (flusher/compactor) run without an
+        // ambient context, where this check is a no-op.
+        crate::common::query_cancel::check()?;
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(16));
     }
 }
 
@@ -1920,8 +1984,17 @@ fn acquire_mutation_lock<'a>(
 /// wait. A long-held partition lock (slow partition-scoped mutation) must
 /// surface as an explicit timeout instead of freezing every partition
 /// writer behind the raised gate for the same duration.
+///
+/// This path deliberately bypasses the partition mutex's FIFO queue: the
+/// gate already parks every queued partition writer (they re-check
+/// `partition_gate` before polling and never touch the mutex while it is
+/// raised), so the collector can always win the mutex within one poll tick.
+/// Going through the queue instead would deadlock — the queue head would
+/// park on the gate while the gate holder waits behind that same head for
+/// the mutex. Fresh partition writers cannot starve the collector either:
+/// the gate flag keeps them out of the fast path entirely.
 pub(super) fn acquire_partition_lock_for_wide_gate<'a>(
-    lock: &'a std::sync::Mutex<()>,
+    lock: &'a FairMutex,
     key: &str,
     partition_key: &str,
     timeout: Duration,
@@ -1947,6 +2020,7 @@ pub(super) fn acquire_partition_lock_for_wide_gate<'a>(
                 partition_key
             )));
         }
+        crate::common::query_cancel::check()?;
         std::thread::sleep(backoff);
         backoff = (backoff * 2).min(Duration::from_millis(16));
     }
@@ -1958,7 +2032,7 @@ pub(super) fn acquire_partition_lock_for_wide_gate<'a>(
 pub(super) fn partition_mutation_lock_arc(
     state: &TableSegmentState,
     partition_key: &str,
-) -> Arc<std::sync::Mutex<()>> {
+) -> Arc<FairMutex> {
     if let Some(lock) = state.partition_locks.read().unwrap().get(partition_key) {
         return Arc::clone(lock);
     }
@@ -1966,19 +2040,27 @@ pub(super) fn partition_mutation_lock_arc(
     Arc::clone(
         registry
             .entry(partition_key.to_string())
-            .or_insert_with(|| Arc::new(std::sync::Mutex::new(()))),
+            .or_insert_with(|| Arc::new(FairMutex::new())),
     )
 }
 
 /// Acquire a partition mutation lock with the same bounded wait, slow-lock
 /// warning, and timeout error as the table-wide mutation lock, so partition
-/// lock queueing is equally visible in the server log. After acquiring the
-/// mutex the writer re-checks the table's wide-gate flag: a table-wide
-/// mutation operation that has already snapshotted this partition holds the
-/// mutex, so the writer releases and retries until the gate clears.
+/// lock queueing is equally visible in the server log. Admission goes
+/// through the partition mutex's FIFO queue: the oldest queued writer polls
+/// the mutex, later arrivals wait behind it, and an abandoned wait (cancel
+/// or timeout) leaves the ticket so the successor takes over. After
+/// acquiring the mutex the writer re-checks the table's wide-gate flag: a
+/// table-wide mutation operation that has already snapshotted this
+/// partition holds the mutex, so the writer releases and retries until the
+/// gate clears. While the gate is raised a queued writer stays parked
+/// without touching the mutex, which is what lets the wide-gate collector
+/// (which bypasses the queue, see
+/// [`acquire_partition_lock_for_wide_gate`]) take the mutex instead of
+/// deadlocking against the queue head.
 pub(super) fn acquire_partition_mutation_lock<'a>(
     state: &TableSegmentState,
-    lock: &'a std::sync::Mutex<()>,
+    lock: &'a FairMutex,
     key: &str,
     partition_key: &str,
 ) -> Result<std::sync::MutexGuard<'a, ()>> {
@@ -1987,26 +2069,48 @@ pub(super) fn acquire_partition_mutation_lock<'a>(
     let warn_after = Duration::from_secs(timeouts.mutation_lock_warn_secs.max(1));
     let start = Instant::now();
     let mut backoff = Duration::from_millis(1);
-    loop {
-        match lock.try_lock() {
-            Ok(guard) => {
-                if !state.partition_gate.load(Ordering::Acquire) {
-                    let waited = start.elapsed();
-                    if waited >= warn_after {
-                        tracing::warn!(
-                            table = key,
-                            partition = partition_key,
-                            wait_ms = waited.as_millis() as u64,
-                            "partition mutation lock acquisition was slow"
-                        );
-                    }
-                    return Ok(guard);
-                }
-                drop(guard);
+    // Uncontended fast path: only while no waiter is queued and the wide
+    // gate is clear, so a fresh arrival can neither barge ahead of the
+    // queue head nor slip under the gate.
+    if lock.queue_empty() && !state.partition_gate.load(Ordering::Acquire) {
+        if let Ok(guard) = lock.try_lock() {
+            if !state.partition_gate.load(Ordering::Acquire) {
+                return Ok(guard);
             }
-            Err(std::sync::TryLockError::WouldBlock) => {}
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                panic!("partition mutation lock poisoned: {}", poisoned)
+            drop(guard);
+        }
+    }
+    let mut ticket = lock.enter_queue();
+    loop {
+        // While the wide gate is raised, stay parked without polling the
+        // mutex: the gate holder collects partition mutexes through the
+        // queue-bypassing path above, and a queued head that kept polling
+        // could hold the admission against the very operation the gate is
+        // freezing the table for.
+        if !state.partition_gate.load(Ordering::Acquire) && ticket.is_head() {
+            match lock.try_lock() {
+                Ok(guard) => {
+                    if !state.partition_gate.load(Ordering::Acquire) {
+                        let waited = start.elapsed();
+                        if waited >= warn_after {
+                            tracing::warn!(
+                                table = key,
+                                partition = partition_key,
+                                wait_ms = waited.as_millis() as u64,
+                                "partition mutation lock acquisition was slow"
+                            );
+                        }
+                        ticket.release();
+                        return Ok(guard);
+                    }
+                    // The gate rose between the checks: release the mutex
+                    // and stay queued until it clears.
+                    drop(guard);
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    panic!("partition mutation lock poisoned: {}", poisoned)
+                }
             }
         }
         if start.elapsed() >= timeout {
@@ -2017,6 +2121,7 @@ pub(super) fn acquire_partition_mutation_lock<'a>(
                 partition_key
             )));
         }
+        crate::common::query_cancel::check()?;
         std::thread::sleep(backoff);
         backoff = (backoff * 2).min(Duration::from_millis(16));
     }
@@ -2083,12 +2188,16 @@ pub(crate) fn recover_replace_journals(table_dir: &Path) {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let Some(final_name) = name.strip_suffix(".replace") else {
+        let Some(final_name) = name
+            .strip_suffix(".replace")
+            .or_else(|| name.strip_suffix(".retire"))
+        else {
             continue;
         };
         let final_path = table_dir.join(final_name);
+        let committed = name.ends_with(".retire") || final_path.exists();
         let Some(olds) = read_replace_journal(&path) else {
-            if final_path.exists() {
+            if committed {
                 // The journal is written BEFORE the rename, so a journal whose
                 // final segment exists means the replacement committed — but an
                 // unreadable journal (torn write / CRC mismatch) leaves the old
@@ -2098,9 +2207,6 @@ pub(crate) fn recover_replace_journals(table_dir: &Path) {
                 // every startup instead.
                 let corrupt = path.with_extension("replace.corrupt");
                 let preserved = std::fs::rename(&path, &corrupt).is_ok();
-                if !preserved {
-                    let _ = std::fs::remove_file(&path);
-                }
                 tracing::error!(
                     journal = %path.display(),
                     preserved_as = %corrupt.display(),
@@ -2121,23 +2227,25 @@ pub(crate) fn recover_replace_journals(table_dir: &Path) {
             }
             continue;
         };
-        if final_path.exists() {
-            for old in &olds {
-                if old != &final_path && old.exists() {
-                    tracing::warn!(
-                        old_segment = %old.display(),
-                        "startup recovery: retiring old segment left by interrupted replacement"
-                    );
-                    let _ = std::fs::remove_file(old);
-                    let _ = remove_sidecar_meta(old);
-                }
-            }
+        if committed {
+            // Table/database renames move journals with the directory. Never
+            // let their old absolute paths retire a newly recreated table at
+            // the former location.
+            let olds = olds
+                .iter()
+                .filter_map(|old| old.file_name().map(|name| table_dir.join(name)))
+                .collect();
+            let _ = crate::storage::segment::snapshot::with_directory(table_dir, |directory| {
+                directory.retire(path.clone(), olds);
+                Ok(())
+            });
+        } else {
+            let _ = std::fs::remove_file(&path);
         }
-        let _ = std::fs::remove_file(&path);
     }
 }
 
-fn read_replace_journal(journal: &Path) -> Option<Vec<PathBuf>> {
+pub(crate) fn read_replace_journal(journal: &Path) -> Option<Vec<PathBuf>> {
     let bytes = std::fs::read(journal).ok()?;
     if bytes.len() < 8 + 4 + 4 || !bytes.starts_with(REPLACE_JOURNAL_MAGIC) {
         return None;
@@ -2189,6 +2297,10 @@ use crate::storage::segment::reader::FooterRewriteMode;
 /// Test-only re-exports of the replacement journal internals.
 #[cfg(test)]
 pub mod manager_core_test_support {
+    pub(in crate::storage::segment_manager) use super::{
+        acquire_mutation_lock as acquire_mutation_lock_for_test,
+        acquire_partition_mutation_lock as acquire_partition_mutation_lock_for_test,
+    };
     pub(crate) use super::{
         recover_replace_journals as recover_replace_journals_for_test,
         replace_journal_path as replace_journal_path_for_test,

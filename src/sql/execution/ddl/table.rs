@@ -641,9 +641,6 @@ pub fn exec_drop_table(
             )));
         } else {
             tracing::info!(db, table = name, path = %tombstone.display(), elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed staged table directory");
-            if let Some(root) = tombstone.parent() {
-                let _ = std::fs::remove_dir(root);
-            }
         }
     }
 
@@ -820,9 +817,6 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
             "rename committed but recovery journal cleanup was deferred"
         );
     }
-    if let Some(root) = operation_dir.parent() {
-        let _ = std::fs::remove_dir(root);
-    }
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
 
@@ -971,9 +965,6 @@ pub(super) fn exec_partition_change(
             operation_dir.display(),
             error
         )));
-    }
-    if let Some(root) = operation_dir.parent() {
-        let _ = std::fs::remove_dir(root);
     }
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
@@ -1660,9 +1651,6 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
             operation_dir.display(),
             error
         )));
-    }
-    if let Some(root) = operation_dir.parent() {
-        let _ = std::fs::remove_dir(root);
     }
 
     Ok(ExecResult::Ok { rows_affected: 0 })

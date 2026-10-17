@@ -327,6 +327,24 @@ impl SegmentManager {
         self.seal_pending_writers_outside_locks(pending_seal, None)
     }
 
+    pub(crate) fn seal_partition_active(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+    ) -> Result<u64> {
+        let state = self.get_or_create_state(&table_key(db, table));
+        let pending = self.with_partition_mutation_lock(db, table, partition_key, || {
+            let mut active = state.active_segments.lock().unwrap();
+            Ok(extract_pending_seals(
+                &state,
+                &mut active,
+                &[partition_key.to_string()],
+            ))
+        })?;
+        self.seal_pending_writers_outside_locks(pending, None)
+    }
+
     pub fn flush_all_active(&self) -> Result<u64> {
         let mut total = 0u64;
         let states = self.table_states_snapshot();

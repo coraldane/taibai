@@ -87,6 +87,80 @@ fn apply_partition_pruning(plan: LogicalPlan) -> (LogicalPlan, bool) {
     }
 }
 
+/// Coerce a predicate literal to the column's type before it feeds
+/// time-range / partition pruning. A VarChar literal against a Timestamp or
+/// Date column parses via the same smart parser INSERT uses; Decimal scales
+/// integers/floats. Returns `None` for combinations we can't coerce — the
+/// caller then skips pruning entirely instead of comparing mistyped values
+/// (a VarChar bound in a TimeRange made every Timestamp row group vanish).
+fn coerce_literal_for_column(
+    value: &ScalarValue,
+    schema: &Schema,
+    idx: usize,
+) -> Option<ScalarValue> {
+    use crate::protocol::types::DataType;
+    use crate::sql::execution::functions::date::{datetime_string_to_days, parse_timestamp_smart};
+    let column = schema.columns.get(idx)?;
+    match (&column.data_type, value) {
+        (DataType::Timestamp, ScalarValue::VarChar(Some(text))) => {
+            Some(ScalarValue::Timestamp(parse_timestamp_smart(text, 0)))
+        }
+        (DataType::Date, ScalarValue::VarChar(Some(text))) => {
+            Some(ScalarValue::Date(datetime_string_to_days(text, 0)))
+        }
+        (DataType::Decimal, ScalarValue::Int64(Some(raw))) => {
+            let multiplier = 10_i64.checked_pow(column.scale.max(0) as u32)?;
+            raw.checked_mul(multiplier)
+                .map(|v| ScalarValue::Decimal(Some(v)))
+        }
+        (DataType::Decimal, ScalarValue::Float64(Some(v))) => {
+            let multiplier = 10_i64.checked_pow(column.scale.max(0) as u32)?;
+            Some(ScalarValue::Decimal(Some(
+                (*v * multiplier as f64).round() as i64
+            )))
+        }
+        // Integer-family widening: an Int64 predicate bound on an Int32
+        // partition column (and vice versa) is exact whenever the value fits.
+        (
+            target @ (DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64),
+            ScalarValue::Int64(Some(v)),
+        ) if matches!(
+            value,
+            ScalarValue::Int64(_)
+                | ScalarValue::Int32(_)
+                | ScalarValue::Int16(_)
+                | ScalarValue::Int8(_)
+        ) =>
+        {
+            let raw = *v;
+            let fits = match target {
+                DataType::Int8 => i8::try_from(raw).is_ok(),
+                DataType::Int16 => i16::try_from(raw).is_ok(),
+                DataType::Int32 => i32::try_from(raw).is_ok(),
+                DataType::Int64 => true,
+                DataType::UInt8 => u8::try_from(raw).is_ok(),
+                DataType::UInt16 => u16::try_from(raw).is_ok(),
+                DataType::UInt32 => u32::try_from(raw).is_ok(),
+                _ => u64::try_from(raw).is_ok(),
+            };
+            if fits {
+                Some(ScalarValue::Int64(Some(raw)))
+            } else {
+                None
+            }
+        }
+        (dt, v) if *dt == v.data_type() => Some(v.clone()),
+        _ => None,
+    }
+}
+
 fn extract_time_range(expr: &LogicalExpr, schema: &Schema) -> Option<TimeRange> {
     if let LogicalExpr::BinaryOp { left, op, right } = expr {
         match op {
@@ -94,9 +168,10 @@ fn extract_time_range(expr: &LogicalExpr, schema: &Schema) -> Option<TimeRange> 
                 if let LogicalExpr::Column(idx) = **left {
                     if let LogicalExpr::Literal(ref val) = **right {
                         let col_name = schema.columns.get(idx)?.name.clone();
+                        let coerced = coerce_literal_for_column(val, schema, idx)?;
                         return Some(TimeRange {
                             column: col_name,
-                            start: Some(val.clone()),
+                            start: Some(coerced),
                             end: None,
                         });
                     }
@@ -106,10 +181,11 @@ fn extract_time_range(expr: &LogicalExpr, schema: &Schema) -> Option<TimeRange> 
                 if let LogicalExpr::Column(idx) = **left {
                     if let LogicalExpr::Literal(ref val) = **right {
                         let col_name = schema.columns.get(idx)?.name.clone();
+                        let coerced = coerce_literal_for_column(val, schema, idx)?;
                         return Some(TimeRange {
                             column: col_name,
                             start: None,
-                            end: Some(val.clone()),
+                            end: Some(coerced),
                         });
                     }
                 }
@@ -141,18 +217,20 @@ fn extract_partition_filter(expr: &LogicalExpr, schema: &Schema) -> Option<Parti
                 if let LogicalExpr::Column(idx) = **left {
                     if let LogicalExpr::Literal(ref val) = **right {
                         let col_name = schema.columns.get(idx)?.name.clone();
+                        let coerced = coerce_literal_for_column(val, schema, idx)?;
                         return Some(PartitionFilter {
                             column: col_name,
-                            values: vec![val.clone()],
+                            values: vec![coerced],
                         });
                     }
                 }
                 if let LogicalExpr::Column(idx) = **right {
                     if let LogicalExpr::Literal(ref val) = **left {
                         let col_name = schema.columns.get(idx)?.name.clone();
+                        let coerced = coerce_literal_for_column(val, schema, idx)?;
                         return Some(PartitionFilter {
                             column: col_name,
-                            values: vec![val.clone()],
+                            values: vec![coerced],
                         });
                     }
                 }
@@ -187,9 +265,13 @@ fn extract_partition_filter(expr: &LogicalExpr, schema: &Schema) -> Option<Parti
         } => {
             if let LogicalExpr::Column(idx) = **expr {
                 let col_name = schema.columns.get(idx)?.name.clone();
+                let coerced: Option<Vec<ScalarValue>> = values
+                    .iter()
+                    .map(|v| coerce_literal_for_column(v, schema, idx))
+                    .collect();
                 return Some(PartitionFilter {
                     column: col_name,
-                    values: values.clone(),
+                    values: coerced?,
                 });
             }
         }

@@ -151,17 +151,17 @@ fn arith_scalar_float_and_decimal_classes() {
         ColumnArray::Float64 { data, .. } => assert_eq!(data[0], 3.0),
         _ => panic!("expected Float64 result"),
     }
-    // Decimal column + integer literal stays in the unscaled integer domain,
-    // exactly like the scalar path (integer_i128 on both sides).
+    // Decimal columns are refused: their arithmetic is scale-aware and
+    // handled by the projection operator, which owns the operand scales.
+    // Raw integer math here would silently drop the scale.
     let mut decimal = ColumnArray::empty(crate::protocol::types::DataType::Decimal);
     decimal.push(&ScalarValue::Decimal(Some(150))).unwrap();
-    let dec_add = decimal
-        .arith_scalar(ArithOp::Add, &ScalarValue::Int64(Some(1)))
-        .unwrap();
-    match &dec_add {
-        ColumnArray::Int64 { data, .. } => assert_eq!(data[0], 151),
-        _ => panic!("expected Int64 result"),
-    }
+    assert!(
+        decimal
+            .arith_scalar(ArithOp::Add, &ScalarValue::Int64(Some(1)))
+            .is_none(),
+        "decimal arithmetic must fall back to the scale-aware path"
+    );
 }
 
 #[test]

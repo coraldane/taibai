@@ -1150,3 +1150,154 @@ impl Handler {
         )
     }
 }
+
+#[test]
+fn dropped_bulk_handler_releases_session_without_disconnect_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let mut handler = logged_in_handler(
+        Arc::new(ServerConfig::default()),
+        Arc::clone(&engine),
+        "root",
+    );
+    ok_rows(
+        &handler
+            .handle_start_bulk_import("START BULK IMPORT")
+            .unwrap(),
+    );
+    assert_eq!(engine.bulk_mode_session_count(), 1);
+    drop(handler);
+    assert_eq!(engine.bulk_mode_session_count(), 0);
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn set_streaming_results_toggles_session_flag() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let mut handler = logged_in_handler(
+        Arc::new(ServerConfig::default()),
+        Arc::clone(&engine),
+        "root",
+    );
+
+    let run = |handler: &mut Handler, sql: &str| -> Message {
+        let mut payload = Vec::new();
+        write_len_prefixed_string(&mut payload, "");
+        write_len_prefixed_string(&mut payload, sql);
+        handler
+            .handle_message_cancellable(
+                Message::new(MSG_TYPE_QUERY, Bytes::from(payload)),
+                Arc::new(crate::common::query_cancel::QueryContext::new(Arc::new(
+                    AtomicBool::new(false),
+                ))),
+                None,
+            )
+            .unwrap()
+            .remove(0)
+    };
+
+    assert_eq!(
+        run(&mut handler, "SET streaming_results = true").msg_type,
+        MSG_TYPE_OK
+    );
+    assert!(handler.session.as_ref().unwrap().streaming_results);
+
+    assert_eq!(
+        run(&mut handler, "SET STREAMING_RESULTS = off").msg_type,
+        MSG_TYPE_OK
+    );
+    assert!(!handler.session.as_ref().unwrap().streaming_results);
+
+    assert_eq!(
+        run(&mut handler, "SET SESSION streaming_results=1").msg_type,
+        MSG_TYPE_OK
+    );
+    assert!(handler.session.as_ref().unwrap().streaming_results);
+
+    let rejected = run(&mut handler, "SET streaming_results = banana");
+    assert_eq!(rejected.msg_type, MSG_TYPE_ERROR);
+    assert!(
+        handler.session.as_ref().unwrap().streaming_results,
+        "an invalid SET value must leave the previous setting unchanged"
+    );
+
+    let unknown = run(&mut handler, "SET autocommit = 1");
+    assert_eq!(unknown.msg_type, MSG_TYPE_ERROR);
+}
+
+#[test]
+fn streaming_splits_oversized_batches_into_frame_sized_chunks() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let mut config = ServerConfig::default();
+    config.server.max_message_size = 256;
+    let mut handler = logged_in_handler(Arc::new(config), Arc::clone(&engine), "root");
+    handler.session.as_mut().unwrap().streaming_results = true;
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "CREATE TABLE split_rows (id INT64)",
+        )
+        .unwrap();
+    let values = (0..200)
+        .map(|i| format!("({i})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            &format!("INSERT INTO split_rows VALUES {values}"),
+        )
+        .unwrap();
+
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let consumer = std::thread::spawn(move || {
+        let mut chunks = Vec::new();
+        while let Some(message) = receiver.blocking_recv() {
+            chunks.push(message);
+        }
+        chunks
+    });
+    let mut payload = Vec::new();
+    write_len_prefixed_string(&mut payload, "");
+    write_len_prefixed_string(&mut payload, "SELECT id FROM split_rows");
+    let responses = handler
+        .handle_message_cancellable(
+            Message::new(MSG_TYPE_QUERY, Bytes::from(payload)),
+            Arc::new(crate::common::query_cancel::QueryContext::new(Arc::new(
+                AtomicBool::new(false),
+            ))),
+            Some(sender),
+        )
+        .unwrap();
+    drop(handler);
+    let chunks = consumer.join().unwrap();
+
+    assert!(
+        chunks.len() >= 2,
+        "oversized batch must split, got {}",
+        chunks.len()
+    );
+    assert!(chunks
+        .iter()
+        .all(|message| message.msg_type == MSG_TYPE_RESULT_CHUNK && message.payload.len() <= 256));
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].msg_type, MSG_TYPE_RESULT_END);
+
+    let mut rows = Vec::new();
+    for chunk in &chunks {
+        let crate::net::client::QueryResult::Rows { batches, .. } =
+            crate::net::client::parse_binary_result(&chunk.payload).unwrap()
+        else {
+            panic!("chunk did not decode to rows")
+        };
+        for batch in batches {
+            for row in 0..batch.num_rows() {
+                rows.push(batch.scalar(row, 0).unwrap());
+            }
+        }
+    }
+    let expected: Vec<ScalarValue> = (0..200).map(|i| ScalarValue::Int64(Some(i))).collect();
+    assert_eq!(rows, expected);
+}

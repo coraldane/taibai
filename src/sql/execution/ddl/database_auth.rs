@@ -45,9 +45,6 @@ pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Resul
                     error
                 ))
             })?;
-            if let Some(root) = tombstone.parent() {
-                let _ = std::fs::remove_dir(root);
-            }
             return Ok(ExecResult::Ok { rows_affected: 0 });
         }
         if if_exists {
@@ -185,9 +182,6 @@ pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Resul
                 tombstone.display(),
                 error
             )));
-        }
-        if let Some(root) = tombstone.parent() {
-            let _ = std::fs::remove_dir(root);
         }
     }
 

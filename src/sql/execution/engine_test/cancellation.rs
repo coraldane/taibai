@@ -1,7 +1,7 @@
 use super::*;
 
 /// A cancelled SELECT aborts at the first safe point instead of running to
-/// completion, while an INSERT already past materialization runs to the end
+/// completion, while an INSERT already in its commit phase runs to the end
 /// (commit phases are not cancellable) and the row becomes visible.
 #[test]
 fn select_cancels_but_inflight_insert_commits() -> Result<()> {
@@ -15,7 +15,7 @@ fn select_cancels_but_inflight_insert_commits() -> Result<()> {
     let context = Arc::new(crate::common::query_cancel::QueryContext::new(
         cancelled.clone(),
     ));
-    let _guard = crate::common::query_cancel::QueryCancellationGuard::enter(context);
+    let _guard = crate::common::query_cancel::QueryCancellationGuard::enter(Arc::clone(&context));
     cancelled.store(true, std::sync::atomic::Ordering::Release);
 
     let select_error = engine
@@ -26,6 +26,11 @@ fn select_cancels_but_inflight_insert_commits() -> Result<()> {
         "unexpected error: {select_error}"
     );
 
+    let error = engine
+        .execute(&mut session, "INSERT INTO cancel_t VALUES (2)")
+        .unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+    context.enter_phase(crate::common::query_cancel::QueryPhase::Committing);
     engine.execute(&mut session, "INSERT INTO cancel_t VALUES (2)")?;
     cancelled.store(false, std::sync::atomic::Ordering::Release);
     assert_eq!(
@@ -53,7 +58,7 @@ fn statement_deadline_cancels_reads_and_protects_writes() -> Result<()> {
         crate::common::query_cancel::QueryContext::new(cancelled)
             .with_deadline(Some(std::time::Instant::now())),
     );
-    let _guard = crate::common::query_cancel::QueryCancellationGuard::enter(context);
+    let _guard = crate::common::query_cancel::QueryCancellationGuard::enter(Arc::clone(&context));
 
     let select_error = engine
         .execute(&mut session, "SELECT id FROM deadline_t WHERE id >= 0")
@@ -63,6 +68,11 @@ fn statement_deadline_cancels_reads_and_protects_writes() -> Result<()> {
         "unexpected error: {select_error}"
     );
 
+    let error = engine
+        .execute(&mut session, "INSERT INTO deadline_t VALUES (7)")
+        .unwrap_err();
+    assert!(error.to_string().contains("statement timeout"));
+    context.enter_phase(crate::common::query_cancel::QueryPhase::Committing);
     engine.execute(&mut session, "INSERT INTO deadline_t VALUES (7)")?;
     drop(_guard);
     assert_eq!(

@@ -597,7 +597,9 @@ fn min_max_bool_column_folds_correctly() {
 
     for stage in ["memtable", "flushed"] {
         if stage == "flushed" {
-            engine.execute(&mut session, "FLUSH TABLE flags").expect("flush");
+            engine
+                .execute(&mut session, "FLUSH TABLE flags")
+                .expect("flush");
         }
         let (_schema, rows) = collect_rows(
             engine
@@ -608,4 +610,44 @@ fn min_max_bool_column_folds_correctly() {
         assert_eq!(rows[0][0], ScalarValue::Bool(Some(false)), "{stage}: MIN");
         assert_eq!(rows[0][1], ScalarValue::Bool(Some(true)), "{stage}: MAX");
     }
+}
+
+#[test]
+fn decimal_multiplication_rescales_when_result_scale_is_capped() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE decimal_products (id INT, a DECIMAL(18,10), b DECIMAL(18,10))",
+        )
+        .unwrap();
+    engine.execute(&mut session,
+        "INSERT INTO decimal_products VALUES (1, 0.1, 0.1), (2, 1.0, 1.0), (3, -0.1, 0.1), (4, NULL, 1.0)"
+    ).unwrap();
+    for flushed in [false, true] {
+        if flushed {
+            engine
+                .execute(&mut session, "FLUSH TABLE decimal_products")
+                .unwrap();
+        }
+        let (schema, rows) = collect_rows(
+            engine
+                .execute(
+                    &mut session,
+                    "SELECT a * b FROM decimal_products ORDER BY id",
+                )
+                .unwrap(),
+        );
+        assert_eq!(schema.columns[0].scale, 18);
+        assert_eq!(
+            rows,
+            vec![
+                vec![ScalarValue::Decimal(Some(10_000_000_000_000_000))],
+                vec![ScalarValue::Decimal(Some(1_000_000_000_000_000_000))],
+                vec![ScalarValue::Decimal(Some(-10_000_000_000_000_000))],
+                vec![ScalarValue::Decimal(None)],
+            ]
+        );
+    }
+    engine.segment_mgr().shutdown();
 }

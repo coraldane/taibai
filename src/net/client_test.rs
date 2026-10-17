@@ -41,3 +41,62 @@ fn parses_binary_decimal_result() {
         ScalarValue::Decimal(Some(12345))
     );
 }
+
+fn int64_batch(name: &str, values: std::ops::Range<i64>) -> RecordBatch {
+    let schema = Schema::new(vec![ColumnDef::new(name, DataType::Int64)]);
+    let mut batch = RecordBatch::new(schema);
+    for value in values {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(value)))
+            .unwrap();
+    }
+    batch
+}
+
+#[test]
+fn result_chunks_merge_and_enforce_schema_stability() {
+    let mut stream_schema = None;
+    let mut batches = Vec::new();
+
+    let first = Message::new(
+        MSG_TYPE_RESULT_CHUNK,
+        Bytes::from(crate::protocol::result::encode_binary_result(&int64_batch(
+            "id",
+            0..3,
+        ))),
+    );
+    merge_result_chunk(&first, &mut stream_schema, &mut batches).unwrap();
+
+    let second = Message::new(
+        MSG_TYPE_RESULT_CHUNK,
+        Bytes::from(crate::protocol::result::encode_binary_result(&int64_batch(
+            "id",
+            3..5,
+        ))),
+    );
+    merge_result_chunk(&second, &mut stream_schema, &mut batches).unwrap();
+
+    let schema = stream_schema.clone().expect("first chunk sets the schema");
+    assert_eq!(schema.columns[0].name, "id");
+    let total: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(total, 5);
+
+    let renamed = Message::new(
+        MSG_TYPE_RESULT_CHUNK,
+        Bytes::from(crate::protocol::result::encode_binary_result(&int64_batch(
+            "amount",
+            5..6,
+        ))),
+    );
+    let error = merge_result_chunk(&renamed, &mut stream_schema, &mut batches)
+        .expect_err("a schema change mid-stream must fail");
+    assert!(error.to_string().contains("schema changed"), "{error}");
+
+    let garbage = Message::new(MSG_TYPE_RESULT_CHUNK, Bytes::from_static(b"not-a-result"));
+    assert!(
+        merge_result_chunk(&garbage, &mut stream_schema, &mut batches).is_err(),
+        "a non-rows chunk payload must fail instead of silently merging"
+    );
+}

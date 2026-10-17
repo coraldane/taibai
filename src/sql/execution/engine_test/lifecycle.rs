@@ -230,7 +230,7 @@ fn optimize_partition_does_not_freeze_other_partitions() -> Result<()> {
     let held = engine
         .segment_mgr()
         .partition_lock_arc_for_tests("main", "opt_freeze", "1");
-    let held_guard = held.lock().unwrap();
+    let held_guard = held.lock_for_test();
 
     let (done_tx, done_rx) = mpsc::channel::<bool>();
     let optimize_engine = Arc::clone(&engine);
@@ -386,7 +386,7 @@ fn delete_partition_eq_does_not_freeze_other_partitions() -> Result<()> {
     let held = engine
         .segment_mgr()
         .partition_lock_arc_for_tests("main", "del_freeze", "1");
-    let held_guard = held.lock().unwrap();
+    let held_guard = held.lock_for_test();
 
     let (done_tx, done_rx) = mpsc::channel::<bool>();
     let delete_engine = Arc::clone(&engine);
@@ -423,5 +423,132 @@ fn delete_partition_eq_does_not_freeze_other_partitions() -> Result<()> {
         ),
         2
     );
+    Ok(())
+}
+
+#[test]
+fn optimize_partition_accepts_quoted_key_and_reports_granularity() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    // YEAR bucketing: the physical partition key is the 4-digit year, not
+    // the YYYYMMDD source value. A quoted DAY-style name must be rejected
+    // with the available partitions listed, and the quoted year must work.
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t_stock_minute (security_id STRING, deal_date INT64) PARTITION BY YEAR(deal_date)",
+    )?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t_stock_minute VALUES ('000529.SZ', 20261008)",
+    )?;
+    engine.execute(&mut session, "FLUSH TABLE t_stock_minute")?;
+
+    let day_style = engine
+        .execute(
+            &mut session,
+            "OPTIMIZE TABLE t_stock_minute ON PARTITION '20261008'",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        day_style.contains("partition '20261008' not found"),
+        "day-style key must be rejected, got: {}",
+        day_style
+    );
+    assert!(
+        day_style.contains("available partitions: 2026"),
+        "error must list the year-granularity partitions, got: {}",
+        day_style
+    );
+
+    engine.execute(
+        &mut session,
+        "OPTIMIZE TABLE t_stock_minute ON PARTITION '2026'",
+    )?;
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t_stock_minute")?,
+            0,
+            0
+        ),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn show_partitions_lists_sealed_and_active_partitions() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE minute_year (security_id STRING, deal_date INT64) PARTITION BY YEAR(deal_date)",
+    )?;
+    engine.execute(&mut session, "CREATE TABLE unpartitioned (id INT64)")?;
+
+    // Rows still in the active writer must already show up, so the user can
+    // discover the partition name before any flush.
+    engine.execute(
+        &mut session,
+        "INSERT INTO minute_year VALUES ('A', 20261008)",
+    )?;
+    let result = engine.execute(&mut session, "SHOW PARTITIONS FROM minute_year")?;
+    let ExecResult::Query { batches, .. } = &result else {
+        panic!("expected query result");
+    };
+    assert_eq!(batches[0].num_rows(), 1, "active partition must be listed");
+    assert_eq!(
+        batches[0]
+            .scalar(0, 1)
+            .and_then(|value| value.to_text())
+            .unwrap(),
+        "2026"
+    );
+
+    engine.execute(&mut session, "FLUSH TABLE minute_year")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO minute_year VALUES ('B', 20250102)",
+    )?;
+
+    let result = engine.execute(&mut session, "SHOW PARTITIONS FROM minute_year")?;
+    let ExecResult::Query { batches, .. } = &result else {
+        panic!("expected query result");
+    };
+    assert_eq!(batches[0].num_rows(), 2);
+    // BTreeMap ordering: 2025 (active, 1 row) before 2026 (sealed, 1 row).
+    let text = |row: usize, col: usize| {
+        batches[0]
+            .scalar(row, col)
+            .and_then(|value| value.to_text())
+            .unwrap()
+    };
+    assert_eq!(text(0, 1), "2025");
+    assert_eq!(text(0, 2), "1");
+    assert_eq!(text(1, 1), "2026");
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM minute_year")?,
+            0,
+            0
+        ),
+        2
+    );
+
+    // Non-partitioned tables never appear, per-table or database-wide.
+    let result = engine.execute(&mut session, "SHOW PARTITIONS FROM unpartitioned")?;
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result");
+    };
+    assert_eq!(batches[0].num_rows(), 0);
+    let result = engine.execute(&mut session, "SHOW PARTITIONS")?;
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result");
+    };
+    assert_eq!(batches[0].num_rows(), 2);
     Ok(())
 }

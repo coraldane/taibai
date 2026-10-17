@@ -77,6 +77,18 @@ CREATE TABLE users (
 ) PARTITION BY HASH(id, 8);
 ```
 
+分区名（分区 key）由分区表达式决定，也是 `OPTIMIZE TABLE ... ON PARTITION` 与 `SHOW PARTITIONS` 使用的名字：
+
+| 分区方式 | 分区名 | 示例 |
+| --- | --- | --- |
+| `PARTITION BY col`（按列值） | 列值本身 | `20261008` |
+| `PARTITION BY DAY(col)` | `YYYYMMDD`（8 位） | `20261008` |
+| `PARTITION BY MONTH(col)` | `YYYYMM`（6 位） | `202610` |
+| `PARTITION BY YEAR(col)` | `YYYY`（4 位） | `2026` |
+| `PARTITION BY MOD/HASH` | 桶编号 | `3` |
+
+注意分区粒度跟随建表表达式：`PARTITION BY YEAR(deal_date)` 的表不存在 `20261008` 这样的天级分区，按天优化需建表时使用 `PARTITION BY DAY(deal_date)`。可用 `SHOW PARTITIONS FROM 表名` 查看当前全部分区名。
+
 ## TTL
 
 基于时间列的过期清理，时长为正整数秒。以下写法等价：

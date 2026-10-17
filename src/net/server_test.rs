@@ -312,8 +312,8 @@ async fn disconnect_during_capacity_wait_still_flushes_bulk_import() {
 async fn kill_query_cancels_a_queued_request() {
     let (_dir, engine) = test_engine();
     // The victim's limiter is fully held, so its query stays queued (and
-    // listed) until the KILL arrives. The killer connection gets its own
-    // limiter so it can run immediately.
+    // listed) until the KILL arrives. Both clients share the saturated limiter,
+    // as they do on a real server.
     let limiter = Arc::new(Semaphore::new(1));
     let held = Arc::clone(&limiter).acquire_owned().await.unwrap();
 
@@ -335,7 +335,7 @@ async fn kill_query_cancels_a_queued_request() {
     let query_id = registry.list()[0].query_id;
 
     let (mut killer, killer_server) =
-        spawn_test_connection_with_limiter(Arc::clone(&engine), Arc::new(Semaphore::new(1)));
+        spawn_test_connection_with_limiter(Arc::clone(&engine), Arc::clone(&limiter));
     login(&mut killer, "root").await;
     killer
         .send(query(&format!("KILL QUERY {}", query_id)))
@@ -479,4 +479,119 @@ fn reserved_bulk_slots_clamped_to_shared_pool() {
     let limiters = RequestLimiters::new(4, 10);
     assert_eq!(limiters.shared.available_permits(), 4);
     assert_eq!(limiters.query.available_permits(), 1);
+}
+
+#[test]
+fn control_request_classifier_does_not_admit_regular_or_mixed_sql() {
+    for sql in [
+        "KILL QUERY 1",
+        "SHOW PROCESSLIST",
+        "SHOW FULL PROCESSLIST;",
+        "/* admin */ KILL QUERY 2;",
+    ] {
+        assert!(is_control_request(&query(sql)), "{sql}");
+    }
+    for sql in [
+        "SELECT 1",
+        "KILL QUERY 1; SELECT 1",
+        "SHOW PROCESSLIST; DELETE FROM t",
+        "KILL QUERY invalid",
+        "SELECT 'SHOW PROCESSLIST'",
+    ] {
+        assert!(!is_control_request(&query(sql)), "{sql}");
+    }
+    assert!(!is_control_request(&query(&format!(
+        "{}SHOW PROCESSLIST",
+        " ".repeat(4096)
+    ))));
+    assert!(!is_control_request(&Message::new(
+        MSG_TYPE_PING,
+        Bytes::new()
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn processlist_responds_when_normal_request_capacity_is_full() {
+    let (_dir, engine) = test_engine();
+    let limiter = Arc::new(Semaphore::new(1));
+    let _held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+    let (mut client, server) = spawn_test_connection_with_limiter(engine, limiter);
+    login(&mut client, "root").await;
+    client.send(query("SHOW PROCESSLIST")).await.unwrap();
+    let response = timeout(Duration::from_secs(2), client.next())
+        .await
+        .expect("administrative inspection must not wait for ordinary queries")
+        .unwrap()
+        .unwrap();
+    assert_ne!(response.msg_type, MSG_TYPE_ERROR);
+    drop(client);
+    let _ = timeout(Duration::from_secs(2), server).await.unwrap();
+}
+
+#[tokio::test]
+async fn queue_cancellation_poll_preserves_fifo_position() {
+    let limiter = Arc::new(Semaphore::new(1));
+    let held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+    let context = Arc::new(crate::common::query_cancel::QueryContext::new(Arc::new(
+        AtomicBool::new(false),
+    )));
+    let first = acquire_slot(&limiter, &context, MSG_TYPE_QUERY, 5, "test");
+    tokio::pin!(first);
+    assert!(futures::poll!(&mut first).is_pending());
+    let second = Arc::clone(&limiter).acquire_owned();
+    tokio::pin!(second);
+    assert!(futures::poll!(&mut second).is_pending());
+
+    // Drive several cancellation ticks while the younger waiter is queued.
+    for _ in 0..3 {
+        tokio::time::sleep(QUEUE_CANCEL_POLL * 2).await;
+        assert!(futures::poll!(&mut first).is_pending());
+    }
+    drop(held);
+    assert!(
+        futures::poll!(&mut second).is_pending(),
+        "a cancellation tick must not move the oldest request to the back"
+    );
+    let permit = match timeout(Duration::from_secs(1), &mut first)
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        SlotAcquisition::Permit(permit) => permit,
+        SlotAcquisition::Rejected(reason) => panic!("unexpected rejection: {reason}"),
+    };
+    drop(permit);
+    let _ = timeout(Duration::from_secs(1), &mut second)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_queue_waiter_releases_its_fifo_position() {
+    let limiter = Arc::new(Semaphore::new(1));
+    let held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+    let context = Arc::new(crate::common::query_cancel::QueryContext::new(Arc::new(
+        AtomicBool::new(false),
+    )));
+    let first = acquire_slot(&limiter, &context, MSG_TYPE_QUERY, 5, "test");
+    tokio::pin!(first);
+    assert!(futures::poll!(&mut first).is_pending());
+    let second = Arc::clone(&limiter).acquire_owned();
+    tokio::pin!(second);
+    assert!(futures::poll!(&mut second).is_pending());
+    context.cancel();
+    assert!(matches!(
+        timeout(Duration::from_secs(1), &mut first)
+            .await
+            .unwrap()
+            .unwrap(),
+        SlotAcquisition::Rejected(_)
+    ));
+    drop(held);
+    let _ = timeout(Duration::from_secs(1), &mut second)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(limiter.available_permits(), 1);
 }

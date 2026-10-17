@@ -407,6 +407,37 @@ fn case_expressions_execute_in_projection_and_aggregates() {
     );
     assert_eq!(rows[0][1], ScalarValue::Decimal(Some(102000)));
 
+    // A nonzero integer branch must be scaled before either projection or
+    // aggregation, including when selected through ELSE or simple CASE.
+    for expression in [
+        "CASE WHEN volume = 0 THEN 5000 ELSE low_px END",
+        "CASE volume WHEN 0 THEN 5000 ELSE low_px END",
+        "CASE WHEN volume <> 0 THEN low_px ELSE 5000 END",
+    ] {
+        let rows = collect_rows(
+            engine
+                .execute(
+                    &mut session,
+                    &format!("SELECT {expression} FROM case_metrics ORDER BY id"),
+                )
+                .expect("decimal case projection"),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![ScalarValue::Decimal(Some(102000))],
+                vec![ScalarValue::Decimal(Some(50000000))],
+                vec![ScalarValue::Decimal(Some(103000))],
+            ]
+        );
+        let rows = collect_rows(engine.execute(&mut session,
+            &format!("SELECT volume, MIN({expression}) FROM case_metrics GROUP BY volume ORDER BY volume"),
+        ).expect("grouped decimal case"));
+        assert_eq!(rows[0][1], ScalarValue::Decimal(Some(50000000)));
+        assert_eq!(rows[1][1], ScalarValue::Decimal(Some(102000)));
+        assert_eq!(rows[2][1], ScalarValue::Decimal(Some(103000)));
+    }
+
     // Production-shaped statMinute query: SUM(trade_value) must preserve
     // DECIMAL rather than emitting an INT64 into a DECIMAL result column.
     let rows = collect_rows(

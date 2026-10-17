@@ -1131,7 +1131,7 @@ fn extract_aggs_from_expr(expr: &Expr, aggs: &mut Vec<(AggFunc, Option<Expr>, bo
 pub fn expr_to_name(expr: &Expr) -> String {
     match expr {
         Expr::Column(name) => name.clone(),
-        Expr::Literal(v) => format!("{:?}", v),
+        Expr::Literal(v) => format!("{}", v),
         Expr::QualifiedColumn { column, .. } => column.clone(),
         Expr::BinaryOp { left, op, right } => {
             let l = expr_to_name(left);

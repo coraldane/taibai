@@ -77,9 +77,11 @@ pub fn finish_flush_batch(table_dir: &Path, intents: Vec<FlushIntent>) -> Result
             continue;
         };
         if ids.contains(&id) && !keep.contains(&path) {
-            archive_or_remove(&tail_dir, &path);
+            archive_or_remove(&tail_dir, &path)?;
         }
     }
+    // Persist source removals before retiring the markers that suppress them.
+    sync_dir_best_effort(&tail_dir);
     for intent in intents {
         remove_file_if_exists(&intent.marker_path)?;
     }

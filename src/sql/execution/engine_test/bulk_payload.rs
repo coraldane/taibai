@@ -504,3 +504,139 @@ fn concurrent_bulk_payload_rejects_duplicate_primary_key() -> Result<()> {
     assert_eq!(count, 1);
     Ok(())
 }
+
+#[test]
+fn bulk_payload_validates_schema_before_constraint_column_access() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    for (table, definition) in [
+        ("pk", "value INT64, id INT64 PRIMARY KEY"),
+        ("uk", "value INT64, id INT64, UNIQUE KEY uk_id (id)"),
+        ("ai", "value INT64, id INT64 AUTO_INCREMENT"),
+    ] {
+        engine.execute(
+            &mut session,
+            &format!("CREATE TABLE {table} ({definition})"),
+        )?;
+        let payload = bulk_payload(table, 1, vec![("value", DataType::Int64, int64_col(&[1]))]);
+        let error = engine
+            .exec_bulk_insert_payload_with_options("main", &payload, false)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("bulk column count mismatch"),
+            "{error}"
+        );
+        assert_eq!(
+            first_text(
+                engine.execute(&mut session, &format!("SELECT COUNT(*) FROM {table}"))?,
+                0,
+                0
+            ),
+            "0"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn bulk_payload_rejects_int32_for_int8_then_accepts_correct_encoding() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(
+        &mut session,
+        "CREATE TABLE flags (id INT64 PRIMARY KEY, is_st INT8)",
+    )?;
+    let invalid = bulk_payload(
+        "flags",
+        2,
+        vec![
+            ("id", DataType::Int64, int64_col(&[1, 2])),
+            (
+                "is_st",
+                DataType::Int32,
+                [0i32.to_le_bytes(), 1i32.to_le_bytes()].concat(),
+            ),
+        ],
+    );
+    let error = engine
+        .exec_bulk_insert_payload_with_options("main", &invalid, true)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("schema=INT8 payload=INT32"),
+        "{error}"
+    );
+    assert_eq!(
+        first_text(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM flags")?,
+            0,
+            0
+        ),
+        "0"
+    );
+    let valid = bulk_payload(
+        "flags",
+        2,
+        vec![
+            ("id", DataType::Int64, int64_col(&[1, 2])),
+            ("is_st", DataType::Int8, vec![0, 1]),
+        ],
+    );
+    assert_eq!(
+        engine.exec_bulk_insert_payload_with_options("main", &valid, false)?,
+        2
+    );
+    let result = engine.execute(&mut session, "SELECT SUM(is_st) FROM flags")?;
+    assert_eq!(first_text(result, 0, 0), "1");
+    Ok(())
+}
+
+#[test]
+fn bulk_payload_rejects_decimal_scale_mismatch_before_writing() -> Result<()> {
+    use crate::net::bulk_importer::encode_columnar_bulk_insert;
+    let dir = tempfile::tempdir()?;
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(&mut session, "CREATE TABLE prices (price DECIMAL(18,4))")?;
+    for scale in [2, 4] {
+        let schema = Schema::new(vec![crate::types::batch::ColumnDef::new(
+            "price",
+            DataType::Decimal,
+        )
+        .with_scale(scale)
+        .with_precision(18)]);
+        let mut batch = RecordBatch::new(schema);
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Decimal(Some(12345)))?;
+        let payload = encode_columnar_bulk_insert("prices", &batch)?;
+        let result = engine.exec_bulk_insert_payload_with_options("main", &payload, false);
+        if scale == 2 {
+            let error = result.expect_err("123.45 must not silently become 1.2345");
+            assert!(error.to_string().contains("scale mismatch"), "{error}");
+            assert_eq!(
+                first_text(
+                    engine.execute(&mut session, "SELECT COUNT(*) FROM prices")?,
+                    0,
+                    0
+                ),
+                "0"
+            );
+        } else {
+            assert_eq!(result?, 1);
+            let ExecResult::Query { batches, .. } =
+                engine.execute(&mut session, "SELECT price FROM prices")?
+            else {
+                panic!("expected rows")
+            };
+            assert_eq!(
+                batches[0].scalar(0, 0),
+                Some(ScalarValue::Decimal(Some(12345)))
+            );
+            assert_eq!(batches[0].schema.columns[0].scale, 4);
+        }
+    }
+    Ok(())
+}

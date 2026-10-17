@@ -45,7 +45,7 @@ use helpers::{
 };
 use reader_cache::ReaderCache;
 use segment_meta_cache::SegmentMetaCache;
-use state::TableSegmentState;
+use state::{FairMutex, TableSegmentState};
 
 fn same_segment_path(a: &Path, b: &Path) -> bool {
     a == b || a.to_string_lossy().replace('\\', "/") == b.to_string_lossy().replace('\\', "/")
@@ -168,6 +168,7 @@ fn is_incomplete_compaction_file(name: &str) -> bool {
         // Torn delete-footer / segment-replacement journal writes.
         || name.ends_with(".del.tmp")
         || name.ends_with(".replace.tmp")
+        || name.ends_with(".retire.tmp")
         || (name.starts_with(".tail_flush_") && name.ends_with(".tmp"))
         // Clustered-compaction external merge sort runs (crash leftovers).
         || name.contains(".merge.tmp.")
@@ -192,3 +193,11 @@ mod seal_outside_lock_tests;
 #[cfg(test)]
 #[path = "segment_manager/seq_allocation_test.rs"]
 mod seq_allocation_tests;
+
+#[cfg(test)]
+#[path = "segment_manager/mutation_lock_cancel_test.rs"]
+mod mutation_lock_cancel_tests;
+
+#[cfg(test)]
+#[path = "segment_manager/mutation_lock_fairness_test.rs"]
+mod mutation_lock_fairness_tests;

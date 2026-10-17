@@ -603,7 +603,7 @@ USE 库名
 FLUSH [TABLE [表名]]                              -- 触发落盘
 PAUSE                                             -- 暂停 flush
 RESUME                                            -- 恢复 flush
-OPTIMIZE TABLE 表名 [ON PARTITION 分区名]          -- 手动 compaction
+OPTIMIZE TABLE 表名 [ON PARTITION 分区名]          -- 手动 compaction；分区名见 SHOW PARTITIONS，粒度由 PARTITION BY 决定（如 YEAR 分区为 4 位年份，详见建表选项 SQL 参考）
 ANALYZE TABLE 表名                                -- 采集统计信息
 REBUILD UNIQUE INDEX[ES] [索引名] ON 表名          -- 流式重建唯一索引
 KILL QUERY 查询ID                                 -- 取消运行中的查询（ID 见 SHOW PROCESSLIST）

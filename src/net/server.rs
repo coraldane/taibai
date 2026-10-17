@@ -13,7 +13,7 @@ use tokio_util::codec::Framed;
 
 use crate::common::config::ServerConfig;
 use crate::common::error::{Result, TaibaiError};
-use crate::net::handler::{build_error, is_heavy_request, Handler};
+use crate::net::handler::{build_error, is_control_request, is_heavy_request, Handler};
 use crate::net::tls::TlsMode;
 use crate::protocol::codec::MessageCodec;
 use crate::protocol::message::{Message, MSG_TYPE_QUERY};
@@ -31,6 +31,7 @@ pub struct Server {
 struct RequestLimiters {
     shared: Arc<Semaphore>,
     query: Arc<Semaphore>,
+    control: Arc<Semaphore>,
 }
 
 impl RequestLimiters {
@@ -40,6 +41,7 @@ impl RequestLimiters {
         Self {
             shared: Arc::new(Semaphore::new(shared)),
             query: Arc::new(Semaphore::new(shared - reserved)),
+            control: Arc::new(Semaphore::new(2)),
         }
     }
 
@@ -49,6 +51,7 @@ impl RequestLimiters {
         Self {
             shared,
             query: Arc::new(Semaphore::new(size)),
+            control: Arc::new(Semaphore::new(2)),
         }
     }
 }
@@ -590,6 +593,10 @@ async fn acquire_slot(
     // a disconnect (or KILL) during a full queue does not stall cleanup
     // for the whole queue timeout.
     let deadline = Instant::now() + Duration::from_secs(queue_timeout_secs.max(1));
+    // Retain the same waiter across cancellation ticks: dropping and recreating
+    // it loses the semaphore FIFO position and can starve older requests.
+    let acquisition = Arc::clone(limiter).acquire_owned();
+    tokio::pin!(acquisition);
     loop {
         if let Err(error) = context.check() {
             return Ok(SlotAcquisition::Rejected(error.to_string()));
@@ -606,12 +613,7 @@ async fn acquire_slot(
                 "server overloaded: request queue wait timeout".into(),
             ));
         }
-        match timeout(
-            remaining.min(QUEUE_CANCEL_POLL),
-            Arc::clone(limiter).acquire_owned(),
-        )
-        .await
-        {
+        match timeout(remaining.min(QUEUE_CANCEL_POLL), &mut acquisition).await {
             Ok(Ok(permit)) => return Ok(SlotAcquisition::Permit(permit)),
             Ok(Err(_)) => {
                 return Err(TaibaiError::Internal("request limiter closed".into()));
@@ -644,7 +646,8 @@ fn run_handler(
         // Queries admit through the capped pool first, so a burst of
         // analytical scans can never occupy the slots bulk writes need to
         // keep committing (`reserved_bulk_slots`).
-        let _query_cap = if msg.msg_type == MSG_TYPE_QUERY {
+        let control_request = is_control_request(&msg);
+        let _query_cap = if msg.msg_type == MSG_TYPE_QUERY && !control_request {
             match acquire_slot(
                 &limiters.query,
                 &context,
@@ -664,8 +667,15 @@ fn run_handler(
             None
         };
 
+        // KILL/PROCESSLIST must remain available when ordinary work fills
+        // every slot, while their own bounded pool prevents unbounded work.
+        let request_pool = if control_request {
+            &limiters.control
+        } else {
+            &limiters.shared
+        };
         let permit = match acquire_slot(
-            &limiters.shared,
+            request_pool,
             &context,
             msg.msg_type,
             queue_timeout_secs,

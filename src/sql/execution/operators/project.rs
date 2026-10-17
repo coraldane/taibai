@@ -7,6 +7,7 @@ use crate::sql::parser::ast::BinOp;
 use crate::sql::planner::LogicalExpr;
 use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
+use crate::types::bitmap::NullBitmap;
 
 use super::ExecutionOp;
 
@@ -82,6 +83,13 @@ impl ProjectExec {
         batch: &RecordBatch,
         col_def: &ColumnDef,
     ) -> Result<ColumnArray> {
+        if col_def.data_type == DataType::Decimal {
+            if let Some(column) =
+                eval_decimal_arithmetic(expr, batch, &batch.schema, self.subqueries.as_ref())?
+            {
+                return Ok(column);
+            }
+        }
         if let Some(column) = crate::sql::execution::expr_vec::eval_expr_to_column(expr, batch)? {
             if column.data_type() == col_def.data_type {
                 return Ok(column);
@@ -309,8 +317,210 @@ pub fn project_column_def(expr: &LogicalExpr, schema: &Schema, alias: Option<&st
         }
     }
 
-    ColumnDef::new(alias.unwrap_or("expr"), infer_type(expr, schema))
+    let mut col_def = ColumnDef::new(alias.unwrap_or("expr"), infer_type(expr, schema));
+    if col_def.data_type == DataType::Decimal {
+        if let Some(scale) = decimal_result_scale(expr, schema) {
+            col_def = col_def.with_scale(scale).with_precision(18);
+        }
+    }
+    col_def
 }
+
+/// Result scale of an arithmetic expression over Decimal operands:
+/// Add/Sub take the wider operand scale, Mul sums them (capped at 18,
+/// matching the CREATE TABLE scale limit). `None` when no Decimal operand.
+fn decimal_result_scale(expr: &LogicalExpr, schema: &Schema) -> Option<i32> {
+    match expr {
+        LogicalExpr::Column(idx) => {
+            let column = schema.columns.get(*idx)?;
+            (column.data_type == DataType::Decimal).then_some(column.scale)
+        }
+        LogicalExpr::BinaryOp { op, left, right } => {
+            if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod) {
+                return None;
+            }
+            let ls = decimal_result_scale(left, schema);
+            let rs = decimal_result_scale(right, schema);
+            match (ls, rs) {
+                (Some(l), Some(r)) if matches!(op, BinOp::Mul) => Some((l + r).min(18)),
+                (Some(l), Some(r)) => Some(l.max(r)),
+                (Some(s), None) | (None, Some(s)) => Some(s),
+                (None, None) => None,
+            }
+        }
+        LogicalExpr::Literal(v) => {
+            use crate::types::scalar::ScalarValue;
+            match v {
+                ScalarValue::Float32(Some(f)) => Some(float_literal_scale(*f as f64)),
+                ScalarValue::Float64(Some(f)) => Some(float_literal_scale(*f)),
+                _ => Some(0),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Scale-aware Decimal arithmetic for projections. Operand scales are
+/// tracked recursively: Add/Sub align both operands to the wider scale,
+/// Mul multiplies raws directly (scales add). Returns `None` for shapes it
+/// does not cover so the caller falls back to the generic paths.
+fn eval_decimal_arithmetic(
+    expr: &LogicalExpr,
+    batch: &RecordBatch,
+    schema: &Schema,
+    subqueries: Option<&SubqueryRegistry>,
+) -> Result<Option<ColumnArray>> {
+    let Some((raws, _scale)) = eval_decimal_operand(expr, batch, schema, subqueries)? else {
+        return Ok(None);
+    };
+    // The result column's scale is set separately by decimal_result_scale.
+
+    let mut data = Vec::with_capacity(raws.len());
+    let mut bitmap = NullBitmap::with_capacity(raws.len());
+    for raw in raws {
+        match i64::try_from(raw) {
+            Ok(v) => {
+                data.push(v);
+                bitmap.push_valid();
+            }
+            Err(_) => {
+                data.push(0);
+                bitmap.push_null();
+            }
+        }
+    }
+    Ok(Some(ColumnArray::Decimal { data, bitmap }))
+}
+
+/// Evaluate `expr` into per-row raw integers plus the scale they carry.
+/// Scales follow decimal arithmetic rules: Add/Sub align to the wider
+/// operand scale, Mul adds them (capped at 18).
+fn eval_decimal_operand(
+    expr: &LogicalExpr,
+    batch: &RecordBatch,
+    schema: &Schema,
+    subqueries: Option<&SubqueryRegistry>,
+) -> Result<Option<(Vec<i128>, i32)>> {
+    match expr {
+        LogicalExpr::Column(idx) => {
+            let Some(column) = schema.columns.get(*idx) else {
+                return Ok(None);
+            };
+            if column.data_type != DataType::Decimal {
+                return Ok(None);
+            }
+            if batch.column(*idx).is_none() {
+                return Ok(None);
+            }
+            let len = batch.num_rows();
+            let mut raws = Vec::with_capacity(len);
+            for row in 0..len {
+                match batch.scalar(row, *idx) {
+                    Some(crate::types::scalar::ScalarValue::Decimal(Some(v))) => {
+                        raws.push(v as i128);
+                    }
+                    _ => raws.push(DECIMAL_NULL_SENTINEL),
+                }
+            }
+            Ok(Some((raws, column.scale)))
+        }
+        LogicalExpr::BinaryOp { op, left, right } => {
+            if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod) {
+                return Ok(None);
+            }
+            let Some((lraws, ls)) = eval_decimal_operand(left, batch, schema, subqueries)? else {
+                return Ok(None);
+            };
+            let Some((rraws, rs)) = eval_decimal_operand(right, batch, schema, subqueries)? else {
+                return Ok(None);
+            };
+            let (scale, align_l, align_r) = match op {
+                BinOp::Mul => ((ls + rs).min(18), 1, 1),
+                _ => {
+                    let common = ls.max(rs);
+                    (
+                        common,
+                        10_i128.pow((common - ls).clamp(0, 18) as u32),
+                        10_i128.pow((common - rs).clamp(0, 18) as u32),
+                    )
+                }
+            };
+            // Multiplication produces raw values at ls + rs decimal places.
+            // If the result scale is capped, shrink the raw value as well;
+            // changing only metadata would multiply the numeric result.
+            let product_divisor = if matches!(op, BinOp::Mul) {
+                10_i128.pow((ls + rs - scale) as u32)
+            } else {
+                1
+            };
+            let mut out = Vec::with_capacity(lraws.len());
+            for (l, r) in lraws.into_iter().zip(rraws) {
+                let value = if l == i128::MIN || r == i128::MIN {
+                    None
+                } else {
+                    match op {
+                        BinOp::Mul => l.checked_mul(r).map(|raw| raw / product_divisor),
+                        BinOp::Add => l
+                            .checked_mul(align_l)
+                            .and_then(|l| r.checked_mul(align_r).and_then(|r| l.checked_add(r))),
+                        BinOp::Sub => l
+                            .checked_mul(align_l)
+                            .and_then(|l| r.checked_mul(align_r).and_then(|r| l.checked_sub(r))),
+                        BinOp::Mod => r.checked_mul(align_r).and_then(|r| {
+                            if r == 0 {
+                                None
+                            } else {
+                                l.checked_mul(align_l).and_then(|l| l.checked_rem(r))
+                            }
+                        }),
+                        _ => None,
+                    }
+                };
+                out.push(value.unwrap_or(i128::MIN));
+            }
+            Ok(Some((out, scale)))
+        }
+        LogicalExpr::Literal(v) => {
+            use crate::types::scalar::ScalarValue;
+            if v.is_null() {
+                return Ok(None);
+            }
+            // Float literals keep their fractional digits as scale (1.5 ->
+            // scale 1); integer and decimal literals contribute scale 0 /
+            // their raw form respectively.
+            let scale = match v {
+                ScalarValue::Float32(Some(f)) => float_literal_scale(*f as f64),
+                ScalarValue::Float64(Some(f)) => float_literal_scale(*f),
+                _ => 0,
+            };
+            let factor = 10_i128.pow(scale as u32);
+            let scalar = eval_expr_column_with(expr, batch, subqueries)?;
+            let mut raws = Vec::with_capacity(scalar.len());
+            for value in &scalar {
+                let raw = match value {
+                    ScalarValue::Float32(Some(f)) => (*f as f64 * factor as f64).round() as i128,
+                    ScalarValue::Float64(Some(f)) => (f * factor as f64).round() as i128,
+                    other => other.integer_i128().unwrap_or(DECIMAL_NULL_SENTINEL),
+                };
+                raws.push(raw);
+            }
+            Ok(Some((raws, scale)))
+        }
+        // CASE/functions may return a mixture of integers and already-scaled
+        // decimals. Without branch scale metadata, treating their raw values
+        // as scale 0 bypasses the projection's required decimal coercion.
+        _ => Ok(None),
+    }
+}
+
+fn float_literal_scale(v: f64) -> i32 {
+    match format!("{}", v).split_once('.') {
+        Some((_, frac)) => frac.len().min(9) as i32,
+        None => 0,
+    }
+}
+
+const DECIMAL_NULL_SENTINEL: i128 = i128::MIN;
 
 #[cfg(test)]
 #[path = "project_test.rs"]

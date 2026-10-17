@@ -12,6 +12,15 @@ server:
   max_bulk_message_size: 134217728
   # 重请求等待执行槽位的最长时间，超时返回 overload 错误而不是静默排队
   request_queue_timeout_secs: 30
+  # 单条协议消息的收发上限，同时决定查询结果集的服务端缓冲上限：
+  # 结果集上限 = min(buffer.query_memory_limit_mb / 2, max_message_size / 2)，
+  # 默认配置下即 32 MB。结果超限报 "query result exceeded memory limit"，
+  # 属确定性错误（同数据重试必然复现），内置客户端不会自动重试。
+  # 需要 >64MB 结果集时会话内执行 SET streaming_results = true 启用分块
+  # 流式结果（不受本上限约束，见 docs/user-guide/query-management.md）；
+  # 直接调大本值则必须同步调大所有客户端的接收上限（内置客户端与
+  # JDBC 客户端均硬编码 64 MB），否则大结果会在客户端解码阶段报协议错误。
+  max_message_size: 67108864
 
 storage:
   # 数据目录；生产部署应改为独立的持久化目录

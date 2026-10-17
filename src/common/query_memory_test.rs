@@ -28,3 +28,16 @@ fn result_batches_are_rejected_before_exceeding_limit() {
     assert_eq!(batches.len(), 1);
     assert_eq!(retained_bytes, batch_bytes);
 }
+
+#[test]
+fn result_limit_error_names_the_binding_configuration() {
+    let err = result_limit_error(32 * 1024 * 1024);
+    let TaibaiError::ResourceBusy(text) = &err else {
+        panic!("expected ResourceBusy, got {err:?}")
+    };
+    assert!(text.contains("exceeded memory limit of 32 MB"), "{text}");
+    // Default limits: the wire cap (32 MB) binds before the query budget
+    // (2048 MB), so the message must name server.max_message_size — the
+    // key that actually constrains results — not the query budget.
+    assert!(text.contains("server.max_message_size = 64 MB"), "{text}");
+}

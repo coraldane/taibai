@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::types::DataType;
 
 fn log_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
     if crate::common::config::insert_profile_enabled() {
@@ -199,7 +200,7 @@ impl SegmentManager {
         self.append_direct_bulk_request(db, &req, &schema, &table_meta, flush_immediately)
     }
 
-    fn validate_direct_bulk_request(
+    pub(crate) fn validate_direct_bulk_request(
         &self,
         req: &DirectBulkRequest<'_>,
         schema: &Schema,
@@ -221,6 +222,12 @@ impl SegmentManager {
                     col_def.name,
                     col_def.data_type.display_name(),
                     payload_col.data_type.display_name()
+                )));
+            }
+            if col_def.data_type == DataType::Decimal && col_def.scale != payload_col.scale {
+                return Err(TaibaiError::Protocol(format!(
+                    "bulk column {} decimal scale mismatch for '{}': schema={} payload={}",
+                    idx, col_def.name, col_def.scale, payload_col.scale
                 )));
             }
             if !col_def.name.eq_ignore_ascii_case(payload_col.name) {

@@ -43,7 +43,7 @@ impl Compactor {
         // granularity (a partial flush would strand a short row group
         // mid-segment and change the output layout), so budgets smaller
         // than a chunk still buffer a whole chunk.
-        let ref_budget_rows = (clustered_merge_budget_bytes() / ROW_REF_BYTES).max(chunk_rows);
+        let ref_budget_rows = (clustered_merge_budget_bytes() / 4 / ROW_REF_BYTES).max(chunk_rows);
 
         let mut writer = SegmentWriter::create_with_bloom_columns(
             tmp_path,
@@ -297,6 +297,7 @@ impl Compactor {
                 .segment_mgr
                 .next_replacement_segment_path(table_dir, partition_key)?;
             let tmp_path = store::replacement_tmp_path(&final_path, "compact_tmp");
+            let cleanup = super::runs::TempRuns(vec![tmp_path.clone()]);
             let rewrite = self.rewrite_unsorted_partition(
                 db,
                 table,
@@ -324,6 +325,7 @@ impl Compactor {
                 });
             }
             return Ok(PreparedCompaction::Replacement {
+                _cleanup: cleanup,
                 segment_files,
                 identities,
                 tmp_path,
@@ -340,9 +342,16 @@ impl Compactor {
         let source_row_group_count = sources.len();
 
         let estimated_width = estimated_row_width_bytes(schema);
-        let in_memory_budget_rows =
-            (clustered_merge_budget_bytes() / estimated_width).max(output_row_group_rows * 4);
-        if global_row_base > in_memory_budget_rows {
+        let in_memory_budget_rows = (clustered_merge_budget_bytes() / 4 / estimated_width).max(1);
+        let stored_bytes = sources.iter().fold(0usize, |sum, source| {
+            sum.saturating_add(
+                source.reader.footer_row_groups()[source.row_group_idx]
+                    .uncompressed_sizes
+                    .iter()
+                    .fold(0usize, |n, &v| n.saturating_add(v as usize)),
+            )
+        });
+        let prepare_external = || -> Result<PreparedCompaction> {
             // Partition exceeds the in-memory budget: spill sorted runs
             // to temp files and k-way merge them into the output, keeping
             // peak memory proportional to the budget instead of the
@@ -351,6 +360,7 @@ impl Compactor {
                 .segment_mgr
                 .next_replacement_segment_path(table_dir, partition_key)?;
             let tmp_path = store::replacement_tmp_path(&final_path, "compact_tmp");
+            let mut output_cleanup = super::runs::TempRuns(vec![tmp_path.clone()]);
             let (rows_written, dropped, dropped_ttl) = self.prepare_clustered_external(
                 db,
                 table,
@@ -368,8 +378,8 @@ impl Compactor {
             if rows_written == 0 {
                 let _ = std::fs::remove_file(&tmp_path);
                 return Ok(PreparedCompaction::AllDropped {
-                    segment_files,
-                    identities,
+                    segment_files: segment_files.clone(),
+                    identities: identities.clone(),
                     segments_read,
                     rows_dropped: dropped,
                     rows_dropped_ttl: dropped_ttl,
@@ -385,16 +395,23 @@ impl Compactor {
                 elapsed_ms = decode_started.elapsed().as_millis(),
                 "clustered optimization finished via external merge sort"
             );
-            return Ok(PreparedCompaction::Replacement {
-                segment_files,
-                identities,
+            output_cleanup.0.clear();
+            Ok(PreparedCompaction::Replacement {
+                _cleanup: super::runs::TempRuns(vec![tmp_path.clone()]),
+                segment_files: segment_files.clone(),
+                identities: identities.clone(),
                 tmp_path,
                 final_path,
                 segments_read,
                 rows_to_write: rows_written,
                 rows_dropped: dropped,
                 rows_dropped_ttl: dropped_ttl,
-            });
+            })
+        };
+        if global_row_base > in_memory_budget_rows
+            || stored_bytes > clustered_merge_budget_bytes() / 4
+        {
+            return prepare_external();
         }
         if global_row_base > u32::MAX as usize {
             return Err(TaibaiError::Storage(format!(
@@ -403,7 +420,7 @@ impl Compactor {
             )));
         }
 
-        let clustered = self.decode_clustered_partition(
+        let clustered = match self.decode_clustered_partition(
             db,
             table,
             partition_label,
@@ -413,7 +430,11 @@ impl Compactor {
             sort_key_indices,
             ttl,
             decode_started,
-        )?;
+        ) {
+            Ok(clustered) => clustered,
+            Err(TaibaiError::ResourceBusy(_)) => return prepare_external(),
+            Err(error) => return Err(error),
+        };
         let preloaded_batch = clustered.batch;
         let sorted_indices = clustered.sorted_indices;
         let deleted_rows = clustered.deleted_rows;
@@ -475,6 +496,7 @@ impl Compactor {
         }
 
         Ok(PreparedCompaction::Replacement {
+            _cleanup: super::runs::TempRuns(vec![tmp_path.clone()]),
             segment_files,
             identities,
             tmp_path,
@@ -541,9 +563,6 @@ impl Compactor {
             let class = if tombstoned || fragmented {
                 rewrite_count += 1;
                 InputClass::Rewrite
-            } else if under_full {
-                small_count += 1;
-                InputClass::MergeSmall
             } else if ttl.is_some_and(|(ttl_col, secs)| {
                 reader
                     .align_indices(schema, &[ttl_col])
@@ -561,6 +580,9 @@ impl Compactor {
                 // only way these rows ever leave the disk is a rewrite.
                 rewrite_count += 1;
                 InputClass::Rewrite
+            } else if under_full {
+                small_count += 1;
+                InputClass::MergeSmall
             } else {
                 InputClass::Keep
             };

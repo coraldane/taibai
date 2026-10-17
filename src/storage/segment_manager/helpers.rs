@@ -236,9 +236,8 @@ pub(super) fn ensure_state_not_retired(
 
 pub(super) fn discover_max_seq(table_dir: &Path) -> u32 {
     let mut max_seq = 0u32;
-    if let Ok(entries) = std::fs::read_dir(table_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
+    if let Ok(names) = store::allocated_segment_names(table_dir) {
+        for name in names {
             if let Some(seq) = store::parse_segment_seq(&name) {
                 max_seq = max_seq.max(seq);
             }
@@ -251,9 +250,8 @@ pub(super) fn discover_max_partition_seq(
     table_dir: &Path,
 ) -> std::collections::HashMap<String, u32> {
     let mut max_seq: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    if let Ok(entries) = std::fs::read_dir(table_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
+    if let Ok(names) = store::allocated_segment_names(table_dir) {
+        for name in names {
             let Some(partition_key) =
                 crate::storage::partition::partition::parse_partition_key(&name)
             else {

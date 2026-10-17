@@ -209,7 +209,7 @@ pub(super) fn remove_other_generations_ex(
     for generation in generations_for_id(tail_dir, id)? {
         if generation.path != keep_path {
             if matches!(generation.kind, GenerationKind::Tail) {
-                archive_or_remove(tail_dir, &generation.path);
+                archive_or_remove(tail_dir, &generation.path)?;
             } else if matches!(
                 generation.kind,
                 GenerationKind::Delete | GenerationKind::Update
@@ -240,24 +240,21 @@ pub(super) fn remove_file_if_exists(path: &Path) -> Result<()> {
 /// scanned as a database), so archived logs stay invisible to SQL. Archive
 /// failures degrade to deletion with a warning - losing an archive copy is
 /// recoverable from a fresh backup, while failing the clear would resurrect
-/// rows.
-pub(super) fn archive_or_remove(tail_dir: &Path, path: &Path) {
+/// rows. Cleanup errors are propagated so suppression markers remain in place.
+pub(super) fn archive_or_remove(tail_dir: &Path, path: &Path) -> Result<()> {
     dispose_tail_file(
         tail_dir,
         path,
         crate::common::config::tail_archive_enabled(),
-    );
+    )
 }
 
 /// Testable core of [`archive_or_remove`]: `archive` selects between the
 /// move-to-archive and delete behaviors.
-pub(super) fn dispose_tail_file(tail_dir: &Path, path: &Path, archive: bool) {
+pub(super) fn dispose_tail_file(tail_dir: &Path, path: &Path, archive: bool) -> Result<()> {
     let is_tail = path.extension().and_then(|value| value.to_str()) == Some("tail");
     if !is_tail || !archive {
-        if let Err(error) = remove_file_if_exists(path) {
-            tracing::warn!(file = %path.display(), error = %error, "tail cleanup failed");
-        }
-        return;
+        return remove_file_if_exists(path);
     }
     if let Some(archive_dir) = archive_dir_for(tail_dir) {
         if fs::create_dir_all(&archive_dir).is_ok() {
@@ -267,7 +264,7 @@ pub(super) fn dispose_tail_file(tail_dir: &Path, path: &Path, archive: bool) {
                 .unwrap_or_default();
             let destination = archive_dir.join(file_name);
             match fs::rename(path, &destination) {
-                Ok(()) => return,
+                Ok(()) => return Ok(()),
                 Err(error) => {
                     tracing::warn!(
                         file = %path.display(),
@@ -278,7 +275,7 @@ pub(super) fn dispose_tail_file(tail_dir: &Path, path: &Path, archive: bool) {
             }
         }
     }
-    let _ = remove_file_if_exists(path);
+    remove_file_if_exists(path)
 }
 
 /// `<data>/wal/<db>/<table>/memtable_tail` for a tail dir of

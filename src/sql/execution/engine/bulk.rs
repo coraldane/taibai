@@ -237,16 +237,7 @@ impl Engine {
     ) -> Result<()> {
         let mut should_save = save_immediately;
         if save_deferred && !save_immediately {
-            let mut state = self.catalog_save_state.lock().unwrap();
-            state.pending_insert_rows =
-                state.pending_insert_rows.saturating_add(rows.max(0) as u64);
-            if state.pending_insert_rows >= CATALOG_SAVE_INSERT_ROWS
-                || state.last_save_at.elapsed() >= CATALOG_SAVE_INTERVAL
-            {
-                state.pending_insert_rows = 0;
-                state.last_save_at = Instant::now();
-                should_save = true;
-            }
+            should_save = self.catalog_stats_save_due(rows.max(0) as u64, 0);
         }
 
         let mut catalogs = self.catalogs.write().unwrap();
@@ -263,6 +254,71 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Account rows removed by DELETE/UPDATE rewrites against the catalog
+    /// row_count. The in-memory decrement always runs under the catalog write
+    /// lock inside the caller's table mutation lock (the C22 ordering), and
+    /// the whole-catalog save shares the INSERT path's debounce gate, so a
+    /// burst of DELETE statements serializes the catalog JSON once per window
+    /// instead of once per statement. A skipped save only leaves disk behind
+    /// memory until the next due save, flush checkpoint, or DDL save — every
+    /// save is a full-catalog snapshot of current memory, so no lost update
+    /// is possible.
+    pub(crate) fn retract_deleted_rows(
+        &self,
+        db: &str,
+        table: &str,
+        rows: u64,
+        save_deferred: bool,
+    ) -> Result<()> {
+        let mut should_save = !save_deferred;
+        if save_deferred {
+            should_save = self.catalog_stats_save_due(0, rows);
+        }
+
+        let mut catalogs = self.catalogs.write().unwrap();
+        if let Some(catalog) = catalogs.get_mut(db) {
+            if let Some(meta) = catalog.get_table_mut(table) {
+                meta.row_count = (meta.row_count - rows as i64).max(0);
+            }
+            if should_save {
+                let meta_dir = self.data_dir.join("meta");
+                catalog.save(&meta_dir)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Shared debounce gate for catalog stats saves: accumulates pending
+    /// insert/delete rows and returns whether a save is due (row threshold
+    /// reached, or the save interval elapsed since the last save with any
+    /// pending change). Resetting the accumulators here — before the caller
+    /// actually saves — matches the existing INSERT gate's contract: a failed
+    /// save reports its error while the next due window retries.
+    fn catalog_stats_save_due(&self, insert_rows: u64, delete_rows: u64) -> bool {
+        let mut state = self.catalog_save_state.lock().unwrap();
+        state.pending_insert_rows = state.pending_insert_rows.saturating_add(insert_rows);
+        state.pending_delete_rows = state.pending_delete_rows.saturating_add(delete_rows);
+        if state.pending_insert_rows + state.pending_delete_rows >= CATALOG_SAVE_INSERT_ROWS
+            || state.last_save_at.elapsed() >= CATALOG_SAVE_INTERVAL
+        {
+            state.pending_insert_rows = 0;
+            state.pending_delete_rows = 0;
+            state.last_save_at = Instant::now();
+            return true;
+        }
+        false
+    }
+
+    /// Record that a full-catalog save just happened outside the gate (flush
+    /// checkpoints, forced rollback save), so the next DML statement does not
+    /// immediately re-serialize what was just persisted.
+    pub(crate) fn mark_catalog_stats_saved(&self) {
+        let mut state = self.catalog_save_state.lock().unwrap();
+        state.pending_insert_rows = 0;
+        state.pending_delete_rows = 0;
+        state.last_save_at = Instant::now();
     }
 
     pub(crate) fn persist_auto_increment_next_value(
@@ -489,6 +545,13 @@ impl Engine {
         // payload, so keeping it alive is free; re-parsing the payload inside
         // the hot feed used to decode the whole frame a second time.
         let req = crate::storage::bulk_payload::parse_direct_bulk_payload(payload)?;
+        // Validate before indexing payload columns for constraints or auto-increment.
+        // Malformed requests must return a protocol error, never panic or mutate indexes.
+        let table_meta = catalog.get_table(&table_name).ok_or_else(|| {
+            TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table_name))
+        })?;
+        self.segment_mgr
+            .validate_direct_bulk_request(&req, &Schema::new(table_meta.columns.clone()))?;
         let mut explicit_auto_increment_max = None;
         let mut unique_index_entries = Vec::new();
         let mut primary_keys = Vec::new();
@@ -503,11 +566,13 @@ impl Engine {
         let has_unique_constraints = table_meta_for_hot.as_ref().is_some_and(|meta| {
             !meta.unique_indexes.is_empty() || meta.columns.iter().any(|column| column.primary_key)
         });
-        let _constraint_guard = has_unique_constraints.then(|| {
-            crate::sql::execution::dml_insert::constraint_insert_lock(db, &table_name)
-                .lock()
-                .unwrap()
-        });
+        let _constraint_guard = if has_unique_constraints {
+            Some(
+                crate::sql::execution::dml_insert::acquire_constraint_insert_lock(db, &table_name)?,
+            )
+        } else {
+            None
+        };
         if let Some(table_meta) = catalog.get_table(&table_name) {
             if !table_meta.unique_indexes.is_empty()
                 || table_meta.has_auto_increment()

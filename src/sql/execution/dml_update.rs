@@ -82,9 +82,7 @@ pub(crate) fn exec_update_with_timezone(
     // permanently. Held across the whole statement and taken before the
     // mutation lock so the global order constraint_insert_lock → mutation
     // lock matches the INSERT path.
-    let _constraint_guard = super::dml_insert::constraint_insert_lock(db, table)
-        .lock()
-        .unwrap();
+    let _constraint_guard = super::dml_insert::acquire_constraint_insert_lock(db, table)?;
 
     let ctx = super::txn_dml::DmlStatementContext::plan(engine, db, table, where_clause)?;
     // Shadow the raw parameter: every consumer below — the memtable batch

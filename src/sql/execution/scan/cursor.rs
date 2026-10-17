@@ -8,7 +8,6 @@ use rayon::prelude::*;
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::catalog::schema::TableMeta;
 use crate::storage::segment::SegmentReader;
-use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::{RecordBatch, Schema};
 
 use super::memtable;
@@ -41,6 +40,7 @@ pub struct ScanCursor {
     db: String,
     plan: ScanPlan,
     segments: Vec<PathBuf>,
+    segment_snapshot: Option<Arc<crate::storage::segment::snapshot::SegmentSnapshot>>,
     initialized: bool,
     segment_pos: usize,
     current_reader: Option<Arc<SegmentReader>>,
@@ -153,6 +153,7 @@ impl ScanCursor {
             db,
             plan,
             segments: Vec::new(),
+            segment_snapshot: None,
             initialized: false,
             segment_pos: 0,
             current_reader: None,
@@ -431,9 +432,11 @@ impl ScanCursor {
         let table_schema = self.table_schema.clone();
         let runtime = self.runtime.clone();
         let segments = self.segments.clone();
+        let segment_snapshot = self.segment_snapshot.clone();
         std::thread::Builder::new()
             .name("taibai-cursor-decode".into())
             .spawn(move || {
+                let _segment_snapshot = segment_snapshot;
                 // A panic in this thread would close the channel and look like
                 // a normal end-of-stream: catch it and fail the query instead.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -655,7 +658,9 @@ impl ScanCursor {
             .join(&self.db)
             .join(&self.spec.table_name);
         self.segments = if table_dir.exists() {
-            let all_segments = SegmentManager::discover_segments(&table_dir)?;
+            let snapshot = crate::storage::segment::snapshot::snapshot_segments(&table_dir)?;
+            let all_segments = snapshot.paths.clone();
+            self.segment_snapshot = Some(snapshot);
             partition::prune_segments_by_partition(all_segments, &self.spec, Some(&self.table_meta))
         } else {
             Vec::new()

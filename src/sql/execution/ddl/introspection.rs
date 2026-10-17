@@ -443,10 +443,38 @@ pub fn exec_show_partitions(
     db: &str,
     table: &Option<String>,
 ) -> Result<ExecResult> {
-    let catalogs = engine.catalogs().read().unwrap();
-    let catalog = catalogs
-        .get(db)
-        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
+    // Only table names are collected under the catalog read guard; the
+    // per-partition scan touches the segment footer of every sealed file, and
+    // holding the global catalog lock across that would stall writers on a
+    // large table for the whole SHOW.
+    let tables: Vec<String> = {
+        let catalogs = engine.catalogs().read().unwrap();
+        let catalog = catalogs
+            .get(db)
+            .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
+        match table {
+            Some(table_name) => {
+                if catalog
+                    .get_table(table_name)
+                    .is_some_and(|meta| meta.is_partitioned())
+                {
+                    vec![table_name.clone()]
+                } else {
+                    Vec::new()
+                }
+            }
+            None => catalog
+                .table_names()
+                .into_iter()
+                .filter(|name| {
+                    catalog
+                        .get_table(name)
+                        .is_some_and(|meta| meta.is_partitioned())
+                })
+                .map(|name| name.to_string())
+                .collect(),
+        }
+    };
 
     let schema = Schema::new(vec![
         ColumnDef::new("Table", DataType::VarChar),
@@ -457,35 +485,84 @@ pub fn exec_show_partitions(
 
     let mut batch = RecordBatch::new(schema.clone());
 
-    if let Some(table_name) = table {
-        let table_name_owned: String = table_name.clone();
-        if let Some(meta) = catalog.get_table(&table_name_owned) {
-            for partition in &meta.partitions {
-                let col0 = batch.column_mut(0).unwrap();
-                col0.push(&ScalarValue::VarChar(Some(table_name_owned.clone())))?;
-                let col1 = batch.column_mut(1).unwrap();
-                col1.push(&ScalarValue::VarChar(Some(partition.key.clone())))?;
-                let col2 = batch.column_mut(2).unwrap();
-                col2.push(&ScalarValue::Int64(Some(partition.row_count)))?;
-                let col3 = batch.column_mut(3).unwrap();
-                col3.push(&ScalarValue::Int64(Some(partition.segment_count as i64)))?;
+    for table_name in tables {
+        // The partition list is derived from disk plus the active writers —
+        // the same view OPTIMIZE TABLE matches against — so the names shown
+        // are exactly the names ON PARTITION accepts.
+        let mut partitions: std::collections::BTreeMap<String, (i64, i64)> = Default::default();
+        let table_dir = engine.data_dir().join(db).join(&table_name);
+        for path in engine
+            .segment_mgr()
+            .discover_inactive_segments(db, &table_name, &table_dir)?
+        {
+            let Some(key) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(crate::storage::partition::partition::parse_partition_key)
+            else {
+                continue;
+            };
+            let entry = partitions.entry(key).or_insert((0, 0));
+            entry.1 += 1;
+            match crate::storage::segment::meta::read_embedded_segment_meta(&path) {
+                Ok(meta) => {
+                    entry.0 = entry.0.saturating_add(
+                        meta.row_count.saturating_sub(meta.deleted_row_count) as i64,
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    db,
+                    table = %table_name,
+                    file = %path.display(),
+                    error = %error,
+                    "SHOW PARTITIONS cannot read segment footer"
+                ),
             }
         }
-    } else {
-        for table_name in catalog.table_names() {
-            let table_name_owned: String = table_name.to_string();
-            if let Some(meta) = catalog.get_table(&table_name_owned) {
-                for partition in &meta.partitions {
-                    let col0 = batch.column_mut(0).unwrap();
-                    col0.push(&ScalarValue::VarChar(Some(table_name_owned.clone())))?;
-                    let col1 = batch.column_mut(1).unwrap();
-                    col1.push(&ScalarValue::VarChar(Some(partition.key.clone())))?;
-                    let col2 = batch.column_mut(2).unwrap();
-                    col2.push(&ScalarValue::Int64(Some(partition.row_count)))?;
-                    let col3 = batch.column_mut(3).unwrap();
-                    col3.push(&ScalarValue::Int64(Some(partition.segment_count as i64)))?;
-                }
+        for (key, rows) in engine
+            .segment_mgr()
+            .active_partition_live_rows(db, &table_name)
+        {
+            // Empty key is the unpartitioned bucket (NULL / unparseable
+            // partition values); it has no name OPTIMIZE could target.
+            if key.is_empty() {
+                continue;
             }
+            let entry = partitions.entry(key).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(rows as i64);
+            entry.1 += 1;
+        }
+        // Rows still in memtables land in those partitions on the next flush,
+        // so they count towards the partition they will belong to.
+        for (key, rows) in engine
+            .batch_writer()
+            .memtable_manager()
+            .flushable_partition_rows(db, &table_name)
+        {
+            if key.is_empty() {
+                continue;
+            }
+            let entry = partitions.entry(key).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(rows as i64);
+        }
+
+        for (key, (rows, segments)) in partitions {
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::VarChar(Some(table_name.clone())))?;
+            batch
+                .column_mut(1)
+                .unwrap()
+                .push(&ScalarValue::VarChar(Some(key)))?;
+            batch
+                .column_mut(2)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(rows)))?;
+            batch
+                .column_mut(3)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(segments)))?;
         }
     }
 
@@ -685,11 +762,12 @@ pub fn exec_optimize_table(
         engine.data_dir().to_path_buf(),
     );
 
-    let stats = if let Some(partition) = partition {
-        compactor.optimize_partition(db, table, &table_meta, partition)?
+    let result = if let Some(partition) = partition {
+        compactor.optimize_partition(db, table, &table_meta, partition)
     } else {
-        compactor.optimize_table(db, table, &table_meta)?
+        compactor.optimize_table(db, table, &table_meta)
     };
+    let stats = compactor.committed_stats();
 
     // Compaction frees segment path numbers the next writer may reuse; the
     // sum-cache key cannot tell incarnations apart (see drop table).
@@ -710,22 +788,36 @@ pub fn exec_optimize_table(
         }
     }
 
-    // The rewrite moved rows to new segment locations, so rebuild the
-    // location-index snapshots eagerly instead of invalidating them for a
-    // lazy rebuild on the next probe. Skip when compaction was a no-op.
-    if stats.segments_written > 0 || stats.rows_dropped > 0 {
+    // Full-table maintenance preserves eager index rebuilding. A partition
+    // operation refreshes on demand so its finishing phase does not take the
+    // table gate for a scan of every historical partition.
+    if (stats.segments_written > 0 || stats.rows_dropped > 0) && partition.is_some() {
+        // Partition maintenance must not rebuild every index over all historical
+        // partitions under the table gate. Epoch validation already rejects old
+        // locations; invalidate the key cache and refresh snapshots on demand.
+        engine
+            .index_manager()
+            .invalidate_primary_key_cache(db, table);
+        let names = table_meta
+            .unique_indexes
+            .iter()
+            .map(|i| i.name.clone())
+            .collect::<Vec<_>>();
+        engine
+            .index_manager()
+            .invalidate_table_unique_index_snapshots(db, table, &names);
+    } else if stats.segments_written > 0 || stats.rows_dropped > 0 {
         let schema = Schema::new(table_meta.columns.clone());
-        let rebuilt = engine
-            .segment_mgr()
-            .with_table_mutation_lock(db, table, || {
-                crate::sql::execution::dml_insert::rebuild_table_location_indexes(
-                    engine,
-                    db,
-                    table,
-                    &table_meta,
-                    &schema,
-                )
-            });
+        let rebuilt = crate::sql::execution::dml_insert::rebuild_table_location_indexes_two_phase(
+            engine.index_manager(),
+            engine.segment_mgr(),
+            engine.memtable_manager(),
+            engine.data_dir(),
+            db,
+            table,
+            &table_meta,
+            &schema,
+        );
         if let Err(error) = rebuilt {
             tracing::warn!(
                 db,
@@ -744,6 +836,7 @@ pub fn exec_optimize_table(
         }
     }
 
+    result?;
     tracing::info!(
         db,
         table,
