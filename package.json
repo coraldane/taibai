@@ -1,0 +1,12 @@
+{
+  "name": "taibai-release",
+  "private": true,
+  "description": "taibai 发版脚本依赖（打包发布走 scripts/release.mjs；数据库本体是纯 Rust，见 Cargo.toml）",
+  "type": "module",
+  "scripts": {
+    "release": "node scripts/release.mjs"
+  },
+  "dependencies": {
+    "ali-oss": "^6.21.0"
+  }
+}

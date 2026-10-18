@@ -50,3 +50,9 @@ Thumbs.db
 *.bak
 *.backup
 target-zcode/
+
+# 发版脚本产物与本地凭证
+/build/
+/dist/
+node_modules/
+conf/release.local.json
