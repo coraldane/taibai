@@ -75,6 +75,26 @@ parse_args() {
     done
 }
 
+resolve_target_dir() {
+    # cargo 的 target 目录会被环境变量或 cargo 配置（含 ~/.cargo/config.toml 的
+    # 全局共享目录）挪走，产物别死认 $PROJECT_ROOT/target
+    if [ -n "$CARGO_TARGET_DIR" ]; then
+        echo "$CARGO_TARGET_DIR"
+        return
+    fi
+    local cfg td
+    for cfg in "$PROJECT_ROOT/.cargo/config.toml" "$HOME/.cargo/config.toml"; do
+        if [ -f "$cfg" ]; then
+            td="$(sed -n 's/^[[:space:]]*target-dir[[:space:]]*=[[:space:]]*["'\'']\{0,1\}\([^"'\''#]*\).*/\1/p' "$cfg" | head -1 | tr -d '[:space:]')"
+            if [ -n "$td" ]; then
+                echo "$td"
+                return
+            fi
+        fi
+    done
+    echo "$PROJECT_ROOT/target"
+}
+
 get_rust_target() {
     local os="$1"
     local arch="$2"
@@ -109,7 +129,7 @@ build_binary() {
     
     if [ "$target_os" = "$DEFAULT_OS" ] && [ "$target_arch" = "$DEFAULT_ARCH" ]; then
         cargo build --release
-        cp -f "$PROJECT_ROOT/target/release/$BINARY_NAME" "$out_dir/$BINARY_NAME"
+        cp -f "$(resolve_target_dir)/release/$BINARY_NAME" "$out_dir/$BINARY_NAME"
     else
         rustup target add "$target_triple" 2>/dev/null || true
         cargo build --release --target "$target_triple" || {
@@ -117,7 +137,7 @@ build_binary() {
             echo "Hint: You may need to install the target with: rustup target add $target_triple"
             exit 1
         }
-        cp -f "$PROJECT_ROOT/target/$target_triple/release/$BINARY_NAME" "$out_dir/$BINARY_NAME"
+        cp -f "$(resolve_target_dir)/$target_triple/release/$BINARY_NAME" "$out_dir/$BINARY_NAME"
     fi
     
     chmod +x "$out_dir/$BINARY_NAME"
