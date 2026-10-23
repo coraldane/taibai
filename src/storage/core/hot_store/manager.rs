@@ -163,6 +163,23 @@ impl HotStoreManager {
         self.invalidated.write().unwrap().remove(&table_key);
     }
 
+    /// Per-store accounting for `SHOW MEMORY`: one `((db, table), bytes)`
+    /// pair per resident store, plus the store count. Uses the same
+    /// estimate the append backpressure enforces.
+    pub fn memory_snapshot(&self) -> Vec<((String, String), u64)> {
+        let stores = self.stores.read().unwrap();
+        stores
+            .iter()
+            .map(|(key, store)| (key.clone(), store.estimated_memory_bytes()))
+            .collect()
+    }
+
+    /// Tables whose store was dropped by [`Self::invalidate`] and await a
+    /// rebuild (sticky markers, one map entry each).
+    pub fn stale_table_count(&self) -> usize {
+        self.invalidated.read().unwrap().len()
+    }
+
     /// Drop an append-only hot store after an in-place mutation and mark the
     /// table STALE. A stale table is not served (`get` finds nothing, readers
     /// fall back to the generic scan) and not fed from a single batch:

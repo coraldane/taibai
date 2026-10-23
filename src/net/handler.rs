@@ -20,6 +20,115 @@ use crate::storage::core::pubsub::{PublishedFrame, SubscribeMode, SubscribeReque
 use crate::types::batch::RecordBatch;
 use crate::types::scalar::ScalarValue;
 
+/// Park interval between live-fan-out waits in the replication push bridge.
+/// Each wake doubles as a disconnect probe: an idle primary never produces an
+/// event whose send would fail, so without the probe a vanished standby left
+/// its bridge thread (stack, 4096-slot channel and registered session) parked
+/// in `recv_timeout` forever — one leaked set per standby reconnect.
+const REPL_PUSH_PARK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cap on out-of-order events buffered while the bridge waits for the missing
+/// seq. A permanent gap (a session the ring already skipped) otherwise grows
+/// the buffer by one entry per subsequent event; past the cap the bridge
+/// drops the session and the standby reconnects + re-pulls history from its
+/// durably applied seq.
+const REPL_PUSH_MAX_PENDING: usize = 8192;
+
+/// Bridge thread of `REPL_HELLO`: replays ring history first, then streams
+/// live fan-out, both funneled into the connection's push queue in strict seq
+/// order. `sink_tx` must already be registered on the `RepLog`. The bridge
+/// exits — unregistering the session — when the push queue rejects (client
+/// gone), the push channel is observed closed at a park timeout, the session
+/// is dropped by the ring, or the pending buffer exceeds
+/// [`REPL_PUSH_MAX_PENDING`]. Returns the detached thread handle so tests can
+/// join it.
+fn spawn_replication_push_bridge(
+    rep_log: Arc<crate::storage::replication::RepLog>,
+    push_tx: tokio::sync::mpsc::Sender<Message>,
+    last_seq: u64,
+    history: Vec<(u64, Arc<crate::storage::replication::ReplicationEvent>)>,
+    park_timeout: Duration,
+) -> std::thread::JoinHandle<()> {
+    let (sink_tx, sink_rx) = crossbeam_channel::bounded::<(
+        u64,
+        Arc<crate::storage::replication::ReplicationEvent>,
+    )>(4096);
+    // Register the bridge's own sink: `publish`'s fan-out drops sessions that
+    // stall past its send timeout, which disconnects `sink_rx` below.
+    rep_log.register_session(&sink_tx);
+    std::thread::Builder::new()
+        .name("taibai-repl-push".into())
+        .spawn(move || {
+            let push = |seq: u64, event: &crate::storage::replication::ReplicationEvent| {
+                let mut payload_bytes = Vec::with_capacity(8 + 4 + 128);
+                payload_bytes.extend_from_slice(&seq.to_le_bytes());
+                let encoded = event.encode();
+                payload_bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                payload_bytes.extend_from_slice(&encoded);
+                push_tx.blocking_send(Message {
+                    msg_type: MSG_TYPE_REPL_EVENT,
+                    payload: bytes::Bytes::from(payload_bytes),
+                })
+            };
+            let abandon = || rep_log.remove_session(&sink_tx);
+            let mut next = last_seq + 1;
+            let mut pending: std::collections::BTreeMap<
+                u64,
+                Arc<crate::storage::replication::ReplicationEvent>,
+            > = std::collections::BTreeMap::new();
+            for (seq, event) in history {
+                if seq < next {
+                    continue;
+                }
+                pending.insert(seq, event);
+                if pending.len() > REPL_PUSH_MAX_PENDING {
+                    abandon();
+                    return;
+                }
+                while let Some(event) = pending.remove(&next) {
+                    if push(next, &event).is_err() {
+                        abandon();
+                        return;
+                    }
+                    next += 1;
+                }
+            }
+            loop {
+                while let Some(event) = pending.remove(&next) {
+                    if push(next, &event).is_err() {
+                        abandon();
+                        return;
+                    }
+                    next += 1;
+                }
+                match sink_rx.recv_timeout(park_timeout) {
+                    Ok((seq, event)) => {
+                        if seq < next {
+                            continue;
+                        }
+                        pending.insert(seq, event);
+                        if pending.len() > REPL_PUSH_MAX_PENDING {
+                            abandon();
+                            return;
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        // The client can vanish while the primary is idle: no
+                        // event ever triggers a failing send, so probe the
+                        // push channel here instead of parking forever.
+                        if push_tx.is_closed() {
+                            abandon();
+                            return;
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            rep_log.remove_session(&sink_tx);
+        })
+        .expect("failed to spawn replication push thread")
+}
+
 pub struct Handler {
     pub session: Option<Session>,
     config: Arc<ServerConfig>,
@@ -1694,70 +1803,18 @@ impl Handler {
             )]);
         };
 
-        let (sink_tx, sink_rx) = crossbeam_channel::bounded::<(
-            u64,
-            Arc<crate::storage::replication::ReplicationEvent>,
-        )>(4096);
-        rep_log.register_session(&sink_tx);
-
         // Bridge thread: ring history first, then live fan-out, both funneled
-        // into the connection push queue in strict seq order.
-        std::thread::Builder::new()
-            .name("taibai-repl-push".into())
-            .spawn(move || {
-                use std::collections::BTreeMap;
-                use std::sync::Arc as StdArc;
-                let push = |seq: u64, event: &crate::storage::replication::ReplicationEvent| {
-                    let mut payload_bytes = Vec::with_capacity(8 + 4 + 128);
-                    payload_bytes.extend_from_slice(&seq.to_le_bytes());
-                    let encoded = event.encode();
-                    payload_bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-                    payload_bytes.extend_from_slice(&encoded);
-                    push_tx.blocking_send(Message {
-                        msg_type: MSG_TYPE_REPL_EVENT,
-                        payload: bytes::Bytes::from(payload_bytes),
-                    })
-                };
-                let mut next = last_seq + 1;
-                let mut pending: BTreeMap<
-                    u64,
-                    StdArc<crate::storage::replication::ReplicationEvent>,
-                > = BTreeMap::new();
-                for (seq, event) in history {
-                    if seq < next {
-                        continue;
-                    }
-                    pending.insert(seq, event);
-                    while let Some(event) = pending.remove(&next) {
-                        if push(next, &event).is_err() {
-                            rep_log.remove_session(&sink_tx);
-                            return;
-                        }
-                        next += 1;
-                    }
-                }
-                loop {
-                    while let Some(event) = pending.remove(&next) {
-                        if push(next, &event).is_err() {
-                            rep_log.remove_session(&sink_tx);
-                            return;
-                        }
-                        next += 1;
-                    }
-                    match sink_rx.recv_timeout(std::time::Duration::from_secs(30)) {
-                        Ok((seq, event)) => {
-                            if seq < next {
-                                continue;
-                            }
-                            pending.insert(seq, event);
-                        }
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-                rep_log.remove_session(&sink_tx);
-            })
-            .expect("failed to spawn replication push thread");
+        // into the connection push queue in strict seq order. The bridge owns
+        // its ring session (register + unregister); the returned handle is
+        // dropped on purpose (detached), the bridge reaps itself via the
+        // disconnect probe / pending cap / channel teardown.
+        let _bridge = spawn_replication_push_bridge(
+            rep_log,
+            push_tx,
+            last_seq,
+            history,
+            REPL_PUSH_PARK_TIMEOUT,
+        );
 
         Ok(vec![build_ok(0)])
     }

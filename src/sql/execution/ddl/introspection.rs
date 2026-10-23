@@ -636,6 +636,111 @@ pub fn exec_show_engines(_engine: &Engine) -> Result<ExecResult> {
     })
 }
 
+/// `SHOW MEMORY`: resident-memory accounting of the engine's long-lived
+/// structures. Every row is a point-in-time counter; none of these were
+/// observable before, which made server-side RSS growth impossible to
+/// attribute from outside the process.
+pub fn exec_show_memory(engine: &Engine) -> Result<ExecResult> {
+    let mut rows: Vec<(&'static str, String, u64)> = Vec::new();
+
+    let hot_mgr = engine.hot_store_manager();
+    let snapshot = hot_mgr.memory_snapshot();
+    rows.push(("hot_store", "stores".into(), snapshot.len() as u64));
+    rows.push((
+        "hot_store",
+        "stale_tables".into(),
+        hot_mgr.stale_table_count() as u64,
+    ));
+    for ((db, table), bytes) in snapshot {
+        rows.push(("hot_store", format!("{db}.{table}"), bytes));
+    }
+
+    match engine.rep_log() {
+        Some(rep_log) => {
+            let (ring_events, ring_bytes) = rep_log.ring_stats();
+            rows.push(("replication", "enabled".into(), 1));
+            rows.push(("replication", "ring_events".into(), ring_events as u64));
+            rows.push(("replication", "ring_bytes_est".into(), ring_bytes));
+            rows.push((
+                "replication",
+                "ring_max_bytes".into(),
+                rep_log.ring_byte_limit(),
+            ));
+            rows.push((
+                "replication",
+                "sessions".into(),
+                rep_log.session_count() as u64,
+            ));
+        }
+        None => {
+            rows.push(("replication", "enabled".into(), 0));
+            // The ceiling is config-sourced, so it stays visible even where
+            // no RepLog instance exists (standby / replication off).
+            rows.push((
+                "replication",
+                "ring_max_bytes".into(),
+                crate::common::config::replication_settings().ring_max_bytes,
+            ));
+        }
+    }
+
+    let (cached_entries, cached_bytes, budget_bytes) = engine.segment_mgr().reader_cache_stats();
+    rows.push((
+        "segment_readers",
+        "cached_entries".into(),
+        cached_entries as u64,
+    ));
+    rows.push(("segment_readers", "cached_heap_bytes".into(), cached_bytes));
+    rows.push(("segment_readers", "cache_budget_bytes".into(), budget_bytes));
+    let (mutable_entries, mutable_bytes) = engine.segment_mgr().mutable_reader_cache_stats();
+    rows.push((
+        "segment_readers",
+        "mutable_entries".into(),
+        mutable_entries as u64,
+    ));
+    rows.push((
+        "segment_readers",
+        "mutable_heap_bytes".into(),
+        mutable_bytes,
+    ));
+    rows.push((
+        "segment_readers",
+        "mutable_budget_bytes".into(),
+        crate::common::config::mutable_reader_cache_budget_bytes(),
+    ));
+
+    rows.push((
+        "memtable",
+        "estimated_bytes".into(),
+        engine.memtable_manager().total_estimated_memory_bytes(),
+    ));
+
+    let schema = Schema::new(vec![
+        ColumnDef::new("Component", DataType::VarChar),
+        ColumnDef::new("Name", DataType::VarChar),
+        ColumnDef::new("Value", DataType::Int64),
+    ]);
+    let mut batch = RecordBatch::new(schema.clone());
+    for (component, name, value) in rows {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(component.to_string())))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(name)))?;
+        batch
+            .column_mut(2)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(value as i64)))?;
+    }
+    Ok(ExecResult::Query {
+        schema,
+        batches: vec![batch],
+    })
+}
+
 pub fn exec_show_processlist(engine: &Engine, full: bool) -> Result<ExecResult> {
     let entries = engine.query_registry().list();
     let schema = Schema::new(vec![

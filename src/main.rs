@@ -7,6 +7,19 @@ use net::server::Server;
 use sql::execution::{AutoCompactConfig, Engine};
 use storage::segment_manager::SegmentConfig;
 
+// Long-running server process: jemalloc's decay-based page return keeps RSS
+// tracking live data (glibc arenas on many-core boxes retain their peak
+// forever). Windows has no jemalloc/MSVC support, so it gets mimalloc.
+// Runtime tuning (decay aggressiveness, profiling) goes through the
+// allocator's own env var: MALLOC_CONF on unix, MIMALLOC_* on Windows.
+#[cfg(unix)]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(windows)]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Clone)]
 struct AsyncTracingWriter {
     sender: crossbeam_channel::Sender<Vec<u8>>,
@@ -187,6 +200,12 @@ where
     common::config::set_storage_runtime_settings(
         config.compression.bulk_zstd_level,
         config.storage.reader_cache_capacity,
+    );
+    common::config::set_mutable_reader_cache_budget_bytes(
+        config
+            .storage
+            .mutable_reader_cache_mb
+            .saturating_mul(1024 * 1024),
     );
     common::config::set_storage_timeouts(common::config::StorageTimeouts {
         mutation_lock_timeout_secs: config.storage.mutation_lock_timeout_secs,

@@ -175,6 +175,7 @@ impl Engine {
         let rep_log = if replication_settings.role_is_primary() {
             let log = Arc::new(crate::storage::replication::RepLog::new(
                 replication_settings.ring_capacity,
+                replication_settings.ring_max_bytes,
                 data_dir,
             ));
             batch_writer.set_rep_log(Arc::clone(&log));
@@ -890,6 +891,7 @@ impl Engine {
                 )
             }
             Statement::ShowEngines => crate::sql::execution::ddl::exec_show_engines(self),
+            Statement::ShowMemory => crate::sql::execution::ddl::exec_show_memory(self),
             Statement::ShowProcesslist { full } => {
                 crate::sql::execution::ddl::exec_show_processlist(self, *full)
             }
@@ -1427,6 +1429,7 @@ impl Engine {
             | Statement::ShowRoles
             | Statement::ShowGrants { .. }
             | Statement::ShowProcesslist { .. }
+            | Statement::ShowMemory
             | Statement::KillQuery { .. }
             | Statement::PauseFlush
             | Statement::ResumeFlush

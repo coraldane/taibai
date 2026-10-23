@@ -195,6 +195,13 @@ impl ReaderCache {
         reader
     }
 
+    /// `(entries, charged heap bytes, budget bytes)` for `SHOW MEMORY`. The
+    /// charge covers owned readers' heap copies; mmap readers are
+    /// page-cache-backed and only their metadata is charged.
+    pub(super) fn stats(&self) -> (usize, u64, u64) {
+        (self.entries.len(), self.used_bytes, self.budget_bytes)
+    }
+
     pub(super) fn invalidate(&mut self, path: &Path) {
         if let Some((_, cost)) = self.entries.remove(path) {
             self.used_bytes -= cost;

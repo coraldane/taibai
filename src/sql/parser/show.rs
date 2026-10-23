@@ -121,6 +121,10 @@ impl Parser {
                 self.advance();
                 Ok(Statement::ShowEngines)
             }
+            Token::Ident(word) if word.eq_ignore_ascii_case("MEMORY") => {
+                self.advance();
+                Ok(Statement::ShowMemory)
+            }
             Token::Full => {
                 self.advance();
                 self.expect(&Token::Processlist)?;
@@ -135,7 +139,7 @@ impl Parser {
                 Ok(Statement::ShowProcesslist { full })
             }
             other => Err(TaibaiError::Sql(format!(
-                "expected TABLES, DATABASES, COLUMNS, INDEXES, CREATE, USER, ROLE, GRANTS, PARTITIONS, STATS, ENGINES, PROCESSLIST, after SHOW, got {}",
+                "expected TABLES, DATABASES, COLUMNS, INDEXES, CREATE, USER, ROLE, GRANTS, PARTITIONS, STATS, ENGINES, MEMORY, PROCESSLIST, after SHOW, got {}",
                 other
             ))),
         }

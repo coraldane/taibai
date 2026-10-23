@@ -77,6 +77,16 @@ argon2 = "0.5"
 # Salt generation for argon2 (OsRng needs the getrandom feature).
 rand_core = { version = "0.6", features = ["getrandom"] }
 
+# Production allocators: jemalloc on unix (page-decay returns freed memory to
+# the OS — glibc arenas on many-core servers retain their peak forever), and
+# mimalloc on Windows where jemalloc cannot build (no MSVC support; mimalloc
+# needs CMake on the Windows build machine). Wired in main.rs.
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+mimalloc = "0.1"
+
 [dev-dependencies]
 tempfile = "3"
 

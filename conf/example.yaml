@@ -36,6 +36,10 @@ storage:
   row_group_target_rows: 65536
   # reader 与 segment 元数据缓存的 segment 数量
   reader_cache_capacity: 1024
+  # 活跃 segment reader 缓存的字节上限。每个条目是活跃（未 seal）segment 文件
+  # 的整份堆拷贝，单条最大约 min_segment_seal_size_mb；并发写入的分区越多，
+  # 驻留拷贝越多。另受 4×reader_cache_capacity 条数上限约束，两者先到先裁。
+  mutable_reader_cache_mb: 4096
   # 等待表级 mutation lock 的最长时间（秒），超时返回锁超时错误而不是永久阻塞
   mutation_lock_timeout_secs: 60
   # 加锁等待超过该阈值时输出 warn 日志，暴露锁排队
@@ -62,6 +66,11 @@ replication:
   user: root
   password: taibai
   ring_capacity: 65536
+  # 复制事件环形缓冲的字节上限。事件与 ring_capacity 条数上限双重封顶：每条
+  # 事件携带整组压缩写入帧（单组上限 16 MiB），只按条数封顶时高写入量主库的
+  # 保留历史可膨胀到数百 GB。超限逐出最老事件，落后备库改走重连 + 段文件
+  # 拉取（REPL_SEGMENT_FETCH）补齐，不影响正确性。
+  ring_max_bytes: 1073741824
 
 buffer:
   query_memory_limit_mb: 4096

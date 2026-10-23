@@ -1301,3 +1301,110 @@ fn streaming_splits_oversized_batches_into_frame_sized_chunks() {
     let expected: Vec<ScalarValue> = (0..200).map(|i| ScalarValue::Int64(Some(i))).collect();
     assert_eq!(rows, expected);
 }
+
+mod replication_push_bridge_tests {
+    use super::*;
+    use crate::storage::replication::{RepLog, ReplicationEvent};
+    use std::time::Duration;
+
+    fn bridge_tail_event() -> ReplicationEvent {
+        ReplicationEvent::TailAppend {
+            db: "main".into(),
+            table: "t".into(),
+            partition: "2026".into(),
+            memtable_id: uuid::Uuid::new_v4(),
+            first_lsn: 1,
+            last_lsn: 2,
+            frames: vec![1, 2, 3, 4],
+        }
+    }
+
+    /// Join a bridge thread through a bounded wait so a regression hangs the
+    /// assert instead of the whole test binary.
+    fn join_with_timeout(bridge: std::thread::JoinHandle<()>) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = bridge.join();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bridge thread did not exit");
+    }
+
+    #[test]
+    fn bridge_exits_when_client_disconnects_on_idle_primary() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let rep_log = std::sync::Arc::new(RepLog::new(64, u64::MAX, temp.path()));
+        let (push_tx, push_rx) = tokio::sync::mpsc::channel::<Message>(1);
+        // Standby vanishes; the primary publishes nothing afterwards, so the
+        // only exit signal is the park-timeout disconnect probe.
+        drop(push_rx);
+
+        let bridge = spawn_replication_push_bridge(
+            rep_log.clone(),
+            push_tx,
+            0,
+            Vec::new(),
+            Duration::from_millis(100),
+        );
+        join_with_timeout(bridge);
+        assert_eq!(rep_log.session_count(), 0);
+    }
+
+    #[test]
+    fn bridge_caps_pending_buffer_on_permanent_seq_gap() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let rep_log = std::sync::Arc::new(RepLog::new(64, u64::MAX, temp.path()));
+        let (push_tx, _push_rx) = tokio::sync::mpsc::channel::<Message>(16);
+
+        // History missing seq 1: `next` never advances, so every replayed
+        // event piles up in `pending` until the cap drops the session.
+        let history: Vec<(u64, std::sync::Arc<ReplicationEvent>)> =
+            (2..=(REPL_PUSH_MAX_PENDING as u64 + 3))
+                .map(|seq| (seq, std::sync::Arc::new(bridge_tail_event())))
+                .collect();
+
+        let bridge = spawn_replication_push_bridge(
+            rep_log.clone(),
+            push_tx,
+            0,
+            history,
+            Duration::from_millis(100),
+        );
+        join_with_timeout(bridge);
+        assert_eq!(rep_log.session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn bridge_streams_history_in_seq_order_and_releases_session() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let rep_log = std::sync::Arc::new(RepLog::new(64, u64::MAX, temp.path()));
+        let (push_tx, mut push_rx) = tokio::sync::mpsc::channel::<Message>(64);
+
+        let history: Vec<(u64, std::sync::Arc<ReplicationEvent>)> = (1..=4)
+            .map(|seq| (seq, std::sync::Arc::new(bridge_tail_event())))
+            .collect();
+        let bridge = spawn_replication_push_bridge(
+            rep_log.clone(),
+            push_tx,
+            0,
+            history,
+            Duration::from_millis(100),
+        );
+
+        for expected_seq in 1..=4u64 {
+            let message = tokio::time::timeout(Duration::from_secs(5), push_rx.recv())
+                .await
+                .expect("push timed out")
+                .expect("push channel closed");
+            let seq = u64::from_le_bytes(message.payload[..8].try_into().unwrap());
+            assert_eq!(seq, expected_seq);
+        }
+
+        // Client disappears; the probe must reap the bridge and session.
+        drop(push_rx);
+        join_with_timeout(bridge);
+        assert_eq!(rep_log.session_count(), 0);
+    }
+}

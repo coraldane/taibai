@@ -585,8 +585,11 @@ SHOW PARTITIONS [FROM 表名]
 SHOW STATS
 SHOW PERFORMANCE BASELINES
 SHOW ENGINES
+SHOW MEMORY
 SHOW PROCESSLIST [FULL]
 ```
+
+`SHOW MEMORY` 输出服务端长驻内存结构的即时计数（需要全局管理员权限），用于归因进程 RSS 增长：`hot_store`（每张 hot 表的内存镜像字节数与 stale 表数）、`replication`（复制环形缓冲的条数、估算字节数与会话数）、`segment_readers`（segment reader 缓存的条目/堆字节/预算，以及活跃 segment 整文件拷贝缓存的条目与堆字节）、`memtable`（未落盘 memtable 估算字节）。
 
 ### 8.2 EXPLAIN
 

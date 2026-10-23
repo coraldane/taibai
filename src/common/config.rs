@@ -173,6 +173,21 @@ pub fn reader_cache_capacity() -> usize {
     *READER_CACHE_CAPACITY.get().unwrap_or(&1024)
 }
 
+static MUTABLE_READER_CACHE_BUDGET_BYTES: OnceLock<u64> = OnceLock::new();
+
+/// Install the mutable-segment reader cache byte budget
+/// (`storage.mutable_reader_cache_mb` in the config file), sourced from the
+/// same startup pass as the other storage runtime tunables.
+pub fn set_mutable_reader_cache_budget_bytes(budget_bytes: u64) {
+    let _ = MUTABLE_READER_CACHE_BUDGET_BYTES.set(budget_bytes.max(1024 * 1024));
+}
+
+pub fn mutable_reader_cache_budget_bytes() -> u64 {
+    *MUTABLE_READER_CACHE_BUDGET_BYTES
+        .get()
+        .unwrap_or(&(4096 * 1024 * 1024))
+}
+
 /// Install the process-wide query limits. Called once during startup.
 /// Returns an error if called more than once (limits are immutable thereafter).
 pub fn set_query_limits(limits: QueryLimits) -> Result<(), QueryLimits> {
@@ -430,6 +445,10 @@ fn default_row_group_target_rows() -> usize {
     8_192
 }
 
+fn default_mutable_reader_cache_mb() -> u64 {
+    4096
+}
+
 fn default_reader_cache_capacity() -> usize {
     1024
 }
@@ -537,6 +556,14 @@ pub struct ReplicationSettings {
     /// Primary only: events retained for reconnecting standbys.
     #[serde(default = "default_replication_ring_capacity")]
     pub ring_capacity: usize,
+    /// Primary only: byte ceiling for the retained-event ring. The ring is
+    /// also entry-bounded (`ring_capacity`), but entries carry whole
+    /// compressed write groups (up to 16 MiB each), so without a byte
+    /// ceiling the retained history can reach hundreds of GB on write-heavy
+    /// primaries. Oldest events are evicted past the ceiling; a lagging
+    /// standby re-bootstraps via segment fetch instead.
+    #[serde(default = "default_replication_ring_max_bytes")]
+    pub ring_max_bytes: u64,
 }
 
 impl Default for ReplicationSettings {
@@ -547,12 +574,17 @@ impl Default for ReplicationSettings {
             user: String::new(),
             password: String::new(),
             ring_capacity: default_replication_ring_capacity(),
+            ring_max_bytes: default_replication_ring_max_bytes(),
         }
     }
 }
 
 fn default_replication_ring_capacity() -> usize {
     65_536
+}
+
+fn default_replication_ring_max_bytes() -> u64 {
+    1024 * 1024 * 1024
 }
 
 impl ReplicationSettings {
@@ -713,6 +745,13 @@ pub struct StorageSettings {
     /// Number of segments kept in the reader and segment-metadata caches.
     #[serde(default = "default_reader_cache_capacity")]
     pub reader_cache_capacity: usize,
+    /// Byte ceiling for the mutable-segment reader cache. Each entry is a
+    /// full heap copy of an active segment file (up to `min_segment_seal_size`),
+    /// and the cache is additionally entry-bounded at 4x the reader cache
+    /// capacity; without a byte ceiling many concurrently-written partitions
+    /// pin one copy each, which showed up as unbounded anon RSS growth.
+    #[serde(default = "default_mutable_reader_cache_mb")]
+    pub mutable_reader_cache_mb: u64,
     /// Maximum time a write may wait for the per-table mutation lock before
     /// failing with a lock timeout error instead of blocking forever.
     #[serde(default = "default_mutation_lock_timeout_secs")]
@@ -1019,6 +1058,7 @@ fn default_storage_settings() -> StorageSettings {
         hybrid_hot_scan_enabled: default_hybrid_hot_scan_enabled(),
         row_group_target_rows: default_row_group_target_rows(),
         reader_cache_capacity: default_reader_cache_capacity(),
+        mutable_reader_cache_mb: default_mutable_reader_cache_mb(),
         tail_async_fsync: false,
         tail_archive: false,
         mutation_lock_timeout_secs: default_mutation_lock_timeout_secs(),

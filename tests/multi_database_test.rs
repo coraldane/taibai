@@ -522,3 +522,132 @@ fn subquery_tables_require_select_permission_on_every_read_path() {
 
     engine.segment_mgr().shutdown();
 }
+
+#[test]
+fn drop_database_releases_hot_store_mirrors() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(&mut session, "CREATE DATABASE db1")
+        .expect("create db1");
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE db1.ticks (
+                security_id VARCHAR PRIMARY KEY,
+                trade_time TIMESTAMP NOT NULL,
+                value INT64
+            ) CLUSTER BY (security_id) HOT BY (trade_time) INDEX (security_id)",
+        )
+        .expect("create hot table");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO db1.ticks VALUES ('A', 1783492992000000, 1)",
+        )
+        .expect("insert hot row");
+    assert!(engine.hot_store_manager().get("db1", "ticks").is_some());
+    assert!(
+        !engine.hot_store_manager().memory_snapshot().is_empty(),
+        "hot mirror must be resident before the drop"
+    );
+
+    engine
+        .execute(&mut session, "DROP DATABASE db1")
+        .expect("drop db1");
+
+    // Regression: DROP DATABASE used to leave every dropped table's hot
+    // mirror (each allowed to grow to the full per-store memory limit)
+    // resident until process restart.
+    assert!(engine.hot_store_manager().get("db1", "ticks").is_none());
+    assert!(engine.hot_store_manager().memory_snapshot().is_empty());
+
+    engine.segment_mgr().shutdown();
+}
+
+fn show_memory_rows(result: ExecResult) -> Vec<(String, String, i64)> {
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result");
+    };
+    let mut rows = Vec::new();
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            let component = match batch.scalar(row, 0) {
+                Some(ScalarValue::VarChar(Some(v))) => v,
+                other => panic!("expected component name, got {:?}", other),
+            };
+            let name = match batch.scalar(row, 1) {
+                Some(ScalarValue::VarChar(Some(v))) => v,
+                other => panic!("expected metric name, got {:?}", other),
+            };
+            let value = match batch.scalar(row, 2) {
+                Some(ScalarValue::Int64(Some(v))) => v,
+                other => panic!("expected int64 value, got {:?}", other),
+            };
+            rows.push((component, name, value));
+        }
+    }
+    rows
+}
+
+#[test]
+fn show_memory_reports_component_rows_and_requires_admin() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(&mut session, "CREATE DATABASE db1")
+        .expect("create db1");
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE db1.ticks (
+                security_id VARCHAR PRIMARY KEY,
+                trade_time TIMESTAMP NOT NULL,
+                value INT64
+            ) CLUSTER BY (security_id) HOT BY (trade_time) INDEX (security_id)",
+        )
+        .expect("create hot table");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO db1.ticks VALUES ('A', 1783492992000000, 1)",
+        )
+        .expect("insert hot row");
+
+    let rows = show_memory_rows(
+        engine
+            .execute(&mut session, "SHOW MEMORY")
+            .expect("show memory"),
+    );
+    let has =
+        |component: &str, name: &str| rows.iter().any(|(c, n, _)| c == component && n == name);
+    assert!(has("hot_store", "stores"), "rows: {rows:?}");
+    assert!(has("hot_store", "db1.ticks"), "rows: {rows:?}");
+    assert!(has("replication", "enabled"), "rows: {rows:?}");
+    assert!(has("replication", "ring_max_bytes"), "rows: {rows:?}");
+    assert!(has("segment_readers", "mutable_entries"), "rows: {rows:?}");
+    assert!(
+        has("segment_readers", "cache_budget_bytes"),
+        "rows: {rows:?}"
+    );
+    assert!(
+        has("segment_readers", "mutable_budget_bytes"),
+        "rows: {rows:?}"
+    );
+    assert!(has("memtable", "estimated_bytes"), "rows: {rows:?}");
+
+    engine
+        .execute(&mut session, "CREATE USER bob IDENTIFIED BY 'pw'")
+        .expect("create bob");
+    let mut bob = Session::new("bob".to_string(), "main".to_string());
+    assert!(
+        engine.execute(&mut bob, "SHOW MEMORY").is_err(),
+        "SHOW MEMORY must require global admin"
+    );
+
+    engine.segment_mgr().shutdown();
+}

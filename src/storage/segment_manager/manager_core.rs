@@ -22,6 +22,25 @@ fn flush_epoch_persist_lock(key: &str) -> &std::sync::Mutex<()> {
     &locks[(hash as usize) % locks.len()]
 }
 
+/// Whether the mutable reader cache must evict one entry before accepting an
+/// entry charged `charged_bytes`. An empty cache always accepts: refusing to
+/// cache an entry larger than the whole budget would disable the cache for
+/// big active segments entirely, and the entry ceiling reclaims it later.
+fn mutable_cache_needs_eviction(
+    entries: usize,
+    used_bytes: u64,
+    charged_bytes: u64,
+    entry_capacity: usize,
+    budget_bytes: u64,
+) -> bool {
+    entries >= entry_capacity
+        || (used_bytes.saturating_add(charged_bytes) > budget_bytes && entries > 0)
+}
+
+fn mutable_cache_used_bytes(cache: &HashMap<PathBuf, (std::sync::Arc<SegmentReader>, u64)>) -> u64 {
+    cache.values().map(|(_, charged)| *charged).sum()
+}
+
 impl SegmentManager {
     pub fn set_flush_transition_delay_for_tests(&self, ms: u64) {
         FLUSH_TRANSITION_DELAY_MS.store(ms, Ordering::Release);
@@ -926,7 +945,12 @@ impl SegmentManager {
         // falls back to the reopen path, whose `open_mutable_reader_owned`
         // also publishes a dirty footer first (preserving old semantics).
         if self.is_mutable_segment_path(path) {
-            let cached = self.mutable_reader_cache.lock().unwrap().get(path).cloned();
+            let cached = self
+                .mutable_reader_cache
+                .lock()
+                .unwrap()
+                .get(path)
+                .map(|(reader, _)| reader.clone());
             if let Some(reader) = cached {
                 if !self.mutable_segment_has_pending_writes(path) {
                     return Ok(reader);
@@ -934,21 +958,34 @@ impl SegmentManager {
             }
             self.invalidate_reader(path);
             let reader = std::sync::Arc::new(self.open_mutable_reader_owned(path)?);
+            let charged_bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
             let mut cache = self.mutable_reader_cache.lock().unwrap();
-            if cache.len() >= reader_cache_capacity().max(1) * 4 {
-                // Evict ONE entry instead of clearing the whole cache: a full
-                // clear made every other active segment's next read pay a
-                // full reopen + footer parse at once. The cache field is a
-                // plain `HashMap` (defined with the struct, no order kept),
-                // so the victim is the first entry in iteration order — any
-                // single eviction bounds growth, and cache correctness never
-                // depended on the choice: `invalidate_reader` evicts on every
-                // visibility change regardless.
-                if let Some(victim) = cache.keys().next().cloned() {
-                    cache.remove(&victim);
+            // Evict single entries instead of clearing the whole cache: a full
+            // clear made every other active segment's next read pay a full
+            // reopen + footer parse at once. The victim is the first entry in
+            // iteration order — cache correctness never depended on the
+            // choice: `invalidate_reader` evicts on every visibility change
+            // regardless. Both ceilings apply: the entry count (4x the reader
+            // cache capacity) and the byte budget
+            // (`storage.mutable_reader_cache_mb`), because entries are full
+            // heap copies of up to `min_segment_seal_size` each.
+            let entry_capacity = reader_cache_capacity().max(1) * 4;
+            let budget = crate::common::config::mutable_reader_cache_budget_bytes();
+            while mutable_cache_needs_eviction(
+                cache.len(),
+                mutable_cache_used_bytes(&cache),
+                charged_bytes,
+                entry_capacity,
+                budget,
+            ) {
+                match cache.keys().next().cloned() {
+                    Some(victim) => {
+                        cache.remove(&victim);
+                    }
+                    None => break,
                 }
             }
-            cache.insert(path.to_path_buf(), reader.clone());
+            cache.insert(path.to_path_buf(), (reader.clone(), charged_bytes));
             return Ok(reader);
         }
 
@@ -1048,6 +1085,24 @@ impl SegmentManager {
             .lock()
             .unwrap()
             .invalidate_under(dir);
+    }
+
+    /// `(entries, charged heap bytes, budget bytes)` of the sealed-segment
+    /// reader cache, for `SHOW MEMORY`.
+    pub fn reader_cache_stats(&self) -> (usize, u64, u64) {
+        self.reader_cache.lock().unwrap().stats()
+    }
+
+    /// `(entries, heap bytes)` of the mutable-segment reader cache. Each
+    /// entry is a full heap copy of an active segment file; the cache is
+    /// entry-bounded (4x the reader cache capacity) with no byte budget, so
+    /// this is the number to watch when RSS grows with active partitions.
+    pub fn mutable_reader_cache_stats(&self) -> (usize, u64) {
+        let cache = self.mutable_reader_cache.lock().unwrap();
+        (
+            cache.len(),
+            cache.values().map(|(_, charged)| *charged).sum(),
+        )
     }
 
     /// Read-side metadata cache for a sealed segment's cluster-key column zone map.
@@ -2306,4 +2361,36 @@ pub mod manager_core_test_support {
         replace_journal_path as replace_journal_path_for_test,
         write_replace_journal as write_replace_journal_for_test,
     };
+}
+
+#[cfg(test)]
+mod mutable_cache_budget_tests {
+    use super::mutable_cache_needs_eviction as needs_eviction;
+
+    #[test]
+    fn empty_cache_always_accepts_even_an_oversized_entry() {
+        // Refusing here would disable the cache for large active segments
+        // entirely; the entry ceiling reclaims the oversized entry later.
+        assert!(!needs_eviction(0, 0, u64::MAX, 4, 1024));
+    }
+
+    #[test]
+    fn entry_ceiling_triggers_eviction() {
+        assert!(needs_eviction(4, 0, 1, 4, u64::MAX));
+        assert!(!needs_eviction(3, 0, 1, 4, u64::MAX));
+    }
+
+    #[test]
+    fn byte_budget_triggers_eviction_only_over_the_ceiling() {
+        assert!(needs_eviction(1, 900, 200, 4, 1024));
+        assert!(!needs_eviction(1, 900, 100, 4, 1024));
+        // Exactly at the budget plus one more byte evicts.
+        assert!(needs_eviction(1, 1024, 1, 4, 1024));
+    }
+
+    #[test]
+    fn used_bytes_saturate_instead_of_overflowing() {
+        // A wrapping add would compute u64::MAX + 1 == 0 and wrongly accept.
+        assert!(needs_eviction(1, u64::MAX, 1, 4, 100));
+    }
 }
