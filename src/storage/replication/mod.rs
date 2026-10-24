@@ -736,6 +736,14 @@ impl RepLog {
         state.sessions.retain(|sender| !sender.same_channel(sink));
     }
 
+    /// Whether `sink` is still registered. The fan-out drops a session that
+    /// cannot keep up; the push thread polls this because it holds its own
+    /// sender clone, so its receiver would never observe a disconnect.
+    pub fn has_session(&self, sink: &SessionSink) -> bool {
+        let state = self.state.lock().unwrap();
+        state.sessions.iter().any(|sender| sender.same_channel(sink))
+    }
+
     pub fn session_count(&self) -> usize {
         self.state.lock().unwrap().sessions.len()
     }

@@ -977,6 +977,23 @@ impl Handler {
             Ok(stmt) => stmt,
             Err(messages) => return Ok(messages),
         };
+        // batch_size comes straight from the client: never trust it for
+        // preallocation. Each parameter costs at least one type-tag byte, so
+        // the remaining payload bounds how many rows can really follow.
+        const MAX_BATCH_EXECUTE_ROWS_NO_PARAMS: usize = 1_000_000;
+        let remaining = payload.len() - offset;
+        let max_rows = if param_count == 0 {
+            MAX_BATCH_EXECUTE_ROWS_NO_PARAMS
+        } else {
+            remaining / param_count
+        };
+        if batch_size > max_rows {
+            session.prepared_statements.insert(stmt);
+            return Ok(vec![build_error(&format!(
+                "invalid batch execute message: batch size {} exceeds limit {} for this payload",
+                batch_size, max_rows
+            ))]);
+        }
         let mut parameter_batch = Vec::with_capacity(batch_size);
 
         for row_idx in 0..batch_size {
@@ -1751,7 +1768,15 @@ impl Handler {
                             }
                             pending.insert(seq, event);
                         }
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            // Dropped by the fan-out as a slow consumer: no
+                            // more events will ever arrive, and our own
+                            // sink_tx keeps sink_rx alive, so exit instead
+                            // of idling forever (thread + pending leak).
+                            if !rep_log.has_session(&sink_tx) {
+                                break;
+                            }
+                        }
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
                 }

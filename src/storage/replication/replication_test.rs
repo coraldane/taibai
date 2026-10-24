@@ -156,3 +156,24 @@ fn standby_watermark_re_stamps_a_lagging_ring() {
     log.note_standby_applied(2);
     assert_eq!(log.current_seq(), 5);
 }
+#[test]
+fn has_session_turns_false_after_removal_or_slow_consumer_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = RepLog::new(16, dir.path()).with_persist_every(u64::MAX);
+
+    let (tx, _rx) = crossbeam_channel::bounded(64);
+    log.register_session(&tx);
+    assert!(log.has_session(&tx));
+    log.remove_session(&tx);
+    assert!(!log.has_session(&tx));
+
+    // A consumer that never drains its 1-slot queue gets dropped by the
+    // fan-out; the push thread relies on has_session to notice and exit.
+    let (slow_tx, _slow_rx) = crossbeam_channel::bounded(1);
+    log.register_session(&slow_tx);
+    assert!(log.has_session(&slow_tx));
+    log.publish(tail_event("a"));
+    log.publish(tail_event("b"));
+    assert!(!log.has_session(&slow_tx), "slow consumer should be dropped");
+    assert_eq!(log.session_count(), 0);
+}

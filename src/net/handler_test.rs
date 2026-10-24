@@ -1301,3 +1301,54 @@ fn streaming_splits_oversized_batches_into_frame_sized_chunks() {
     let expected: Vec<ScalarValue> = (0..200).map(|i| ScalarValue::Int64(Some(i))).collect();
     assert_eq!(rows, expected);
 }
+#[test]
+fn batch_execute_rejects_oversized_batch_size() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
+
+    let mut sql_payload = Vec::new();
+    write_len_prefixed_string(&mut sql_payload, "main");
+    write_len_prefixed_string(
+        &mut sql_payload,
+        "CREATE TABLE batch_oversized (id INT64, value INT64)",
+    );
+    handler
+        .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(sql_payload)))
+        .unwrap();
+
+    let mut prep_payload = Vec::new();
+    write_len_prefixed_string(&mut prep_payload, "INSERT INTO batch_oversized VALUES (?, ?)");
+    let prepared = handler
+        .handle_message(Message::new(MSG_TYPE_PREPARE, Bytes::from(prep_payload)))
+        .unwrap();
+    let stmt_id = u32::from_le_bytes(prepared[0].payload[..4].try_into().unwrap());
+
+    // Claims ~4 billion rows but carries no parameter bytes: must be rejected
+    // up front instead of preallocating a giant Vec.
+    let mut batch_payload = Vec::new();
+    batch_payload.extend_from_slice(&stmt_id.to_le_bytes());
+    batch_payload.extend_from_slice(&u32::MAX.to_le_bytes());
+    let response = handler
+        .handle_message(Message::new(
+            MSG_TYPE_BATCH_EXECUTE,
+            Bytes::from(batch_payload),
+        ))
+        .unwrap();
+    assert_eq!(response.len(), 1);
+    assert_ne!(response[0].msg_type, MSG_TYPE_PREPARE);
+    let text = String::from_utf8_lossy(&response[0].payload);
+    assert!(text.contains("exceeds limit"), "unexpected response: {}", text);
+
+    // The prepared statement must still be usable after the rejection.
+    let mut ok_payload = Vec::new();
+    ok_payload.extend_from_slice(&stmt_id.to_le_bytes());
+    ok_payload.extend_from_slice(&1u32.to_le_bytes());
+    append_int64_param(&mut ok_payload, 1);
+    append_int64_param(&mut ok_payload, 10);
+    let response = handler
+        .handle_message(Message::new(MSG_TYPE_BATCH_EXECUTE, Bytes::from(ok_payload)))
+        .unwrap();
+    assert_eq!(ok_rows(&response), 1);
+}
