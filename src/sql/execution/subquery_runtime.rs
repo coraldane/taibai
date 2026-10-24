@@ -34,6 +34,9 @@ pub struct CorrelatedSnapshot {
     pub schemas: HashMap<String, Schema>,
     pub batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
     pub cache: HashMap<String, CachedResult>,
+    /// Total ScalarValues held by cached IN lists; bounds cache memory, since
+    /// the entry cap alone lets 65536 huge IN lists pile up.
+    pub cached_in_elems: usize,
 }
 
 pub struct SubqueryRegistryInner {
@@ -268,12 +271,33 @@ fn eval_row(
     // (and every cached IN list) without limit. Evict a single entry instead
     // of clearing the whole table — clear-all threw every hot correlation
     // key out at once, collapsing the hit rate whenever the cap cycled.
-    if snapshot.cache.len() >= 65536 {
-        if let Some(victim) = snapshot.cache.keys().next().cloned() {
-            snapshot.cache.remove(&victim);
+    // Entry count alone does not bound memory: each IN list can be huge.
+    // Lists above MAX_CACHED_IN_LIST_LEN are not memoized at all, and the
+    // total element count across cached lists is kept under a budget.
+    const MAX_CACHED_ENTRIES: usize = 65536;
+    const MAX_CACHED_IN_LIST_LEN: usize = 65536;
+    const MAX_CACHED_IN_ELEMS: usize = 1 << 20;
+    let elems = match &result {
+        CachedResult::InList(list) => list.len(),
+        _ => 0,
+    };
+    if elems > MAX_CACHED_IN_LIST_LEN {
+        return Ok(value);
+    }
+    while snapshot.cache.len() >= MAX_CACHED_ENTRIES
+        || (elems > 0 && snapshot.cached_in_elems + elems > MAX_CACHED_IN_ELEMS)
+    {
+        let Some(victim) = snapshot.cache.keys().next().cloned() else {
+            break;
+        };
+        if let Some(CachedResult::InList(old)) = snapshot.cache.remove(&victim) {
+            snapshot.cached_in_elems = snapshot.cached_in_elems.saturating_sub(old.len());
         }
     }
-    snapshot.cache.insert(key, result);
+    if let Some(CachedResult::InList(old)) = snapshot.cache.insert(key, result) {
+        snapshot.cached_in_elems = snapshot.cached_in_elems.saturating_sub(old.len());
+    }
+    snapshot.cached_in_elems += elems;
     Ok(value)
 }
 

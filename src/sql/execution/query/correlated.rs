@@ -612,6 +612,7 @@ pub(super) fn bind_correlated_subquery(
             schemas: snapshot_schemas,
             batches: snapshot_batches,
             cache: HashMap::new(),
+            cached_in_elems: 0,
         },
     );
 
