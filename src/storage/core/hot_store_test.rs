@@ -960,3 +960,38 @@ fn compact_prefix_reclaims_string_pool_entries() {
         "a reclaimed symbol must resolve as never-seen"
     );
 }
+#[test]
+fn string_pool_memory_stays_bounded_under_churn() {
+    let mut pool = StringPool::new();
+    let mut seen_max = 0u32;
+    for round in 0..200u32 {
+        let mut ids = Vec::new();
+        for i in 0..100u32 {
+            ids.push(pool.intern(&format!("k{}_{}", round, i)));
+        }
+        // Fresh ids only ever increase: never reuse a released id.
+        assert!(ids.iter().all(|&id| round == 0 || id >= seen_max));
+        seen_max = *ids.iter().max().unwrap() + 1;
+        // Keep only the last value of this round alive.
+        let keep = *ids.last().unwrap();
+        pool.retain_ids(&std::collections::HashSet::from([keep]));
+        assert_eq!(pool.lookup(&format!("k{}_99", round)), Some(keep));
+        assert_eq!(pool.lookup(&format!("k{}_0", round)), None);
+        assert!(pool.len() <= 101, "pool grew to {} slots", pool.len());
+    }
+    // A survivor in the middle keeps its id and is still resolvable after
+    // earlier slots are trimmed.
+    let a = pool.intern("a");
+    let b = pool.intern("b");
+    let c = pool.intern("c");
+    pool.retain_ids(&std::collections::HashSet::from([b]));
+    assert_eq!(pool.lookup("b"), Some(b));
+    assert_eq!(pool.intern("b"), b);
+    assert_eq!(pool.lookup("a"), None);
+    assert_eq!(pool.lookup("c"), None);
+    let c2 = pool.intern("c");
+    assert!(c2 > c && c2 != a);
+    // Trailing tombstone of "c" must stay: trimming it would let the next
+    // fresh id reuse c's old id. Layout: [b, None(c), c2].
+    assert_eq!(pool.len(), 3);
+}

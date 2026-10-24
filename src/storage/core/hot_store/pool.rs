@@ -22,14 +22,20 @@ pub(super) const POOL_CACHE_SLOTS: usize = 4096;
 /// ids, never string bytes. A direct-mapped hash cache sits in front of the
 /// map so repeated symbols within a batch skip the full lookup entirely.
 ///
-/// Released ids are tombstoned (`reverse[i] = None`) rather than removed:
-/// ids are positions in `reverse`, and postings in surviving chunk indexes
-/// embed them. Tombstoned ids are gone from `forward`, so a later intern of
-/// the same string allocates a fresh id — safe because no live postings
-/// reference a released one.
+/// Released ids are tombstoned (`reverse[i] = None`) rather than reused:
+/// postings in surviving chunk indexes embed ids, so an id must never come
+/// back naming a different string. Tombstoned ids are gone from `forward`, so
+/// a later intern of the same string allocates a fresh id.
+///
+/// Ids are `base + position in reverse`. After a release, the leading run of
+/// tombstones is trimmed off and `base` advances past it, so a long-running
+/// pool over high-cardinality keys keeps memory proportional to the resident
+/// window instead of one slot per string ever seen.
 pub struct StringPool {
     pub(super) forward: HashMap<String, u32, FastBuild>,
     pub(super) reverse: Vec<Option<String>>,
+    /// Id of `reverse[0]`; every id below it has been released.
+    pub(super) base: u32,
     pub(super) cache: Vec<PoolCacheSlot>,
 }
 
@@ -38,6 +44,7 @@ impl StringPool {
         Self {
             forward: HashMap::with_hasher(FastBuild::default()),
             reverse: Vec::new(),
+            base: 0,
             cache: vec![
                 PoolCacheSlot {
                     hash: 0,
@@ -50,17 +57,17 @@ impl StringPool {
     }
 
     #[inline]
+    fn entry(&self, id: u32) -> Option<&str> {
+        let pos = id.checked_sub(self.base)? as usize;
+        self.reverse.get(pos).and_then(|entry| entry.as_deref())
+    }
+
+    #[inline]
     pub(super) fn cached(&self, s: &str) -> Option<(usize, PoolCacheSlot)> {
         let hash = FastHasher::hash_str(s);
         let idx = (hash as usize) & (POOL_CACHE_SLOTS - 1);
         let slot = self.cache[idx];
-        if slot.hash == hash
-            && self
-                .reverse
-                .get(slot.id as usize)
-                .and_then(|entry| entry.as_deref())
-                == Some(s)
-        {
+        if slot.hash == hash && self.entry(slot.id) == Some(s) {
             Some((idx, slot))
         } else {
             None
@@ -76,7 +83,11 @@ impl StringPool {
         let id = match self.forward.get(s) {
             Some(&id) => id,
             None => {
-                let id = self.reverse.len() as u32;
+                // Ids are never reused; wrapping would silently alias a new
+                // string onto ids still embedded in live postings.
+                let next = self.base as u64 + self.reverse.len() as u64;
+                let id = u32::try_from(next)
+                    .expect("string pool id space exhausted (u32)");
                 self.reverse.push(Some(s.to_string()));
                 self.forward.insert(s.to_string(), id);
                 id
@@ -98,17 +109,35 @@ impl StringPool {
     }
 
     /// Drop every id outside `live`: removes its string from `forward` and
-    /// tombstones its `reverse` slot. Called after a prefix compaction so the
-    /// pool tracks the rows actually resident instead of growing without
-    /// bound on high-cardinality string keys. The direct-mapped cache is
-    /// cleared wholesale — its (hash, id) slots may name released ids.
+    /// tombstones its `reverse` slot, then trims the leading tombstone run so
+    /// the backing vector actually shrinks. Called after a prefix compaction
+    /// so the pool tracks the rows actually resident instead of growing
+    /// without bound on high-cardinality string keys. The direct-mapped cache
+    /// is cleared wholesale — its (hash, id) slots may name released ids.
     pub fn retain_ids(&mut self, live: &HashSet<u32>) {
-        for (id, slot) in self.reverse.iter_mut().enumerate() {
-            if slot.is_some() && !live.contains(&(id as u32)) {
+        let base = self.base;
+        for (pos, slot) in self.reverse.iter_mut().enumerate() {
+            let id = base + pos as u32;
+            if slot.is_some() && !live.contains(&id) {
                 if let Some(s) = slot.take() {
                     self.forward.remove(s.as_str());
                 }
             }
+        }
+        let dead_prefix = self
+            .reverse
+            .iter()
+            .position(|slot| slot.is_some())
+            .unwrap_or(self.reverse.len());
+        if dead_prefix > 0 {
+            self.reverse.drain(..dead_prefix);
+            self.base += dead_prefix as u32;
+            if self.reverse.capacity() > 2 * self.reverse.len().max(64) {
+                self.reverse.shrink_to_fit();
+            }
+        }
+        if self.forward.capacity() > 2 * self.forward.len().max(64) {
+            self.forward.shrink_to_fit();
         }
         for slot in self.cache.iter_mut() {
             slot.hash = 0;
@@ -116,6 +145,7 @@ impl StringPool {
         }
     }
 
+    /// Number of resident slots (live strings plus interior tombstones).
     pub fn len(&self) -> usize {
         self.reverse.len()
     }
