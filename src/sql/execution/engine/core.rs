@@ -1067,14 +1067,6 @@ impl Engine {
         columns: &[String],
         query: &Statement,
     ) -> Result<ExecResult> {
-        // Stream the source in row chunks instead of materializing the whole
-        // result as boxed Expr literals first (peak memory used to be 2-3x
-        // the source). Every chunk goes through the regular INSERT path, so
-        // constraint validation, partition routing and catalog accounting
-        // are unchanged; a failing chunk leaves earlier chunks inserted,
-        // matching the multi-partition INSERT path's existing partial-failure
-        // semantics. The SELECT's LIMIT/OFFSET remain the knob for one-shot
-        // bulk loads.
         let txn_id = session.active_txn_id();
         let query_result = crate::sql::execution::query::exec_select_with_txn(
             self,
@@ -1087,52 +1079,44 @@ impl Engine {
                 "INSERT SELECT source did not return rows".to_string(),
             ));
         };
-        const INSERT_SELECT_CHUNK_ROWS: usize = 4096;
+        if batches.is_empty() {
+            return Ok(ExecResult::Ok { rows_affected: 0 });
+        }
         let db = table.effective_database(&session.database);
-        let mut chunk: Vec<Vec<crate::sql::parser::ast::Expr>> = Vec::new();
+        let source_num_cols = batches[0].num_columns();
+        let plan = crate::sql::execution::dml_insert::resolve_insert_select_plan(
+            self,
+            db,
+            &table.name,
+            columns,
+            source_num_cols,
+        )?;
         let mut rows_affected_total = 0u64;
-        let flush_chunk = |chunk: &mut Vec<Vec<crate::sql::parser::ast::Expr>>| {
-            if chunk.is_empty() {
-                return Ok(ExecResult::Ok { rows_affected: 0 });
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
             }
-            let result = crate::sql::execution::dml_insert::exec_insert(
+            let result = crate::sql::execution::dml_insert::exec_insert_select_batch(
                 self,
                 db,
                 &table.name,
-                columns,
-                chunk.as_slice(),
-                session.timezone_offset_hours,
+                &plan.table_meta,
+                &plan.schema,
+                &plan.provided_by_col,
+                &plan.missing_auto_inc,
+                batch,
                 txn_id,
                 session.bulk_import_mode,
-            );
-            if result.is_ok() {
-                chunk.clear();
-            }
-            result
-        };
-        for batch in &batches {
-            for row_idx in 0..batch.num_rows() {
-                let mut row = Vec::with_capacity(batch.num_columns());
-                for col_idx in 0..batch.num_columns() {
-                    let value = batch.scalar(row_idx, col_idx).ok_or_else(|| {
-                        TaibaiError::Internal("INSERT SELECT result column is missing".to_string())
-                    })?;
-                    row.push(crate::sql::parser::ast::Expr::Literal(value));
-                }
-                chunk.push(row);
-                if chunk.len() >= INSERT_SELECT_CHUNK_ROWS {
-                    let inserted = flush_chunk(&mut chunk)?;
-                    if let ExecResult::Ok { rows_affected } = inserted {
-                        rows_affected_total += rows_affected;
-                    }
-                }
+                session.timezone_offset_hours,
+            )?;
+            if let ExecResult::Ok { rows_affected } = result {
+                rows_affected_total += rows_affected;
             }
         }
-        let last_result = flush_chunk(&mut chunk);
-        if last_result.is_ok() && txn_id > 0 {
+        if txn_id > 0 {
             session.mark_txn_write();
         }
-        last_result.map(|_| ExecResult::Ok {
+        Ok(ExecResult::Ok {
             rows_affected: rows_affected_total,
         })
     }

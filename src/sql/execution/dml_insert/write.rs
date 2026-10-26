@@ -490,6 +490,171 @@ fn exec_insert_inner(
     )
 }
 
+pub(crate) struct InsertSelectPlan {
+    pub table_meta: std::sync::Arc<crate::storage::catalog::schema::TableMeta>,
+    pub schema: Schema,
+    pub provided_by_col: Vec<Option<usize>>,
+    pub missing_auto_inc: Vec<usize>,
+}
+
+pub(crate) fn resolve_insert_select_plan(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    columns: &[String],
+    source_num_cols: usize,
+) -> Result<InsertSelectPlan> {
+    let catalogs = engine.catalogs().read().unwrap();
+    let catalog = catalogs
+        .get(db)
+        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
+    let table_meta = catalog
+        .get_table_shared(table)
+        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
+        .clone();
+    engine
+        .segment_mgr()
+        .set_table_compression_level(db, table, table_meta.compression_level);
+    let schema = Schema::new(table_meta.columns.clone());
+    let col_indices = if columns.is_empty() {
+        if source_num_cols != schema.columns.len() {
+            return Err(TaibaiError::Sql(format!(
+                "INSERT SELECT has {} source columns but table has {} columns",
+                source_num_cols,
+                schema.columns.len()
+            )));
+        }
+        (0..schema.columns.len()).collect()
+    } else {
+        if source_num_cols != columns.len() {
+            return Err(TaibaiError::Sql(format!(
+                "INSERT SELECT has {} source columns but {} columns were specified",
+                source_num_cols,
+                columns.len()
+            )));
+        }
+        let mut seen = HashSet::new();
+        let mut indices = Vec::with_capacity(columns.len());
+        for col_name in columns {
+            let idx = schema
+                .index_of(col_name)
+                .ok_or_else(|| TaibaiError::Sql(format!("column '{}' not found", col_name)))?;
+            if !seen.insert(idx) {
+                return Err(TaibaiError::Sql(format!(
+                    "column '{}' specified more than once",
+                    col_name
+                )));
+            }
+            indices.push(idx);
+        }
+        indices
+    };
+    let mut provided_by_col: Vec<Option<usize>> = vec![None; schema.columns.len()];
+    for (value_idx, &col_idx) in col_indices.iter().enumerate() {
+        provided_by_col[col_idx] = Some(value_idx);
+    }
+    let auto_inc_cols: Vec<usize> = schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.auto_increment)
+        .map(|(i, _)| i)
+        .collect();
+    let missing_auto_inc: Vec<usize> = auto_inc_cols
+        .iter()
+        .filter(|&idx| provided_by_col[*idx].is_none())
+        .cloned()
+        .collect();
+    drop(catalogs);
+    Ok(InsertSelectPlan {
+        table_meta,
+        schema,
+        provided_by_col,
+        missing_auto_inc,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exec_insert_select_batch(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    table_meta: &std::sync::Arc<crate::storage::catalog::schema::TableMeta>,
+    target_schema: &Schema,
+    provided_by_col: &[Option<usize>],
+    missing_auto_inc: &[usize],
+    source_batch: RecordBatch,
+    txn_id: u64,
+    bulk_import_mode: bool,
+    timezone_offset_hours: i32,
+) -> Result<ExecResult> {
+    let num_rows = source_batch.num_rows();
+    if num_rows == 0 {
+        return Ok(ExecResult::Ok { rows_affected: 0 });
+    }
+    let auto_inc_counter = if !missing_auto_inc.is_empty() {
+        engine.auto_increment_manager().get(db, table)
+    } else {
+        None
+    };
+    let mut columns: Vec<ColumnArray> = Vec::with_capacity(target_schema.columns.len());
+    for (target_col_idx, target_col) in target_schema.columns.iter().enumerate() {
+        if let Some(src_value_idx) = provided_by_col[target_col_idx] {
+            let src_col = &source_batch.columns[src_value_idx];
+            if src_col.data_type() == target_col.data_type {
+                columns.push(src_col.shared_clone());
+            } else {
+                let mut col = ColumnArray::with_capacity(target_col.data_type, num_rows);
+                for row in 0..num_rows {
+                    let scalar = source_batch.scalar(row, src_value_idx).ok_or_else(|| {
+                        TaibaiError::Internal("INSERT SELECT source column missing".into())
+                    })?;
+                    let casted = eval_expr_to_scalar_with_scale_timezone(
+                        &Expr::Literal(scalar),
+                        &target_col.data_type,
+                        target_col.scale,
+                        timezone_offset_hours,
+                    )?;
+                    col.push(&casted)?;
+                }
+                columns.push(col);
+            }
+        } else {
+            let mut col = ColumnArray::with_capacity(target_col.data_type, num_rows);
+            for _ in 0..num_rows {
+                let scalar = materialize_missing_insert_scalar(
+                    engine,
+                    db,
+                    table,
+                    &auto_inc_counter,
+                    target_schema,
+                    target_col_idx,
+                    timezone_offset_hours,
+                )?;
+                col.push(&scalar)?;
+            }
+            columns.push(col);
+        }
+    }
+    let batch = RecordBatch::try_new(target_schema.clone(), columns)?;
+    exec_materialized_insert_batch(
+        engine,
+        db,
+        table,
+        table_meta,
+        target_schema.clone(),
+        batch,
+        txn_id,
+        bulk_import_mode,
+        true,
+        true,
+        false,
+        missing_auto_inc.to_vec(),
+        true,
+        true,
+    )
+}
+
 fn materialize_insert_values(
     engine: &Engine,
     db: &str,

@@ -117,8 +117,8 @@ pub(crate) use constraints::{
 pub use fast::{set_fast_insert_disabled_for_tests, try_exec_fast_insert_sql};
 pub(crate) use write::{
     append_unique_index_entries_after_insert, build_unique_index_entries_for_batch,
-    primary_location_entries_for_batch, rebuild_table_location_indexes,
-    rebuild_table_location_indexes_two_phase, write_batch_by_partition,
+    exec_insert_select_batch, primary_location_entries_for_batch, rebuild_table_location_indexes,
+    rebuild_table_location_indexes_two_phase, resolve_insert_select_plan, write_batch_by_partition,
 };
 pub use write::{exec_insert, exec_replace};
 
