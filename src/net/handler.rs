@@ -289,10 +289,27 @@ impl Handler {
                 error = %error,
                 "failed to roll back open transaction on disconnect"
             ),
-            Err(_) => tracing::warn!(
-                txn_id,
-                "panicked while rolling back open transaction on disconnect"
-            ),
+            Err(_) => {
+                tracing::warn!(
+                    txn_id,
+                    "panicked while rolling back open transaction on disconnect; \
+                     forcing txn mutation cleanup"
+                );
+                if let Err(cleanup_err) = std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| {
+                        let _ = self.engine.batch_writer().rollback_txn(txn_id);
+                        self.engine
+                            .index_manager()
+                            .discard_txn_published_entries_at_rollback(txn_id);
+                    }),
+                ) {
+                    tracing::error!(
+                        txn_id,
+                        "cleanup after rollback panic also panicked: {:?}",
+                        cleanup_err
+                    );
+                }
+            },
         }
     }
 
@@ -629,12 +646,16 @@ impl Handler {
             }
             Ok(ExecResult::Query { schema, batches }) => {
                 let encode_start = Instant::now();
+                let encoded = crate::protocol::result::encode_binary_result_batches(&schema, &batches);
+                drop(batches);
                 let timings = ServerTimings {
                     total: server_start.elapsed(),
                     execute: execute_elapsed,
                     encode: encode_start.elapsed(),
                 };
-                let msg = build_binary_query_result_with_timings(&schema, &batches, timings);
+                let mut payload = encoded;
+                append_server_timing_trailer(&mut payload, timings);
+                let msg = Message::new(MSG_TYPE_BINARY_QUERY_RESULT, Bytes::from(payload));
                 let msg = match self.validate_query_response(msg) {
                     Ok(msg) => msg,
                     Err(error) => return Ok(vec![build_query_error(&error)]),
@@ -1035,12 +1056,16 @@ impl Handler {
             }
             Ok(ExecResult::Query { schema, batches }) => {
                 let encode_start = Instant::now();
+                let encoded = crate::protocol::result::encode_binary_result_batches(&schema, &batches);
+                drop(batches);
                 let timings = ServerTimings {
                     total: server_start.elapsed(),
                     execute: execute_elapsed,
                     encode: encode_start.elapsed(),
                 };
-                let msg = build_binary_query_result_with_timings(&schema, &batches, timings);
+                let mut payload = encoded;
+                append_server_timing_trailer(&mut payload, timings);
+                let msg = Message::new(MSG_TYPE_BINARY_QUERY_RESULT, Bytes::from(payload));
                 let msg = match self.validate_query_response(msg) {
                     Ok(msg) => msg,
                     Err(error) => return Ok(vec![build_query_error(&error)]),
@@ -2057,19 +2082,6 @@ fn append_server_timing_trailer(buf: &mut Vec<u8>, timings: ServerTimings) {
 
 fn append_duration_micros(buf: &mut Vec<u8>, elapsed: Duration) {
     buf.extend_from_slice(&(elapsed.as_micros().min(u128::from(u64::MAX)) as u64).to_le_bytes());
-}
-
-/// Build the binary result message with the server-timing trailer
-/// appended before the payload is frozen, avoiding a second copy of the
-/// whole result payload.
-fn build_binary_query_result_with_timings(
-    schema: &crate::types::batch::Schema,
-    batches: &[crate::types::batch::RecordBatch],
-    timings: ServerTimings,
-) -> Message {
-    let mut encoded = crate::protocol::result::encode_binary_result_batches(schema, batches);
-    append_server_timing_trailer(&mut encoded, timings);
-    Message::new(MSG_TYPE_BINARY_QUERY_RESULT, Bytes::from(encoded))
 }
 
 #[cfg(test)]

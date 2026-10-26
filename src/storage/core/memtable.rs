@@ -1459,6 +1459,10 @@ impl MemTableManager {
         drop(memtables);
         self.remove_writable_keys(&retired_keys);
         self.prune_replace_key_indexes();
+        self.table_schemas
+            .lock()
+            .unwrap()
+            .remove(&(db.to_string(), table.to_string()));
         cleared
     }
 

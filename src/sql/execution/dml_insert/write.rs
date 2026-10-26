@@ -1600,8 +1600,25 @@ pub(crate) fn write_batch_by_partition_deferred(
     }
 
     if let Some(ranges) = partition_ranges_if_contiguous(table_meta, &batch) {
-        for (partition_key, start, end) in ranges {
-            let part_batch = slice_batch_fast(&batch, start, end)?;
+        if ranges.len() == 1 && ranges[0].1 == 0 && ranges[0].2 == batch.num_rows() {
+            let (partition_key, _, _) = ranges.into_iter().next().unwrap();
+            write_partition_batch(
+                engine,
+                db,
+                table,
+                table_meta,
+                &partition_key,
+                batch,
+                schema,
+                txn_id,
+                table_lock_held,
+                hot_fed,
+                Some(&mut *deferred),
+            )?;
+            return Ok(());
+        }
+        for (partition_key, start, end) in &ranges {
+            let part_batch = slice_batch_fast(&batch, *start, *end)?;
             write_partition_batch(
                 engine,
                 db,

@@ -36,6 +36,7 @@ fn test_writer_config() -> BatchWriterConfig {
         spill_enabled: true,
         spill_min_age_secs: 0,
         tail_async_fsync: false,
+        memory_hard_limit: 1 << 31,
     }
 }
 

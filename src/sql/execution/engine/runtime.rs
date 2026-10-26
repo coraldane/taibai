@@ -1299,6 +1299,44 @@ impl Engine {
         }
     }
 
+    pub fn warmup_unique_indexes(&self) {
+        let catalogs = self.catalogs.read().unwrap();
+        let mut warmed = 0usize;
+        let mut failed = 0usize;
+        for (db, catalog) in catalogs.iter() {
+            for (table, table_meta) in catalog.tables.iter() {
+                for idx in &table_meta.unique_indexes {
+                    match self
+                        .index_manager
+                        .preload_unique_index(db, table, &idx.name)
+                    {
+                        Ok(true) => {
+                            warmed += 1;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                db,
+                                table,
+                                index = %idx.name,
+                                error = %e,
+                                "warmup: load unique index state failed"
+                            );
+                            failed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if warmed > 0 || failed > 0 {
+            tracing::info!(
+                warmed,
+                failed,
+                "warmup: unique index states preloaded"
+            );
+        }
+    }
+
     /// Graceful shutdown checkpoint.
     /// Physical writers are sealed, while restart-safe low-rate tails remain
     /// in memtable form so routine restarts do not create tiny segments.

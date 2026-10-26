@@ -152,6 +152,7 @@ impl Engine {
                 // tails. Use the configured memory budget for asynchronous
                 // checkpoint pressure instead of a fixed 512 MiB estimate.
                 max_total_memory: hot_store_memory_limit_bytes,
+                memory_hard_limit: hot_store_memory_limit_bytes.saturating_mul(2),
                 tail_async_fsync,
                 ..BatchWriterConfig::default()
             },
@@ -268,6 +269,7 @@ impl Engine {
         if hot_warmup_enabled {
             engine.warmup_hot_stores();
         }
+        engine.warmup_unique_indexes();
         for (db, table) in recovered_tail_tables {
             engine.invalidate_hot_store(&db, &table);
         }

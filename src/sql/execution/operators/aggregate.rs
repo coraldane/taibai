@@ -663,7 +663,7 @@ impl ExecutionOp for HashAggregateExec {
         let mut groups: HashMap<Vec<u8>, Vec<Accumulator>> = HashMap::with_capacity(1024);
         let mut group_keys: Vec<(Vec<u8>, Vec<ScalarValue>)> = Vec::new();
         let mut estimated_group_bytes = 0usize;
-        let mut batch_refresh_counter = 0usize;
+        let mut rows_since_refresh = 0usize;
         let mut spills = Vec::new();
         let mut memory = MemoryManager::reservation();
         let mut key_buf: Vec<u8> = Vec::new();
@@ -818,9 +818,9 @@ impl ExecutionOp for HashAggregateExec {
             // queries O(batches × groups). New-group growth is accounted
             // incrementally at insert; the full sweep (which catches
             // accumulator growth) runs periodically.
-            batch_refresh_counter += 1;
-            if batch_refresh_counter >= 64 {
-                batch_refresh_counter = 0;
+            rows_since_refresh += batch.num_rows();
+            if rows_since_refresh >= 65536 {
+                rows_since_refresh = 0;
                 estimated_group_bytes = group_keys
                     .iter()
                     .map(|(key, scalars)| {

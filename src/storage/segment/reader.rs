@@ -1298,7 +1298,7 @@ pub(crate) fn constant_column(
             return Ok(column);
         }
     }
-    let mut column = crate::types::array::ColumnArray::empty(data_type);
+    let mut column = crate::types::array::ColumnArray::with_capacity(data_type, row_count);
     if value.is_null() {
         for _ in 0..row_count {
             column.push_null_value();
@@ -1429,7 +1429,7 @@ fn split_batch(
 }
 
 fn split_column(col: &ColumnArray, start: usize, end: usize) -> ColumnArray {
-    let mut new_col = ColumnArray::empty(col.data_type());
+    let mut new_col = ColumnArray::with_capacity(col.data_type(), end - start);
     for i in start..end {
         new_col.push(&col.scalar(i)).unwrap();
     }

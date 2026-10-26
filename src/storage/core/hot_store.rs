@@ -672,7 +672,9 @@ const SELECTED_MAX_ROWS: usize = 512;
 const PARALLEL_GATHER_MIN_ROWS: u64 = 32_768;
 
 fn estimate_batch_memory(batch: &RecordBatch) -> u64 {
-    batch.estimated_size_bytes() as u64 + batch.num_rows() as u64 * 4 // index postings
+    // Include index overhead: each row may insert into the group HashMap
+    // (key pointer + vec entry ~ 40 bytes per row for high-cardinality keys).
+    batch.estimated_size_bytes() as u64 + batch.num_rows() as u64 * 44
 }
 
 #[cfg(test)]

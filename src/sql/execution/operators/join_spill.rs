@@ -4,6 +4,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use crate::common::error::{Result, TaibaiError};
 use crate::sql::execution::join_hashtable::{JoinHashTable, RowPointer};
 use crate::sql::execution::spill::{SpillFile, SpillWriter};
+use crate::sql::parser::ast::JoinType;
 use crate::sql::planner::LogicalExpr;
 use crate::storage::segment::SegmentReader;
 use crate::types::array::ColumnArray;
@@ -378,4 +379,257 @@ fn append_output_row(
             .push(value)?;
     }
     Ok(())
+}
+
+enum OuterProbePhase {
+    Probing,
+    EmittingUnmatched { ptr_idx: usize },
+    Done,
+}
+
+struct OuterPartitionProbeState {
+    inner: PartitionProbeState,
+    phase: OuterProbePhase,
+}
+
+pub(super) struct PartitionedOuterJoin {
+    partitions: VecDeque<JoinPartition>,
+    current: Option<OuterPartitionProbeState>,
+    build_key_columns: Vec<usize>,
+    probe_key_columns: Vec<usize>,
+    build_left: bool,
+    join_type: JoinType,
+    condition: LogicalExpr,
+    left_schema: Schema,
+    build_schema: Schema,
+    probe_schema: Schema,
+    output_schema: Schema,
+    memory_limit_bytes: usize,
+    batch_rows: usize,
+}
+
+impl PartitionedOuterJoin {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn create(
+        initial_build_batches: Vec<RecordBatch>,
+        build_input: &mut dyn ExecutionOp,
+        probe_input: &mut dyn ExecutionOp,
+        build_schema: Schema,
+        probe_schema: Schema,
+        build_key_columns: Vec<usize>,
+        probe_key_columns: Vec<usize>,
+        build_left: bool,
+        join_type: JoinType,
+        condition: LogicalExpr,
+        left_schema: Schema,
+        output_schema: Schema,
+        memory_limit_bytes: usize,
+        partition_count: usize,
+        batch_rows: usize,
+    ) -> Result<Self> {
+        let partition_count = partition_count.max(2).next_power_of_two();
+        let build_files = partition_input(
+            initial_build_batches,
+            build_input,
+            &build_schema,
+            &build_key_columns,
+            partition_count,
+            batch_rows,
+        )?;
+        let probe_files = partition_input(
+            Vec::new(),
+            probe_input,
+            &probe_schema,
+            &probe_key_columns,
+            partition_count,
+            batch_rows,
+        )?;
+        let emit_unmatched_build = matches!(join_type, JoinType::Left | JoinType::Full);
+        let partitions = build_files
+            .into_iter()
+            .zip(probe_files)
+            .filter_map(|(build, probe)| {
+                match (build, probe) {
+                    (Some(b), Some(p)) => Some(JoinPartition { build: b, probe: p }),
+                    (Some(b), None) if emit_unmatched_build => {
+                        let empty_probe = SpillWriter::create(probe_schema.clone(), batch_rows)
+                            .and_then(|w| w.finish())
+                            .ok()?;
+                        Some(JoinPartition { build: b, probe: empty_probe })
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        Ok(Self {
+            partitions,
+            current: None,
+            build_key_columns,
+            probe_key_columns,
+            build_left,
+            join_type,
+            condition,
+            left_schema,
+            build_schema,
+            probe_schema,
+            output_schema,
+            memory_limit_bytes: memory_limit_bytes.max(1),
+            batch_rows: batch_rows.max(1),
+        })
+    }
+
+    fn emit_unmatched_build(&self) -> bool {
+        matches!(self.join_type, JoinType::Left | JoinType::Full)
+    }
+
+    fn emit_unmatched_probe(&self) -> bool {
+        matches!(self.join_type, JoinType::Right | JoinType::Full)
+    }
+
+    pub(super) fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        let mut output = RecordBatch::with_capacity(self.output_schema.clone(), self.batch_rows);
+        let build_left = self.build_left;
+        let emit_unmatched_build = self.emit_unmatched_build();
+        let emit_unmatched_probe = self.emit_unmatched_probe();
+        let null_probe: Vec<ScalarValue> = self
+            .probe_schema
+            .columns
+            .iter()
+            .map(|col| ScalarValue::null_for_type(col.data_type))
+            .collect();
+        let null_build: Vec<ScalarValue> = self
+            .build_schema
+            .columns
+            .iter()
+            .map(|col| ScalarValue::null_for_type(col.data_type))
+            .collect();
+        let build_key_columns = self.build_key_columns.clone();
+        let probe_key_columns = self.probe_key_columns.clone();
+        let memory_limit = self.memory_limit_bytes;
+        let left_col_count = self.left_schema.columns.len();
+
+        while output.num_rows() < self.batch_rows {
+            if self.current.is_none() {
+                let Some(partition) = self.partitions.pop_front() else {
+                    break;
+                };
+                self.current = Some(OuterPartitionProbeState {
+                    inner: PartitionProbeState::new(partition)?,
+                    phase: OuterProbePhase::Probing,
+                });
+            }
+            let outer = self.current.as_mut().expect("outer partition initialized");
+            let state = &mut outer.inner;
+
+            match &mut outer.phase {
+                OuterProbePhase::Done => {
+                    let _ = outer;
+                    self.current = None;
+                    continue;
+                }
+                OuterProbePhase::EmittingUnmatched { ptr_idx } => {
+                    let ht = match state.hash_table.as_ref() {
+                        Some(ht) => ht,
+                        None => {
+                            outer.phase = OuterProbePhase::Done;
+                            continue;
+                        }
+                    };
+                    let unmatched = ht.unmatched_rows();
+                    while *ptr_idx < unmatched.len() && output.num_rows() < self.batch_rows {
+                        let pointer = &unmatched[*ptr_idx];
+                        *ptr_idx += 1;
+                        let build_row = collect_build_row(ht, pointer);
+                        let (left, right) = if build_left {
+                            (build_row, null_probe.clone())
+                        } else {
+                            (null_probe.clone(), build_row)
+                        };
+                        append_output_row(&mut output, &left, &right)?;
+                    }
+                    if *ptr_idx >= unmatched.len() {
+                        if !state.load_next_build_chunk(&build_key_columns, memory_limit)? {
+                            outer.phase = OuterProbePhase::Done;
+                        } else {
+                            outer.phase = OuterProbePhase::Probing;
+                        }
+                    }
+                    continue;
+                }
+                OuterProbePhase::Probing => {}
+            }
+
+            if state.hash_table.is_none()
+                && !state.load_next_build_chunk(&build_key_columns, memory_limit)?
+            {
+                outer.phase = OuterProbePhase::Done;
+                continue;
+            }
+
+            if state.pending_match < state.pending_matches.len() {
+                let pointer = state.pending_matches[state.pending_match];
+                state.pending_match += 1;
+                let ht = state.hash_table.as_mut().expect("join hash table missing");
+                let build_row = collect_build_row(ht, &pointer);
+                ht.mark_matched(&pointer);
+                let probe_row = state
+                    .pending_probe_row
+                    .as_ref()
+                    .expect("join probe row missing");
+                let (left_row, right_row) = if build_left {
+                    (build_row, probe_row.clone())
+                } else {
+                    (probe_row.clone(), build_row)
+                };
+                if join_rows_match_expr(
+                    &self.condition,
+                    &left_row,
+                    &right_row,
+                    left_col_count,
+                )? {
+                    append_output_row(&mut output, &left_row, &right_row)?;
+                }
+                continue;
+            }
+
+            let Some(probe_row) = state.next_probe_row()? else {
+                if emit_unmatched_build {
+                    outer.phase = OuterProbePhase::EmittingUnmatched { ptr_idx: 0 };
+                } else {
+                    state.hash_table = None;
+                    if !state.load_next_build_chunk(&build_key_columns, memory_limit)? {
+                        outer.phase = OuterProbePhase::Done;
+                    }
+                }
+                continue;
+            };
+            let key = probe_key_columns
+                .iter()
+                .map(|index| probe_row[*index].clone())
+                .collect::<Vec<_>>();
+            let matches = state
+                .hash_table
+                .as_ref()
+                .expect("join hash table missing")
+                .probe(&key);
+            let has_match = !matches.is_empty();
+            state.pending_matches = matches;
+            state.pending_match = 0;
+            state.pending_probe_row = Some(probe_row.clone());
+
+            if !has_match && emit_unmatched_probe {
+                let (left, right) = if build_left {
+                    (null_build.clone(), probe_row)
+                } else {
+                    (probe_row, null_build.clone())
+                };
+                append_output_row(&mut output, &left, &right)?;
+            }
+        }
+        if output.num_rows() == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(output))
+        }
+    }
 }

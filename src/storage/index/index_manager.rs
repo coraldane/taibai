@@ -250,6 +250,15 @@ impl IndexManager {
         }))
     }
 
+    pub(crate) fn preload_unique_index(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+    ) -> Result<bool> {
+        Ok(self.load_unique_index_state(db, table, index_name)?.is_some())
+    }
+
     fn load_unique_index_state(
         &self,
         db: &str,

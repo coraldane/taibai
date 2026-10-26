@@ -13,7 +13,7 @@ use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
-use super::join_spill::PartitionedInnerJoin;
+use super::join_spill::{PartitionedInnerJoin, PartitionedOuterJoin};
 use super::{ExecutionOp, RuntimeInFilter};
 
 /// Decomposed ASOF join condition: equality keys plus exactly one time-key
@@ -45,6 +45,7 @@ pub struct HashJoinExec {
     build_left: bool,
     memory_limit_bytes: usize,
     spill_state: Option<PartitionedInnerJoin>,
+    spill_outer_state: Option<PartitionedOuterJoin>,
     hash_table: Option<JoinHashTable>,
     memory_reservation: Option<MemoryReservation>,
     asof_index: Option<AsofJoinIndex>,
@@ -75,6 +76,8 @@ struct ProbeState {
     /// same query budget as the build side so a probe-heavy join fails with
     /// a clean budget error instead of an OOM.
     probe_materialized_bytes: u64,
+    /// Bytes accumulated by the anti-join right-side collection loop.
+    right_bytes: usize,
     right_batch_idx: usize,
     right_row_idx: usize,
     right_collected: bool,
@@ -210,6 +213,7 @@ impl HashJoinExec {
                 }
             },
             spill_state: None,
+            spill_outer_state: None,
             hash_table: None,
             memory_reservation: None,
             asof_index: None,
@@ -238,61 +242,64 @@ impl HashJoinExec {
         if self.join_type == JoinType::Inner {
             return self.build_inner();
         }
-        // Non-inner builds have no spill path (the hash table must keep
-        // unmatched build rows until the end for outer semantics). They still
-        // reserve against the query memory manager like `build_inner`, and a
-        // build that exceeds the limit fails cleanly instead of growing
-        // without bound until OOM.
         let mut memory = MemoryManager::reservation();
         let mut estimated_bytes = 0usize;
-        let check_build_budget = |batch: &RecordBatch,
-                                  estimated_bytes: &mut usize,
-                                  memory: &mut MemoryReservation,
-                                  limit: usize|
-         -> Result<()> {
-            *estimated_bytes =
-                estimated_bytes.saturating_add(batch.estimated_size_bytes().saturating_mul(2));
-            super::profile::record_current_peak_memory(*estimated_bytes);
-            if *estimated_bytes >= limit || !memory.try_resize(*estimated_bytes) {
-                return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
-                    "join build side exceeds the query memory limit ({} of {} bytes);                      non-inner joins have no spill path - reduce the build side or raise                      the limit",
-                    *estimated_bytes, limit
-                )));
-            }
-            Ok(())
-        };
         match self.join_type {
             JoinType::Right | JoinType::Full => {
-                // For RIGHT/FULL join, build hash table from right side
                 let right_key_cols = self.right_key_cols.to_vec();
                 let mut ht = JoinHashTable::new(right_key_cols);
                 while let Some(batch) = self.right.next_batch()? {
                     crate::common::query_cancel::check()?;
-                    check_build_budget(
-                        &batch,
-                        &mut estimated_bytes,
-                        &mut memory,
-                        self.memory_limit_bytes,
-                    )?;
+                    estimated_bytes = estimated_bytes
+                        .saturating_add(batch.estimated_size_bytes().saturating_mul(2));
+                    super::profile::record_current_peak_memory(estimated_bytes);
                     ht.insert_batch(batch);
+                    if estimated_bytes >= self.memory_limit_bytes
+                        || !memory.try_resize(estimated_bytes)
+                    {
+                        let all_build = std::mem::take(&mut ht.build_data);
+                        let limits = crate::common::config::query_limits();
+                        self.spill_outer_state = Some(PartitionedOuterJoin::create(
+                            all_build,
+                            self.right.as_mut(),
+                            self.left.as_mut(),
+                            self.right_schema.clone(),
+                            self.left_schema.clone(),
+                            self.right_key_cols.clone(),
+                            self.left_key_cols.clone(),
+                            false,
+                            self.join_type,
+                            self.condition.clone(),
+                            self.left_schema.clone(),
+                            self.output_schema.clone(),
+                            self.memory_limit_bytes,
+                            limits.join_spill_partitions,
+                            limits.spill_batch_rows,
+                        )?);
+                        self.probe_state.build_done = true;
+                        return Ok(());
+                    }
                 }
                 ht.finalize();
                 self.probe_state.fast_enabled = self.condition_is_pure_eq();
                 self.hash_table = Some(ht);
             }
             JoinType::Asof | JoinType::LeftAsof => {
-                // Asof join: build the partitioned sorted index from the
-                // right side; matched rows are fetched from the same batches.
                 let plan = self.asof_join_plan()?;
                 let mut batches = Vec::new();
                 while let Some(batch) = self.right.next_batch()? {
                     crate::common::query_cancel::check()?;
-                    check_build_budget(
-                        &batch,
-                        &mut estimated_bytes,
-                        &mut memory,
-                        self.memory_limit_bytes,
-                    )?;
+                    estimated_bytes = estimated_bytes
+                        .saturating_add(batch.estimated_size_bytes().saturating_mul(2));
+                    super::profile::record_current_peak_memory(estimated_bytes);
+                    if estimated_bytes >= self.memory_limit_bytes
+                        || !memory.try_resize(estimated_bytes)
+                    {
+                        return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
+                            "ASOF join build side exceeds the query memory limit ({} of {} bytes)",
+                            estimated_bytes, self.memory_limit_bytes
+                        )));
+                    }
                     batches.push(batch);
                 }
                 let mut asof_idx = AsofJoinIndex::new();
@@ -308,13 +315,35 @@ impl HashJoinExec {
                 let mut ht = JoinHashTable::new(self.left_key_cols.clone());
                 while let Some(batch) = self.left.next_batch()? {
                     crate::common::query_cancel::check()?;
-                    check_build_budget(
-                        &batch,
-                        &mut estimated_bytes,
-                        &mut memory,
-                        self.memory_limit_bytes,
-                    )?;
+                    estimated_bytes = estimated_bytes
+                        .saturating_add(batch.estimated_size_bytes().saturating_mul(2));
+                    super::profile::record_current_peak_memory(estimated_bytes);
                     ht.insert_batch(batch);
+                    if estimated_bytes >= self.memory_limit_bytes
+                        || !memory.try_resize(estimated_bytes)
+                    {
+                        let all_build = std::mem::take(&mut ht.build_data);
+                        let limits = crate::common::config::query_limits();
+                        self.spill_outer_state = Some(PartitionedOuterJoin::create(
+                            all_build,
+                            self.left.as_mut(),
+                            self.right.as_mut(),
+                            self.left_schema.clone(),
+                            self.right_schema.clone(),
+                            self.left_key_cols.clone(),
+                            self.right_key_cols.clone(),
+                            true,
+                            self.join_type,
+                            self.condition.clone(),
+                            self.left_schema.clone(),
+                            self.output_schema.clone(),
+                            self.memory_limit_bytes,
+                            limits.join_spill_partitions,
+                            limits.spill_batch_rows,
+                        )?);
+                        self.probe_state.build_done = true;
+                        return Ok(());
+                    }
                 }
                 ht.finalize();
                 self.inject_right_runtime_filter(&ht);
@@ -462,6 +491,9 @@ impl ExecutionOp for HashJoinExec {
         if let Some(spill) = self.spill_state.as_mut() {
             return spill.next_batch();
         }
+        if let Some(spill) = self.spill_outer_state.as_mut() {
+            return spill.next_batch();
+        }
 
         match self.join_type {
             JoinType::Inner if self.probe_state.fast_enabled => {
@@ -480,6 +512,9 @@ impl ExecutionOp for HashJoinExec {
             }
             JoinType::Semi if self.probe_state.fast_enabled => {
                 self.probe_fast(FastJoinPlan::BuildLeftProbeRight, true)
+            }
+            JoinType::Anti if self.probe_state.fast_enabled => {
+                self.probe_fast_anti()
             }
             JoinType::Asof | JoinType::LeftAsof => self.probe_asof(),
             JoinType::Inner => self.probe_inner(),
@@ -927,9 +962,47 @@ impl HashJoinExec {
     }
 
     /// Anti join: emit left rows that have NO match in right.
+    fn probe_fast_anti(&mut self) -> Result<Option<RecordBatch>> {
+        if !self.probe_state.right_collected {
+            while let Some(batch) = self.right.next_batch()? {
+                crate::common::query_cancel::check()?;
+                self.probe_state.right_bytes += batch.estimated_size_bytes();
+                if self.probe_state.right_bytes > self.memory_limit_bytes {
+                    return Err(crate::common::error::TaibaiError::ResourceBusy(
+                        "anti-join right side exceeds memory limit".into(),
+                    ));
+                }
+                let table = self.hash_table.as_mut().unwrap();
+                for row in 0..batch.num_rows() {
+                    let Some(matches) = table.probe_batch_row(&batch, row, &self.right_key_cols)
+                    else {
+                        continue;
+                    };
+                    for ptr in matches.to_vec() {
+                        table.mark_matched(&ptr);
+                    }
+                }
+            }
+            self.probe_state.right_collected = true;
+            let ht = self.hash_table.as_ref().unwrap();
+            let unmatched = ht.unmatched_rows();
+            self.probe_state.pending_unmatched = unmatched;
+            self.probe_state.pending_unmatched_mode = Some(UnmatchedMode::AntiLeft);
+            self.materialize_unmatched_chunk();
+        }
+        self.drain_buffer()
+    }
+
     fn probe_anti(&mut self) -> Result<Option<RecordBatch>> {
         if !self.probe_state.right_collected {
             while let Some(batch) = self.right.next_batch()? {
+                crate::common::query_cancel::check()?;
+                self.probe_state.right_bytes += batch.estimated_size_bytes();
+                if self.probe_state.right_bytes > self.memory_limit_bytes {
+                    return Err(crate::common::error::TaibaiError::ResourceBusy(
+                        "anti-join right side exceeds memory limit".into(),
+                    ));
+                }
                 for row in 0..batch.num_rows() {
                     let right_row: Vec<ScalarValue> = (0..batch.num_columns())
                         .map(|c| batch.scalar(row, c).unwrap_or(ScalarValue::Int64(None)))

@@ -50,12 +50,22 @@ pub(super) fn acquire_constraint_insert_lock(
     table: &str,
 ) -> Result<std::sync::MutexGuard<'static, ()>> {
     let lock = constraint_insert_lock(db, table);
+    let start = Instant::now();
+    let timeout = std::time::Duration::from_secs(
+        crate::common::config::storage_timeouts().mutation_lock_timeout_secs,
+    );
     loop {
         crate::common::query_cancel::check()?;
         match lock.try_lock() {
             Ok(guard) => return Ok(guard),
             Err(std::sync::TryLockError::WouldBlock) => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                if start.elapsed() >= timeout {
+                    return Err(TaibaiError::ResourceBusy(format!(
+                        "constraint insert lock for {}.{} timed out after {:?}",
+                        db, table, timeout
+                    )));
+                }
+                std::thread::yield_now();
             }
             Err(std::sync::TryLockError::Poisoned(_)) => {
                 return Err(TaibaiError::Internal(

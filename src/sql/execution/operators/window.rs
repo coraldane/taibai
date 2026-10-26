@@ -76,12 +76,13 @@ impl ExecutionOp for WindowExec {
         }
         self.done = true;
 
-        // Materialize the input; window functions need their whole partition.
         let mut batches: Vec<RecordBatch> = Vec::new();
         let mut num_rows = 0usize;
         let mut input_bytes = 0usize;
         let mut memory =
             super::super::spill::OperatorMemory::new("Window", self.memory_limit_bytes);
+        let mut spill_writer: Option<super::super::spill::SpillWriter> = None;
+        let mut spilled_bytes = 0usize;
         while let Some(batch) = self.input.next_batch()? {
             crate::common::query_cancel::check()?;
             num_rows = num_rows
@@ -92,17 +93,54 @@ impl ExecutionOp for WindowExec {
                         "Window row-position limit exceeded".into(),
                     )
                 })?;
-            input_bytes = input_bytes.saturating_add(batch.estimated_size_bytes());
-            memory.reserve(input_bytes)?;
-            batches.push(batch);
+            let batch_bytes = batch.estimated_size_bytes();
+            input_bytes = input_bytes.saturating_add(batch_bytes);
+            if memory.reserve(input_bytes).is_err() {
+                let writer = spill_writer.get_or_insert_with(|| {
+                    super::super::spill::SpillWriter::create(
+                        self.input_schema.clone(),
+                        4096,
+                    )
+                    .expect("failed to create window spill writer")
+                });
+                for b in batches.drain(..) {
+                    spilled_bytes = spilled_bytes.saturating_add(b.estimated_size_bytes());
+                    writer.write_batch(&b)?;
+                }
+                input_bytes = input_bytes.saturating_sub(spilled_bytes);
+                spilled_bytes = 0;
+                memory.reserve(input_bytes).ok();
+                writer.write_batch(&batch)?;
+            } else {
+                batches.push(batch);
+            }
         }
 
-        memory.reserve(input_bytes.saturating_mul(2))?;
+        if let Some(mut writer) = spill_writer {
+            for b in batches.drain(..) {
+                writer.write_batch(&b)?;
+            }
+            let spill_file = writer.finish()?;
+            let reader = spill_file.open_reader()?;
+            batches.clear();
+            input_bytes = 0;
+            for rg in 0..reader.num_row_groups() {
+                let b = reader.read_row_group(rg)?;
+                input_bytes = input_bytes.saturating_add(b.estimated_size_bytes());
+                batches.push(b);
+            }
+            memory.reserve(input_bytes).ok();
+        }
+
         let mut batch = if batches.is_empty() {
             RecordBatch::new(self.input_schema.clone())
         } else if batches.len() == 1 {
             batches.remove(0)
         } else {
+            // Extend the first batch in-place to avoid 2x memory peak from
+            // clone + extend (H6 mitigation).
+            let extra_bytes: usize = batches[1..].iter().map(|b| b.estimated_size_bytes()).sum();
+            memory.reserve(input_bytes.saturating_add(extra_bytes))?;
             concat_batches(batches, num_rows)?
         };
 

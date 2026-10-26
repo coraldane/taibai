@@ -192,14 +192,7 @@ impl CommitCompletion {
     }
 
     pub(super) fn wait(&self) -> Result<()> {
-        let mut guard = self.outcome.lock().unwrap();
-        while guard.is_none() {
-            guard = self.ready.wait(guard).unwrap();
-        }
-        match guard.as_ref().unwrap() {
-            Ok(()) => Ok(()),
-            Err(message) => Err(TaibaiError::Storage(message.clone())),
-        }
+        self.wait_bounded(Duration::from_secs(60), Duration::from_secs(10))
     }
 
     pub(super) fn wait_bounded(&self, timeout: Duration, warn_after: Duration) -> Result<()> {
@@ -250,6 +243,14 @@ impl TailCommitTicket {
     pub(crate) fn wait(self) -> Result<()> {
         let (timeout, warn_after) = tail_commit_timeouts();
         self.completion.wait_bounded(timeout, warn_after)
+    }
+
+    /// Returns `true` when the submit already failed synchronously (queue
+    /// full or committer stopped). The caller can reject the write before
+    /// appending to the memtable, preventing undurable rows.
+    pub(crate) fn is_immediate_failure(&self) -> bool {
+        let guard = self.completion.outcome.lock().unwrap();
+        matches!(guard.as_ref(), Some(Err(_)))
     }
 }
 
@@ -736,7 +737,9 @@ pub(super) fn tail_commit_loop(
                 }
                 last_group_size = group.len();
 
-                let written = write_append_group(&mut files, &mut compressor, group);
+                let has_rep = rep_log.get().is_some();
+                let written =
+                    write_append_group(&mut files, &mut compressor, group, has_rep);
 
                 if async_fsync {
                     // Tail-append replication events are published INLINE on
@@ -866,6 +869,7 @@ pub(super) fn write_append_group(
     files: &mut TailFileSet,
     compressor: &mut zstd::bulk::Compressor<'_>,
     group: Vec<AppendCommand>,
+    has_replication: bool,
 ) -> Vec<WrittenTailGroup> {
     if crate::common::config::insert_profile_enabled() {
         let bytes = group
@@ -917,7 +921,9 @@ pub(super) fn write_append_group(
                 });
                 entry.completions.push(command.completion);
                 entry.bytes += frame_bytes;
-                entry.frames.extend_from_slice(command.prepared.frame());
+                if has_replication {
+                    entry.frames.extend_from_slice(command.prepared.frame());
+                }
                 entry.last_lsn = lsn;
             }
             Err(error) => command.completion.finish(Err(error.to_string())),

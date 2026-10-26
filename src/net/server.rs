@@ -63,13 +63,19 @@ impl Server {
                 Ok(()) => match tls_config.load_server_config() {
                     Ok(server_config) => Some(TlsAcceptor::from(server_config)),
                     Err(e) => {
-                        tracing::error!("Failed to load TLS configuration: {}", e);
-                        None
+                        panic!(
+                            "TLS is enabled but certificate/key loading failed: {}; \
+                             refusing to start — fix the TLS configuration or disable TLS",
+                            e
+                        );
                     }
                 },
                 Err(e) => {
-                    tracing::error!("TLS configuration invalid: {}", e);
-                    None
+                    panic!(
+                        "TLS configuration is invalid: {}; \
+                         refusing to start — fix the TLS configuration or disable TLS",
+                        e
+                    );
                 }
             },
             TlsMode::Disable => None,
