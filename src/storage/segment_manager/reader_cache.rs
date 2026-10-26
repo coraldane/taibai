@@ -133,6 +133,11 @@ impl LruOrder {
         self.unlink(id);
         self.free.push(id);
     }
+
+    fn shrink(&mut self) {
+        self.index.shrink_to(self.index.len() * 2);
+        self.free.shrink_to(self.free.len() * 2);
+    }
 }
 
 pub(super) struct ReaderCache {
@@ -222,9 +227,6 @@ impl ReaderCache {
     }
 
     fn evict_if_needed(&mut self) {
-        // The newest entry sits at the back of `order` and costs at most the
-        // whole budget (oversized entries never reach the map), so this loop
-        // always terminates with the just-inserted entry surviving.
         while self.used_bytes > self.budget_bytes {
             if let Some(oldest) = self.order.pop_front() {
                 if let Some((_, cost)) = self.entries.remove(&oldest) {
@@ -233,6 +235,10 @@ impl ReaderCache {
             } else {
                 break;
             }
+        }
+        if self.entries.capacity() > self.entries.len().max(16) * 4 {
+            self.entries.shrink_to(self.entries.len() * 2);
+            self.order.shrink();
         }
     }
 }

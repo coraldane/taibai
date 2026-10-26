@@ -127,7 +127,10 @@ impl MemoryReservation {
                     self.bytes = target;
                     return true;
                 }
-                Err(actual) => used = actual,
+                Err(actual) => {
+                    used = actual;
+                    std::hint::spin_loop();
+                }
             }
         }
     }

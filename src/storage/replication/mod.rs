@@ -478,7 +478,7 @@ struct RepLogState {
 /// the frame-carrying variants; the rest is fixed fields plus strings. Used
 /// only for accounting/reporting, never for correctness.
 fn estimated_event_bytes(event: &ReplicationEvent) -> u64 {
-    const WORDS: u64 = 96;
+    const WORDS: u64 = 192;
     match event {
         ReplicationEvent::TailAppend {
             db,

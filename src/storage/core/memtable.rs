@@ -320,6 +320,9 @@ impl MemTable {
     }
 
     pub fn read(&self) -> Option<RecordBatch> {
+        if self.row_count() == 0 {
+            return None;
+        }
         if self.ensure_resident().is_err() {
             return None;
         }
@@ -377,6 +380,9 @@ impl MemTable {
     /// flush path so the data stays resident (then the memtable is marked
     /// `Archived`), in contrast to `take_batch()` which empties the memtable.
     pub fn read_snapshot(&self) -> Option<RecordBatch> {
+        if self.row_count() == 0 {
+            return None;
+        }
         if self.ensure_resident().is_err() {
             return None;
         }
@@ -388,6 +394,9 @@ impl MemTable {
     /// uses this so change notifications cost an `Arc` clone instead of a
     /// full column copy on the transaction-commit path.
     pub fn read_snapshot_arc(&self) -> Option<Arc<RecordBatch>> {
+        if self.row_count() == 0 {
+            return None;
+        }
         if self.ensure_resident().is_err() {
             return None;
         }

@@ -976,18 +976,25 @@ pub(super) fn db_table_from_dir(table_dir: &Path) -> (String, String) {
 }
 
 pub(super) fn sync_append_group(files: &mut TailFileSet, written: Vec<WrittenTailGroup>) {
+    let mut outcomes: HashMap<TailKey, std::result::Result<(), String>> = HashMap::new();
+    for group in &written {
+        outcomes.entry(group.key.clone()).or_insert_with(|| {
+            let sync_start = Instant::now();
+            let result = files.sync(&group.key).map_err(|error| error.to_string());
+            let sync_elapsed = sync_start.elapsed();
+            let warn_after = tail_commit_timeouts().1;
+            if sync_elapsed >= warn_after {
+                tracing::warn!(
+                    tail = ?group.key,
+                    fsync_ms = sync_elapsed.as_millis() as u64,
+                    "durable tail fsync was slow"
+                );
+            }
+            result
+        });
+    }
     for group in written {
-        let sync_start = Instant::now();
-        let outcome = files.sync(&group.key).map_err(|error| error.to_string());
-        let sync_elapsed = sync_start.elapsed();
-        let warn_after = tail_commit_timeouts().1;
-        if sync_elapsed >= warn_after {
-            tracing::warn!(
-                tail = ?group.key,
-                fsync_ms = sync_elapsed.as_millis() as u64,
-                "durable tail fsync was slow"
-            );
-        }
+        let outcome = outcomes.get(&group.key).cloned().unwrap();
         for completion in group.completions {
             completion.finish(outcome.clone());
         }

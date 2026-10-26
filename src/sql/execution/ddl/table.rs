@@ -924,7 +924,7 @@ pub(super) fn exec_partition_change(
                 cleared_rows,
                 "partition change cleared resident memtables and flushed active segments"
             );
-            engine.hot_store_manager().remove(db, name);
+            engine.hot_store_manager().invalidate(db, name);
             let unique_index_names = before_meta
                 .unique_indexes
                 .iter()

@@ -889,20 +889,14 @@ impl SegmentReader {
             }
         }
 
-        let batch = self.read_columns_fast(target_rg, &column_indices)?;
-
-        if batch.num_rows() == 0 {
-            return Ok(crate::types::batch::RecordBatch::new(batch.schema.clone()));
-        }
+        let filtered = self.read_columns_filtered(target_rg, &column_indices, &[local_row_idx])?;
 
         let mut selected_columns = Vec::with_capacity(column_indices.len());
-        for (i, &_col_idx) in column_indices.iter().enumerate() {
-            if let Some(col) = batch.column(i) {
-                let scalar = col.scalar(local_row_idx);
-                let mut single_col = ColumnArray::empty(col.data_type());
-                single_col.push(&scalar)?;
-                selected_columns.push(single_col);
-            }
+        for (_col_idx, col) in &filtered {
+            let scalar = col.scalar(0);
+            let mut single_col = ColumnArray::empty(col.data_type());
+            single_col.push(&scalar)?;
+            selected_columns.push(single_col);
         }
 
         let result_schema = crate::types::batch::Schema::new(

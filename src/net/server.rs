@@ -161,17 +161,15 @@ async fn handle_connection(
     if let Some(acceptor) = tls_acceptor {
         tracing::debug!("Performing TLS handshake");
         let handshake = acceptor.accept(stream);
-        let tls_stream = if config.server.tls_handshake_timeout_secs == 0 {
-            handshake.await
+        let handshake_timeout = if config.server.tls_handshake_timeout_secs == 0 {
+            Duration::from_secs(30)
         } else {
-            timeout(
-                Duration::from_secs(config.server.tls_handshake_timeout_secs),
-                handshake,
-            )
+            Duration::from_secs(config.server.tls_handshake_timeout_secs)
+        };
+        let tls_stream = timeout(handshake_timeout, handshake)
             .await
             .map_err(|_| TaibaiError::Network("TLS handshake timed out".into()))?
-        }
-        .map_err(|e| TaibaiError::Network(format!("TLS handshake failed: {}", e)))?;
+            .map_err(|e| TaibaiError::Network(format!("TLS handshake failed: {}", e)))?;
         tracing::debug!("TLS handshake completed");
         handle_framed(tls_stream, config, engine, limiters).await
     } else {
@@ -293,7 +291,7 @@ where
         requests_in_flight += 1;
 
         let context = build_query_context(&config, Arc::new(AtomicBool::new(false)));
-        let (stream_sender, mut stream_receiver) = tokio::sync::mpsc::channel(1);
+        let (stream_sender, mut stream_receiver) = tokio::sync::mpsc::channel(8);
         let mut worker = run_handler(
             handler.take().expect("handler available between requests"),
             msg,
