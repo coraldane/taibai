@@ -1,7 +1,9 @@
 mod active_writer;
+mod catalog;
 mod cluster_meta_cache;
 mod config;
 pub(crate) mod helpers;
+mod maintenance;
 mod reader_cache;
 mod segment_meta_cache;
 mod state;
@@ -27,6 +29,7 @@ use crate::storage::segment::{
 };
 use crate::types::batch::{RecordBatch, Schema};
 
+pub use catalog::{plan_ttl_fully_expired, MaintenanceTtlColumn, SegmentPlanMeta};
 pub(crate) use config::bulk_compression_level;
 pub(crate) use config::resolve_compression_level;
 pub use config::SegmentConfig;
@@ -123,6 +126,7 @@ mod manager_core;
 // module) that the flat include! layout used to expose; visibility per item
 // is preserved (min of pub and the item's own).
 use direct_bulk::*;
+pub(crate) use maintenance::*;
 pub(crate) use manager_core::*;
 
 fn cleanup_incomplete_compaction_files(table_dir: &Path) {
@@ -163,7 +167,8 @@ fn cleanup_incomplete_compaction_files(table_dir: &Path) {
 }
 
 fn is_incomplete_compaction_file(name: &str) -> bool {
-    name.ends_with(".compact_tmp")
+    name == "segment_catalog.tmp"
+        || name.ends_with(".compact_tmp")
         || name.ends_with(".meta.compact.tmp")
         || name.ends_with(".update_tmp")
         || name.ends_with(".epoch.tmp")
@@ -203,3 +208,11 @@ mod mutation_lock_cancel_tests;
 #[cfg(test)]
 #[path = "segment_manager/mutation_lock_fairness_test.rs"]
 mod mutation_lock_fairness_tests;
+
+#[cfg(test)]
+#[path = "segment_manager/maintenance_test.rs"]
+mod maintenance_tests;
+
+#[cfg(test)]
+#[path = "segment_manager/catalog_test.rs"]
+mod catalog_tests;

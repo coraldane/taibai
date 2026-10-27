@@ -2,10 +2,11 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::segment_manager::active_writer::ActiveSegmentWriter;
+use crate::storage::segment_manager::catalog::{CatalogEntryRecord, SegmentPlanMeta};
 
 /// Mutation mutex with a FIFO admission queue.
 ///
@@ -127,6 +128,20 @@ impl Drop for QueuedTicket<'_> {
     }
 }
 
+/// One maintenance-tracked segment path: its revision/retired state (the
+/// Phase 1 protocol) plus the advisory plan metadata of the segment catalog.
+/// `plan` is `None` while the segment is mutable, freshly published, or
+/// invalidated — the next maintenance round rebuilds it from the footer.
+pub(super) struct MaintenanceEntry {
+    revision: u64,
+    retired: bool,
+    plan: Option<Arc<SegmentPlanMeta>>,
+}
+
+/// Minimum interval between catalog file writes; persistence is also gated on
+/// the generation counter, so a burst of rounds coalesces into one write.
+const CATALOG_PERSIST_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
 pub(super) struct TableSegmentState {
     pub(super) seq: AtomicU32,
     /// Per-table zstd level override (`COMPRESSION_LEVEL`), refreshed by DDL
@@ -135,6 +150,21 @@ pub(super) struct TableSegmentState {
     pub(super) compression_level_override: AtomicI32,
     pub(super) partition_seq: Mutex<HashMap<String, u32>>,
     pub(super) active_segments: Mutex<HashMap<String, ActiveSegmentWriter>>,
+    pub(super) maintenance_entries: Mutex<HashMap<PathBuf, MaintenanceEntry>>,
+    next_maintenance_revision: AtomicU64,
+    /// Bumped on every maintenance-entry content change (plan fill/clear,
+    /// publish, retire, prune); persistence compares it against the last
+    /// persisted generation.
+    catalog_generation: AtomicU64,
+    catalog_last_persisted: AtomicU64,
+    catalog_last_persist_at: Mutex<Option<Instant>>,
+    /// The on-disk catalog file was loaded (or found absent) for this state.
+    catalog_loaded: AtomicBool,
+    /// First maintenance round after startup must reconcile the catalog
+    /// against the directory: files may have changed out-of-band while the
+    /// process was down (crash window, replication apply, external tools).
+    catalog_needs_reconcile: AtomicBool,
+    catalog_rounds: AtomicU32,
     pub(super) mutation_lock: FairMutex,
     /// Per-partition mutation locks. Partition-scoped writers (memtable
     /// INSERT, single-partition bulk append, memtable flush/seal) take only
@@ -176,6 +206,14 @@ impl TableSegmentState {
             compression_level_override: AtomicI32::new(0),
             partition_seq: Mutex::new(partition_seq),
             active_segments: Mutex::new(HashMap::new()),
+            maintenance_entries: Mutex::new(HashMap::new()),
+            next_maintenance_revision: AtomicU64::new(1),
+            catalog_generation: AtomicU64::new(0),
+            catalog_last_persisted: AtomicU64::new(0),
+            catalog_last_persist_at: Mutex::new(None),
+            catalog_loaded: AtomicBool::new(false),
+            catalog_needs_reconcile: AtomicBool::new(true),
+            catalog_rounds: AtomicU32::new(0),
             mutation_lock: FairMutex::new(),
             partition_locks: RwLock::new(HashMap::new()),
             partition_gate: AtomicBool::new(false),
@@ -196,6 +234,221 @@ impl TableSegmentState {
     pub(super) fn set_compression_level_override(&self, level: Option<i32>) {
         self.compression_level_override
             .store(level.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    pub(super) fn maintenance_revision(&self, path: &Path) -> (u64, bool) {
+        let mut entries = self.maintenance_entries.lock().unwrap();
+        let entry = entries
+            .entry(path.to_path_buf())
+            .or_insert_with(|| MaintenanceEntry {
+                revision: self
+                    .next_maintenance_revision
+                    .fetch_add(1, Ordering::Relaxed),
+                retired: false,
+                plan: None,
+            });
+        (entry.revision, entry.retired)
+    }
+
+    pub(super) fn maintenance_plan(&self, path: &Path) -> Option<Arc<SegmentPlanMeta>> {
+        self.maintenance_entries
+            .lock()
+            .unwrap()
+            .get(path)
+            .and_then(|entry| entry.plan.clone())
+    }
+
+    /// Attach freshly captured plan metadata. Entries retired in the meantime
+    /// keep their tombstone and stay planless.
+    pub(super) fn set_maintenance_plan(&self, path: &Path, plan: Arc<SegmentPlanMeta>) {
+        let mut entries = self.maintenance_entries.lock().unwrap();
+        let entry = entries
+            .entry(path.to_path_buf())
+            .or_insert_with(|| MaintenanceEntry {
+                revision: self
+                    .next_maintenance_revision
+                    .fetch_add(1, Ordering::Relaxed),
+                retired: false,
+                plan: None,
+            });
+        if !entry.retired {
+            entry.plan = Some(plan);
+            self.touch_catalog_generation();
+        }
+    }
+
+    /// Seed an entry from the persisted catalog file. Never overwrites a live
+    /// entry: in-process state wins over the advisory file.
+    pub(super) fn seed_maintenance_plan(&self, path: PathBuf, plan: Arc<SegmentPlanMeta>) {
+        let mut entries = self.maintenance_entries.lock().unwrap();
+        if let std::collections::hash_map::Entry::Vacant(slot) = entries.entry(path) {
+            slot.insert(MaintenanceEntry {
+                revision: self
+                    .next_maintenance_revision
+                    .fetch_add(1, Ordering::Relaxed),
+                retired: false,
+                plan: Some(plan),
+            });
+            self.touch_catalog_generation();
+        }
+    }
+
+    /// Drop the entry for a segment file that no longer exists on disk.
+    pub(super) fn remove_maintenance_path(&self, path: &Path) {
+        if self
+            .maintenance_entries
+            .lock()
+            .unwrap()
+            .remove(path)
+            .is_some()
+        {
+            self.touch_catalog_generation();
+        }
+    }
+
+    /// Reconcile diff: drop entries for paths the directory scan no longer
+    /// sees. Retired entries stay until their plan lease prunes them.
+    pub(super) fn retain_maintenance_paths(&self, keep: &HashSet<PathBuf>) {
+        let mut entries = self.maintenance_entries.lock().unwrap();
+        let before = entries.len();
+        entries.retain(|path, entry| entry.retired || keep.contains(path));
+        if entries.len() != before {
+            drop(entries);
+            self.touch_catalog_generation();
+        }
+    }
+
+    /// Non-retired entry paths: the steady-state candidate list for a
+    /// catalog-driven maintenance round.
+    pub(super) fn maintenance_paths(&self) -> Vec<PathBuf> {
+        self.maintenance_entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, entry)| !entry.retired)
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    pub(super) fn catalog_records(&self) -> Vec<CatalogEntryRecord> {
+        self.maintenance_entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(path, entry)| {
+                let plan = entry.plan.as_ref()?;
+                (!entry.retired).then(|| {
+                    CatalogEntryRecord::from_plan(
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        plan,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Throttled persistence gate: `Some(generation)` when a write is due,
+    /// carrying the generation to mark persisted after it succeeds.
+    pub(super) fn catalog_persist_due(&self) -> Option<u64> {
+        let generation = self.catalog_generation.load(Ordering::Relaxed);
+        if generation == self.catalog_last_persisted.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut last = self.catalog_last_persist_at.lock().unwrap();
+        let due = last.is_none_or(|instant| instant.elapsed() >= CATALOG_PERSIST_MIN_INTERVAL);
+        if due {
+            *last = Some(Instant::now());
+            return Some(generation);
+        }
+        None
+    }
+
+    pub(super) fn mark_catalog_persisted(&self, generation: u64) {
+        self.catalog_last_persisted
+            .store(generation, Ordering::Relaxed);
+    }
+
+    pub(super) fn take_catalog_reconcile_request(&self) -> bool {
+        self.catalog_needs_reconcile.swap(false, Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn request_catalog_reconcile(&self) {
+        self.catalog_needs_reconcile.store(true, Ordering::Relaxed);
+    }
+
+    pub(super) fn next_catalog_round(&self) -> u32 {
+        self.catalog_rounds.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(super) fn catalog_load_guard(&self) -> bool {
+        !self.catalog_loaded.swap(true, Ordering::SeqCst)
+    }
+
+    fn touch_catalog_generation(&self) {
+        self.catalog_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn bump_maintenance_revision(&self, path: &Path) {
+        let revision = self
+            .next_maintenance_revision
+            .fetch_add(1, Ordering::Relaxed);
+        self.maintenance_entries
+            .lock()
+            .unwrap()
+            .entry(path.to_path_buf())
+            .and_modify(|entry| {
+                entry.revision = revision;
+                entry.plan = None;
+            })
+            .or_insert(MaintenanceEntry {
+                revision,
+                retired: false,
+                plan: None,
+            });
+        self.touch_catalog_generation();
+    }
+
+    pub(super) fn publish_maintenance_segment(&self, path: &Path) {
+        let revision = self
+            .next_maintenance_revision
+            .fetch_add(1, Ordering::Relaxed);
+        self.maintenance_entries.lock().unwrap().insert(
+            path.to_path_buf(),
+            MaintenanceEntry {
+                revision,
+                retired: false,
+                plan: None,
+            },
+        );
+        self.touch_catalog_generation();
+    }
+
+    pub(super) fn retire_maintenance_segment(&self, path: &Path) {
+        let revision = self
+            .next_maintenance_revision
+            .fetch_add(1, Ordering::Relaxed);
+        self.maintenance_entries.lock().unwrap().insert(
+            path.to_path_buf(),
+            MaintenanceEntry {
+                revision,
+                retired: true,
+                plan: None,
+            },
+        );
+        self.touch_catalog_generation();
+    }
+
+    pub(super) fn prune_retired_maintenance_segments(&self) {
+        let mut entries = self.maintenance_entries.lock().unwrap();
+        let removed = entries.values().any(|entry| entry.retired);
+        if removed {
+            entries.retain(|_, entry| !entry.retired);
+            drop(entries);
+            self.touch_catalog_generation();
+        }
     }
 
     /// Record that `path` is being sealed outside the locks. Must be called

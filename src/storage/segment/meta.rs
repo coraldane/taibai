@@ -423,7 +423,7 @@ fn sync_parent_dir(_path: &Path) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn sync_parent_dir(path: &Path) -> Result<()> {
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::File::open(parent)?.sync_all()?;
     }

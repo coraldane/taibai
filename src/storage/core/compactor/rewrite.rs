@@ -1,6 +1,7 @@
 //! Streaming rewrites and selection of compaction inputs.
 
 use super::*;
+use crate::storage::segment_manager::plan_ttl_fully_expired;
 
 impl Compactor {
     /// Streaming rewrite of an unsorted partition: walk the input segments
@@ -181,7 +182,7 @@ impl Compactor {
         table: &str,
         table_dir: &Path,
         partition_key: Option<&str>,
-        segment_files: Vec<PathBuf>,
+        segment_inputs: Vec<super::PlannedSegment>,
         schema: &Schema,
         sort_key_indices: &[usize],
         bloom_column_indices: &[usize],
@@ -189,11 +190,11 @@ impl Compactor {
         ttl: Option<(usize, i64)>,
         compression_level: i32,
     ) -> Result<PreparedCompaction> {
-        let segment_files: Vec<PathBuf> = segment_files
+        let segment_inputs: Vec<super::PlannedSegment> = segment_inputs
             .into_iter()
-            .filter(|path| path.exists())
+            .filter(|segment| segment.path.exists())
             .collect();
-        if segment_files.is_empty() {
+        if segment_inputs.is_empty() {
             return Ok(PreparedCompaction::Skipped);
         }
         let partition_label = partition_key.unwrap_or("<unpartitioned>");
@@ -201,7 +202,7 @@ impl Compactor {
         // (both call sites pass `cluster_key_indices`), so it doubles as the
         // "is this table clustered" signal for the input selection below.
         let table_is_clustered = !bloom_column_indices.is_empty();
-        let segment_files = if sort_key_indices.is_empty() && !table_is_clustered {
+        let identities = if sort_key_indices.is_empty() && !table_is_clustered {
             // Non-clustered table: only dirty (or under-full, merge-worthy)
             // segments enter the rewrite; clean full-size segments are never
             // rewritten — rewriting them would be pure write amplification.
@@ -216,7 +217,7 @@ impl Compactor {
                 db,
                 table,
                 partition_key,
-                &segment_files,
+                &segment_inputs,
                 schema,
                 output_row_group_rows,
                 ttl,
@@ -237,37 +238,29 @@ impl Compactor {
             // thousands of tiny row groups after many small flushes; this
             // check keeps OPTIMIZE able to repair the main source of read
             // amplification.
-            if sort_key_indices.is_empty() && segment_files.len() == 1 {
-                let reader = self.segment_mgr.open_reader_cached(&segment_files[0])?;
+            if sort_key_indices.is_empty() && segment_inputs.len() == 1 {
+                let meta = &segment_inputs[0].meta;
                 let compact_row_groups =
-                    reader.row_count().div_ceil(output_row_group_rows as u64) as usize;
+                    meta.row_count.div_ceil(output_row_group_rows as u64) as usize;
                 let needs_row_group_compaction =
-                    reader.num_row_groups() > compact_row_groups.max(1);
-                if reader.deleted_row_count() == 0 && !needs_row_group_compaction {
+                    meta.row_group_rows.len() > compact_row_groups.max(1);
+                if meta.deleted_row_count == 0 && !needs_row_group_compaction {
                     tracing::info!(
                         db,
                         table,
                         partition_key = partition_key.unwrap_or("<none>"),
-                        segment = %segment_files[0].display(),
+                        segment = %segment_inputs[0].path.display(),
                         "skipping clean single-segment optimization"
                     );
                     return Ok(PreparedCompaction::Skipped);
                 }
             }
-            segment_files
+            segment_inputs
         };
-        let identities = segment_files
+        let segment_files = identities
             .iter()
-            .map(|path| compaction_input_identity(&self.segment_mgr, path))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                TaibaiError::Storage(format!(
-                    "compaction input unreadable before rewrite on {}.{} partition {}",
-                    db,
-                    table,
-                    partition_key.unwrap_or("<none>")
-                ))
-            })?;
+            .map(|segment| segment.path.clone())
+            .collect::<Vec<PathBuf>>();
         let segments_read = segment_files.len();
 
         tracing::info!(
@@ -533,12 +526,12 @@ impl Compactor {
         db: &str,
         table: &str,
         partition_key: Option<&str>,
-        segment_files: &[PathBuf],
+        segment_files: &[super::PlannedSegment],
         schema: &Schema,
         output_row_group_rows: usize,
         ttl: Option<(usize, i64)>,
         now_us: i64,
-    ) -> Result<Option<Vec<PathBuf>>> {
+    ) -> Result<Option<Vec<super::PlannedSegment>>> {
         #[derive(Clone, Copy, PartialEq)]
         enum InputClass {
             /// Tombstoned or row-group fragmented: worth rewriting alone.
@@ -553,28 +546,25 @@ impl Compactor {
         let mut classes = Vec::with_capacity(segment_files.len());
         let mut rewrite_count = 0usize;
         let mut small_count = 0usize;
-        for path in segment_files {
-            let reader = self.segment_mgr.open_reader_cached(path)?;
-            let compact_row_groups =
-                reader.row_count().div_ceil(output_row_group_rows as u64) as usize;
-            let fragmented = reader.num_row_groups() > compact_row_groups.max(1);
-            let tombstoned = reader.deleted_row_count() > 0;
-            let under_full = reader.row_count() < output_row_group_rows as u64;
+        let ttl_plan_column = ttl
+            .and_then(|(ttl_col, _)| schema.columns.get(ttl_col))
+            .map(|column| column.name.as_str());
+        for segment in segment_files {
+            let meta = &segment.meta;
+            let compact_row_groups = meta.row_count.div_ceil(output_row_group_rows as u64) as usize;
+            let fragmented = meta.row_group_rows.len() > compact_row_groups.max(1);
+            let tombstoned = meta.deleted_row_count > 0;
+            let under_full = meta.row_count < output_row_group_rows as u64;
             let class = if tombstoned || fragmented {
                 rewrite_count += 1;
                 InputClass::Rewrite
-            } else if ttl.is_some_and(|(ttl_col, secs)| {
-                reader
-                    .align_indices(schema, &[ttl_col])
-                    .ok()
-                    .is_some_and(|indices| {
-                        segment_ttl_fully_expired(
-                            &reader,
-                            indices[0],
-                            secs.saturating_mul(1_000_000),
-                            now_us,
-                        )
-                    })
+            } else if ttl.is_some_and(|(_, secs)| {
+                plan_ttl_fully_expired(
+                    meta,
+                    ttl_plan_column.unwrap_or_default(),
+                    secs.saturating_mul(1_000_000),
+                    now_us,
+                )
             }) {
                 // Clean and full, but provably past the TTL horizon: the
                 // only way these rows ever leave the disk is a rewrite.

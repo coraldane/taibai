@@ -1103,3 +1103,58 @@ fn external_index_build_merges_runs_and_keeps_previous_base_on_scan_error() -> R
     );
     Ok(())
 }
+
+#[test]
+fn stream_prepare_failure_preserves_previous_base() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
+    let manager =
+        IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
+    manager
+        .persist_unique_index_stream("db", "t", "uq", &["v".into()], |emit| emit(entry(7, 70)))?;
+
+    super::stream_build::fail_next_stream_prepare();
+    let error = manager
+        .persist_unique_index_stream("db", "t", "uq", &["v".into()], |emit| emit(entry(8, 80)))
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("forced unique index stream prepare"));
+    assert_eq!(
+        manager.unique_key_exists("db", "t", "uq", &[ScalarValue::Int64(Some(7))])?,
+        Some(true)
+    );
+    assert_eq!(
+        manager.unique_key_exists("db", "t", "uq", &[ScalarValue::Int64(Some(8))])?,
+        Some(false)
+    );
+    Ok(())
+}
+
+#[test]
+fn stream_publish_rejects_epoch_drift_and_preserves_previous_base() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
+    let manager =
+        IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
+    manager
+        .persist_unique_index_stream("db", "t", "uq", &["v".into()], |emit| emit(entry(7, 70)))?;
+
+    let mut build = manager.unique_index_stream_begin("db", "t", "uq")?;
+    manager.unique_index_stream_push(&mut build, entry(8, 80))?;
+    let prepared = manager.unique_index_stream_prepare("db", "t", "uq", &["v".into()], build)?;
+    segment_mgr.note_segments_changed("db", "t");
+    let error = manager
+        .unique_index_stream_publish("db", "t", "uq", prepared)
+        .unwrap_err();
+    assert!(matches!(error, TaibaiError::ResourceBusy(_)));
+    assert_eq!(
+        manager.unique_key_exists("db", "t", "uq", &[ScalarValue::Int64(Some(7))])?,
+        Some(true)
+    );
+    assert_eq!(
+        manager.unique_key_exists("db", "t", "uq", &[ScalarValue::Int64(Some(8))])?,
+        Some(false)
+    );
+    Ok(())
+}

@@ -895,15 +895,17 @@ impl Engine {
         }
         if stats.segments_written > 0 || stats.rows_dropped > 0 {
             let schema = Schema::new(table_meta.columns.clone());
-            let rebuilt = self.segment_mgr.with_table_mutation_lock(db, table, || {
-                crate::sql::execution::dml_insert::rebuild_table_location_indexes(
-                    self,
+            let rebuilt =
+                crate::sql::execution::dml_insert::rebuild_table_location_indexes_two_phase(
+                    &self.index_manager,
+                    &self.segment_mgr,
+                    self.memtable_manager(),
+                    &self.data_dir,
                     db,
                     table,
                     &table_meta,
                     &schema,
-                )
-            });
+                );
             if let Err(error) = rebuilt {
                 tracing::warn!(
                     db,
@@ -1329,11 +1331,7 @@ impl Engine {
             }
         }
         if warmed > 0 || failed > 0 {
-            tracing::info!(
-                warmed,
-                failed,
-                "warmup: unique index states preloaded"
-            );
+            tracing::info!(warmed, failed, "warmup: unique index states preloaded");
         }
     }
 

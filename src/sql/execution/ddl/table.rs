@@ -390,39 +390,28 @@ pub fn exec_rebuild_unique_index(
     let table_schema = Schema::new(table_meta.columns.clone());
     engine.flush_table_buffers(db, table)?;
     let mut rebuilt = 0u64;
-    engine
-        .segment_mgr()
-        .with_table_mutation_lock(db, table, || {
-            for index in &table_meta.unique_indexes {
-                if index_name
-                    .map(|name| !index.name.eq_ignore_ascii_case(name))
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                let indices = resolve_unique_index_columns(&table_schema, &index.columns)?;
-                engine.index_manager().persist_unique_index_stream(
-                    db,
-                    table,
-                    &index.name,
-                    &index.columns,
-                    |visit| {
-                        crate::sql::execution::dml_insert::visit_unique_index_entries_from(
-                            engine.segment_mgr(),
-                            &engine.memtable_manager().get_by_table(db, table),
-                            &engine.data_dir().join(db).join(table),
-                            table,
-                            &table_schema,
-                            &indices,
-                            "REBUILD UNIQUE INDEX statement",
-                            visit,
-                        )
-                    },
-                )?;
-                rebuilt += 1;
-            }
-            Ok(())
-        })?;
+    for index in &table_meta.unique_indexes {
+        if index_name
+            .map(|name| !index.name.eq_ignore_ascii_case(name))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let indices = resolve_unique_index_columns(&table_schema, &index.columns)?;
+        // Scanning, external merging and fsync all run outside the table
+        // mutation lock. The helper takes that lock only for epoch/fingerprint
+        // validation and atomic publication; concurrent drift is retryable.
+        crate::sql::execution::dml_insert::rebuild_single_location_index_two_phase(
+            engine,
+            db,
+            table,
+            &table_schema,
+            &index.name,
+            &index.columns,
+            &indices,
+        )?;
+        rebuilt += 1;
+    }
 
     if rebuilt == 0 {
         if let Some(index_name) = index_name {

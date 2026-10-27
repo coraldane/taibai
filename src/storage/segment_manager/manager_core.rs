@@ -749,40 +749,6 @@ impl SegmentManager {
             .collect())
     }
 
-    pub fn cleanup_fully_deleted_segments(
-        &self,
-        db: &str,
-        table: &str,
-        table_dir: &Path,
-    ) -> Result<u64> {
-        self.with_table_mutation_lock(db, table, || {
-            // Same pin gate as compaction/TTL/DDL: an open transaction's
-            // deferred tombstones reference segment paths, and deleting a
-            // fully-deleted segment under them left that COMMIT retrying a
-            // vanished path forever.
-            if self
-                .txn_mutations()
-                .is_some_and(|registry| registry.table_has_pins(db, table))
-            {
-                tracing::debug!(
-                    db,
-                    table,
-                    "table pinned by an open transaction, skipping fully-deleted cleanup"
-                );
-                return Ok(0);
-            }
-            let mut removed = 0u64;
-            for path in self.discover_inactive_segments(db, table, table_dir)? {
-                let reader = self.open_reader_cached(&path)?;
-                if reader.row_count() > 0 && reader.deleted_row_count() >= reader.row_count() {
-                    self.remove_segment_file(&path)?;
-                    removed += 1;
-                }
-            }
-            Ok(removed)
-        })
-    }
-
     pub fn find_unsealed_segment(
         table_dir: &Path,
         min_seal_size: u64,
@@ -838,6 +804,7 @@ impl SegmentManager {
             let seq = state.seq.fetch_add(1, Ordering::Relaxed) + 1;
             let path = table_dir.join(store::regular_segment_filename(seq));
             if !path.exists() {
+                state.publish_maintenance_segment(&path);
                 return Ok(path);
             }
             // The in-process counter fell behind the directory — a scan-based
@@ -870,6 +837,7 @@ impl SegmentManager {
             };
             let path = table_dir.join(store::partition_segment_filename(partition_key, seq));
             if !path.exists() {
+                state.publish_maintenance_segment(&path);
                 return Ok(path);
             }
             let dir_max = store::max_segment_seq_by_scan(table_dir, Some(partition_key))?;
@@ -920,6 +888,9 @@ impl SegmentManager {
                     }
                 }
             }
+        }
+        if let Ok(state) = self.get_or_create_state_for_table_dir(table_dir) {
+            state.publish_maintenance_segment(&path);
         }
         Ok(path)
     }
@@ -1069,6 +1040,9 @@ impl SegmentManager {
         self.reader_cache.lock().unwrap().invalidate(path);
         self.segment_meta_cache.lock().unwrap().invalidate(path);
         self.cluster_meta_cache.lock().unwrap().invalidate(path);
+        if let Some(state) = self.state_for_segment_path(path) {
+            state.bump_maintenance_revision(path);
+        }
     }
 
     pub fn invalidate_readers_under(&self, dir: &Path) {
@@ -1085,6 +1059,22 @@ impl SegmentManager {
             .lock()
             .unwrap()
             .invalidate_under(dir);
+        if let Ok(key) = self.table_state_key_from_dir(dir) {
+            let state = self.tables.read().unwrap().get(&key).cloned();
+            if let Some(state) = state {
+                let paths = state
+                    .maintenance_entries
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .filter(|path| path.starts_with(dir))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for path in paths {
+                    state.bump_maintenance_revision(&path);
+                }
+            }
+        }
     }
 
     /// `(entries, charged heap bytes, budget bytes)` of the sealed-segment
@@ -1220,6 +1210,9 @@ impl SegmentManager {
         self.invalidate_reader(path);
         std::fs::remove_file(path)?;
         remove_sidecar_meta(path)?;
+        if let Some(state) = self.state_for_segment_path(path) {
+            state.retire_maintenance_segment(path);
+        }
         Ok(())
     }
 
@@ -1263,11 +1256,17 @@ impl SegmentManager {
                 let _ = std::fs::remove_file(&journal);
                 return Err(error.into());
             }
+            if let Some(state) = self.state_for_segment_path(final_path) {
+                state.publish_maintenance_segment(final_path);
+            }
             // The journal now retires the old paths for discovery. Existing
             // leases retain their files; failed physical deletion remains
             // recoverable without exposing duplicate rows to new scans.
             for old_seg in old_segments {
                 self.invalidate_reader(old_seg);
+                if let Some(state) = self.state_for_segment_path(old_seg) {
+                    state.retire_maintenance_segment(old_seg);
+                }
             }
             directory.retire(journal, old_segments.to_vec());
             Ok(())
@@ -1291,6 +1290,9 @@ impl SegmentManager {
             write_replace_journal(&journal, paths)?;
             for path in paths {
                 self.invalidate_reader(path);
+                if let Some(state) = self.state_for_segment_path(path) {
+                    state.retire_maintenance_segment(path);
+                }
             }
             directory.retire(journal, paths.to_vec());
             Ok(())
@@ -1758,7 +1760,7 @@ impl SegmentManager {
             .any(|segment| same_segment_path(&segment.path, path))
     }
 
-    fn state_for_segment_path(&self, path: &Path) -> Option<Arc<TableSegmentState>> {
+    pub(super) fn state_for_segment_path(&self, path: &Path) -> Option<Arc<TableSegmentState>> {
         let tables = self.tables.read().unwrap();
         let table_dir = path.parent()?;
         let key = self.table_state_key_from_dir(table_dir).ok()?;
@@ -1830,6 +1832,9 @@ impl SegmentManager {
         let (Some(db), Some(table)) = (components.next(), components.next()) else {
             return;
         };
+        if let Some(state) = self.state_for_segment_path(path) {
+            state.publish_maintenance_segment(path);
+        }
         self.note_segments_changed(
             &db.as_os_str().to_string_lossy(),
             &table.as_os_str().to_string_lossy(),

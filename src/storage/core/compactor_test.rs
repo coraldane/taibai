@@ -518,7 +518,10 @@ fn cleanup_fully_deleted_segments_removes_inactive_segment() -> Result<()> {
 
     let segment_mgr = SegmentManager::new(tmp.path())?;
     segment_mgr.rewrite_delete_footer(&seg_path, &[0b0000_0011], 2)?;
-    let removed = segment_mgr.cleanup_fully_deleted_segments("default", "t", &table_dir)?;
+    let snapshot = segment_mgr.capture_maintenance_snapshot("default", "t", &table_dir, None)?;
+    let removed =
+        segment_mgr.cleanup_fully_deleted_segments("default", "t", &table_dir, &snapshot)?;
+    drop(snapshot);
 
     assert_eq!(removed, 1);
     assert!(!seg_path.exists());
