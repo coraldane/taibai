@@ -96,7 +96,13 @@ where
         }
         emit(batch)?;
     }
-    Ok(Some(schema.unwrap_or_else(Schema::empty)))
+    // No batch means no rows matched, not "no columns": fall back to the
+    // schema the operator tree planned, so an empty result still describes
+    // its columns.
+    let schema = schema
+        .or_else(|| pipeline.output_schema())
+        .unwrap_or_else(Schema::empty);
+    Ok(Some(schema))
 }
 
 pub fn exec_select(engine: &Engine, db: &str, stmt: &Statement) -> Result<ExecResult> {

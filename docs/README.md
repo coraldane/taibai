@@ -29,6 +29,7 @@
 ## 架构与设计
 
 - [Taibai 列式数据库服务器](design/TAIBAI_DESIGN_ZH.md)：整体架构与各子系统设计。
+- [二进制协议（线上格式参考）](design/wire-protocol.md)：帧格式、消息类型表、登录能力字节、流式结果的 `0x26`/`0x27` 语义与客户端接入检查清单。
 - [分区级 mutation lock 设计](design/partition-mutation-locks.md)：写入互斥的锁粒度与锁序。
 - [元数据折叠聚合执行](design/folded-aggregate-execution.md)：COUNT(*)/分组聚合从段 footer 元数据直接作答的设计。
 - [Direct Bulk 二进制协议](design/direct-bulk-binary-protocol.md)

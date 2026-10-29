@@ -79,7 +79,10 @@ pub fn drain_pipeline(
             result_limit,
         )?;
     }
-    Ok((result_schema.unwrap_or_else(Schema::empty), result_batches))
+    let schema = result_schema
+        .or_else(|| pipeline.output_schema())
+        .unwrap_or_else(Schema::empty);
+    Ok((schema, result_batches))
 }
 
 /// Rewrite the input of `SELECT DISTINCT` into a zone-map-answering scan

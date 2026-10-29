@@ -193,6 +193,70 @@ fn streaming_query_emits_chunks_and_end_marker() {
 }
 
 #[test]
+fn streaming_query_sends_schema_chunk_for_empty_result() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
+    handler.session.as_mut().unwrap().streaming_results = true;
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "CREATE TABLE empty_stream (id INT64, label VARCHAR)",
+        )
+        .unwrap();
+
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+    let consumer = std::thread::spawn(move || {
+        let mut chunks = Vec::new();
+        while let Some(message) = receiver.blocking_recv() {
+            chunks.push(message);
+        }
+        chunks
+    });
+    let mut payload = Vec::new();
+    write_len_prefixed_string(&mut payload, "");
+    write_len_prefixed_string(&mut payload, "SELECT id, label FROM empty_stream");
+    let responses = handler
+        .handle_message_cancellable(
+            Message::new(MSG_TYPE_QUERY, Bytes::from(payload)),
+            Arc::new(crate::common::query_cancel::QueryContext::new(Arc::new(
+                AtomicBool::new(false),
+            ))),
+            Some(sender),
+        )
+        .unwrap();
+    drop(handler);
+    let chunks = consumer.join().unwrap();
+
+    assert_eq!(
+        chunks.len(),
+        1,
+        "an empty result must still deliver its schema, got {} chunk(s)",
+        chunks.len()
+    );
+    assert_eq!(chunks[0].msg_type, MSG_TYPE_RESULT_CHUNK);
+    let crate::net::client::QueryResult::Rows {
+        schema, batches, ..
+    } = crate::net::client::parse_binary_result(&chunks[0].payload).unwrap()
+    else {
+        panic!("schema-only chunk did not decode to rows")
+    };
+    let names: Vec<&str> = schema
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["id", "label"]);
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        0
+    );
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].msg_type, MSG_TYPE_RESULT_END);
+}
+
+#[test]
 fn query_response_size_reserves_timing_trailer() {
     let dir = tempfile::TempDir::new().unwrap();
     let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
@@ -1407,4 +1471,50 @@ mod replication_push_bridge_tests {
         join_with_timeout(bridge);
         assert_eq!(rep_log.session_count(), 0);
     }
+}
+
+#[test]
+fn empty_result_keeps_columns_without_streaming() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "CREATE TABLE empty_single (id INT64, label VARCHAR)",
+        )
+        .unwrap();
+
+    let mut payload = Vec::new();
+    write_len_prefixed_string(&mut payload, "");
+    write_len_prefixed_string(&mut payload, "SELECT id, label FROM empty_single");
+    let responses = handler
+        .handle_message_cancellable(
+            Message::new(MSG_TYPE_QUERY, Bytes::from(payload)),
+            Arc::new(crate::common::query_cancel::QueryContext::new(Arc::new(
+                AtomicBool::new(false),
+            ))),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].msg_type, MSG_TYPE_BINARY_QUERY_RESULT);
+    let crate::net::client::QueryResult::Rows {
+        schema, batches, ..
+    } = crate::net::client::parse_binary_result(&responses[0].payload).unwrap()
+    else {
+        panic!("empty result did not decode to rows")
+    };
+    let names: Vec<&str> = schema
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["id", "label"]);
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        0
+    );
 }

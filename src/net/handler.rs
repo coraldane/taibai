@@ -565,6 +565,12 @@ impl Handler {
                 // pre-encode estimate, and each chunk carries its own copy of
                 // the schema header.
                 let chunk_budget = max_message_size / 2;
+                // Streaming contract: the schema travels in the chunks, and
+                // RESULT_END carries only timings. A result set with zero rows
+                // therefore still emits one zero-row chunk, otherwise the
+                // client would have no way to learn the column list (a
+                // zero-row SELECT would come back as zero columns).
+                let mut chunks_sent = false;
                 match self.engine.execute_streaming_query(session, sql, |batch| {
                     for part in split_batch_for_chunks(batch, chunk_budget)? {
                         let payload = crate::protocol::result::encode_binary_result(&part);
@@ -584,12 +590,27 @@ impl Handler {
                                     "client disconnected during query stream".into(),
                                 )
                             })?;
+                        chunks_sent = true;
                     }
                     Ok(())
                 }) {
-                    Ok(Some(_)) => {
+                    Ok(Some(schema)) => {
                         if has_query_database {
                             session.database = original_database;
+                        }
+                        if !chunks_sent && schema.num_columns() > 0 {
+                            let payload =
+                                crate::protocol::result::encode_binary_result_batches(&schema, &[]);
+                            sender
+                                .blocking_send(Message::new(
+                                    MSG_TYPE_RESULT_CHUNK,
+                                    Bytes::from(payload),
+                                ))
+                                .map_err(|_| {
+                                    TaibaiError::Network(
+                                        "client disconnected during query stream".into(),
+                                    )
+                                })?;
                         }
                         let timings = ServerTimings {
                             total: server_start.elapsed(),

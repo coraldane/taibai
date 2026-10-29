@@ -26,6 +26,24 @@ pub struct ProjectExec {
 }
 
 impl ExecutionOp for ProjectExec {
+    fn output_schema(&self) -> Option<Schema> {
+        // Derived from the input schema and the projection list, so it holds
+        // for an input that yields no batch at all.
+        Some(Schema::new(
+            self.expressions
+                .iter()
+                .enumerate()
+                .map(|(i, expr)| {
+                    project_column_def(
+                        expr,
+                        &self.input_schema,
+                        self.aliases.get(i).and_then(|alias| alias.as_deref()),
+                    )
+                })
+                .collect(),
+        ))
+    }
+
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         match self.input.next_batch()? {
             Some(batch) => {
