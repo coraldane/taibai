@@ -194,6 +194,16 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
+# jemalloc 参数：background_thread 让 decay 在进程空闲时也持续推进，
+# 否则导入等大分配高峰结束后，已释放的 extent 会长期滞留在 RSS 里。
+# 注意：tikv-jemalloc 以 _rjem_ 前缀编译，实际读取的是 _RJEM_MALLOC_CONF
+# （配置文件名也是 /etc/_rjem_malloc.conf）。两个都设，避免依赖构建细节。
+Environment="MALLOC_CONF=background_thread:true,dirty_decay_ms:500,muzzy_decay_ms:0,narenas:16"
+Environment="_RJEM_MALLOC_CONF=background_thread:true,dirty_decay_ms:500,muzzy_decay_ms:0,narenas:16"
+# 内存护栏：MemoryHigh 触发软限回收（勿低于实际工作集，否则会持续节流），
+# MemoryMax 兜底防止异常增长拖垮整机。
+MemoryHigh=32G
+MemoryMax=64G
 ExecStart=$BIN_DIR/taibai --config $CONF_DIR/taibai.yaml
 Restart=on-failure
 RestartSec=5
