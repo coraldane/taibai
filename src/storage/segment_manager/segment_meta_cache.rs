@@ -1,29 +1,42 @@
-use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::storage::segment::meta::SegmentMetaSnapshot;
 
+use super::byte_lru::ByteLru;
+
+/// Parsed segment-metadata cache.
+///
+/// # Bound
+///
+/// Byte-budgeted, not entry-counted. The previous implementation kept
+/// `capacity` entries (default 1024, from `storage.reader_cache_capacity`) and
+/// never looked at their size. A sealed 2 GiB segment's footer parses into
+/// ~24 MiB of row-group metadata — bloom filters for every column of every
+/// row group dominate — so the same knob silently authorized a 24 GiB
+/// resident set. Nothing reported it: the cache was absent from
+/// `SHOW MEMORY`, and an idle server never calls `put`, so the eviction path
+/// never ran either.
+///
+/// Entries are charged [`SegmentMetaSnapshot::estimated_heap_bytes`], an
+/// explicit walk of the owned buffers. An entry bigger than the whole budget
+/// is handed back to the caller but not cached, so one outsized segment
+/// cannot flush the working set.
 pub(super) struct SegmentMetaCache {
-    capacity: usize,
-    entries: HashMap<PathBuf, Arc<SegmentMetaSnapshot>>,
-    order: VecDeque<PathBuf>,
+    inner: ByteLru<PathBuf, Arc<SegmentMetaSnapshot>>,
 }
 
 impl SegmentMetaCache {
-    pub(super) fn new(capacity: usize) -> Self {
+    /// The floor (`>= 1 MiB`) is applied where the config value is installed,
+    /// so tests can drive eviction with budgets too small for production.
+    pub(super) fn new(budget_bytes: u64) -> Self {
         Self {
-            capacity: capacity.max(1),
-            entries: HashMap::new(),
-            order: VecDeque::new(),
+            inner: ByteLru::new(budget_bytes),
         }
     }
 
     pub(super) fn get(&mut self, path: &Path) -> Option<Arc<SegmentMetaSnapshot>> {
-        let key = path.to_path_buf();
-        let meta = self.entries.get(&key).cloned()?;
-        self.touch(&key);
-        Some(meta)
+        self.inner.get(&path.to_path_buf()).cloned()
     }
 
     pub(super) fn put(
@@ -32,51 +45,25 @@ impl SegmentMetaCache {
         meta: SegmentMetaSnapshot,
     ) -> Arc<SegmentMetaSnapshot> {
         let meta = Arc::new(meta);
-        if self
-            .entries
-            .insert(path.clone(), Arc::clone(&meta))
-            .is_none()
-        {
-            self.order.push_back(path);
-        }
-        self.evict_if_needed();
+        let cost_bytes = meta.estimated_heap_bytes();
+        self.inner.put(path, Arc::clone(&meta), cost_bytes);
         meta
     }
 
     pub(super) fn invalidate(&mut self, path: &Path) {
-        let key = path.to_path_buf();
-        self.entries.remove(&key);
-        if let Some(pos) = self.order.iter().position(|p| p == &key) {
-            self.order.remove(pos);
-        }
+        self.inner.invalidate(&path.to_path_buf());
     }
 
     pub(super) fn invalidate_under(&mut self, dir: &Path) {
-        let keys = self
-            .entries
-            .keys()
-            .filter(|path| path.starts_with(dir))
-            .cloned()
-            .collect::<Vec<_>>();
-        for key in keys {
-            self.invalidate(&key);
-        }
+        self.inner.retain(|path| !path.starts_with(dir));
     }
 
-    fn touch(&mut self, path: &PathBuf) {
-        if let Some(pos) = self.order.iter().position(|p| p == path) {
-            self.order.remove(pos);
-        }
-        self.order.push_back(path.clone());
-    }
-
-    fn evict_if_needed(&mut self) {
-        while self.entries.len() > self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
-            } else {
-                break;
-            }
-        }
+    /// `(entries, charged heap bytes, budget bytes)` for `SHOW MEMORY`.
+    pub(super) fn stats(&self) -> (usize, u64, u64) {
+        self.inner.stats()
     }
 }
+
+#[cfg(test)]
+#[path = "segment_meta_cache_test.rs"]
+mod tests;

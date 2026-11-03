@@ -188,6 +188,37 @@ pub fn mutable_reader_cache_budget_bytes() -> u64 {
         .unwrap_or(&(4096 * 1024 * 1024))
 }
 
+static READER_CACHE_BUDGET_BYTES: OnceLock<u64> = OnceLock::new();
+
+/// Install the sealed-reader cache byte budget (`storage.reader_cache_mb`).
+pub fn set_reader_cache_budget_bytes(budget_bytes: u64) {
+    let _ = READER_CACHE_BUDGET_BYTES.set(budget_bytes.max(1024 * 1024));
+}
+
+/// Byte ceiling for the sealed-segment reader cache.
+pub fn reader_cache_budget_bytes() -> u64 {
+    *READER_CACHE_BUDGET_BYTES
+        .get()
+        .unwrap_or(&(2048 * 1024 * 1024))
+}
+
+static SEGMENT_META_CACHE_BUDGET_BYTES: OnceLock<u64> = OnceLock::new();
+
+/// Install the segment-metadata cache byte budget
+/// (`storage.segment_meta_cache_mb`), sourced from the same startup pass as
+/// the other storage runtime tunables.
+pub fn set_segment_meta_cache_budget_bytes(budget_bytes: u64) {
+    let _ = SEGMENT_META_CACHE_BUDGET_BYTES.set(budget_bytes.max(1024 * 1024));
+}
+
+/// Byte ceiling for the parsed segment-metadata cache (`SHOW MEMORY` reports
+/// the live figure as `segment_meta.cache_budget_bytes`).
+pub fn segment_meta_cache_budget_bytes() -> u64 {
+    *SEGMENT_META_CACHE_BUDGET_BYTES
+        .get()
+        .unwrap_or(&(2048 * 1024 * 1024))
+}
+
 /// Install the process-wide query limits. Called once during startup.
 /// Returns an error if called more than once (limits are immutable thereafter).
 pub fn set_query_limits(limits: QueryLimits) -> Result<(), QueryLimits> {
@@ -449,8 +480,16 @@ fn default_mutable_reader_cache_mb() -> u64 {
     4096
 }
 
+fn default_segment_meta_cache_mb() -> u64 {
+    2048
+}
+
 fn default_reader_cache_capacity() -> usize {
     1024
+}
+
+fn default_reader_cache_mb() -> u64 {
+    2048
 }
 
 fn default_bulk_zstd_level() -> i32 {
@@ -745,6 +784,12 @@ pub struct StorageSettings {
     /// Number of segments kept in the reader and segment-metadata caches.
     #[serde(default = "default_reader_cache_capacity")]
     pub reader_cache_capacity: usize,
+    /// Byte ceiling for the sealed-segment reader cache. Each entry is a
+    /// parsed footer plus (for owned readers) the file copy; the footer of a
+    /// 2 GiB segment measures ~68 MiB, so this is the ceiling that actually
+    /// binds. `reader_cache_capacity` remains an entry-count cap on top.
+    #[serde(default = "default_reader_cache_mb")]
+    pub reader_cache_mb: u64,
     /// Byte ceiling for the mutable-segment reader cache. Each entry is a
     /// full heap copy of an active segment file (up to `min_segment_seal_size`),
     /// and the cache is additionally entry-bounded at 4x the reader cache
@@ -752,6 +797,16 @@ pub struct StorageSettings {
     /// pin one copy each, which showed up as unbounded anon RSS growth.
     #[serde(default = "default_mutable_reader_cache_mb")]
     pub mutable_reader_cache_mb: u64,
+    /// Byte ceiling for the parsed segment-metadata (footer) cache. One entry
+    /// is a segment's parsed footer: row-group metadata, zone maps and bloom
+    /// filters — tens of MiB for a multi-GiB segment.
+    ///
+    /// Sized in BYTES on purpose. The cache used to be sized in ENTRIES
+    /// (`reader_cache_capacity`, default 1024) while the per-entry cost grew
+    /// with segment size: a 24 MiB footer turned a stable-looking knob into a
+    /// 25 GiB resident set, with no metric anywhere to show it.
+    #[serde(default = "default_segment_meta_cache_mb")]
+    pub segment_meta_cache_mb: u64,
     /// Maximum time a write may wait for the per-table mutation lock before
     /// failing with a lock timeout error instead of blocking forever.
     #[serde(default = "default_mutation_lock_timeout_secs")]
@@ -1058,7 +1113,9 @@ fn default_storage_settings() -> StorageSettings {
         hybrid_hot_scan_enabled: default_hybrid_hot_scan_enabled(),
         row_group_target_rows: default_row_group_target_rows(),
         reader_cache_capacity: default_reader_cache_capacity(),
+        reader_cache_mb: default_reader_cache_mb(),
         mutable_reader_cache_mb: default_mutable_reader_cache_mb(),
+        segment_meta_cache_mb: default_segment_meta_cache_mb(),
         tail_async_fsync: false,
         tail_archive: false,
         mutation_lock_timeout_secs: default_mutation_lock_timeout_secs(),

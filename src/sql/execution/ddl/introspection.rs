@@ -709,6 +709,24 @@ pub fn exec_show_memory(engine: &Engine) -> Result<ExecResult> {
         crate::common::config::mutable_reader_cache_budget_bytes(),
     ));
 
+    // The segment-metadata cache. Entries are the compact footer index
+    // (~12 B per row group) plus the footer bytes, not a parsed object graph.
+    // It was once the only metadata cache missing from this report, which is
+    // exactly how it grew to 25 GiB unnoticed.
+    let (meta_entries, meta_bytes, meta_budget) = engine.segment_mgr().segment_meta_cache_stats();
+    rows.push((
+        "segment_meta",
+        "cached_entries".into(),
+        meta_entries as u64,
+    ));
+    rows.push(("segment_meta", "cached_heap_bytes".into(), meta_bytes));
+    rows.push(("segment_meta", "cache_budget_bytes".into(), meta_budget));
+    rows.push((
+        "caches",
+        "charged_heap_bytes_total".into(),
+        cached_bytes + mutable_bytes + meta_bytes,
+    ));
+
     rows.push((
         "memtable",
         "estimated_bytes".into(),

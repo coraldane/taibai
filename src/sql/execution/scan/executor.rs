@@ -746,13 +746,14 @@ impl<'a> ScanExecutor<'a> {
                     cols.push(*col);
                 }
             }
-            // Borrowed footer access: the deep-cloning variant materialized
-            // every row group's metadata (bloom filters + value sets) just to
-            // read one entry's column sizes.
-            let row_groups = reader.footer_row_groups();
-            if let Some(rg) = row_groups.get(rg_idx) {
+            // Layout-only decode of the single row group this call is
+            // accounting for: the previous borrowed accessor existed only
+            // because the whole graph used to be resident, and the cloning
+            // variant before it materialised bloom filters and value sets
+            // just to read column sizes.
+            if let Ok(layout) = reader.row_group_layout(rg_idx) {
                 for col_idx in cols {
-                    if let Some(bytes) = rg.column_compressed_sizes.get(col_idx) {
+                    if let Some(bytes) = layout.column_compressed_sizes.get(col_idx) {
                         entry.bytes_read_compressed += *bytes;
                     }
                 }

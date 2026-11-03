@@ -155,9 +155,33 @@ impl ReaderCache {
     /// (at least one entry's worth). The count-based config knob stays the
     /// only tunable so existing deployments keep working unchanged; only the
     /// internal bound switches from "N entries" to "N * 256 KiB bytes".
+    /// Test-only constructor: derives the budget from an entry count via
+    /// [`AVG_READER_COST_BYTES`]. Production builds set the budget directly
+    /// (`with_budget_bytes`), because real entries are charged their true
+    /// parsed-footer size.
+    #[cfg(test)]
     pub(super) fn new(capacity: usize) -> Self {
         Self {
             budget_bytes: capacity.max(1) as u64 * AVG_READER_COST_BYTES,
+            used_bytes: 0,
+            entries: HashMap::new(),
+            order: LruOrder::new(),
+        }
+    }
+
+    /// Build a cache with an explicit byte budget
+    /// (`storage.reader_cache_mb`).
+    ///
+    /// Entries are charged their real parsed-footer size
+    /// ([`crate::storage::segment::SegmentReader::footer_heap_bytes`]), which
+    /// for a 28k-row-group segment is tens of MiB rather than the
+    /// `AVG_READER_COST_BYTES` constant the count-derived budget assumed.
+    /// Keeping one knob for the budget — in bytes — is what stops a
+    /// "segment count" from silently pricing a cache that holds object
+    /// graphs.
+    pub(super) fn with_budget_bytes(budget_bytes: u64) -> Self {
+        Self {
+            budget_bytes: budget_bytes.max(AVG_READER_COST_BYTES),
             used_bytes: 0,
             entries: HashMap::new(),
             order: LruOrder::new(),

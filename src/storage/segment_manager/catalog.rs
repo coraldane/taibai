@@ -15,6 +15,7 @@ use crc32fast::Hasher;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::segment::meta::{atomic_replace, sync_parent_dir, SegmentMetaSnapshot};
+use crate::storage::segment::RowGroupMeta;
 use crate::types::scalar::ScalarValue;
 
 pub(super) const CATALOG_FILE_NAME: &str = "segment_catalog";
@@ -78,19 +79,28 @@ pub fn build_plan_meta(
     file_len: u64,
     ttl_column: Option<&MaintenanceTtlColumn>,
 ) -> SegmentPlanMeta {
-    let row_group_rows = meta
-        .footer_row_groups()
-        .iter()
-        .map(|group| group.row_count)
+    let row_group_count = meta.row_group_count();
+    // Row counts come straight from the resident index — no decode at all.
+    let row_group_rows = (0..row_group_count)
+        .map(|row_group| meta.row_group_row_count(row_group))
         .collect();
     let ttl = ttl_column.and_then(|ttl| {
         let index = ttl
             .names()
             .find_map(|name| meta.footer_schema().index_of(name))?;
-        let zones = meta
-            .footer_row_groups()
-            .iter()
-            .map(|group| match group.zone_maps.get(index) {
+        // TTL zones need one column's bounds per row group, so the records
+        // are decoded one at a time into a reused buffer rather than the
+        // whole footer being materialised.
+        let mut zones = Vec::with_capacity(row_group_count);
+        let mut scratch = RowGroupMeta::empty();
+        for row_group in 0..row_group_count {
+            let decoded = meta.row_group_meta_into(row_group, &mut scratch).is_ok();
+            let zone = if decoded {
+                scratch.zone_maps.get(index)
+            } else {
+                None
+            };
+            zones.push(match zone {
                 Some(zone) => PlanTtlZone {
                     row_count: zone.row_count,
                     null_count: zone.null_count,
@@ -104,8 +114,8 @@ pub fn build_plan_meta(
                     null_count: 0,
                     max_timestamp_us: None,
                 },
-            })
-            .collect();
+            });
+        }
         Some(PlanTtlStats {
             column: ttl.name.clone(),
             zones,

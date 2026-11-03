@@ -1,6 +1,7 @@
 //! Row-group work planning and parallel reads.
 
 use super::*;
+use crate::storage::segment::RowGroupMeta;
 
 /// Plan and run the per-row-group work for one segment: metadata-only folds
 /// collected first, data folds (run-level or decode+mask batches) read in
@@ -28,14 +29,18 @@ pub(super) fn fold_row_groups(
     let has_sum = plan.has_sum;
     let has_avg = plan.has_avg;
 
-    let row_groups = reader.footer_row_groups();
-    let mut candidates = vec![false; row_groups.len()];
+    let row_group_count = reader.num_row_groups();
+    let mut candidates = vec![false; row_group_count];
     for &index in candidate_indices {
         if let Some(candidate) = candidates.get_mut(index) {
             *candidate = true;
         }
     }
     let mut row_start = 0u64;
+    // One reusable decode buffer for the whole walk: row-group records are
+    // decoded on demand and dropped before the next one, so peak memory is a
+    // single record instead of the segment's whole metadata graph.
+    let mut scratch = RowGroupMeta::empty();
 
     // Build the per-row-group work list first: metadata-only folds run
     // inline; data folds read their batches in parallel chunks (reads
@@ -60,14 +65,13 @@ pub(super) fn fold_row_groups(
         /// every clause is zone-map vacuous for this row group).
         apply_mask: bool,
     }
-    /// Per fold unit: (key values, zone maps, row count, column sums).
-    type MetaFold<'a> = (
-        Vec<ScalarValue>,
-        &'a [crate::storage::partition::pruning::ZoneMap],
-        u64,
-        &'a [i64],
-    );
-    let mut meta_folds: Vec<MetaFold<'_>> = Vec::new();
+    // Per fold unit: (key values, row-group index, live row count).
+    // Per metadata-only fold unit: (key values, row-group index, live row
+    // count). Only the index is kept — re-decoding that one record when the
+    // fold runs costs a few hundred bytes, whereas holding its zone maps here
+    // would re-materialise the graph on a full-scan fold where every group
+    // qualifies.
+    let mut meta_folds: Vec<(Vec<ScalarValue>, usize, u64)> = Vec::new();
     let mut data_folds: Vec<DataFold> = Vec::new();
 
     // Per-clause zone-map classification is only sound without IN /
@@ -77,11 +81,13 @@ pub(super) fn fold_row_groups(
         && spec.in_predicates.is_empty()
         && spec.remaining_predicate.is_none();
 
-    for (row_group_index, row_group_meta) in row_groups.iter().enumerate() {
+    for row_group_index in 0..row_group_count {
         if !candidates[row_group_index] {
-            row_start += row_group_meta.row_count;
+            row_start += reader.row_group_rows(row_group_index);
             continue;
         }
+        reader.row_group_meta_into(row_group_index, &mut scratch)?;
+        let row_group_meta = &scratch;
 
         let predicate_match = if spec.in_predicates.is_empty() && spec.remaining_predicate.is_none()
         {
@@ -137,12 +143,7 @@ pub(super) fn fold_row_groups(
             && (!has_sum && !has_avg || rg_sums_available)
         {
             if let Some(unit_key) = rg_unit_key {
-                meta_folds.push((
-                    unit_key,
-                    &row_group_meta.zone_maps,
-                    row_group_meta.row_count,
-                    &row_group_meta.col_sums,
-                ));
+                meta_folds.push((unit_key, row_group_index, row_group_meta.row_count));
                 row_start += row_group_meta.row_count;
                 continue;
             }
@@ -255,12 +256,7 @@ pub(super) fn fold_row_groups(
                         row_group_meta.row_count,
                     ))
             };
-            meta_folds.push((
-                Vec::new(),
-                &row_group_meta.zone_maps,
-                live_rows,
-                &row_group_meta.col_sums,
-            ));
+            meta_folds.push((Vec::new(), row_group_index, live_rows));
             row_start += row_group_meta.row_count;
             continue;
         }
@@ -290,14 +286,15 @@ pub(super) fn fold_row_groups(
         row_start += row_group_meta.row_count;
     }
 
-    for (key, zone_maps, row_count, col_sums) in meta_folds {
+    for (key, row_group_index, row_count) in meta_folds {
+        reader.row_group_meta_into(row_group_index, &mut scratch)?;
         fold_metadata(
             groups.group(key),
             column_map,
             defaults,
-            zone_maps,
+            &scratch.zone_maps,
             row_count,
-            col_sums,
+            &scratch.col_sums,
         )?;
     }
 

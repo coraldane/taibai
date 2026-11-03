@@ -338,10 +338,16 @@ impl Compactor {
         let in_memory_budget_rows = (clustered_merge_budget_bytes() / 4 / estimated_width).max(1);
         let stored_bytes = sources.iter().fold(0usize, |sum, source| {
             sum.saturating_add(
-                source.reader.footer_row_groups()[source.row_group_idx]
-                    .uncompressed_sizes
-                    .iter()
-                    .fold(0usize, |n, &v| n.saturating_add(v as usize)),
+                source
+                    .reader
+                    .row_group_meta(source.row_group_idx)
+                    .map(|row_group| {
+                        row_group
+                            .uncompressed_sizes
+                            .iter()
+                            .fold(0usize, |n, &v| n.saturating_add(v as usize))
+                    })
+                    .unwrap_or(0),
             )
         });
         let prepare_external = || -> Result<PreparedCompaction> {

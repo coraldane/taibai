@@ -135,8 +135,12 @@ impl SegmentManager {
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             tables: RwLock::new(tables),
-            reader_cache: Mutex::new(ReaderCache::new(reader_cache_capacity())),
-            segment_meta_cache: Mutex::new(SegmentMetaCache::new(reader_cache_capacity())),
+            reader_cache: Mutex::new(ReaderCache::with_budget_bytes(
+                crate::common::config::reader_cache_budget_bytes(),
+            )),
+            segment_meta_cache: Mutex::new(SegmentMetaCache::new(
+                crate::common::config::segment_meta_cache_budget_bytes(),
+            )),
             cluster_meta_cache: Mutex::new(ClusterMetaCache::new()),
             mutable_reader_cache: Mutex::new(HashMap::new()),
             flush_epochs: RwLock::new(HashMap::new()),
@@ -987,12 +991,19 @@ impl SegmentManager {
                 Err(err) => return Err(err),
             }
         };
+        // Charge the parsed footer on BOTH paths. An mmap reader keeps its
+        // column payload in the page cache, but its footer is a heap object
+        // graph — ~68 MiB for a 2 GiB segment with 28k row groups. The old
+        // flat 256 KiB charge for mmap readers is how a nominal 256 MiB
+        // budget became effectively unbounded.
+        let footer_bytes = reader.footer_heap_bytes();
         let cost_bytes = if owned {
-            std::fs::metadata(path)
-                .map(|meta| meta.len())
-                .unwrap_or(reader_cache::AVG_READER_COST_BYTES)
+            footer_bytes
+                + std::fs::metadata(path)
+                    .map(|meta| meta.len())
+                    .unwrap_or(reader_cache::AVG_READER_COST_BYTES)
         } else {
-            reader_cache::AVG_READER_COST_BYTES
+            footer_bytes
         };
         Ok(self
             .reader_cache
@@ -1083,16 +1094,25 @@ impl SegmentManager {
         self.reader_cache.lock().unwrap().stats()
     }
 
-    /// `(entries, heap bytes)` of the mutable-segment reader cache. Each
-    /// entry is a full heap copy of an active segment file; the cache is
-    /// entry-bounded (4x the reader cache capacity) with no byte budget, so
-    /// this is the number to watch when RSS grows with active partitions.
+    /// `(entries, charged heap bytes, budget bytes)` of the mutable-segment
+    /// reader cache. Each entry is a full heap copy of an active segment
+    /// file, so both ceilings apply: the entry count (4x the reader cache
+    /// capacity) and `storage.mutable_reader_cache_mb`.
     pub fn mutable_reader_cache_stats(&self) -> (usize, u64) {
         let cache = self.mutable_reader_cache.lock().unwrap();
         (
             cache.len(),
             cache.values().map(|(_, charged)| *charged).sum(),
         )
+    }
+
+    /// `(entries, charged heap bytes, budget bytes)` of the parsed
+    /// segment-metadata cache, for `SHOW MEMORY`. This is the cache that used
+    /// to be entry-counted and invisible: it held one parsed footer per
+    /// scanned segment — tens of MiB each — and grew to the whole RSS
+    /// without appearing in any memory report.
+    pub fn segment_meta_cache_stats(&self) -> (usize, u64, u64) {
+        self.segment_meta_cache.lock().unwrap().stats()
     }
 
     /// Read-side metadata cache for a sealed segment's cluster-key column zone map.

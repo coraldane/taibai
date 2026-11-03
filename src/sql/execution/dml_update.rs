@@ -1165,7 +1165,7 @@ fn plan_segment_rows_for_reinsert(
 
         for rg_idx in 0..reader.num_row_groups() {
             if let Some(pred) = &aligned_predicate {
-                if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
+                if !pred.matches_row_group(&reader.zone_maps(rg_idx)) {
                     continue;
                 }
             }

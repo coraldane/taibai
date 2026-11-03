@@ -760,7 +760,7 @@ pub(crate) fn exec_update_in_txn(
 
             for rg_idx in 0..reader.num_row_groups() {
                 if let Some(ref pred) = aligned_predicate {
-                    if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
+                    if !pred.matches_row_group(&reader.zone_maps(rg_idx)) {
                         continue;
                     }
                 }

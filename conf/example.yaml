@@ -34,8 +34,16 @@ storage:
   # row group 数量、tail 滚动次数与元数据开销（代价是未刷盘驻留内存上限升高，
   # spill 机制会在内存压力下自动释放冷 memtable）。
   row_group_target_rows: 65536
-  # reader 与 segment 元数据缓存的 segment 数量
+  # reader 缓存的 segment 数量上限（仅约束 reader cache 条目数）
   reader_cache_capacity: 1024
+  # sealed reader 缓存的字节上限。每条是一个 segment 解析后的 footer（2GiB 段
+  # 约 68MiB，其中行组 zone map 占大头），所以真正起作用的是这个字节预算。
+  reader_cache_mb: 2048
+  # segment 元数据（footer）缓存的字节上限。单条是一个 segment 解析后的
+  # footer：行组元数据、zone map、布隆过滤器。2GiB 的段约 24MB 一条，
+  # 其中 95% 是「每列每行组」的布隆过滤器。按字节限容而非按条数：以前
+  # 按 1024 条限容，单条从 1MB 涨到 24MB 时上限就悄悄涨到了 25GiB。
+  segment_meta_cache_mb: 2048
   # 活跃 segment reader 缓存的字节上限。每个条目是活跃（未 seal）segment 文件
   # 的整份堆拷贝，单条最大约 min_segment_seal_size_mb；并发写入的分区越多，
   # 驻留拷贝越多。另受 4×reader_cache_capacity 条数上限约束，两者先到先裁。

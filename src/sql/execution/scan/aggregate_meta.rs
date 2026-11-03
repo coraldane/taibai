@@ -429,9 +429,9 @@ fn fold_one_segment(
             m.footer_zone_maps().to_vec(),
             m.row_count,
             m.deleted_row_count,
-            m.footer_row_groups()
-                .first()
-                .is_some_and(|rg| rg.col_sums.len() == rg.zone_maps.len()),
+            m.row_group_meta(0)
+                .map(|row_group| row_group.col_sums.len() == row_group.zone_maps.len())
+                .unwrap_or(false),
         ),
         None => {
             let reader = segment_mgr.open_scan_reader(segment_path, spec.reader_txn_id)?;
@@ -441,9 +441,9 @@ fn fold_one_segment(
                 reader.row_count(),
                 reader.deleted_row_count(),
                 reader
-                    .footer_row_groups()
-                    .first()
-                    .is_some_and(|rg| rg.col_sums.len() == rg.zone_maps.len()),
+                    .row_group_meta(0)
+                    .map(|row_group| row_group.col_sums.len() == row_group.zone_maps.len())
+                    .unwrap_or(false),
             );
             overlay_reader = Some(reader);
             view
@@ -667,7 +667,7 @@ fn fold_one_segment(
 
     let candidate_indices = if let Some(meta) = &meta {
         row_group::prune_row_group_meta(
-            meta.footer_row_groups(),
+            meta,
             &aligned_checks.predicate,
             &aligned_checks.bloom_checks,
             &aligned_checks.in_check_refs(),
@@ -787,7 +787,8 @@ pub fn compute_distinct_column(
         let bitmap_is_empty = bitmap.is_empty();
 
         for rg_idx in 0..reader.num_row_groups() {
-            let Some(zone_map) = reader.zone_maps(rg_idx).get(col_idx) else {
+            let zone_maps = reader.zone_maps(rg_idx);
+            let Some(zone_map) = zone_maps.get(col_idx) else {
                 return Ok(None);
             };
             let single_valued = !zone_map.min_value.is_null()

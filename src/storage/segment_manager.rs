@@ -1,4 +1,5 @@
 mod active_writer;
+mod byte_lru;
 mod catalog;
 mod cluster_meta_cache;
 mod config;

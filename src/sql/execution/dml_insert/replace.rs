@@ -211,7 +211,7 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
                 continue;
             }
             if !replace_keys_may_match_row_group_from_refs(
-                reader.zone_maps(rg_idx),
+                &reader.zone_maps(rg_idx),
                 &fallback_key_sets,
                 &key_envelopes,
             ) && group_candidates.is_empty()

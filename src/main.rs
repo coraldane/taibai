@@ -201,11 +201,31 @@ where
         config.compression.bulk_zstd_level,
         config.storage.reader_cache_capacity,
     );
+    common::config::set_reader_cache_budget_bytes(
+        config.storage.reader_cache_mb.saturating_mul(1024 * 1024),
+    );
     common::config::set_mutable_reader_cache_budget_bytes(
         config
             .storage
             .mutable_reader_cache_mb
             .saturating_mul(1024 * 1024),
+    );
+    common::config::set_segment_meta_cache_budget_bytes(
+        config
+            .storage
+            .segment_meta_cache_mb
+            .saturating_mul(1024 * 1024),
+    );
+    // One startup line that makes every cache ceiling auditable. The
+    // segment-metadata cache grew to the whole RSS because its limit was an
+    // entry COUNT that no operator could translate into bytes, and no report
+    // showed its size. Logging the byte ceilings at boot makes the next such
+    // regression visible in the log instead of in `free -g`.
+    tracing::info!(
+        reader_cache_mb = config.storage.reader_cache_mb,
+        mutable_reader_cache_mb = config.storage.mutable_reader_cache_mb,
+        segment_meta_cache_mb = config.storage.segment_meta_cache_mb,
+        "cache byte ceilings configured"
     );
     common::config::set_storage_timeouts(common::config::StorageTimeouts {
         mutation_lock_timeout_secs: config.storage.mutation_lock_timeout_secs,

@@ -68,6 +68,22 @@ impl Hash for ScalarValue {
 impl Eq for ScalarValue {}
 
 impl ScalarValue {
+    /// Heap bytes owned by this value, beyond `size_of::<ScalarValue>()`.
+    ///
+    /// Used by cache byte accounting: a `SegmentMetaSnapshot` holds one of
+    /// these per zone-map bound and per value-set entry, so a footer whose
+    /// bounds are VARCHAR/Blob (market-data symbols, partition keys) costs
+    /// far more than its header count suggests. Inline-sized variants report
+    /// 0 — their bytes are already covered by the enclosing `size_of` charge.
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            ScalarValue::VarChar(Some(value)) => value.capacity(),
+            ScalarValue::Blob(Some(value)) => value.capacity(),
+            ScalarValue::Vector(Some(value)) => value.capacity() * std::mem::size_of::<f32>(),
+            _ => 0,
+        }
+    }
+
     pub fn integer_i128(&self) -> Option<i128> {
         match self {
             ScalarValue::Int8(Some(v)) => Some(*v as i128),
