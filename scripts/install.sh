@@ -6,6 +6,7 @@ PREFIX="/usr/local/taibai"
 INSTALL_SERVICE=true
 CONFIG_FILE=""
 DATA_DIR=""
+DATA_DIR_EXPLICIT=""
 
 print_help() {
     cat << EOF
@@ -43,6 +44,7 @@ for arg in "$@"; do
             ;;
         -data-dir=*)
             DATA_DIR="${arg#-data-dir=}"
+            DATA_DIR_EXPLICIT=1
             ;;
         -no-service)
             INSTALL_SERVICE=false
@@ -170,12 +172,17 @@ EOF
     fi
 fi
 
-if [ -f "$CONFIG_DEST" ]; then
-    if grep -q "data_dir:" "$CONFIG_DEST" 2>/dev/null; then
+# Rewrite the configured data_dir ONLY when the operator explicitly passed
+# -data-dir. Unconditionally rewriting it with the default silently pointed
+# existing deployments at an empty catalog on upgrade (hz-dev-204,
+# 2026-11-06): the server booted, every database "stopped existing", and the
+# real data directory sat untouched a mount point away.
+if [ -n "$DATA_DIR_EXPLICIT" ] && [ -f "$CONFIG_DEST" ]; then
+    if grep -q "^[[:space:]]*data_dir:" "$CONFIG_DEST" 2>/dev/null; then
         if [ "$OS" = "Darwin" ]; then
-            sed -i '' "s|data_dir:.*|data_dir: \"$DATA_DIR\"|" "$CONFIG_DEST" 2>/dev/null || true
+            sed -i '' "s|^[[:space:]]*data_dir:.*|data_dir: \"$DATA_DIR\"|" "$CONFIG_DEST" 2>/dev/null || true
         else
-            sed -i "s|data_dir:.*|data_dir: \"$DATA_DIR\"|" "$CONFIG_DEST" 2>/dev/null || true
+            sed -i "s|^[[:space:]]*data_dir:.*|data_dir: \"$DATA_DIR\"|" "$CONFIG_DEST" 2>/dev/null || true
         fi
     fi
 fi
