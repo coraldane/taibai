@@ -15,6 +15,24 @@ use super::row_filter;
 use super::runtime::ScanRuntime;
 use super::spec::ScanSpec;
 
+/// Everything the scan needs from one atomic view of the table. Built under
+/// the table flush read lock by [`ScanExecutor::snapshot_flush_phase`]; the
+/// segment lease keeps the listed files alive for the whole decode after the
+/// lock is released.
+struct ScanPhase {
+    plan: super::strategy::ScanPlan,
+    scan_limit: Option<usize>,
+    segment_snapshot: Option<std::sync::Arc<crate::storage::segment::snapshot::SegmentSnapshot>>,
+    segment_paths: Vec<PathBuf>,
+    /// Whether any memtable existed at snapshot time; the ordered-cluster
+    /// early-termination check in phase 2 refuses to run when it did.
+    memtables_present: bool,
+    /// Raw memtable batches materialized under the same lock as the segment
+    /// snapshot; filtered/projected and pushed after the segment leg,
+    /// preserving the historic output order.
+    memtable_batches: Vec<RecordBatch>,
+}
+
 pub struct ScanExecutor<'a> {
     /// Owned clone of the caller's spec: the hybrid partial-residency leg
     /// appends its complementary range clause to this copy at run time.
@@ -88,13 +106,6 @@ impl<'a> ScanExecutor<'a> {
     }
 
     pub fn execute(&mut self) -> Result<Vec<RecordBatch>> {
-        let segment_mgr = self.runtime.segment_mgr().clone();
-        let db = self.db.to_string();
-        let table = self.spec.table_name.clone();
-        segment_mgr.with_table_flush_read_lock(&db, &table, || self.execute_scan())
-    }
-
-    fn execute_scan(&mut self) -> Result<Vec<RecordBatch>> {
         let mut output = LimitedBatchSink::new(None);
         self.execute_scan_into(&mut output)?;
         if output.over_cap {
@@ -110,76 +121,41 @@ impl<'a> ScanExecutor<'a> {
     }
 
     fn execute_scan_into<S: BatchSink>(&mut self, output: &mut S) -> Result<()> {
-        let table_dir = self
-            .runtime
-            .data_dir()
-            .join(self.db)
-            .join(&self.spec.table_name);
+        // Phase 1 — atomic snapshot under the table flush read lock.
+        // Discovery, the memtable materialization and the hybrid-mirror
+        // bound must observe the table atomically (same contract as
+        // ScanCursor::initialize): a memtable flush between discovery and
+        // the memtable scan would move rows into a segment missing from the
+        // snapshot while retiring the memtable that still held them — the
+        // rows would vanish. Only metadata and memory-resident work happens
+        // here; the lock is released before any segment decoding so a long
+        // scan cannot stall the flush writer.
+        let phase = {
+            let segment_mgr = self.runtime.segment_mgr().clone();
+            let db = self.db.to_string();
+            let table = self.spec.table_name.clone();
+            segment_mgr
+                .with_table_flush_read_lock(&db, &table, || self.snapshot_flush_phase(output))?
+        };
 
-        let mut plan =
-            super::strategy::ScanPlanner::new(&self.spec, &self.table_schema, &self.table_meta)
-                .build();
-        let mut scan_limit = plan.scan_limit;
-
-        if self.try_fast_paths(&plan, output)? {
+        // Phase 2 — decode and emit, holding the segment lease instead of
+        // the table lock.
+        let Some(phase) = phase else {
             return Ok(());
-        }
+        };
+        let ScanPhase {
+            plan,
+            mut scan_limit,
+            segment_snapshot,
+            segment_paths,
+            memtables_present,
+            memtable_batches,
+        } = phase;
+        let _lease = segment_snapshot;
 
-        // Hybrid partial-residency leg: the mirror answers every row above
-        // its coverage bound through the inverted index; the segment and
-        // memtable legs below run with the complementary `<= covers` range
-        // clause so the two sides never overlap.
-        if let Some((mirror_batch, pk_idx, covers)) = memtable::hybrid_hot_mirror_scan(
-            self.runtime.hot_store_manager(),
-            self.runtime.memtable_manager(),
-            self.db,
-            &self.table_meta,
-            &self.spec,
-        ) {
-            let mirror_rows = mirror_batch.num_rows() as u64;
-            self.spec
-                .range_predicates
-                .push(crate::storage::partition::pruning::RangeClause {
-                    column_index: pk_idx,
-                    op: crate::storage::partition::pruning::RangeOp::Le,
-                    value: covers.clone(),
-                });
-            self.spec.hot_mirror_bound = Some((pk_idx, covers));
-            plan =
-                super::strategy::ScanPlanner::new(&self.spec, &self.table_schema, &self.table_meta)
-                    .build();
-            scan_limit = plan.scan_limit;
-            output.set_limit(scan_limit);
-            if let Some(s) = self.stats.as_deref_mut() {
-                s.entry(self.spec.table_name.clone())
-                    .or_default()
-                    .hot_mirror_rows += mirror_rows;
-            }
-            let mirror_batch = super::strategy::apply_ttl_filter_and_projection(
-                mirror_batch,
-                &self.table_meta,
-                &plan.projection_cols,
-                plan.strip_ttl_column,
-            )?;
-            if !output.push(mirror_batch) {
-                return Ok(());
-            }
-        }
-
-        let memtables_present = !self
-            .runtime
-            .memtable_manager()
-            .get_by_table(self.db, &self.spec.table_name)
-            .is_empty();
-        if plan.ordered_limit.is_some() && memtables_present {
-            scan_limit = None;
-        }
-
-        if table_dir.exists() {
-            let all_segments = SegmentManager::discover_segments(&table_dir)?;
-
+        if _lease.is_some() {
             let filtered_segments = partition::prune_segments_by_partition(
-                all_segments,
+                segment_paths,
                 &self.spec,
                 Some(&self.table_meta),
             );
@@ -417,16 +393,11 @@ impl<'a> ScanExecutor<'a> {
             output.set_limit(scan_limit);
         }
 
-        let mut memtable_spec = self.spec.clone();
-        memtable_spec.projection = Some(plan.projection_cols.clone());
-
-        for batch in memtable::scan_memtables(
-            self.runtime.memtable_manager(),
-            self.runtime.hot_store_manager(),
-            self.db,
-            &self.spec.table_name,
-            &memtable_spec,
-        )? {
+        // The memtable batches were materialized atomically with the
+        // segment snapshot in phase 1; only the residual filtering and
+        // emission happen here, after the segment leg, preserving the
+        // historic output order.
+        for batch in memtable_batches {
             crate::common::query_cancel::check()?;
             let batch = super::strategy::apply_ttl_filter_and_projection(
                 batch,
@@ -440,6 +411,112 @@ impl<'a> ScanExecutor<'a> {
         }
 
         Ok(())
+    }
+
+    /// Phase 1 of [`Self::execute_scan_into`], run under the table flush
+    /// read lock. Returns `Ok(None)` when a fast path produced the final
+    /// answer and the general legs must not run.
+    fn snapshot_flush_phase<S: BatchSink>(
+        &mut self,
+        output: &mut S,
+    ) -> Result<Option<ScanPhase>> {
+        let table_dir = self
+            .runtime
+            .data_dir()
+            .join(self.db)
+            .join(&self.spec.table_name);
+
+        let mut plan =
+            super::strategy::ScanPlanner::new(&self.spec, &self.table_schema, &self.table_meta)
+                .build();
+        let mut scan_limit = plan.scan_limit;
+
+        if self.try_fast_paths(&plan, output)? {
+            return Ok(None);
+        }
+
+        // Hybrid partial-residency leg: the mirror answers every row above
+        // its coverage bound through the inverted index; the segment and
+        // memtable legs below run with the complementary `<= covers` range
+        // clause so the two sides never overlap.
+        if let Some((mirror_batch, pk_idx, covers)) = memtable::hybrid_hot_mirror_scan(
+            self.runtime.hot_store_manager(),
+            self.runtime.memtable_manager(),
+            self.db,
+            &self.table_meta,
+            &self.spec,
+        ) {
+            let mirror_rows = mirror_batch.num_rows() as u64;
+            self.spec
+                .range_predicates
+                .push(crate::storage::partition::pruning::RangeClause {
+                    column_index: pk_idx,
+                    op: crate::storage::partition::pruning::RangeOp::Le,
+                    value: covers.clone(),
+                });
+            self.spec.hot_mirror_bound = Some((pk_idx, covers));
+            plan =
+                super::strategy::ScanPlanner::new(&self.spec, &self.table_schema, &self.table_meta)
+                    .build();
+            scan_limit = plan.scan_limit;
+            output.set_limit(scan_limit);
+            if let Some(s) = self.stats.as_deref_mut() {
+                s.entry(self.spec.table_name.clone())
+                    .or_default()
+                    .hot_mirror_rows += mirror_rows;
+            }
+            let mirror_batch = super::strategy::apply_ttl_filter_and_projection(
+                mirror_batch,
+                &self.table_meta,
+                &plan.projection_cols,
+                plan.strip_ttl_column,
+            )?;
+            if !output.push(mirror_batch) {
+                return Ok(None);
+            }
+        }
+
+        let memtables_present = !self
+            .runtime
+            .memtable_manager()
+            .get_by_table(self.db, &self.spec.table_name)
+            .is_empty();
+        if plan.ordered_limit.is_some() && memtables_present {
+            scan_limit = None;
+        }
+
+        // Snapshot the segment list and materialize the memtable batches in
+        // the same critical section (see execute_scan_into). The lease in
+        // the snapshot defers physical deletion of these files by concurrent
+        // compaction until the scan finishes.
+        let segment_snapshot = if table_dir.exists() {
+            Some(crate::storage::segment::snapshot::snapshot_segments(&table_dir)?)
+        } else {
+            None
+        };
+        let segment_paths = segment_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.paths.clone())
+            .unwrap_or_default();
+
+        let mut memtable_spec = self.spec.clone();
+        memtable_spec.projection = Some(plan.projection_cols.clone());
+        let memtable_batches = memtable::scan_memtables(
+            self.runtime.memtable_manager(),
+            self.runtime.hot_store_manager(),
+            self.db,
+            &self.spec.table_name,
+            &memtable_spec,
+        )?;
+
+        Ok(Some(ScanPhase {
+            plan,
+            scan_limit,
+            segment_snapshot,
+            segment_paths,
+            memtables_present,
+            memtable_batches,
+        }))
     }
 
     /// The unified fast-path chain. Order mirrors the historic routing:

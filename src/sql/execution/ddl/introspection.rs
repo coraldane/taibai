@@ -992,56 +992,67 @@ pub fn exec_analyze_table(engine: &Engine, db: &str, table: &str) -> Result<Exec
     // partition's INSERTs for the scan duration. The flush-visibility
     // read lock only keeps the scan from observing a memtable→segment
     // transition mid-flip.
-    let (row_count, columns, composite_columns) =
-        engine
-            .segment_mgr()
-            .with_table_flush_read_lock(db, table, || {
-                let paths =
-                    crate::storage::segment_manager::SegmentManager::discover_segments(&table_dir)?;
-                let mut collectors = table_meta
-                    .columns
-                    .iter()
-                    .map(|_| AnalyzeColumnCollector::new())
-                    .collect::<Vec<_>>();
-                let mut composite_collectors = composite_groups
-                    .iter()
-                    .map(|group| AnalyzeCompositeCollector::new(group.clone()))
-                    .collect::<Vec<_>>();
-                let mut row_count = 0u64;
-                for path in paths {
-                    let reader = engine.segment_mgr().open_reader_cached(&path)?;
-                    for row_group in 0..reader.num_row_groups() {
-                        let mut batch = reader.read_row_group(row_group)?;
-                        if !reader.delete_bitmap().is_empty() {
-                            batch = crate::storage::segment::delete_bitmap::filter_batch(
-                                batch,
-                                reader.row_group_start_row(row_group),
-                                reader.delete_bitmap(),
-                            )?;
-                        }
-                        row_count = row_count.saturating_add(batch.num_rows() as u64);
-                        for (column, collector) in collectors.iter_mut().enumerate() {
-                            if let Some(values) = batch.column(column) {
-                                collector.update(values);
-                            }
-                        }
-                        for collector in &mut composite_collectors {
-                            collector.update(&batch);
-                        }
+    // Snapshot the segment list under the flush read lock (consistent with
+    // the flush that just ran), then decode outside it: ANALYZE holds the
+    // lease for the whole scan, so compaction defers physical deletion of
+    // the listed files, while a long statistics pass cannot stall the flush
+    // writer the way the previous lock-spanning-decode did.
+    let snapshot = engine.segment_mgr().with_table_flush_read_lock(db, table, || {
+        if !table_dir.exists() {
+            return Ok(None);
+        }
+        crate::storage::segment::snapshot::snapshot_segments(&table_dir).map(Some)
+    })?;
+    let _lease = snapshot.as_ref();
+    let paths = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.paths.clone())
+        .unwrap_or_default();
+    let (row_count, columns, composite_columns) = {
+        let mut collectors = table_meta
+            .columns
+            .iter()
+            .map(|_| AnalyzeColumnCollector::new())
+            .collect::<Vec<_>>();
+        let mut composite_collectors = composite_groups
+            .iter()
+            .map(|group| AnalyzeCompositeCollector::new(group.clone()))
+            .collect::<Vec<_>>();
+        let mut row_count = 0u64;
+        for path in paths {
+            let reader = engine.segment_mgr().open_reader_cached(&path)?;
+            for row_group in 0..reader.num_row_groups() {
+                let mut batch = reader.read_row_group(row_group)?;
+                if !reader.delete_bitmap().is_empty() {
+                    batch = crate::storage::segment::delete_bitmap::filter_batch(
+                        batch,
+                        reader.row_group_start_row(row_group),
+                        reader.delete_bitmap(),
+                    )?;
+                }
+                row_count = row_count.saturating_add(batch.num_rows() as u64);
+                for (column, collector) in collectors.iter_mut().enumerate() {
+                    if let Some(values) = batch.column(column) {
+                        collector.update(values);
                     }
                 }
-                let columns = table_meta
-                    .columns
-                    .iter()
-                    .zip(collectors)
-                    .map(|(column, collector)| (column.name.clone(), collector.finish()))
-                    .collect::<HashMap<_, _>>();
-                let composite_columns = composite_collectors
-                    .into_iter()
-                    .map(AnalyzeCompositeCollector::finish)
-                    .collect();
-                Ok((row_count, columns, composite_columns))
-            })?;
+                for collector in &mut composite_collectors {
+                    collector.update(&batch);
+                }
+            }
+        }
+        let columns = table_meta
+            .columns
+            .iter()
+            .zip(collectors)
+            .map(|(column, collector)| (column.name.clone(), collector.finish()))
+            .collect::<HashMap<_, _>>();
+        let composite_columns = composite_collectors
+            .into_iter()
+            .map(AnalyzeCompositeCollector::finish)
+            .collect();
+        (row_count, columns, composite_columns)
+    };
 
     let collected_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

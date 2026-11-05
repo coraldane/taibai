@@ -571,3 +571,108 @@ fn recovered_segment_insert_after_delete_same_partition_key_is_immediately_count
     assert_eq!(count_star(count), 5189);
     engine.segment_mgr().shutdown();
 }
+
+fn int64_column_values(result: ExecResult) -> Vec<i64> {
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result");
+    };
+    let mut values = Vec::new();
+    for batch in batches {
+        for row_idx in 0..batch.num_rows() {
+            if let Some(taibai::types::scalar::ScalarValue::Int64(Some(value))) =
+                batch.scalar(row_idx, 0)
+            {
+                values.push(value);
+            }
+        }
+    }
+    values
+}
+
+/// Regression for the snapshot scan conversion: the materialized-scan
+/// executor holds the table flush read lock only while building its atomic
+/// snapshot (segment list + memtable batches) and decodes afterwards,
+/// protected by the segment lease. While a single writer moves rows into
+/// new segments via repeated flushes, every concurrent scan must observe
+/// the appended ids exactly once — a row lost between a memtable
+/// retirement and the segment snapshot (or duplicated across the two legs)
+/// breaks the contiguity assertion below.
+#[test]
+fn executor_scan_sees_each_row_exactly_once_across_concurrent_flushes() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Arc::new(Engine::new(temp_dir.path(), "main").expect("create engine"));
+    let mut setup = session();
+    engine
+        .execute(
+            &mut setup,
+            "CREATE TABLE t_snapshot_scan (id INT64 AUTO_INCREMENT PRIMARY KEY, pad INT32)",
+        )
+        .expect("create table");
+    engine
+        .execute(&mut setup, "INSERT INTO t_snapshot_scan (pad) VALUES (1), (2), (3)")
+        .expect("seed rows");
+    engine
+        .flush_table_buffers("main", "t_snapshot_scan")
+        .expect("seed flush");
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let writer_engine = Arc::clone(&engine);
+    let writer_stop = Arc::clone(&stop);
+    let writer = thread::spawn(move || {
+        let mut s = session();
+        let mut inserted = 0u64;
+        while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            writer_engine
+                .execute(&mut s, "INSERT INTO t_snapshot_scan (pad) VALUES (7)")
+                .expect("insert row");
+            inserted += 1;
+            if inserted % 3 == 0 {
+                writer_engine
+                    .flush_table_buffers("main", "t_snapshot_scan")
+                    .expect("flush memtable");
+            }
+        }
+        inserted
+    });
+
+    let reader_engine = Arc::clone(&engine);
+    let reader = thread::spawn(move || {
+        let mut s = session();
+        for _ in 0..300 {
+            // The predicate defeats metadata folding, forcing the general
+            // segment + memtable scan path this regression guards.
+            let scan = reader_engine
+                .execute(&mut s, "SELECT id FROM t_snapshot_scan WHERE id >= 0")
+                .expect("scan while flushing");
+            let ids = int64_column_values(scan);
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                ids.len(),
+                "a row appeared twice in one scan (segment/memtable leg overlap)"
+            );
+            if let Some(max) = ids.iter().max() {
+                assert_eq!(
+                    ids.len(),
+                    *max as usize,
+                    "visible ids must stay contiguous 1..=max across flush transitions"
+                );
+            }
+        }
+    });
+
+    reader.join().expect("reader thread");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let inserted = writer.join().expect("writer thread");
+
+    let mut verifier = session();
+    let final_scan = engine
+        .execute(&mut verifier, "SELECT id FROM t_snapshot_scan WHERE id >= 0")
+        .expect("final scan");
+    let ids = int64_column_values(final_scan);
+    assert_eq!(ids.len() as u64, inserted + 3, "final row count");
+    engine.segment_mgr().shutdown();
+}
