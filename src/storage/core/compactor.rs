@@ -378,14 +378,14 @@ impl Compactor {
                 if let Some(errors) = partition_errors.get(&partition_key) {
                     return Err(maintenance_partition_error(db, table, lock_key, errors));
                 }
-                // Permits are acquired BEFORE the partition lock, in the same
-                // order as query scans (cpu then io). Sleeping on the global
-                // work limiter while holding the partition lock would freeze
+                // Heavy decode/rewrite under the process-wide memory gate
+                // BEFORE the partition lock — the gate serializes all heavy
+                // rewrites (one prepare at a time process-wide), so no
+                // admission wait is needed or possible here. Holding any
+                // lock while queueing for a global resource would freeze
                 // that partition's INSERTs for the whole queue delay.
                 let prepared = {
                     let _memory = compaction_memory_gate();
-                    let _cpu_permit = crate::common::work_limiter::acquire_cpu();
-                    let _io_permit = crate::common::work_limiter::acquire_io();
                     self.prepare_compact_segment_group(
                         db,
                         table,
@@ -524,13 +524,11 @@ impl Compactor {
             return Err(maintenance_partition_error(db, table, &matched_key, errors));
         }
 
-        // Permits before the partition lock, heavy decode/sort/write outside
-        // it — same split as `compact_table`'s partition workers.
+        // Heavy decode/rewrite under the process-wide memory gate before the
+        // partition lock — same split as `compact_table`'s partition workers.
         let stats = {
             let prepared = {
                 let _memory = compaction_memory_gate();
-                let _cpu_permit = crate::common::work_limiter::acquire_cpu();
-                let _io_permit = crate::common::work_limiter::acquire_io();
                 self.prepare_compact_segment_group(
                     db,
                     table,
@@ -783,8 +781,12 @@ impl Compactor {
 }
 
 /// Heavy rewrites share one process-wide memory allowance. Acquire on the
-/// calling thread, before CPU/IO permits and outside mutation locks; columns
-/// still decode/compress in parallel without blocking Rayon workers on permits.
+/// calling thread, outside mutation locks; columns decode/compress in
+/// parallel on the global pool. This gate is the concurrency bound on all
+/// heavy rewrite work — at most one prepare runs process-wide — which is
+/// what the removed work-limiter permits effectively enforced for
+/// compaction as well (see
+/// docs/design/resource-admission-and-backpressure.md).
 fn compaction_memory_gate() -> std::sync::MutexGuard<'static, ()> {
     static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     GATE.lock().unwrap_or_else(|e| e.into_inner())

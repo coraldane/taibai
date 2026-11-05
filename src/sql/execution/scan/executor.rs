@@ -336,8 +336,9 @@ impl<'a> ScanExecutor<'a> {
                         {
                             return None;
                         }
-                        let _cpu = crate::common::work_limiter::acquire_cpu();
-                        let _io = crate::common::work_limiter::acquire_io();
+                        // No admission waits inside rayon lanes: concurrency
+                        // is bounded by pool size (see
+                        // docs/design/resource-admission-and-backpressure.md).
                         match super::strategy::read_row_group_with_strategy(
                             &self.spec,
                             &plan,
@@ -579,23 +580,20 @@ impl<'a> ScanExecutor<'a> {
                     {
                         return None;
                     }
-                    let reader = {
-                        let _io = crate::common::work_limiter::acquire_io();
-                        match manager.open_scan_reader(path, self.spec.reader_txn_id) {
-                            Ok(reader) => reader,
-                            // A segment removed by concurrent compaction is
-                            // skipped; any other open failure fails the query.
-                            Err(error) => {
-                                return if path.exists() {
-                                    Some(Err(error))
-                                } else {
-                                    tracing::warn!(
-                                        segment = %path.display(),
-                                        "parallel scan: segment vanished mid-scan; skipping"
-                                    );
-                                    None
-                                };
-                            }
+                    let reader = match manager.open_scan_reader(path, self.spec.reader_txn_id) {
+                        Ok(reader) => reader,
+                        // A segment removed by concurrent compaction is
+                        // skipped; any other open failure fails the query.
+                        Err(error) => {
+                            return if path.exists() {
+                                Some(Err(error))
+                            } else {
+                                tracing::warn!(
+                                    segment = %path.display(),
+                                    "parallel scan: segment vanished mid-scan; skipping"
+                                );
+                                None
+                            };
                         }
                     };
                     let candidates = match manager.segment_meta(path) {
@@ -635,17 +633,14 @@ impl<'a> ScanExecutor<'a> {
                             {
                                 return Ok(None);
                             }
-                            let batch_result = {
-                                let _cpu = crate::common::work_limiter::acquire_cpu();
-                                let _io = crate::common::work_limiter::acquire_io();
+                            let batch_result =
                                 super::strategy::read_row_group_with_strategy(
                                     &self.spec,
                                     plan,
                                     &self.table_schema,
                                     &reader,
                                     row_group,
-                                )
-                            };
+                                );
                             let batch = batch_result?;
                             let batch = super::strategy::apply_ttl_filter_and_projection(
                                 batch,

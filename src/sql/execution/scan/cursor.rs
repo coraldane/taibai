@@ -322,8 +322,9 @@ impl ScanCursor {
                 {
                     return None;
                 }
-                let _cpu = crate::common::work_limiter::acquire_cpu();
-                let _io = crate::common::work_limiter::acquire_io();
+                // No admission waits inside rayon lanes: concurrency is
+                // bounded by pool size (see
+                // docs/design/resource-admission-and-backpressure.md).
                 Some(strategy::read_row_group_with_strategy(
                     &spec,
                     &plan,
@@ -496,16 +497,22 @@ impl ScanCursor {
                             let decoded: Vec<_> = background_decode_pool().install(|| {
                                 chunk
                                     .par_iter()
-                                    .map(|row_group| {
-                                        let _cpu = crate::common::work_limiter::acquire_cpu();
-                                        let _io = crate::common::work_limiter::acquire_io();
-                                        strategy::read_row_group_with_strategy(
+                                    .filter_map(|row_group| {
+                                        // Same cancellation contract as
+                                        // fill_prefetch's lanes: stop starting
+                                        // new decodes once the query is killed.
+                                        if cancel_flag.as_ref().is_some_and(|flag| {
+                                            flag.load(std::sync::atomic::Ordering::Acquire)
+                                        }) {
+                                            return None;
+                                        }
+                                        Some(strategy::read_row_group_with_strategy(
                                             &spec,
                                             &plan,
                                             &table_schema,
                                             &reader,
                                             *row_group,
-                                        )
+                                        ))
                                     })
                                     .collect()
                             });

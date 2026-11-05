@@ -19,8 +19,6 @@ buffer:
   query_memory_limit_mb: 4096
   execution_threads: 16
   max_parallel_row_groups: 8
-  global_io_permits: 4
-  global_cpu_permits: 16
 
 compression:
   enabled: true

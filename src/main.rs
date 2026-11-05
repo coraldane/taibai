@@ -281,8 +281,6 @@ where
         spill_batch_rows: config.buffer.spill_batch_rows.max(1),
         join_spill_partitions: config.buffer.join_spill_partitions.max(2),
         max_parallel_segments: config.buffer.max_parallel_segments.max(1),
-        global_io_permits: config.buffer.global_io_permits.max(1),
-        global_cpu_permits: config.buffer.global_cpu_permits.max(1),
         hybrid_hot_scan_enabled: config.storage.hybrid_hot_scan_enabled,
     });
     let engine = Arc::new(engine);
