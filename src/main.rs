@@ -306,7 +306,11 @@ where
         tracing::info!("close-of-day scheduler started");
     }
 
+    start_watchdog(engine.clone());
     let server = Server::new(config, engine.clone());
+    if common::watchdog::sd_notify("READY=1\n") {
+        tracing::info!("sd_notify READY=1 sent; systemd watchdog pings follow each canary round");
+    }
 
     if let Err(e) = server.run_with_shutdown(shutdown).await {
         tracing::error!(error = %e, "server error");
@@ -1007,4 +1011,46 @@ fn install_dir_from_config_path(config_path: &str) -> Option<std::path::PathBuf>
     let config_path = std::path::Path::new(config_path);
     let config_dir = config_path.parent()?;
     config_dir.parent().map(std::path::Path::to_path_buf)
+}
+
+/// Start the self-healing watchdog: a real scan canary on a fixed cadence
+/// plus systemd sd_notify pings. After three consecutive failures the wedge
+/// hook dumps every running query to the log and aborts, handing recovery
+/// to systemd's Restart=on-failure instead of a human.
+fn start_watchdog(engine: Arc<Engine>) {
+    let wedge_engine = Arc::clone(&engine);
+    let canary: common::watchdog::Canary = Arc::new(move || {
+        let (db, table) = engine.canary_target();
+        let mut session = net::session::Session::new("root".to_string(), db);
+        // LIMIT 1 through the general scan path exercises segment open,
+        // row-group decode and the background decode pool — the machinery
+        // that wedged on 2026-11-05. With no tables at all, SELECT 1 still
+        // walks parse → plan → execute → encode.
+        let sql = match &table {
+            Some(table) => format!("SELECT * FROM {table} LIMIT 1"),
+            None => "SELECT 1".to_string(),
+        };
+        engine.execute(&mut session, &sql).map(|_| ())
+    });
+    let on_wedge: common::watchdog::WedgeHook = Arc::new(move |report| {
+        tracing::error!(
+            consecutive_failures = report.consecutive_failures,
+            timeout_secs = report.timeout.as_secs(),
+            "{}",
+            report.message
+        );
+        for query in wedge_engine.query_registry().list() {
+            tracing::error!(
+                query_id = query.query_id,
+                elapsed_secs = query.elapsed_secs,
+                phase = ?query.phase,
+                cancelled = query.cancelled,
+                sql = %query.sql,
+                "running query at wedge time"
+            );
+        }
+        std::process::abort();
+    });
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    common::watchdog::spawn_supervised(common::watchdog::WatchdogConfig::default(), stop, canary, on_wedge);
 }

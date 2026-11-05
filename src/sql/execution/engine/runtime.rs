@@ -52,6 +52,40 @@ impl Engine {
         Arc::clone(&self.query_registry)
     }
 
+    /// Pick the watchdog canary target: the table with the fewest rows by
+    /// collected statistics, so the probe stays cheap on any deployment
+    /// shape. Tables without statistics sort last; an empty catalog yields
+    /// no table and the caller falls back to a bare SELECT 1.
+    pub fn canary_target(&self) -> (String, Option<String>) {
+        let catalogs = self
+            .catalogs
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut best: Option<(i64, String, String)> = None;
+        for (db, catalog) in catalogs.iter() {
+            if db.starts_with('.') {
+                continue;
+            }
+            for name in catalog.table_names() {
+                let Some(meta) = catalog.get_table(name) else {
+                    continue;
+                };
+                let rows = meta
+                    .statistics
+                    .as_ref()
+                    .map(|stats| stats.row_count)
+                    .unwrap_or(i64::MAX);
+                if best.as_ref().map_or(true, |(fewest, ..)| rows < *fewest) {
+                    best = Some((rows, db.clone(), name.to_string()));
+                }
+            }
+        }
+        match best {
+            Some((_, db, table)) => (db, Some(table)),
+            None => (String::new(), None),
+        }
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }

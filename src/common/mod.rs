@@ -8,3 +8,4 @@ pub mod query_cancel;
 pub mod query_log;
 pub mod query_memory;
 pub mod thread_supervisor;
+pub mod watchdog;

@@ -191,7 +191,12 @@ After=network.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# Type=notify：服务在监听就绪后 sd_notify READY=1，看门狗线程每轮 canary
+# 发 WATCHDOG=1 心跳。进程"活着但卡死"（2026-11-05 事故形态）时 canary
+# 连续失败 3 次自动 abort，由 Restart 拉起；连看门狗自身都停摆的极端
+# 场景由 WatchdogSec 兜底（90s = 3×(15s 间隔+10s 超时) + 余量）。
+Type=notify
+WatchdogSec=90
 User=root
 Group=root
 # jemalloc 参数：background_thread 让 decay 在进程空闲时也持续推进，
