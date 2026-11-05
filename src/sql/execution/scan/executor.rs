@@ -572,6 +572,7 @@ impl<'a> ScanExecutor<'a> {
                 FastPathOutcome::FinalAnswer(batch) => {
                     self.final_answer = Some(batch);
                     self.metadata_answered = true;
+                    super::fast_path::note_metadata_answer();
                     if let Some(s) = self.stats.as_deref_mut() {
                         s.entry(self.spec.table_name.clone())
                             .or_default()

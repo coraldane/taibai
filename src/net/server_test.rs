@@ -535,7 +535,7 @@ async fn queue_cancellation_poll_preserves_fifo_position() {
     let context = Arc::new(crate::common::query_cancel::QueryContext::new(Arc::new(
         AtomicBool::new(false),
     )));
-    let first = acquire_slot(&limiter, &context, MSG_TYPE_QUERY, 5, "test");
+    let first = acquire_slot(&limiter, &context, MSG_TYPE_QUERY, 5, admission::SHARED);
     tokio::pin!(first);
     assert!(futures::poll!(&mut first).is_pending());
     let second = Arc::clone(&limiter).acquire_owned();
@@ -574,7 +574,7 @@ async fn cancelled_queue_waiter_releases_its_fifo_position() {
     let context = Arc::new(crate::common::query_cancel::QueryContext::new(Arc::new(
         AtomicBool::new(false),
     )));
-    let first = acquire_slot(&limiter, &context, MSG_TYPE_QUERY, 5, "test");
+    let first = acquire_slot(&limiter, &context, MSG_TYPE_QUERY, 5, admission::SHARED);
     tokio::pin!(first);
     assert!(futures::poll!(&mut first).is_pending());
     let second = Arc::clone(&limiter).acquire_owned();

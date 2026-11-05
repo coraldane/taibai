@@ -25,6 +25,21 @@
 //! above it.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static METADATA_ANSWERS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Count a fast-path node answering a query outright (no operator pipeline
+/// ran). Exposed via `SHOW WORKLOAD` so operators can see how often
+/// MAX/MIN/COUNT-style probes fold to metadata instead of scanning — the
+/// first question asked when a nightly MAX(id) suddenly runs hot.
+pub fn note_metadata_answer() {
+    METADATA_ANSWERS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn metadata_answers_total() -> u64 {
+    METADATA_ANSWERS_TOTAL.load(Ordering::Relaxed)
+}
 
 use crate::common::error::Result;
 use crate::sql::planner::{AggregateExpr, LogicalExpr};

@@ -651,3 +651,55 @@ fn show_memory_reports_component_rows_and_requires_admin() {
 
     engine.segment_mgr().shutdown();
 }
+
+#[test]
+fn show_workload_reports_admission_canary_and_fast_path_counters() {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let engine = std::sync::Arc::new(Engine::new(temp_dir.path(), "main").expect("engine"));
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    engine
+        .execute(&mut session, "CREATE TABLE t_wl (id INT64)")
+        .expect("create table");
+
+    let rows = show_memory_rows(engine.execute(&mut session, "SHOW WORKLOAD").expect("show workload"));
+    let value = |component: &str, name: &str| -> Option<i64> {
+        rows.iter()
+            .find(|(c, n, _)| c == component && n == name)
+            .map(|(_, _, v)| *v)
+    };
+    // Admission pools must all be present with a capacity.
+    for pool in ["query", "shared", "control"] {
+        assert!(
+            value("admission", &format!("{pool}.capacity")).is_some(),
+            "missing {pool} capacity, rows: {rows:?}"
+        );
+    }
+    // The canary has not run inside a bare engine test: status stays at
+    // "never ran" with zero failures.
+    assert_eq!(value("canary", "last_status"), Some(3));
+    assert_eq!(value("canary", "consecutive_failures"), Some(0));
+    assert!(value("pools", "rayon_global_threads").is_some());
+    // The folded-answer counter exists and starts at zero.
+    assert_eq!(value("fast_path", "metadata_answers_total"), Some(0));
+
+    // A metadata-foldable aggregate bumps the fast-path counter.
+    engine
+        .execute(&mut session, "INSERT INTO t_wl VALUES (1), (2), (3)")
+        .expect("insert rows");
+    engine
+        .execute(&mut session, "SELECT MAX(id) FROM t_wl")
+        .expect("foldable aggregate");
+    let rows = show_memory_rows(
+        engine
+            .execute(&mut session, "SHOW WORKLOAD")
+            .expect("show workload again"),
+    );
+    let folded = rows
+        .iter()
+        .find(|(c, n, _)| c == "fast_path" && n == "metadata_answers_total")
+        .map(|(_, _, v)| *v)
+        .expect("fast path counter");
+    assert!(folded >= 1, "MAX(id) should have folded to metadata, got {folded}");
+
+    engine.segment_mgr().shutdown();
+}

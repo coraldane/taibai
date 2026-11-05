@@ -86,7 +86,10 @@ impl FoldedAggregateExec {
             node.try_answer(&ctx)
         })?;
         self.state = match outcome {
-            FastPathOutcome::FinalAnswer(batch) => FoldedState::Answered(Some(batch)),
+            FastPathOutcome::FinalAnswer(batch) => {
+                crate::sql::execution::scan::fast_path::note_metadata_answer();
+                FoldedState::Answered(Some(batch))
+            }
             // The folded node never produces ScanRows; any other outcome is
             // a decline. Build the regular pipeline over the same scan.
             // ScanExec::deferred is lazy, so nothing was opened for the

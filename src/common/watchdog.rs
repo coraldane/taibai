@@ -24,14 +24,14 @@ pub const CANARY_NEVER_RAN: u8 = 3;
 
 /// Canary health counters, injectable so tests run against a private
 /// instance instead of the process-wide one.
-struct CanaryMetrics {
+pub struct CanaryMetrics {
     last_latency_ms: AtomicU64,
     last_status: AtomicU8,
     consecutive_failures: AtomicU32,
 }
 
 impl CanaryMetrics {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             last_latency_ms: AtomicU64::new(u64::MAX),
             last_status: AtomicU8::new(CANARY_NEVER_RAN),

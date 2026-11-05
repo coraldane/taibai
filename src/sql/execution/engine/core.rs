@@ -894,6 +894,7 @@ impl Engine {
             }
             Statement::ShowEngines => crate::sql::execution::ddl::exec_show_engines(self),
             Statement::ShowMemory => crate::sql::execution::ddl::exec_show_memory(self),
+            Statement::ShowWorkload => crate::sql::execution::ddl::exec_show_workload(self),
             Statement::ShowProcesslist { full } => {
                 crate::sql::execution::ddl::exec_show_processlist(self, *full)
             }
@@ -1416,6 +1417,7 @@ impl Engine {
             | Statement::ShowGrants { .. }
             | Statement::ShowProcesslist { .. }
             | Statement::ShowMemory
+            | Statement::ShowWorkload
             | Statement::KillQuery { .. }
             | Statement::PauseFlush
             | Statement::ResumeFlush

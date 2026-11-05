@@ -1369,3 +1369,71 @@ fn estimate_hll(registers: &[u8]) -> u64 {
     };
     corrected.round().max(0.0) as u64
 }
+
+/// `SHOW WORKLOAD`: the admission, canary and fast-path telemetry that made
+/// the 2026-11-05 incident invisible until clients timed out — queue
+/// pressure is meant to be watched here, not scraped from logs after the
+/// fact. Canary status codes: 0 ok, 1 failed, 2 timed out, 3 never ran.
+pub fn exec_show_workload(engine: &Engine) -> Result<ExecResult> {
+    let mut rows: Vec<(&'static str, String, u64)> = Vec::new();
+
+    for (pool, capacity, acquired, rejected) in crate::net::server::admission::snapshot() {
+        rows.push(("admission", format!("{pool}.capacity"), capacity));
+        rows.push(("admission", format!("{pool}.acquired_total"), acquired));
+        rows.push(("admission", format!("{pool}.rejected_overload_total"), rejected));
+    }
+
+    rows.push((
+        "queries",
+        "running".into(),
+        engine.query_registry().list().len() as u64,
+    ));
+
+    let (latency_ms, status, failures) = crate::common::watchdog::canary_snapshot();
+    if latency_ms != u64::MAX {
+        rows.push(("canary", "last_latency_ms".into(), latency_ms));
+    }
+    rows.push(("canary", "last_status".into(), status as u64));
+    rows.push((
+        "canary",
+        "consecutive_failures".into(),
+        failures as u64,
+    ));
+
+    rows.push((
+        "pools",
+        "rayon_global_threads".into(),
+        rayon::current_num_threads() as u64,
+    ));
+
+    rows.push((
+        "fast_path",
+        "metadata_answers_total".into(),
+        crate::sql::execution::scan::fast_path::metadata_answers_total(),
+    ));
+
+    let schema = Schema::new(vec![
+        ColumnDef::new("Component", DataType::VarChar),
+        ColumnDef::new("Name", DataType::VarChar),
+        ColumnDef::new("Value", DataType::Int64),
+    ]);
+    let mut batch = RecordBatch::new(schema.clone());
+    for (component, name, value) in rows {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(component.to_string())))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(name)))?;
+        batch
+            .column_mut(2)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(value as i64)))?;
+    }
+    Ok(ExecResult::Query {
+        schema,
+        batches: vec![batch],
+    })
+}
