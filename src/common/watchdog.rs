@@ -78,15 +78,12 @@ pub fn sd_notify(state: &str) -> bool {
         // spelling replaces it with NUL.
         #[cfg(target_os = "linux")]
         let target: std::path::PathBuf = {
-            use std::os::unix::ffi::OsStrExt;
-            let mut bytes = std::os::unix::ffi::OsStringExt::into_vec(
-                raw.clone().into(),
-            );
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+            let mut bytes = raw.clone().into_vec();
             if bytes.first() == Some(&b'@') {
                 bytes[0] = 0;
             }
-            std::ffi::OsString::from(std::os::unix::ffi::OsStr::from_bytes(&bytes))
-                .into()
+            std::ffi::OsStr::from_bytes(&bytes).to_os_string().into()
         };
         #[cfg(not(target_os = "linux"))]
         let target: std::path::PathBuf = std::path::PathBuf::from(raw);
