@@ -129,6 +129,10 @@ impl Parser {
                 self.advance();
                 Ok(Statement::ShowWorkload)
             }
+            Token::Ident(word) if word.eq_ignore_ascii_case("VERSION") => {
+                self.advance();
+                Ok(Statement::ShowVersion)
+            }
             Token::Full => {
                 self.advance();
                 self.expect(&Token::Processlist)?;

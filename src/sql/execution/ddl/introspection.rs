@@ -759,6 +759,25 @@ pub fn exec_show_memory(engine: &Engine) -> Result<ExecResult> {
     })
 }
 
+/// `SHOW VERSION` — one row carrying the full build identity (version +
+/// git commit + build time). Exists so a deployed server's exact source
+/// revision is always queryable; before this, pinning a running binary to a
+/// source state required filesystem access that remote hosts often deny.
+pub fn exec_show_version() -> Result<ExecResult> {
+    let schema = Schema::new(vec![ColumnDef::new("Version", DataType::VarChar)]);
+    let mut batch = RecordBatch::new(schema.clone());
+    batch
+        .column_mut(0)
+        .unwrap()
+        .push(&ScalarValue::VarChar(Some(
+            crate::version::get_full_version(),
+        )))?;
+    Ok(ExecResult::Query {
+        schema,
+        batches: vec![batch],
+    })
+}
+
 pub fn exec_show_processlist(engine: &Engine, full: bool) -> Result<ExecResult> {
     let entries = engine.query_registry().list();
     let schema = Schema::new(vec![

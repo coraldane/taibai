@@ -895,6 +895,7 @@ impl Engine {
             Statement::ShowEngines => crate::sql::execution::ddl::exec_show_engines(self),
             Statement::ShowMemory => crate::sql::execution::ddl::exec_show_memory(self),
             Statement::ShowWorkload => crate::sql::execution::ddl::exec_show_workload(self),
+            Statement::ShowVersion => crate::sql::execution::ddl::exec_show_version(),
             Statement::ShowProcesslist { full } => {
                 crate::sql::execution::ddl::exec_show_processlist(self, *full)
             }
@@ -1402,6 +1403,7 @@ impl Engine {
             Statement::UseDatabase(_)
             | Statement::ShowDatabases
             | Statement::ShowEngines
+            | Statement::ShowVersion
             | Statement::Begin
             | Statement::Commit
             | Statement::Rollback => Ok(()),
