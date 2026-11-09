@@ -231,8 +231,8 @@ pub fn spawn_supervised(
     );
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(all(test, unix))]
+mod sd_notify_tests {
     use super::*;
 
     #[test]
@@ -260,6 +260,11 @@ mod tests {
         std::env::remove_var("NOTIFY_SOCKET");
         assert!(!sd_notify("WATCHDOG=1\n"));
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn consecutive_failures_fire_the_wedge_hook_at_the_threshold() {
