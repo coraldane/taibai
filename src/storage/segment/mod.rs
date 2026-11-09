@@ -176,3 +176,7 @@ pub use crate::storage::partition::pruning::{
 #[cfg(test)]
 #[path = "statement_journal_test.rs"]
 mod statement_journal_tests;
+
+#[cfg(test)]
+#[path = "atomic_publish_test.rs"]
+mod atomic_publish_tests;

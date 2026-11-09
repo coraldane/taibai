@@ -66,7 +66,13 @@ impl BuildingRowGroup {
 }
 
 pub struct SegmentWriter {
+    /// Final segment path. The file only appears here after a successful
+    /// `seal()` — until then all bytes land on `staging_path`, so a crash
+    /// mid-write can never leave a half-written segment at the final path
+    /// (which discovery would otherwise adopt and which poisoned every read
+    /// of the table with opaque decode errors).
     path: PathBuf,
+    staging_path: PathBuf,
     file: fs::File,
     schema: Schema,
     row_group_size: usize,
@@ -75,6 +81,19 @@ pub struct SegmentWriter {
     total_rows: u64,
     bloom_columns: Vec<bool>,
     compression_level: i32,
+}
+
+/// `final.dat` → `final.dat.partial`. The `.partial` suffix is chosen so the
+/// name cannot match `is_segment_filename` — discovery must never adopt a
+/// staged file.
+fn staging_path_for(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    let mut staged = path.to_path_buf();
+    staged.set_file_name(format!("{}.partial", name.to_string_lossy()));
+    staged
 }
 
 impl SegmentWriter {
@@ -101,12 +120,15 @@ impl SegmentWriter {
         bloom_column_indices: &[usize],
         compression_level: i32,
     ) -> Result<Self> {
+        // All bytes go to the staging path; seal() publishes atomically.
+        let staging_path = staging_path_for(path);
         remove_sidecar_meta(path)?;
+        remove_sidecar_meta(&staging_path)?;
         let mut file = fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(path)?;
+            .open(&staging_path)?;
 
         let header = encode_segment_header();
         file.write_all(&header)?;
@@ -119,6 +141,7 @@ impl SegmentWriter {
 
         Ok(Self {
             path: path.to_path_buf(),
+            staging_path,
             file,
             schema,
             row_group_size: row_group_size
@@ -324,12 +347,26 @@ impl SegmentWriter {
         self.file.write_all(&data_end.to_le_bytes())?;
         self.file.flush()?;
         self.file.sync_all()?;
-        remove_sidecar_meta(&self.path)?;
+
+        // Publish atomically: close the staging handle, then rename the
+        // fully-written segment into its final path. A crash before this
+        // point leaves only a `.partial` file, which discovery never adopts.
+        let Self {
+            path,
+            staging_path,
+            total_rows,
+            row_groups,
+            ..
+        } = self;
+        fs::rename(&staging_path, &path)?;
+        crate::storage::segment::meta::sync_parent_dir(&path)?;
+        remove_sidecar_meta(&path)?;
+        remove_sidecar_meta(&staging_path)?;
 
         tracing::debug!(
-            path = %self.path.display(),
-            rows = self.total_rows,
-            row_groups = self.row_groups.len(),
+            path = %path.display(),
+            rows = total_rows,
+            row_groups = row_groups.len(),
             deleted = deleted_row_count,
             "segment sealed"
         );

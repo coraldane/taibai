@@ -140,8 +140,10 @@ impl SegmentReader {
 
         if file_len < SEGMENT_HEADER_SIZE as u64 {
             return Err(TaibaiError::Storage(format!(
-                "segment file too small: {} bytes (need >= {})",
-                file_len, SEGMENT_HEADER_SIZE
+                "segment file too small: {} bytes (need >= {}) ({})",
+                file_len,
+                SEGMENT_HEADER_SIZE,
+                path.display()
             )));
         }
 
@@ -172,8 +174,11 @@ impl SegmentReader {
         if footer_source.data_end < SEGMENT_HEADER_SIZE as u64 || footer_source.data_end > file_len
         {
             return Err(TaibaiError::Storage(format!(
-                "invalid footer data_end: {} (file size {}, header size {})",
-                footer_source.data_end, file_len, SEGMENT_HEADER_SIZE
+                "invalid footer data_end: {} (file size {}, header size {}, file {})",
+                footer_source.data_end,
+                file_len,
+                SEGMENT_HEADER_SIZE,
+                path.display()
             )));
         }
 
@@ -197,14 +202,28 @@ impl SegmentReader {
         // footer is validated by the very same index parse that will read it:
         // the eager parse this replaced materialised the whole ~80 MiB object
         // graph just to answer "is it well formed?".
+        //
+        // Parse failures always carry the segment path: without it a corrupt
+        // footer surfaced as an anonymous `bad scalar tag: 0` that told ops
+        // nothing about WHICH file was broken.
         let (bytes, index) = match footer_source.sidecar {
             Some(footer) => {
-                let index = parse_segment_footer_index(&footer)?;
+                let index = parse_segment_footer_index(&footer).map_err(|error| {
+                    TaibaiError::Storage(format!(
+                        "segment {} sidecar footer unreadable: {error}",
+                        path.display()
+                    ))
+                })?;
                 (FooterBytes::Owned(footer), index)
             }
             None => {
                 let footer_bytes = embedded_footer_slice(&data, footer_source.data_end, file_len)?;
-                let index = parse_segment_footer_index(footer_bytes)?;
+                let index = parse_segment_footer_index(footer_bytes).map_err(|error| {
+                    TaibaiError::Storage(format!(
+                        "segment {} footer unreadable: {error}",
+                        path.display()
+                    ))
+                })?;
                 (FooterBytes::Embedded, index)
             }
         };

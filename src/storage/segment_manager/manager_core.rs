@@ -907,8 +907,54 @@ impl SegmentManager {
         match SegmentReader::open(path) {
             Ok(reader) => Ok(reader),
             Err(err) if is_transient_footer_error(&err) => self.open_mutable_reader_owned(path),
-            Err(err) => Err(err),
+            Err(err) => Err(self.quarantine_on_permanent_open_error(path, err)),
         }
+    }
+
+    /// A reader-open failure that is NOT transient (footer-in-flux while a
+    /// writer holds the segment) and NOT on a mutable segment means the file
+    /// is permanently corrupt — e.g. a process died mid-write before the
+    /// atomic-publish protocol existed, leaving a torn segment. Quarantine it
+    /// by renaming it out of the segment-filename pattern: the bytes stay on
+    /// disk for forensics, the rest of the table keeps serving, and the next
+    /// discovery simply stops seeing the file. Without this, ONE bad segment
+    /// poisoned EVERY query (and DELETE) against the table with opaque
+    /// decode errors — the 2026-11-07 `t_theme_snapshot` outage.
+    fn quarantine_on_permanent_open_error(&self, path: &Path, err: TaibaiError) -> TaibaiError {
+        if is_transient_footer_error(&err) || self.is_mutable_segment_path(path) {
+            return err;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "segment".to_string());
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let quarantined = path.with_file_name(format!("{name}.corrupt-{epoch}"));
+        match std::fs::rename(path, &quarantined) {
+            Ok(()) => {
+                tracing::error!(
+                    original = %path.display(),
+                    quarantined = %quarantined.display(),
+                    error = %err,
+                    "corrupt segment quarantined; the rest of the table stays readable"
+                );
+                self.invalidate_reader(path);
+            }
+            Err(rename_err) => {
+                // Cannot move the file aside (locked, permission): keep it so
+                // the same precise error surfaces on every attempt.
+                tracing::error!(
+                    file = %path.display(),
+                    error = %err,
+                    rename_error = %rename_err,
+                    "corrupt segment could not be quarantined"
+                );
+            }
+        }
+        err
     }
 
     pub fn open_reader_cached(&self, path: &Path) -> Result<Arc<SegmentReader>> {
@@ -980,7 +1026,7 @@ impl SegmentManager {
                 Err(err) if is_transient_footer_error(&err) => {
                     (self.open_mutable_reader_owned(path)?, true)
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(self.quarantine_on_permanent_open_error(path, err)),
             }
         } else {
             match SegmentReader::open(path) {
@@ -988,7 +1034,7 @@ impl SegmentManager {
                 Err(err) if is_transient_footer_error(&err) => {
                     (self.open_mutable_reader_owned(path)?, true)
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(self.quarantine_on_permanent_open_error(path, err)),
             }
         };
         // Charge the parsed footer on BOTH paths. An mmap reader keeps its
@@ -1721,7 +1767,20 @@ impl SegmentManager {
 
     fn open_mutable_reader_owned(&self, path: &Path) -> Result<SegmentReader> {
         let Some(state) = self.state_for_segment_path(path) else {
-            return SegmentReader::open_owned(path);
+            // No table state (table never opened this process): still guard
+            // against a corrupt segment file leaking into every later read —
+            // quarantine only files that match the segment naming pattern.
+            return SegmentReader::open_owned(path).map_err(|err| {
+                let is_segment_named = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(crate::storage::segment::store::is_segment_filename);
+                if is_segment_named {
+                    self.quarantine_on_permanent_open_error(path, err)
+                } else {
+                    err
+                }
+            });
         };
 
         // A segment removed from the active map is sealed outside every lock:
@@ -1738,22 +1797,35 @@ impl SegmentManager {
             state.wait_sealing_segments_drained(timeout)?;
         }
 
-        let mut active_guard = state.active_segments.lock().unwrap();
-        for segment in active_guard.values_mut() {
-            if same_segment_path(&segment.path, path) {
-                // Flush buffered rows as well, not just dirty metadata:
-                // rows sitting in the writer's buffer are invisible to a
-                // reader, which made DELETE skip them.
-                if segment.buffered_rows > 0 {
-                    segment.flush_buffer(&|path| self.invalidate_reader(path))?;
+        let mut active_hit = false;
+        {
+            let mut active_guard = state.active_segments.lock().unwrap();
+            for segment in active_guard.values_mut() {
+                if same_segment_path(&segment.path, path) {
+                    // Flush buffered rows as well, not just dirty metadata:
+                    // rows sitting in the writer's buffer are invisible to a
+                    // reader, which made DELETE skip them.
+                    if segment.buffered_rows > 0 {
+                        segment.flush_buffer(&|path| self.invalidate_reader(path))?;
+                    }
+                    if segment.dirty_meta {
+                        segment.flush_meta(&|path| self.invalidate_reader(path))?;
+                    }
+                    active_hit = true;
+                    break;
                 }
-                if segment.dirty_meta {
-                    segment.flush_meta(&|path| self.invalidate_reader(path))?;
-                }
-                return SegmentReader::open_owned(path);
             }
         }
+        if active_hit {
+            // Active segment: the sidecar footer carries visibility while the
+            // embedded one is unwritten; a failure here is the writer's
+            // in-flight state, never a quarantine candidate.
+            return SegmentReader::open_owned(path);
+        }
+        // Not active, not sealing: a permanent open failure means the sealed
+        // file is corrupt.
         SegmentReader::open_owned(path)
+            .map_err(|err| self.quarantine_on_permanent_open_error(path, err))
     }
 
     fn is_mutable_segment_path(&self, path: &Path) -> bool {

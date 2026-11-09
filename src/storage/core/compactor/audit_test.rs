@@ -170,6 +170,11 @@ fn optimize_audit_retirement_failure_must_not_publish_duplicates() -> Result<()>
     let result = mgr.with_partition_mutation_lock("default", "t", "", || {
         c.commit_prepared_compaction("default", "t", &dir, None, a)
     });
+    // Release the maintenance plan lease before verifying recovery: exactly
+    // like production, where `optimize_table` returns and drops its snapshot.
+    // Retirement is only drained once the last directory reader leaves, so
+    // recovery called under an active lease can only queue, not delete.
+    drop(maintenance);
     let outputs = SegmentManager::discover_segments(&dir)?;
     drop(held);
     assert!(

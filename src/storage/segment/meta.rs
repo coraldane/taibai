@@ -464,7 +464,7 @@ pub(crate) fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_parent_dir(_path: &Path) -> Result<()> {
+pub(crate) fn sync_parent_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
