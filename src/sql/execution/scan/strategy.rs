@@ -258,7 +258,7 @@ pub fn prune_segment(spec: &ScanSpec, reader: &SegmentReader) -> Option<RowGroup
     // Re-index the catalog-space predicate and check lists onto this
     // segment's footer column order — after a DROP/RENAME COLUMN, positional
     // use prunes the WRONG row groups.
-    let Ok(aligned) = super::row_filter::align_prune_checks_to_footer(
+    let Ok(mut aligned) = super::row_filter::align_prune_checks_to_footer(
         &spec.table_schema,
         reader.schema(),
         &pred,
@@ -271,6 +271,27 @@ pub fn prune_segment(spec: &ScanSpec, reader: &SegmentReader) -> Option<RowGroup
         // can match the clause.
         return None;
     };
+    // The TTL clause rides along only when its column resolves onto this
+    // footer. A footer that predates the TTL column carries default-filled
+    // (possibly live) rows, so an unalignable TTL column drops the clause —
+    // never the segment, unlike a user clause above.
+    if let Some(clause) = spec.ttl_prune_clause.clone() {
+        if let Ok(footer_cols) = super::row_filter::align_indices_to_footer(
+            &spec.table_schema,
+            reader.schema(),
+            std::slice::from_ref(&clause.column_index),
+        ) {
+            if let Some(&footer_col) = footer_cols.first() {
+                aligned.predicate.clauses.push(
+                    crate::storage::partition::pruning::RangeClause {
+                        column_index: footer_col,
+                        op: clause.op,
+                        value: clause.value.clone(),
+                    },
+                );
+            }
+        }
+    }
     if !row_group::prune_segment_by_zone_map(&aligned.predicate, segment_zone_maps) {
         return None;
     }

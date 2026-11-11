@@ -41,6 +41,16 @@ pub struct ScanSpec {
     /// point — fast paths check it instead of re-deriving TTL state, so a
     /// new fast path cannot forget the gate.
     pub ttl_active: bool,
+    /// TTL read-visibility as a pruning-only range clause: rows are visible
+    /// while `ttl_col + duration > now`, so anything with
+    /// `ttl_col <= now - duration` is provably dead and zone-map pruning may
+    /// skip it without decoding. Unlike user predicates this clause must
+    /// never drop a whole segment whose footer predates the TTL column
+    /// (default-filled rows may still be live), so the reader-side prune
+    /// aligns it separately and drops the clause on failure — see
+    /// `strategy::prune_segment`. The read-time TTL filter stays the
+    /// authority on visibility; this clause only removes work.
+    pub ttl_prune_clause: Option<RangeClause>,
     /// Partial-residency bound when the hybrid hot-mirror leg is active:
     /// `(partition_column_index, covers_from_value)`. The mirror answers rows
     /// with `column > value` (its leg adds a `Gt` clause); every non-mirror
@@ -182,6 +192,7 @@ impl ScanSpec {
             set_index_columns: Vec::new(),
             reader_txn_id: 0,
             ttl_active: false,
+            ttl_prune_clause: None,
             hot_mirror_bound: None,
             metadata_fold: None,
             distinct_column: None,
@@ -213,6 +224,14 @@ impl ScanSpec {
                 cols.push(pred.column_index);
             }
         }
+        // The TTL prune clause participates in the absent-column gate of
+        // the meta prune (row_filter): a footer that predates the TTL
+        // column must keep every row group, like any other predicate column.
+        if let Some(clause) = &self.ttl_prune_clause {
+            if !cols.contains(&clause.column_index) {
+                cols.push(clause.column_index);
+            }
+        }
         if let Some(expr) = &self.remaining_predicate {
             collect_expr_columns(expr, &mut cols);
         }
@@ -238,6 +257,22 @@ impl ScanSpec {
         clauses.extend(self.range_predicates.iter().cloned());
         crate::storage::partition::pruning::RowGroupPredicate::new(clauses)
     }
+
+    /// [`Self::to_row_group_predicate`] plus the TTL prune clause, for the
+    /// meta (sidecar) prune: that gateway runs the absent-column check over
+    /// [`Self::all_predicate_columns`] first, so by the time this is aligned
+    /// the TTL column is guaranteed present in the footer. The reader-side
+    /// prune cannot use this — it must be able to drop the TTL clause alone
+    /// when the footer predates the column (see `strategy::prune_segment`).
+    pub fn to_row_group_predicate_with_ttl(
+        &self,
+    ) -> crate::storage::partition::pruning::RowGroupPredicate {
+        let mut predicate = self.to_row_group_predicate();
+        if let Some(clause) = &self.ttl_prune_clause {
+            predicate.clauses.push(clause.clone());
+        }
+        predicate
+    }
 }
 
 pub fn compile_scan_spec(
@@ -249,6 +284,7 @@ pub fn compile_scan_spec(
     let mut spec = ScanSpec::new(table_name);
     spec.table_schema = table_schema.clone();
     spec.ttl_active = table_meta.ttl.is_some();
+    spec.ttl_prune_clause = compile_ttl_prune_clause(table_meta, table_schema);
 
     if let LogicalPlan::Scan(scan) = plan {
         spec.distinct_column = scan.distinct_column.clone();
@@ -286,6 +322,33 @@ pub fn compile_scan_spec(
     }
 
     spec
+}
+
+/// Compile the table's TTL into a pruning-only range clause: rows are
+/// visible while `ttl_col + duration > now`, so a row group whose zone-map
+/// max satisfies `ttl_col <= now - duration` holds no live row and can be
+/// skipped without decoding. Emitted only for timestamp TTL columns — zone
+/// maps of other column types keep the read-time filter as the sole gate.
+/// The cutoff uses the compile-time clock; the read-time TTL filter remains
+/// the authority on visibility, so a boundary row that expires mid-query is
+/// still filtered there.
+fn compile_ttl_prune_clause(table_meta: &TableMeta, table_schema: &Schema) -> Option<RangeClause> {
+    let ttl = table_meta.ttl.as_ref()?;
+    let col_idx = table_meta.get_ttl_column_index_cached()?;
+    let column = table_schema.columns.get(col_idx)?;
+    if column.data_type != crate::protocol::types::DataType::Timestamp {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64;
+    let ttl_micros = ttl.duration_secs.saturating_mul(1_000_000);
+    Some(RangeClause {
+        column_index: col_idx,
+        op: crate::storage::partition::pruning::RangeOp::Gt,
+        value: ScalarValue::Timestamp(Some(now.saturating_sub(ttl_micros))),
+    })
 }
 
 fn bloom_index_columns(table_meta: &TableMeta, table_schema: &Schema) -> Vec<usize> {

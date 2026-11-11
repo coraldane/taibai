@@ -97,3 +97,71 @@ fn eq_predicate_values_are_coerced_to_column_type() {
         vec![(1usize, ScalarValue::Int32(Some(20260916)))]
     );
 }
+
+fn ttl_schema() -> Schema {
+    Schema::new(vec![
+        ColumnDef::new("id", DataType::Int64),
+        ColumnDef::new("ts", DataType::Timestamp),
+    ])
+}
+
+/// A timestamp TTL compiles into a pruning-only `ts > now - duration`
+/// clause: zone maps below the cutoff are provably expired.
+#[test]
+fn ttl_prune_clause_compiled_for_timestamp_ttl() {
+    let schema = ttl_schema();
+    let mut meta = TableMeta::new("main", "events", schema.columns.clone());
+    meta.set_ttl("ts", 3600);
+
+    let clause = compile_ttl_prune_clause(&meta, &schema).expect("ttl prune clause");
+    assert_eq!(clause.column_index, 1);
+    assert!(matches!(
+        clause.op,
+        crate::storage::partition::pruning::RangeOp::Gt
+    ));
+    let ScalarValue::Timestamp(Some(cutoff)) = clause.value else {
+        panic!("timestamp cutoff, got {:?}", clause.value);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+    let expected = now - 3600 * 1_000_000;
+    assert!(
+        (cutoff - expected).abs() < 5_000_000,
+        "cutoff {cutoff} should track now - ttl (±5s), expected ~{expected}"
+    );
+}
+
+/// No TTL, or a TTL on a non-timestamp column, emits nothing: the read-time
+/// filter stays the sole gate for those tables.
+#[test]
+fn ttl_prune_clause_skipped_without_timestamp_ttl() {
+    let schema = ttl_schema();
+    let mut meta = TableMeta::new("main", "events", schema.columns.clone());
+    assert!(compile_ttl_prune_clause(&meta, &schema).is_none());
+
+    meta.set_ttl("id", 3600);
+    assert!(
+        compile_ttl_prune_clause(&meta, &schema).is_none(),
+        "Int64 TTL column must not feed zone-map pruning"
+    );
+}
+
+/// The clause joins the absent-column gate of the meta prune but never
+/// becomes a user predicate: strategy selection, row filtering and the
+/// reader-side predicate stay untouched.
+#[test]
+fn ttl_prune_clause_is_gate_visible_but_not_a_user_predicate() {
+    let mut spec = ScanSpec::new("events");
+    spec.ttl_prune_clause = Some(RangeClause {
+        column_index: 1,
+        op: crate::storage::partition::pruning::RangeOp::Gt,
+        value: ScalarValue::Timestamp(Some(0)),
+    });
+
+    assert!(spec.all_predicate_columns().contains(&1));
+    assert!(!spec.has_predicates());
+    assert!(spec.to_row_group_predicate().clauses.is_empty());
+    assert_eq!(spec.to_row_group_predicate_with_ttl().clauses.len(), 1);
+}

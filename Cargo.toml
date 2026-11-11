@@ -238,6 +238,10 @@ name = "ttl_purge_test"
 path = "tests/ttl_purge_test.rs"
 
 [[test]]
+name = "ttl_scan_prune_test"
+path = "tests/ttl_scan_prune_test.rs"
+
+[[test]]
 name = "window_function_test"
 path = "tests/window_function_test.rs"
 

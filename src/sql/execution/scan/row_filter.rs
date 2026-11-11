@@ -1545,7 +1545,7 @@ pub(super) fn meta_prune_row_groups(
     let aligned = match align_prune_checks_to_footer(
         &spec.table_schema,
         footer_schema,
-        &spec.to_row_group_predicate(),
+        &spec.to_row_group_predicate_with_ttl(),
         &super::row_group::build_bloom_check_list(spec),
         &super::row_group::build_in_check_list(spec),
         &super::row_group::build_set_check_list(spec),
