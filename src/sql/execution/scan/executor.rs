@@ -695,6 +695,8 @@ impl<'a> ScanExecutor<'a> {
                         }
                         _ => super::strategy::prune_segment(&self.spec, &reader)?.candidate_indices,
                     };
+                    let candidates =
+                        super::candidates::skip_fully_deleted_row_groups(&reader, candidates);
                     // Row groups inside a segment decode in parallel as
                     // well; actual concurrency is bounded by the global
                     // cpu/io permits, not by rayon lane count. Decode and

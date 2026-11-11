@@ -242,6 +242,10 @@ name = "ttl_scan_prune_test"
 path = "tests/ttl_scan_prune_test.rs"
 
 [[test]]
+name = "deleted_row_group_skip_test"
+path = "tests/deleted_row_group_skip_test.rs"
+
+[[test]]
 name = "window_function_test"
 path = "tests/window_function_test.rs"
 
