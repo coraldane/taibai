@@ -290,3 +290,150 @@ fn compaction_physically_purges_expired_rows() {
 
     engine.segment_mgr().shutdown();
 }
+
+/// Unpartitioned TTL tables used to leave expired rows behind the read-time
+/// filter forever: the purge pass only understood whole temporal partitions.
+/// Fully-expired segments must now be physically dropped file-by-file, with
+/// catalog accounting and idempotent reruns. (The selective multi-segment
+/// case — expired files dropped while neighbours survive — is covered by
+/// the maintenance unit tests; here the whole table is expired.)
+#[test]
+fn ttl_purge_drops_fully_expired_segments_of_unpartitioned_table() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE plain_ticks (
+                ts TIMESTAMP,
+                value DOUBLE
+            ) TTL (ts, 3600)",
+        )
+        .expect("create plain_ticks");
+
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    engine
+        .execute(
+            &mut session,
+            &format!(
+                "INSERT INTO plain_ticks VALUES ({}, 1.0), ({}, 2.0)",
+                micros("2024-01-15 10:00:00"),
+                micros("2024-01-15 11:00:00")
+            ),
+        )
+        .expect("insert old (bulk)");
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
+    engine.flush_all_buffers().expect("flush bulk buffers");
+    engine
+        .segment_mgr()
+        .seal_table_active("main", "plain_ticks")
+        .expect("seal bulk segment");
+
+    let table_dir = temp_dir.path().join("main").join("plain_ticks");
+    let segments_before =
+        taibai::storage::segment_manager::SegmentManager::discover_segments(&table_dir)
+            .expect("discover before");
+    assert!(!segments_before.is_empty());
+    assert_eq!(
+        total_physical_rows(temp_dir.path(), &engine, "main", "plain_ticks"),
+        2
+    );
+
+    // The read-time filter already hides the old rows; the purge must also
+    // reclaim them physically.
+    let count = engine
+        .execute(&mut session, "SELECT COUNT(*) FROM plain_ticks")
+        .expect("count before purge");
+    assert_eq!(scalar_i64(count), 0);
+
+    let reclaimed = engine.run_ttl_partition_purge().expect("purge");
+    assert_eq!(reclaimed, 2);
+
+    let segments_after =
+        taibai::storage::segment_manager::SegmentManager::discover_segments(&table_dir)
+            .expect("discover after");
+    assert!(
+        segments_after.is_empty(),
+        "fully-expired segments must be dropped: {segments_after:?}"
+    );
+    assert_eq!(
+        total_physical_rows(temp_dir.path(), &engine, "main", "plain_ticks"),
+        0
+    );
+
+    let count = engine
+        .execute(&mut session, "SELECT COUNT(*) FROM plain_ticks")
+        .expect("count after purge");
+    assert_eq!(scalar_i64(count), 0);
+
+    let meta = engine.get_table_meta("main", "plain_ticks").expect("meta");
+    assert_eq!(meta.row_count, 0, "catalog row_count must drop with the files");
+
+    // Idempotent: nothing left to reclaim.
+    let reclaimed = engine.run_ttl_partition_purge().expect("purge 2");
+    assert_eq!(reclaimed, 0);
+
+    engine.segment_mgr().shutdown();
+}
+
+/// A segment straddling the TTL cutoff (some rows expired, some live) must
+/// never be dropped by the segment-level purge — only compaction may
+/// rewrite it. The purge reports zero and the files stay.
+#[test]
+fn ttl_purge_keeps_partially_expired_segments() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE mixed_ticks (
+                ts TIMESTAMP,
+                value DOUBLE
+            ) TTL (ts, 3600)",
+        )
+        .expect("create mixed_ticks");
+
+    let now = chrono::Utc::now().timestamp_micros();
+    engine
+        .execute(
+            &mut session,
+            &format!(
+                "INSERT INTO mixed_ticks VALUES ({}, 1.0), ({}, 2.0)",
+                now - 3_600 * 1_000_000 - 60_000_000, // long expired
+                now + 3_600 * 1_000_000,              // live
+            ),
+        )
+        .expect("insert mixed");
+    engine
+        .execute(&mut session, "FLUSH TABLE mixed_ticks")
+        .expect("flush");
+    engine
+        .segment_mgr()
+        .seal_table_active("main", "mixed_ticks")
+        .expect("seal");
+
+    let reclaimed = engine.run_ttl_partition_purge().expect("purge");
+    assert_eq!(reclaimed, 0, "partially-expired segment must be kept");
+
+    let table_dir = temp_dir.path().join("main").join("mixed_ticks");
+    let segments = taibai::storage::segment_manager::SegmentManager::discover_segments(&table_dir).expect("discover");
+    assert_eq!(segments.len(), 1, "segment file must survive: {segments:?}");
+    assert_eq!(
+        total_physical_rows(temp_dir.path(), &engine, "main", "mixed_ticks"),
+        2,
+        "rows stay physical until compaction rewrites them"
+    );
+
+    let count = engine
+        .execute(&mut session, "SELECT COUNT(*) FROM mixed_ticks")
+        .expect("count");
+    assert_eq!(scalar_i64(count), 1, "only the live row is visible");
+
+    engine.segment_mgr().shutdown();
+}

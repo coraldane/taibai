@@ -1,12 +1,17 @@
-//! Partition-level TTL purge (roadmap step 3, P3.4): for temporal partitions
-//! whose TTL column is the partition column, fully-expired partitions are
-//! dropped physically — segment files removed and catalog entries retired —
-//! instead of lingering behind the read-time row filter forever.
+//! TTL physical purge. Two complementary passes run from the same periodic
+//! entry point:
 //!
-//! The purge is an idempotent reconciliation: each run deletes expired
-//! partition files and retires catalog entries whose files are gone. A crash
-//! between the two steps converges on the next run. Rows remain invisible
-//! throughout because the read-time TTL filter is never disabled.
+//! * Partition-level (roadmap step 3, P3.4): for temporal partitions whose
+//!   TTL column is the partition column, fully-expired partitions are
+//!   dropped whole — segment files removed and catalog entries retired.
+//! * Segment-level: for every other TTL table (unpartitioned, or TTL on a
+//!   non-partition column), immutable segments whose plan statistics prove
+//!   every row group expired are dropped file-by-file. No rewrite: the
+//!   pass only removes provably-dead files.
+//!
+//! Both passes are idempotent reconciliations: a crash between steps
+//! converges on the next run. Rows remain invisible throughout because the
+//! read-time TTL filter is never disabled.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,7 +31,7 @@ pub fn purge_expired_partitions(engine: &Engine) -> Result<u64> {
         let mut out = Vec::new();
         for (db, catalog) in catalogs.iter() {
             for (table, meta) in catalog.tables.iter() {
-                if purge_applies(meta) {
+                if meta.ttl.is_some() {
                     out.push((db.clone(), table.clone()));
                 }
             }
@@ -41,9 +46,112 @@ pub fn purge_expired_partitions(engine: &Engine) -> Result<u64> {
         if engine.txn_mutations().table_has_pins(&db, &table) {
             continue;
         }
-        rows_reclaimed += purge_table(engine, &db, &table)?;
+        let Some(meta) = engine.get_table_meta(&db, &table) else {
+            continue;
+        };
+        rows_reclaimed += if purge_applies(&meta) {
+            purge_table(engine, &db, &table)?
+        } else {
+            // Unpartitioned (or TTL on a non-partition column): drop
+            // provably-expired segments file-by-file instead.
+            purge_table_expired_segments(engine, &db, &table, &meta)?
+        };
     }
     Ok(rows_reclaimed)
+}
+
+/// Segment-level TTL reclaim for tables the partition purge cannot handle
+/// (unpartitioned, or the TTL column is not the partition column): drop
+/// immutable segments whose maintenance plan proves every row group
+/// expired. Partially-expired segments are left to compaction — this pass
+/// never rewrites or copies data, it only removes provably-dead files.
+/// Idempotent: a crash between file removal and the catalog update
+/// converges on the next run (the rows are gone from disk either way).
+fn purge_table_expired_segments(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    meta: &TableMeta,
+) -> Result<u64> {
+    let Some(ttl) = meta.ttl.as_ref() else {
+        return Ok(0);
+    };
+    let Some(ttl_idx) = meta.get_ttl_column_index_cached() else {
+        return Ok(0);
+    };
+    let Some(column) = meta.columns.get(ttl_idx) else {
+        return Ok(0);
+    };
+    let ttl_ctx = crate::storage::segment_manager::MaintenanceTtlColumn {
+        name: column.name.clone(),
+        previous_names: column.previous_names.clone(),
+    };
+
+    let table_dir = engine.data_dir().join(db).join(table);
+    if !table_dir.exists() {
+        return Ok(0);
+    }
+    let mgr = engine.segment_mgr();
+    let snapshot = match mgr.capture_maintenance_snapshot(db, table, &table_dir, Some(&ttl_ctx)) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(db, table, %error, "ttl purge: segment snapshot failed");
+            return Ok(0);
+        }
+    };
+    let duration_us = ttl.duration_secs.saturating_mul(1_000_000);
+    let rows = mgr.cleanup_ttl_expired_segments(
+        db,
+        table,
+        &table_dir,
+        &snapshot,
+        &ttl_ctx.name,
+        duration_us,
+        now_micros(),
+    )?;
+    if rows == 0 {
+        return Ok(0);
+    }
+
+    // Catalog accounting, files-first/catalog-second like the partition
+    // purge: never hold a catalog write while taking mutation locks.
+    {
+        let mut catalogs = engine.catalogs().write().unwrap();
+        let Some(catalog) = catalogs.get_mut(db) else {
+            return Ok(rows);
+        };
+        let Some(table_meta) = catalog.get_table_mut(table) else {
+            return Ok(rows);
+        };
+        let previous_meta = table_meta.clone();
+        table_meta.row_count = (table_meta.row_count - rows as i64).max(0);
+        let meta_dir = engine.data_dir().join("meta");
+        if let Err(save_error) = catalog.save(&meta_dir) {
+            if let Some(table_meta) = catalog.get_table_mut(table) {
+                *table_meta = previous_meta;
+            }
+            return Err(TaibaiError::Storage(format!(
+                "ttl purge: failed to save catalog for '{db}.{table}': {save_error}"
+            )));
+        }
+    }
+
+    // Dropped segments may still be referenced by unique-index location
+    // snapshots; same invalidation the partition purge performs.
+    engine
+        .index_manager()
+        .invalidate_primary_key_index(db, table);
+    let unique_index_names = meta
+        .unique_indexes
+        .iter()
+        .map(|index| index.name.clone())
+        .collect::<Vec<_>>();
+    engine
+        .index_manager()
+        .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
+
+    tracing::info!(db, table, rows, "ttl purge: dropped fully-expired segments");
+    Ok(rows)
 }
 
 /// Whole-partition expiry requires a temporal partition scheme whose

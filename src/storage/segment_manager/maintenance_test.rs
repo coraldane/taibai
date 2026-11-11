@@ -145,3 +145,128 @@ fn only_conflicting_transaction_pins_block_reclaim() -> Result<()> {
     );
     Ok(())
 }
+
+fn write_ttl_segment(path: &Path, timestamps: &[i64]) -> Result<()> {
+    let schema = Schema::new(vec![ColumnDef::new("ts", DataType::Timestamp)]);
+    let mut batch = RecordBatch::new(schema.clone());
+    for ts in timestamps {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Timestamp(Some(*ts)))?;
+    }
+    let mut writer = SegmentWriter::create(path, schema, 8192, 3)?;
+    writer.write_batch(&batch)?;
+    writer.seal()
+}
+
+/// The TTL cleanup drops only segments whose every row group is provably
+/// expired; neighbours (fresh, or straddling the cutoff) survive untouched.
+#[test]
+fn ttl_cleanup_drops_only_fully_expired_segments() -> Result<()> {
+    let now = 1_800_000_000i64 * 1_000_000; // fixed horizon
+    let duration = 3_600i64 * 1_000_000;
+    let old = now - 10 * duration;
+    let fresh = now + duration;
+
+    let tmp = tempfile::tempdir()?;
+    let table_dir = tmp.path().join("db/t");
+    std::fs::create_dir_all(&table_dir)?;
+    let expired = table_dir.join("seg_00001.dat");
+    let straddling = table_dir.join("seg_00002.dat");
+    let live = table_dir.join("seg_00003.dat");
+    write_ttl_segment(&expired, &[old, old + 1])?;
+    write_ttl_segment(&straddling, &[old, fresh])?;
+    write_ttl_segment(&live, &[fresh, fresh + 1])?;
+    let manager = SegmentManager::new(tmp.path())?;
+
+    let ttl_ctx = MaintenanceTtlColumn {
+        name: "ts".to_string(),
+        previous_names: Vec::new(),
+    };
+    let snapshot =
+        manager.capture_maintenance_snapshot("db", "t", &table_dir, Some(&ttl_ctx))?;
+    let rows = manager.cleanup_ttl_expired_segments(
+        "db",
+        "t",
+        &table_dir,
+        &snapshot,
+        "ts",
+        duration,
+        now,
+    )?;
+    assert_eq!(rows, 2, "only the fully-expired segment's rows are reclaimed");
+    // The snapshot lease keeps retired files readable until it drops.
+    assert!(straddling.exists(), "cutoff-straddling segment must be kept");
+    assert!(live.exists(), "live segment must be kept");
+    drop(snapshot);
+    assert!(!expired.exists(), "expired segment file must be gone");
+
+    // Idempotent.
+    let snapshot =
+        manager.capture_maintenance_snapshot("db", "t", &table_dir, Some(&ttl_ctx))?;
+    assert_eq!(
+        manager.cleanup_ttl_expired_segments(
+            "db",
+            "t",
+            &table_dir,
+            &snapshot,
+            "ts",
+            duration,
+            now
+        )?,
+        0
+    );
+    drop(snapshot);
+    manager.shutdown();
+    Ok(())
+}
+
+/// A NULL ttl timestamp is never visible, but the plan-level check refuses
+/// to prove expiry through a group with NULLs — the segment stays.
+#[test]
+fn ttl_cleanup_keeps_segments_with_null_timestamps() -> Result<()> {
+    let now = 1_800_000_000i64 * 1_000_000;
+    let duration = 3_600i64 * 1_000_000;
+    let old = now - 10 * duration;
+
+    let tmp = tempfile::tempdir()?;
+    let table_dir = tmp.path().join("db/t");
+    std::fs::create_dir_all(&table_dir)?;
+    let path = table_dir.join("seg_00001.dat");
+    let schema = Schema::new(vec![ColumnDef::new("ts", DataType::Timestamp)]);
+    let mut batch = RecordBatch::new(schema.clone());
+    batch
+        .column_mut(0)
+        .unwrap()
+        .push(&ScalarValue::Timestamp(Some(old)))?;
+    batch.column_mut(0).unwrap().push(&ScalarValue::Timestamp(None))?;
+    let mut writer = SegmentWriter::create(&path, schema, 8192, 3)?;
+    writer.write_batch(&batch)?;
+    writer.seal()?;
+
+    let manager = SegmentManager::new(tmp.path())?;
+    let ttl_ctx = MaintenanceTtlColumn {
+        name: "ts".to_string(),
+        previous_names: Vec::new(),
+    };
+    let snapshot =
+        manager.capture_maintenance_snapshot("db", "t", &table_dir, Some(&ttl_ctx))?;
+    assert_eq!(
+        manager.cleanup_ttl_expired_segments(
+            "db",
+            "t",
+            &table_dir,
+            &snapshot,
+            "ts",
+            duration,
+            now
+        )?,
+        0,
+        "a NULL in the ttl zone must keep the segment"
+    );
+    assert!(path.exists());
+    drop(snapshot);
+    manager.shutdown();
+    Ok(())
+}

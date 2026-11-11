@@ -6,7 +6,8 @@ use crate::common::error::Result;
 use crate::storage::segment::meta::SegmentMetaSnapshot;
 use crate::storage::segment::snapshot::SegmentSnapshot;
 use crate::storage::segment_manager::catalog::{
-    build_plan_meta, load_catalog_file, store_catalog_file, MaintenanceTtlColumn, SegmentPlanMeta,
+    build_plan_meta, load_catalog_file, plan_ttl_fully_expired, store_catalog_file,
+    MaintenanceTtlColumn, SegmentPlanMeta,
 };
 use crate::storage::segment_manager::{
     same_segment_path, table_key, SegmentManager, TableSegmentState,
@@ -421,6 +422,97 @@ impl SegmentManager {
             removed += committed.len() as u64;
         }
         Ok(removed)
+    }
+
+    /// Physically drop immutable segments whose every row group the TTL
+    /// proves expired ([`plan_ttl_fully_expired`]). The read-path TTL prune
+    /// already skips these without decoding; this reclaims their disk,
+    /// footer-index and catalog footprint instead of leaving dead history
+    /// behind the read-time filter forever. Returns the LIVE rows removed,
+    /// for catalog accounting.
+    ///
+    /// Mirrors [`Self::cleanup_fully_deleted_segments`] — lease-backed
+    /// candidates, re-validated and retired in bounded batches under the
+    /// partition mutation locks — but there is no rewrite pass: a provably
+    /// expired segment is removed as-is, so the purge never copies data.
+    pub fn cleanup_ttl_expired_segments(
+        &self,
+        db: &str,
+        table: &str,
+        table_dir: &Path,
+        snapshot: &MaintenanceSnapshot,
+        ttl_column: &str,
+        duration_us: i64,
+        now_us: i64,
+    ) -> Result<u64> {
+        let candidates: Vec<PlannedSegment> = snapshot
+            .planned_segments()
+            .into_iter()
+            .filter(|candidate| {
+                plan_ttl_fully_expired(&candidate.meta, ttl_column, duration_us, now_us)
+            })
+            .collect();
+        let mut rows_reclaimed = 0u64;
+        for batch in candidates.chunks(RECLAIM_COMMIT_BATCH) {
+            let mut partitions = batch
+                .iter()
+                .map(|candidate| {
+                    candidate
+                        .path
+                        .file_name()
+                        .and_then(|name| {
+                            crate::storage::partition::partition::parse_partition_key(
+                                &name.to_string_lossy(),
+                            )
+                        })
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>();
+            partitions.sort();
+            partitions.dedup();
+            let partition_refs = partitions.iter().map(String::as_str).collect::<Vec<_>>();
+            let committed =
+                self.with_partition_set_mutation_lock(db, table, &partition_refs, || {
+                    let keep: Vec<&PlannedSegment> = batch
+                        .iter()
+                        .filter(|candidate| {
+                            self.maintenance_candidate_current(candidate, None)
+                                && !self.txn_mutations().is_some_and(|registry| {
+                                    registry.segment_pin_conflicts(db, table, &candidate.path)
+                                })
+                        })
+                        .collect();
+                    if keep.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    let paths = keep
+                        .iter()
+                        .map(|candidate| candidate.path.clone())
+                        .collect::<Vec<_>>();
+                    self.retire_segments(table_dir, &paths)?;
+                    Ok(keep)
+                })?;
+            if committed.is_empty() {
+                continue;
+            }
+            self.note_segments_changed(db, table);
+            let names = committed
+                .iter()
+                .map(|candidate| candidate.path.clone())
+                .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+                .collect::<Vec<_>>();
+            self.emit_segments_removed(table_dir, &names);
+            rows_reclaimed += committed
+                .iter()
+                .map(|candidate| {
+                    candidate
+                        .meta
+                        .row_count
+                        .saturating_sub(candidate.meta.deleted_row_count)
+                })
+                .sum::<u64>();
+        }
+        Ok(rows_reclaimed)
     }
 
     fn maintenance_candidate_current(
