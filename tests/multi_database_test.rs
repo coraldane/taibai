@@ -567,6 +567,66 @@ fn drop_database_releases_hot_store_mirrors() {
     engine.segment_mgr().shutdown();
 }
 
+#[test]
+fn drop_database_with_primary_key_table_releases_index_state() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    let create = "CREATE TABLE db1.ticks (
+            security_id VARCHAR PRIMARY KEY,
+            trade_time TIMESTAMP NOT NULL,
+            value INT64
+        ) CLUSTER BY (security_id) HOT BY (trade_time) INDEX (security_id)";
+
+    engine
+        .execute(&mut session, "CREATE DATABASE db1")
+        .expect("create db1");
+    engine.execute(&mut session, create).expect("create table");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO db1.ticks VALUES ('A', 1783492992000000, 1)",
+        )
+        .expect("insert row");
+
+    // Regression: the cached unique-index state pins an open handle on its
+    // index base file. On Windows that handle made the staging rename of the
+    // database directory fail with "access denied", so DROP DATABASE always
+    // errored for any table with a PRIMARY KEY. DROP TABLE already released
+    // the states before staging; DROP DATABASE did not.
+    engine
+        .execute(&mut session, "DROP DATABASE db1")
+        .expect("drop db1");
+    assert!(!temp_dir.path().join("db1").exists());
+
+    // Recreating the same database and table must not inherit the dropped
+    // index state: 'A' is gone with the old database, so it is insertable
+    // again. A stale cached state would report a duplicate primary key.
+    engine
+        .execute(&mut session, "CREATE DATABASE db1")
+        .expect("recreate db1");
+    engine
+        .execute(&mut session, create)
+        .expect("recreate table");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO db1.ticks VALUES ('A', 1783492992000000, 1)",
+        )
+        .expect("insert row into the recreated database");
+    match engine
+        .execute(&mut session, "SELECT COUNT(*) FROM db1.ticks")
+        .expect("count rows")
+    {
+        ExecResult::Query { batches, .. } => {
+            assert_eq!(batches[0].scalar(0, 0), Some(ScalarValue::Int64(Some(1))));
+        }
+        other => panic!("expected query result, got {:?}", other),
+    }
+
+    engine.segment_mgr().shutdown();
+}
+
 fn show_memory_rows(result: ExecResult) -> Vec<(String, String, i64)> {
     let ExecResult::Query { batches, .. } = result else {
         panic!("expected query result");

@@ -104,6 +104,18 @@ pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Resul
                     .close_table_state_handles(name, table_name);
             }
             engine.segment_mgr().invalidate_readers_under(&database_dir);
+            // Unique-index states pin an open handle on the index base file
+            // (they read it lazily through it). A staged rename — or removal —
+            // of the directory holding that file is refused by Windows while
+            // the handle lives. DROP TABLE releases the same states before its
+            // staging rename; do it here too, before the database directory is
+            // staged away. The states rebuild from disk on next use, so this is
+            // safe on the restore path below.
+            for (table_name, _) in &table_indexes {
+                engine
+                    .index_manager()
+                    .drop_table_index_states(name, table_name);
+            }
             let tombstone = stage_database_directory(engine.data_dir(), name).map_err(|error| {
                 TaibaiError::Storage(format!(
                     "failed to stage database '{}' for DROP: {}",
