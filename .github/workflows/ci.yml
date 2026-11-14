@@ -32,9 +32,11 @@ jobs:
           {
             echo "### 失败的测试用例"
             grep -E '^test .* FAILED$|^error: [0-9]+ targets? failed' test-output.log \
-              | sort -u | head -40
+              | sort -u | head -20
+            echo "### 断言详情"
+            grep -A10 -E '^---- .* stdout ----' test-output.log | head -80 || true
           } > failing.txt
-          echo "::error title=Test failures::$(tr '\n' ' ' < failing.txt | cut -c1-900)"
+          echo "::error title=Test failures::$(tr '\n' ' ' < failing.txt | cut -c1-3000)"
           exit 1
       - name: Upload test log
         if: failure()
