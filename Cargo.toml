@@ -14,10 +14,12 @@ name = "taibai"
 version = "0.2.9"
 edition = "2021"
 autotests = false
-description = "An experimental Rust columnar database server for analytical workloads"
+description = "An experimental columnar database server in Rust, built for market-data and tick workloads"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/coraldane/taibai"
+homepage = "https://github.com/coraldane/taibai"
 readme = "README.md"
-keywords = ["database", "columnar", "analytics", "sql"]
+keywords = ["database", "columnar", "olap", "timeseries", "market-data"]
 categories = ["database-implementations"]
 
 [lib]

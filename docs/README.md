@@ -48,7 +48,10 @@
 
 报告中的数据只适用于文档记录的版本、配置和测试环境。
 
-- [Taibai vs DuckDB vs kdb+ 性能对比报告](reports/benchmark-vs-duckdb-kdb-2026-09.md)：当前版本的对照基准与后续优化方向。
+性能数据目前分散在运维文档中，没有单独维护的对比报告。要得到可引用的数字，请用仓库自带的基准工具在自己的环境重测，并按[性能数据说明](user-guide/limitations.md)记录版本、配置、硬件、数据集、预热方式和完整命令：
+
+- [示例工具使用指南](operations/examples-guide.md)：`batch_import`、`multi_insert`、`insert_csv`、`load_csv` 等导入路径的吞吐对比与用法。
+- [金融行情场景验证与测试清单](operations/financial-market-data-validation-checklist.md)：行情场景应测的指标与判定口径。
 
 ## 项目治理
 
