@@ -1,6 +1,6 @@
 # Taibai
 
-**为行情与 tick 数据准备的开源列式数据库。** 单二进制部署、SQL 即用、中文文档齐备，面向「大量写入 + 按标的与时间聚合」的分析场景。
+**为行情与 tick 数据准备的开源列式数据库。** 单二进制部署、SQL 即用、五种语言官方驱动、中文文档齐备，面向「大量写入 + 按标的与时间聚合」的分析场景。
 
 <sub>An open-source columnar database in Rust, built for market-data / tick workloads.</sub>
 
@@ -80,6 +80,22 @@ ORDER BY t.ts;
 
 结果里每笔成交都带上了成交时刻的有效报价。`LEFT ASOF JOIN` 会保留匹配不到的左行（价格为空）。四种不等式方向（`>=` `>` `<=` `<`）的语义见 [SQL 语法参考](docs/user-guide/sql-reference.md)。
 
+## SQL 与驱动
+
+SQL 是自有实现：解析器、优化器、执行器都在服务端内核里，不依赖任何外部 SQL 引擎。语法以 MySQL 为参照，保留分析场景真正会用的那部分——DDL、DML、多表 Join、子查询、CTE、窗口函数、`EXPLAIN`——去掉存储过程、触发器、游标这类在这里很少用到的语法。所以写起来和 MySQL 接近，但它不是 MySQL 的兼容层：不支持的语句会直接报错，不会静默给出不一样的结果。
+
+接入侧提供五种语言的官方驱动，各自独立仓库发布：
+
+| 语言 | 仓库 | 引入方式 |
+|---|---|---|
+| Go | [coraldane/taibai-go](https://github.com/coraldane/taibai-go) | `go get`，兼容 `database/sql` |
+| Java | [coraldane/taibai-jdbc](https://gitee.com/coraldane/taibai-jdbc) | Maven，JDBC 4.2 |
+| Python | [coraldane/taibai-python](https://gitee.com/coraldane/taibai-python) | pip（源码安装），`asyncio` |
+| C++ | [coraldane/taibai-cpp](https://gitee.com/coraldane/taibai-cpp) | CMake，C++17 |
+| Rust | [coraldane/taibai-rust](https://gitee.com/coraldane/taibai-rust) | Cargo，tokio 异步 |
+
+每种语言的安装方式、可运行的最小示例和连接参数见[多语言驱动](docs/drivers/README.md)。
+
 ## 为行情数据专门做的事
 
 - **`ASOF JOIN`**：`ON` 条件由若干等值键 + 恰好一个时间不等式组成，按等值键分区、时间键二分匹配；`ASOF LEFT JOIN` 拼写同样接受。
@@ -101,7 +117,7 @@ ORDER BY t.ts;
 
 ## 已知边界
 
-- SQL 是自有实现，**不兼容** MySQL / PostgreSQL 方言，现有 BI 与 ORM 驱动不能直接对接。
+- SQL 语法以 MySQL 为参照，但为自有实现：没有实现存储过程、触发器、游标与 `LOAD DATA`；要求 PostgreSQL/MySQL 原生协议的 BI 工具无法直连，需通过官方驱动接入。
 - 相关子查询仅支持直接外层引用，更深嵌套会明确报错（不会静默给错结果）；`JOIN ON` 内的子查询不支持。
 - 单机为主：有 primary/standby 流复制，没有分片与多副本一致性协议。
 - `0.x` 期间段格式与协议仍会变；升级前请按[兼容性指引](docs/user-guide/limitations.md)备份并跑 `migrate`。
@@ -113,6 +129,7 @@ ORDER BY t.ts;
 ## 文档
 
 - [五分钟快速开始](docs/getting-started/quick-start.md)
+- [多语言驱动](docs/drivers/README.md)：Go / Java / Python / C++ / Rust 的仓库地址、安装方式与 quickstart
 - [SQL 语法参考](docs/user-guide/sql-reference.md)：全部支持的语法，以及明确不支持的清单
 - [建表选项](docs/user-guide/table-options.md)：`CLUSTER BY`、`PARTITION BY`、`TTL`、`HOT`、`DURABILITY`、`COMPRESSION_LEVEL`
 - [事务与并发语义](docs/user-guide/transactions-and-concurrency.md)

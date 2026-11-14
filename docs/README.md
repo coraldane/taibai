@@ -11,7 +11,8 @@
 
 面向日常使用，描述当前版本的实际行为：
 
-- [SQL 语法参考](user-guide/sql-reference.md)：**全部**支持的 SQL 语法——DDL、DML、查询、表达式、内置函数、管理语句，以及明确不支持的能力清单。taibai 方言不兼容主流数据库，请以此为准。
+- [SQL 语法参考](user-guide/sql-reference.md)：**全部**支持的 SQL 语法——DDL、DML、查询、表达式、内置函数、管理语句，以及明确不支持的能力清单。语法以 MySQL 为参照，但方言是自有实现，不支持的语句会明确报错，请以此为准。
+- [多语言驱动](drivers/README.md)：Go / Java / Python / C++ / Rust 官方驱动的仓库地址、安装方式与最小可运行示例。
 - [事务与并发语义](user-guide/transactions-and-concurrency.md)：隔离级别、可见性、锁与持久化边界。
 - [查询管理与语句超时](user-guide/query-management.md)：`SHOW PROCESSLIST`、`KILL QUERY` 与语句超时配置。
 - [变更订阅（Pub/Sub）](user-guide/pubsub.md)：订阅表插入变更、主题通配符与慢消费者策略，以及可恢复的可靠订阅（序列确认、具名书签、列过滤）。
