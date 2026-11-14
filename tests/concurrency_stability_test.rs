@@ -640,6 +640,11 @@ fn executor_scan_sees_each_row_exactly_once_across_concurrent_flushes() {
     });
 
     let reader_engine = Arc::clone(&engine);
+    let reader_table_dir = temp_dir
+        .path()
+        .join("main")
+        .join("t_snapshot_scan")
+        .to_path_buf();
     let reader = thread::spawn(move || {
         let mut s = session();
         for _ in 0..300 {
@@ -658,11 +663,44 @@ fn executor_scan_sees_each_row_exactly_once_across_concurrent_flushes() {
                 "a row appeared twice in one scan (segment/memtable leg overlap)"
             );
             if let Some(max) = ids.iter().max() {
-                assert_eq!(
-                    ids.len(),
-                    *max as usize,
-                    "visible ids must stay contiguous 1..=max across flush transitions"
-                );
+                // Report exactly which ids went missing: a hole at the head is
+                // the seed segment, a hole at the tail is the newest flush. The
+                // segment listing and the follow-up count separate "the scan
+                // read a skewed snapshot" from "the rows are really gone".
+                let missing = (1..=*max)
+                    .filter(|candidate| sorted.binary_search(candidate).is_err())
+                    .collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    let mut segments = std::fs::read_dir(&reader_table_dir)
+                        .map(|entries| {
+                            entries
+                                .flatten()
+                                .map(|entry| {
+                                    format!(
+                                        "{}:{}B",
+                                        entry.file_name().to_string_lossy(),
+                                        entry.metadata().map(|meta| meta.len()).unwrap_or(0)
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    segments.sort();
+                    let follow_up = reader_engine
+                        .execute(&mut s, "SELECT COUNT(*) FROM t_snapshot_scan WHERE id >= 0")
+                        .ok()
+                        .map(int64_column_values)
+                        .unwrap_or_default();
+                    panic!(
+                        "visible ids must stay contiguous 1..=max across flush transitions; \
+                         missing {:?} ({} of {}) while {} ids were visible; \
+                         segments {segments:?}; a follow-up count now returns {follow_up:?}",
+                        &missing[..missing.len().min(12)],
+                        missing.len(),
+                        *max,
+                        ids.len()
+                    );
+                }
             }
         }
     });
@@ -680,5 +718,13 @@ fn executor_scan_sees_each_row_exactly_once_across_concurrent_flushes() {
         .expect("final scan");
     let ids = int64_column_values(final_scan);
     assert_eq!(ids.len() as u64, inserted + 3, "final row count");
+    let mut settled = ids.clone();
+    settled.sort_unstable();
+    assert_eq!(
+        settled,
+        (1..=inserted as i64 + 3).collect::<Vec<_>>(),
+        "the quiescent table must expose exactly ids 1..={}",
+        inserted + 3
+    );
     engine.segment_mgr().shutdown();
 }

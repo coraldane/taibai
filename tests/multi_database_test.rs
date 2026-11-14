@@ -743,8 +743,11 @@ fn show_workload_reports_admission_canary_and_fast_path_counters() {
     assert_eq!(value("canary", "last_status"), Some(3));
     assert_eq!(value("canary", "consecutive_failures"), Some(0));
     assert!(value("pools", "rayon_global_threads").is_some());
-    // The folded-answer counter exists and starts at zero.
-    assert_eq!(value("fast_path", "metadata_answers_total"), Some(0));
+    // The folded-answer counter is a process-global atomic reported by SHOW
+    // WORKLOAD, so tests running in parallel inside this binary may already
+    // have folded a metadata answer before this one starts. Assert the
+    // increment this test causes instead of an absolute zero.
+    let folded_baseline = value("fast_path", "metadata_answers_total").expect("fast path counter");
 
     // A metadata-foldable aggregate bumps the fast-path counter.
     engine
@@ -764,8 +767,8 @@ fn show_workload_reports_admission_canary_and_fast_path_counters() {
         .map(|(_, _, v)| *v)
         .expect("fast path counter");
     assert!(
-        folded >= 1,
-        "MAX(id) should have folded to metadata, got {folded}"
+        folded >= folded_baseline + 1,
+        "MAX(id) should have folded to metadata, got {folded} (baseline {folded_baseline})"
     );
 
     engine.segment_mgr().shutdown();
