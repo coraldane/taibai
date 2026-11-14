@@ -317,3 +317,7 @@ path = "tests/sql_reference_doc_test.rs"
 [[test]]
 name = "grant_replication_test"
 path = "tests/grant_replication_test.rs"
+
+[[test]]
+name = "scan_snapshot_bound_test"
+path = "tests/scan_snapshot_bound_test.rs"

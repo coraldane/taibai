@@ -41,6 +41,11 @@ pub struct ScanCursor {
     plan: ScanPlan,
     segments: Vec<PathBuf>,
     segment_snapshot: Option<Arc<crate::storage::segment::snapshot::SegmentSnapshot>>,
+    /// Row-group ceiling per segment, pinned under the same flush read lock
+    /// that produced the snapshot. Active segments republish their footer on
+    /// every append, so the set read when the segment is actually opened can
+    /// include row groups whose memtable rows are already in this snapshot.
+    segment_row_group_bounds: std::collections::HashMap<PathBuf, usize>,
     initialized: bool,
     segment_pos: usize,
     current_reader: Option<Arc<SegmentReader>>,
@@ -154,6 +159,7 @@ impl ScanCursor {
             plan,
             segments: Vec::new(),
             segment_snapshot: None,
+            segment_row_group_bounds: std::collections::HashMap::new(),
             initialized: false,
             segment_pos: 0,
             current_reader: None,
@@ -594,7 +600,10 @@ impl ScanCursor {
             self.current_reader = None;
             return Ok(());
         };
-        self.current_candidates = opened.indices;
+        self.current_candidates = super::candidates::clamp_to_snapshot_bound(
+            opened.indices,
+            self.segment_row_group_bounds.get(segment).copied(),
+        );
         self.candidate_pos = 0;
         self.current_reader = Some(opened.reader);
         Ok(())
@@ -609,7 +618,11 @@ impl ScanCursor {
         let segment_mgr = self.runtime.segment_mgr().clone();
         let db = self.db.clone();
         let table = self.spec.table_name.clone();
-        segment_mgr.with_table_flush_read_lock(&db, &table, || self.initialize_unlocked())
+        segment_mgr.with_table_flush_read_lock(&db, &table, || self.initialize_unlocked())?;
+        // Test hook: the flush-visibility protocol covers the interval between
+        // this snapshot and the first segment open below.
+        super::executor::sleep_snapshot_pause();
+        Ok(())
     }
 
     fn initialize_unlocked(&mut self) -> Result<()> {
@@ -667,6 +680,15 @@ impl ScanCursor {
         self.segments = if table_dir.exists() {
             let snapshot = crate::storage::segment::snapshot::snapshot_segments(&table_dir)?;
             let all_segments = snapshot.paths.clone();
+            self.segment_row_group_bounds = all_segments
+                .iter()
+                .filter_map(|path| {
+                    self.runtime
+                        .segment_mgr()
+                        .snapshot_row_group_bound(path)
+                        .map(|bound| (path.clone(), bound))
+                })
+                .collect();
             self.segment_snapshot = Some(snapshot);
             partition::prune_segments_by_partition(all_segments, &self.spec, Some(&self.table_meta))
         } else {

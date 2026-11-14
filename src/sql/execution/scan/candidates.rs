@@ -57,6 +57,21 @@ pub(super) fn open_segment_with_candidates(
     Ok(Some(SegmentCandidates { reader, indices }))
 }
 
+/// Drop row groups appended after the scan's snapshot point.
+///
+/// An active segment keeps its row-group set growing: every memtable flush
+/// appends one and republishes the footer. The scan only pins the set that was
+/// published under the flush read lock, but it opens the file later, in the
+/// decode phase, so its footer may list row groups whose source memtable was
+/// already part of the same snapshot. Reading them would return those rows
+/// twice — once from the segment and once from the memtable leg.
+pub(super) fn clamp_to_snapshot_bound(indices: Vec<usize>, bound: Option<usize>) -> Vec<usize> {
+    match bound {
+        Some(bound) => indices.into_iter().filter(|&idx| idx < bound).collect(),
+        None => indices,
+    }
+}
+
 /// Drop row groups the delete bitmap already empties: they decode to
 /// zero-row batches, which defeats LIMIT-style early termination exactly
 /// like an expired row group does. Bitmap-range check only — never touches

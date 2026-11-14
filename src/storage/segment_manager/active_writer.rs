@@ -65,6 +65,15 @@ pub(super) struct ActiveSegmentWriter {
 }
 
 impl ActiveSegmentWriter {
+    /// Row groups this segment holds right now, including groups whose footer
+    /// is not published yet: a reader that opens the segment publishes the
+    /// pending footer first, so this is exactly the set it sees. Freezing the
+    /// count at snapshot time keeps row groups appended by a *later* flush out
+    /// of that scan, while leaving deferred bulk appends visible.
+    pub(super) fn visible_row_group_count(&self) -> usize {
+        self.row_groups.len()
+    }
+
     /// Rows appended to this segment that a fresh reader cannot see yet: row
     /// groups written to the data file after the last footer publish plus the
     /// not-yet-row-grouped buffer. Reclaim paths must treat these as not

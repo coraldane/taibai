@@ -1077,6 +1077,42 @@ impl SegmentManager {
         true
     }
 
+    /// Row groups of `path` that a reader opening it right now would see.
+    ///
+    /// A scan pins this count under the table flush read lock and refuses to
+    /// read row groups beyond it. The ceiling matters because a segment can
+    /// gain row groups after the snapshot: an active segment republishes its
+    /// footer on every append, and an unsealed segment that no writer owns yet
+    /// can still be adopted by the next flush (`find_unsealed_segment`). Those
+    /// appended rows come from a memtable that is already part of the same
+    /// snapshot, so reading them from the segment as well would return them
+    /// twice. For a sealed segment the count is immutable and the ceiling is a
+    /// no-op.
+    ///
+    /// `None` means the count could not be established (unreadable footer);
+    /// callers then keep the historic unbounded behaviour.
+    pub fn snapshot_row_group_bound(&self, path: &Path) -> Option<usize> {
+        // Covers both sealed segments (cached footer, immutable — the ceiling
+        // is a no-op) and unsealed segments no writer owns yet, which can
+        // still be adopted by the next flush (`find_unsealed_segment`).
+        if let Ok(Some(meta)) = self.segment_meta(path) {
+            return Some(meta.row_group_count());
+        }
+        // A writer owns this segment: freeze the row-group set it holds now.
+        if let Some(state) = self.state_for_segment_path(path) {
+            let active_guard = state.active_segments.lock().unwrap();
+            if let Some(segment) = active_guard
+                .values()
+                .find(|segment| same_segment_path(&segment.path, path))
+            {
+                return Some(segment.visible_row_group_count());
+            }
+        }
+        crate::storage::segment::meta::read_embedded_segment_meta(path)
+            .ok()
+            .map(|meta| meta.row_group_count())
+    }
+
     /// Rows written to this table's active segments that a fresh reader
     /// cannot see yet (footer not published / still in the append buffer).
     /// Hot-store reclamation must not count these as persisted.

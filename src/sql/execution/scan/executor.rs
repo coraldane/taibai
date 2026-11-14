@@ -15,6 +15,27 @@ use super::row_filter;
 use super::runtime::ScanRuntime;
 use super::spec::ScanSpec;
 
+/// Test-only pause between the snapshot phase and the decode phase.
+///
+/// The flush-visibility protocol protects exactly that interval: the snapshot
+/// is taken under the table flush read lock, the segment files are opened
+/// after it is released. A test that needs that interval to be observable
+/// (instead of a microsecond-wide race) sets this.
+static SNAPSHOT_PAUSE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Widen the snapshot-to-decode window by `ms` milliseconds. Test hook; set
+/// back to 0 when done.
+pub fn set_snapshot_pause_for_tests(ms: u64) {
+    SNAPSHOT_PAUSE_MS.store(ms, Ordering::Release);
+}
+
+pub(super) fn sleep_snapshot_pause() {
+    let ms = SNAPSHOT_PAUSE_MS.load(Ordering::Acquire);
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
 /// Everything the scan needs from one atomic view of the table. Built under
 /// the table flush read lock by [`ScanExecutor::snapshot_flush_phase`]; the
 /// segment lease keeps the listed files alive for the whole decode after the
@@ -24,6 +45,12 @@ struct ScanPhase {
     scan_limit: Option<usize>,
     segment_snapshot: Option<std::sync::Arc<crate::storage::segment::snapshot::SegmentSnapshot>>,
     segment_paths: Vec<PathBuf>,
+    /// Row-group ceiling per segment, captured under the same lock as the
+    /// snapshot. Active segments keep appending row groups to a footer the
+    /// scan reads only later, in phase 2; without the ceiling a flush that
+    /// lands in between makes the scan read the flushed rows from the segment
+    /// *and* from the memtable batch it already snapshotted.
+    segment_row_group_bounds: HashMap<PathBuf, usize>,
     /// Whether any memtable existed at snapshot time; the ordered-cluster
     /// early-termination check in phase 2 refuses to run when it did.
     memtables_present: bool,
@@ -143,11 +170,13 @@ impl<'a> ScanExecutor<'a> {
         let Some(phase) = phase else {
             return Ok(());
         };
+        sleep_snapshot_pause();
         let ScanPhase {
             plan,
             mut scan_limit,
             segment_snapshot,
             segment_paths,
+            segment_row_group_bounds,
             memtables_present,
             memtable_batches,
         } = phase;
@@ -192,7 +221,12 @@ impl<'a> ScanExecutor<'a> {
                 && filtered_segments.len() > 1
                 && crate::common::config::query_limits().max_parallel_segments > 1;
             if use_segment_parallel {
-                for batch in self.scan_segments_parallel(&filtered_segments, &mgr, &plan)? {
+                for batch in self.scan_segments_parallel(
+                    &filtered_segments,
+                    &mgr,
+                    &plan,
+                    &segment_row_group_bounds,
+                )? {
                     crate::common::query_cancel::check()?;
                     if !output.push(batch) {
                         return Ok(());
@@ -224,7 +258,10 @@ impl<'a> ScanExecutor<'a> {
                         }
                     };
                     let reader = opened.reader;
-                    let candidate_indices = opened.indices;
+                    let candidate_indices = super::candidates::clamp_to_snapshot_bound(
+                        opened.indices,
+                        segment_row_group_bounds.get(seg_path).copied(),
+                    );
 
                     if let Some(s) = self.stats.as_deref_mut() {
                         s.entry(self.spec.table_name.clone())
@@ -498,6 +535,19 @@ impl<'a> ScanExecutor<'a> {
             .map(|snapshot| snapshot.paths.clone())
             .unwrap_or_default();
 
+        // Still under the flush read lock: pin how many row groups each segment
+        // had published. For a sealed segment the count cannot change, but the
+        // same map also covers unsealed segments a later flush may append to.
+        let segment_row_group_bounds = segment_paths
+            .iter()
+            .filter_map(|path| {
+                self.runtime
+                    .segment_mgr()
+                    .snapshot_row_group_bound(path)
+                    .map(|bound| (path.clone(), bound))
+            })
+            .collect();
+
         let mut memtable_spec = self.spec.clone();
         memtable_spec.projection = Some(plan.projection_cols.clone());
         let memtable_batches = memtable::scan_memtables(
@@ -513,6 +563,7 @@ impl<'a> ScanExecutor<'a> {
             scan_limit,
             segment_snapshot,
             segment_paths,
+            segment_row_group_bounds,
             memtables_present,
             memtable_batches,
         }))
@@ -625,6 +676,7 @@ impl<'a> ScanExecutor<'a> {
         paths: &[PathBuf],
         manager: &std::sync::Arc<SegmentManager>,
         plan: &super::strategy::ScanPlan,
+        row_group_bounds: &HashMap<PathBuf, usize>,
     ) -> Result<Vec<RecordBatch>> {
         use rayon::prelude::*;
         let max_parallel = crate::common::config::query_limits()
@@ -696,6 +748,10 @@ impl<'a> ScanExecutor<'a> {
                     };
                     let candidates =
                         super::candidates::skip_fully_deleted_row_groups(&reader, candidates);
+                    let candidates = super::candidates::clamp_to_snapshot_bound(
+                        candidates,
+                        row_group_bounds.get(path).copied(),
+                    );
                     // Row groups inside a segment decode in parallel as
                     // well; actual concurrency is bounded by the global
                     // cpu/io permits, not by rayon lane count. Decode and
