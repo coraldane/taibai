@@ -242,7 +242,10 @@ impl<'a> ScanExecutor<'a> {
                     // anything else must fail the query instead of silently
                     // skipping the whole segment's rows.
                     let opened = match super::candidates::open_segment_with_candidates(
-                        &mgr, seg_path, &self.spec,
+                        &mgr,
+                        seg_path,
+                        &self.spec,
+                        segment_row_group_bounds.get(seg_path).copied().unwrap_or(0),
                     ) {
                         Ok(Some(opened)) => opened,
                         Ok(None) => continue,
@@ -709,7 +712,11 @@ impl<'a> ScanExecutor<'a> {
                     {
                         return None;
                     }
-                    let reader = match manager.open_scan_reader(path, self.spec.reader_txn_id) {
+                    let reader = match manager.open_scan_reader_at_least(
+                        path,
+                        self.spec.reader_txn_id,
+                        row_group_bounds.get(path).copied().unwrap_or(0),
+                    ) {
                         Ok(reader) => reader,
                         // A segment removed by concurrent compaction is
                         // skipped; any other open failure fails the query.

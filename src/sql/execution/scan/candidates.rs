@@ -32,10 +32,17 @@ pub(super) struct SegmentCandidates {
 /// skipped without being opened. Errors bubble to the caller, which owns the
 /// vanished-vs-corrupt distinction (a compaction-removed segment skips, an
 /// IO or footer error fails the query).
+///
+/// `min_row_groups` is the row-group count the scan pinned at snapshot time:
+/// the reader must expose at least that many (see
+/// `SegmentManager::open_scan_reader_at_least`), otherwise a footer that was
+/// still being republished when the scan opened the file would silently hide
+/// the rows of the newest group.
 pub(super) fn open_segment_with_candidates(
     mgr: &SegmentManager,
     segment: &Path,
     spec: &ScanSpec,
+    min_row_groups: usize,
 ) -> Result<Option<SegmentCandidates>> {
     let meta_candidates = mgr.segment_meta(segment).ok().flatten().and_then(|meta| {
         match super::row_filter::meta_prune_row_groups(&meta, spec) {
@@ -46,7 +53,7 @@ pub(super) fn open_segment_with_candidates(
     if meta_candidates.as_ref().is_some_and(Vec::is_empty) {
         return Ok(None);
     }
-    let reader = mgr.open_scan_reader(segment, spec.reader_txn_id)?;
+    let reader = mgr.open_scan_reader_at_least(segment, spec.reader_txn_id, min_row_groups)?;
     let indices = match meta_candidates {
         Some(indices) => indices,
         None => strategy::prune_segment(spec, &reader)

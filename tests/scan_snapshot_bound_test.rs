@@ -119,3 +119,61 @@ fn scan_does_not_read_row_groups_flushed_after_its_snapshot() {
     assert_eq!(final_ids.len(), 6, "flush must not lose or duplicate rows");
     engine.segment_mgr().shutdown();
 }
+
+/// A scan pins its segment's row-group count under the flush read lock but
+/// opens the file later. A reader that parsed the footer before the publisher
+/// appended the new one exposes a strict prefix of those row groups; accepting
+/// it drops the newest group's rows, whose memtable the same flush retired.
+/// The pinned count is therefore a floor `open_scan_reader_at_least` enforces.
+#[test]
+fn scan_reader_must_expose_every_row_group_the_snapshot_pinned() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+    let mut setup = session();
+    engine
+        .execute(&mut setup, "CREATE TABLE t_reader_floor (id INT64)")
+        .expect("create table");
+    for batch in 0..2 {
+        engine
+            .execute(
+                &mut setup,
+                &format!("INSERT INTO t_reader_floor VALUES ({batch})"),
+            )
+            .expect("insert row");
+        engine
+            .flush_table_buffers("main", "t_reader_floor")
+            .expect("flush row group");
+    }
+
+    let table_dir = temp_dir.path().join("main").join("t_reader_floor");
+    let segment = std::fs::read_dir(&table_dir)
+        .expect("read table dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "dat"))
+        .expect("segment file");
+    let row_groups = engine
+        .segment_mgr()
+        .open_scan_reader(&segment, 0)
+        .expect("open reader")
+        .num_row_groups();
+    assert_eq!(row_groups, 2, "each flush must add one row group");
+
+    let reader = engine
+        .segment_mgr()
+        .open_scan_reader_at_least(&segment, 0, row_groups)
+        .expect("a reader at the pinned count is accepted");
+    assert_eq!(reader.num_row_groups(), row_groups);
+
+    let error = engine
+        .segment_mgr()
+        .open_scan_reader_at_least(&segment, 0, row_groups + 1)
+        .err()
+        .expect("a reader behind the pinned count must not be handed to the scan");
+    assert!(
+        error.to_string().contains("never became readable"),
+        "unexpected error: {error}"
+    );
+
+    engine.segment_mgr().shutdown();
+}

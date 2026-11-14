@@ -582,6 +582,10 @@ impl ScanCursor {
             self.runtime.segment_mgr(),
             segment,
             &self.spec,
+            self.segment_row_group_bounds
+                .get(segment)
+                .copied()
+                .unwrap_or(0),
         ) {
             Ok(opened) => opened,
             Err(error) => {

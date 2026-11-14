@@ -2,6 +2,10 @@ use super::*;
 
 static FLUSH_TRANSITION_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Attempts made to open a scan reader that exposes at least the row-group
+/// count the scan pinned at snapshot time (see `open_scan_reader_at_least`).
+const SCAN_READER_MIN_ROW_GROUP_RETRIES: usize = 5;
+
 /// Striped mutexes serializing per-table flush-epoch file persistence outside
 /// the global epoch lock. Hashing the table key to one of N stripes keeps
 /// same-table writes ordered while unrelated tables usually proceed in
@@ -352,6 +356,61 @@ impl SegmentManager {
         &self,
     ) -> Option<&std::sync::Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>> {
         self.txn_mutations.get()
+    }
+
+    /// Open a reader that is guaranteed to expose at least `min_row_groups`
+    /// row groups.
+    ///
+    /// A scan pins its segment's row-group count under the flush read lock
+    /// (`snapshot_row_group_bound`) and only opens the file in its decode
+    /// phase. Footer republication is not atomic with that open: a reader that
+    /// captured the file length *before* the publisher appended the new footer
+    /// parses the previous — still perfectly valid — footer, and
+    /// `open_reader_cached` then caches it after the publisher's
+    /// `invalidate_reader` already ran. Such a reader is a strict prefix of the
+    /// snapshot's row groups, so the rows of the newest group are read from
+    /// neither leg: the memtable that held them was retired by the same flush.
+    /// The pinned count is a floor a correct read can never undershoot, so
+    /// retry against the cache-cleared path instead of accepting the prefix.
+    pub fn open_scan_reader_at_least(
+        &self,
+        path: &Path,
+        reader_txn_id: u64,
+        min_row_groups: usize,
+    ) -> Result<std::sync::Arc<SegmentReader>> {
+        if min_row_groups == 0 {
+            return self.open_scan_reader(path, reader_txn_id);
+        }
+        let mut delay = std::time::Duration::from_millis(1);
+        let mut last_seen = 0usize;
+        for attempt in 1..=SCAN_READER_MIN_ROW_GROUP_RETRIES {
+            let reader = self.open_scan_reader(path, reader_txn_id)?;
+            let row_groups = reader.num_row_groups();
+            if row_groups >= min_row_groups {
+                return Ok(reader);
+            }
+            last_seen = row_groups;
+            if attempt == SCAN_READER_MIN_ROW_GROUP_RETRIES {
+                break;
+            }
+            tracing::debug!(
+                path = %path.display(),
+                row_groups,
+                min_row_groups,
+                attempt,
+                "scan reader is behind the snapshot's row groups; reopening"
+            );
+            self.invalidate_reader(path);
+            std::thread::sleep(delay);
+            delay *= 2;
+        }
+        Err(TaibaiError::Storage(format!(
+            "segment '{}' exposes {} row group(s) but the scan snapshot pinned {}; \
+             the footer publication the snapshot observed never became readable",
+            path.display(),
+            last_seen,
+            min_row_groups
+        )))
     }
 
     /// Open a reader for a query. Transactions that ran deferred DELETE or
