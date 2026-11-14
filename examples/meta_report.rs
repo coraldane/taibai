@@ -37,8 +37,8 @@ fn main() {
             value_set_cols += 1;
             for value in set {
                 value_set_entries += 1;
-                value_set_bytes += std::mem::size_of::<taibai::types::scalar::ScalarValue>()
-                    + value.heap_bytes();
+                value_set_bytes +=
+                    std::mem::size_of::<taibai::types::scalar::ScalarValue>() + value.heap_bytes();
             }
         }
         zone_map_bytes += rg.zone_maps.len()
@@ -58,7 +58,10 @@ fn main() {
     println!("row groups     : {rg_count}");
     println!("columns        : {col_count}");
     println!("rows           : {}", parsed.row_count);
-    println!("avg rows/rg    : {}", parsed.row_count as usize / rg_count.max(1));
+    println!(
+        "avg rows/rg    : {}",
+        parsed.row_count as usize / rg_count.max(1)
+    );
     println!("--- parsed heap (approx) ---");
     println!(
         "bloom          : {bloom_count} filters, {:.2} MiB",
@@ -82,7 +85,10 @@ fn main() {
             .flat_map(|rg| rg.compressed_sizes.iter())
             .sum();
         println!("--- per row group ---");
-        println!("footer bytes   : {:.1} KiB", mib(footer_len) * 1024.0 / rg_count as f64);
+        println!(
+            "footer bytes   : {:.1} KiB",
+            mib(footer_len) * 1024.0 / rg_count as f64
+        );
         println!(
             "value sets     : {:.1} KiB",
             mib(value_set_bytes) * 1024.0 / rg_count as f64

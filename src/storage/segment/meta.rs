@@ -68,9 +68,7 @@ impl SegmentMetaSnapshot {
     /// This is what the metadata cache charges an entry, so the reported
     /// size is the real one.
     pub fn estimated_heap_bytes(&self) -> u64 {
-        std::mem::size_of::<Self>() as u64
-            + self.index.heap_bytes()
-            + self.footer.len() as u64
+        std::mem::size_of::<Self>() as u64 + self.index.heap_bytes() + self.footer.len() as u64
     }
 
     /// The segment's own schema, in footer column order.

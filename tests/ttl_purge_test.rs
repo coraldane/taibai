@@ -371,7 +371,10 @@ fn ttl_purge_drops_fully_expired_segments_of_unpartitioned_table() {
     assert_eq!(scalar_i64(count), 0);
 
     let meta = engine.get_table_meta("main", "plain_ticks").expect("meta");
-    assert_eq!(meta.row_count, 0, "catalog row_count must drop with the files");
+    assert_eq!(
+        meta.row_count, 0,
+        "catalog row_count must drop with the files"
+    );
 
     // Idempotent: nothing left to reclaim.
     let reclaimed = engine.run_ttl_partition_purge().expect("purge 2");
@@ -422,7 +425,8 @@ fn ttl_purge_keeps_partially_expired_segments() {
     assert_eq!(reclaimed, 0, "partially-expired segment must be kept");
 
     let table_dir = temp_dir.path().join("main").join("mixed_ticks");
-    let segments = taibai::storage::segment_manager::SegmentManager::discover_segments(&table_dir).expect("discover");
+    let segments = taibai::storage::segment_manager::SegmentManager::discover_segments(&table_dir)
+        .expect("discover");
     assert_eq!(segments.len(), 1, "segment file must survive: {segments:?}");
     assert_eq!(
         total_physical_rows(temp_dir.path(), &engine, "main", "mixed_ticks"),

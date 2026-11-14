@@ -97,11 +97,8 @@ impl ExecutionOp for WindowExec {
             input_bytes = input_bytes.saturating_add(batch_bytes);
             if memory.reserve(input_bytes).is_err() {
                 let writer = spill_writer.get_or_insert_with(|| {
-                    super::super::spill::SpillWriter::create(
-                        self.input_schema.clone(),
-                        4096,
-                    )
-                    .expect("failed to create window spill writer")
+                    super::super::spill::SpillWriter::create(self.input_schema.clone(), 4096)
+                        .expect("failed to create window spill writer")
                 });
                 for b in batches.drain(..) {
                     spilled_bytes = spilled_bytes.saturating_add(b.estimated_size_bytes());

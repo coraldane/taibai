@@ -174,7 +174,10 @@ fn has_session_turns_false_after_removal_or_slow_consumer_drop() {
     assert!(log.has_session(&slow_tx));
     log.publish(tail_event("a"));
     log.publish(tail_event("b"));
-    assert!(!log.has_session(&slow_tx), "slow consumer should be dropped");
+    assert!(
+        !log.has_session(&slow_tx),
+        "slow consumer should be dropped"
+    );
     assert_eq!(log.session_count(), 0);
 }
 

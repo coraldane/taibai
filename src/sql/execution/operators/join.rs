@@ -513,9 +513,7 @@ impl ExecutionOp for HashJoinExec {
             JoinType::Semi if self.probe_state.fast_enabled => {
                 self.probe_fast(FastJoinPlan::BuildLeftProbeRight, true)
             }
-            JoinType::Anti if self.probe_state.fast_enabled => {
-                self.probe_fast_anti()
-            }
+            JoinType::Anti if self.probe_state.fast_enabled => self.probe_fast_anti(),
             JoinType::Asof | JoinType::LeftAsof => self.probe_asof(),
             JoinType::Inner => self.probe_inner(),
             JoinType::Left => self.probe_left(),

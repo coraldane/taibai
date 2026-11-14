@@ -1052,5 +1052,10 @@ fn start_watchdog(engine: Arc<Engine>) {
         std::process::abort();
     });
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    common::watchdog::spawn_supervised(common::watchdog::WatchdogConfig::default(), stop, canary, on_wedge);
+    common::watchdog::spawn_supervised(
+        common::watchdog::WatchdogConfig::default(),
+        stop,
+        canary,
+        on_wedge,
+    );
 }

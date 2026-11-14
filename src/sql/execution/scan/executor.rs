@@ -416,10 +416,7 @@ impl<'a> ScanExecutor<'a> {
     /// Phase 1 of [`Self::execute_scan_into`], run under the table flush
     /// read lock. Returns `Ok(None)` when a fast path produced the final
     /// answer and the general legs must not run.
-    fn snapshot_flush_phase<S: BatchSink>(
-        &mut self,
-        output: &mut S,
-    ) -> Result<Option<ScanPhase>> {
+    fn snapshot_flush_phase<S: BatchSink>(&mut self, output: &mut S) -> Result<Option<ScanPhase>> {
         let table_dir = self
             .runtime
             .data_dir()
@@ -490,7 +487,9 @@ impl<'a> ScanExecutor<'a> {
         // the snapshot defers physical deletion of these files by concurrent
         // compaction until the scan finishes.
         let segment_snapshot = if table_dir.exists() {
-            Some(crate::storage::segment::snapshot::snapshot_segments(&table_dir)?)
+            Some(crate::storage::segment::snapshot::snapshot_segments(
+                &table_dir,
+            )?)
         } else {
             None
         };
@@ -713,14 +712,13 @@ impl<'a> ScanExecutor<'a> {
                             {
                                 return Ok(None);
                             }
-                            let batch_result =
-                                super::strategy::read_row_group_with_strategy(
-                                    &self.spec,
-                                    plan,
-                                    &self.table_schema,
-                                    &reader,
-                                    row_group,
-                                );
+                            let batch_result = super::strategy::read_row_group_with_strategy(
+                                &self.spec,
+                                plan,
+                                &self.table_schema,
+                                &reader,
+                                row_group,
+                            );
                             let batch = batch_result?;
                             let batch = super::strategy::apply_ttl_filter_and_projection(
                                 batch,

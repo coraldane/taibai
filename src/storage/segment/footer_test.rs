@@ -308,7 +308,10 @@ fn lazy_index_decodes_every_row_group_identically_to_the_eager_parse() {
         let actual = index
             .decode_row_group(&footer, row_group)
             .unwrap_or_else(|err| panic!("row group {row_group}: {err}"));
-        assert_eq!(actual.offset, expected.offset, "row group {row_group} offset");
+        assert_eq!(
+            actual.offset, expected.offset,
+            "row group {row_group} offset"
+        );
         assert_eq!(
             actual.row_count, expected.row_count,
             "row group {row_group} row count"
@@ -346,9 +349,8 @@ fn lazy_index_costs_a_fixed_small_charge_per_row_group() {
     // And the point of the index: the decoded graph it replaces is an order
     // of magnitude larger for the same segment.
     let eager = parse_segment_footer(&large_footer).unwrap();
-    let eager_per_row_group =
-        crate::storage::segment::row_groups_heap_bytes(&eager.row_groups)
-            / eager.row_groups.len() as u64;
+    let eager_per_row_group = crate::storage::segment::row_groups_heap_bytes(&eager.row_groups)
+        / eager.row_groups.len() as u64;
     assert!(
         eager_per_row_group > 10 * per_row_group,
         "eager {eager_per_row_group} B vs index {per_row_group} B per row group"

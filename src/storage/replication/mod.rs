@@ -819,7 +819,10 @@ impl RepLog {
     /// sender clone, so its receiver would never observe a disconnect.
     pub fn has_session(&self, sink: &SessionSink) -> bool {
         let state = self.state.lock().unwrap();
-        state.sessions.iter().any(|sender| sender.same_channel(sink))
+        state
+            .sessions
+            .iter()
+            .any(|sender| sender.same_channel(sink))
     }
 
     pub fn session_count(&self) -> usize {

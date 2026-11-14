@@ -738,8 +738,7 @@ pub(super) fn tail_commit_loop(
                 last_group_size = group.len();
 
                 let has_rep = rep_log.get().is_some();
-                let written =
-                    write_append_group(&mut files, &mut compressor, group, has_rep);
+                let written = write_append_group(&mut files, &mut compressor, group, has_rep);
 
                 if async_fsync {
                     // Tail-append replication events are published INLINE on

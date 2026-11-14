@@ -1402,9 +1402,7 @@ fn show_version_returns_build_identity() {
         ExecResult::Query { batches, .. } => match batches[0].scalar(0, 0) {
             Some(ScalarValue::VarChar(Some(version))) => {
                 assert!(
-                    !version.is_empty()
-                        && version.contains("commit")
-                        && version.contains("built"),
+                    !version.is_empty() && version.contains("commit") && version.contains("built"),
                     "version must carry the build identity, got: {version}"
                 );
             }

@@ -714,11 +714,7 @@ pub fn exec_show_memory(engine: &Engine) -> Result<ExecResult> {
     // It was once the only metadata cache missing from this report, which is
     // exactly how it grew to 25 GiB unnoticed.
     let (meta_entries, meta_bytes, meta_budget) = engine.segment_mgr().segment_meta_cache_stats();
-    rows.push((
-        "segment_meta",
-        "cached_entries".into(),
-        meta_entries as u64,
-    ));
+    rows.push(("segment_meta", "cached_entries".into(), meta_entries as u64));
     rows.push(("segment_meta", "cached_heap_bytes".into(), meta_bytes));
     rows.push(("segment_meta", "cache_budget_bytes".into(), meta_budget));
     rows.push((
@@ -1016,12 +1012,14 @@ pub fn exec_analyze_table(engine: &Engine, db: &str, table: &str) -> Result<Exec
     // lease for the whole scan, so compaction defers physical deletion of
     // the listed files, while a long statistics pass cannot stall the flush
     // writer the way the previous lock-spanning-decode did.
-    let snapshot = engine.segment_mgr().with_table_flush_read_lock(db, table, || {
-        if !table_dir.exists() {
-            return Ok(None);
-        }
-        crate::storage::segment::snapshot::snapshot_segments(&table_dir).map(Some)
-    })?;
+    let snapshot = engine
+        .segment_mgr()
+        .with_table_flush_read_lock(db, table, || {
+            if !table_dir.exists() {
+                return Ok(None);
+            }
+            crate::storage::segment::snapshot::snapshot_segments(&table_dir).map(Some)
+        })?;
     let _lease = snapshot.as_ref();
     let paths = snapshot
         .as_ref()
@@ -1399,7 +1397,11 @@ pub fn exec_show_workload(engine: &Engine) -> Result<ExecResult> {
     for (pool, capacity, acquired, rejected) in crate::net::server::admission::snapshot() {
         rows.push(("admission", format!("{pool}.capacity"), capacity));
         rows.push(("admission", format!("{pool}.acquired_total"), acquired));
-        rows.push(("admission", format!("{pool}.rejected_overload_total"), rejected));
+        rows.push((
+            "admission",
+            format!("{pool}.rejected_overload_total"),
+            rejected,
+        ));
     }
 
     rows.push((
@@ -1413,11 +1415,7 @@ pub fn exec_show_workload(engine: &Engine) -> Result<ExecResult> {
         rows.push(("canary", "last_latency_ms".into(), latency_ms));
     }
     rows.push(("canary", "last_status".into(), status as u64));
-    rows.push((
-        "canary",
-        "consecutive_failures".into(),
-        failures as u64,
-    ));
+    rows.push(("canary", "consecutive_failures".into(), failures as u64));
 
     rows.push((
         "pools",

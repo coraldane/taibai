@@ -1538,9 +1538,7 @@ pub(super) fn meta_prune_row_groups(
         // row logically carries the column's DEFAULT, so every row group
         // stays a candidate (the reader gate routes drifted segments
         // through default-filled evaluation).
-        return Ok(MetaPrune::Candidates(
-            (0..meta.row_group_count()).collect(),
-        ));
+        return Ok(MetaPrune::Candidates((0..meta.row_group_count()).collect()));
     }
     let aligned = match align_prune_checks_to_footer(
         &spec.table_schema,

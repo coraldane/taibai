@@ -78,13 +78,8 @@ impl<K: Eq + Hash + Clone, V> ByteLru<K, V> {
                 entry.cost_bytes = cost_bytes;
             }
             None => {
-                self.entries.insert(
-                    key.clone(),
-                    Entry {
-                        value,
-                        cost_bytes,
-                    },
-                );
+                self.entries
+                    .insert(key.clone(), Entry { value, cost_bytes });
                 self.order.push_back(key);
             }
         }

@@ -11,14 +11,13 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 fn exec(engine: &Engine, session: &mut Session, sql: &str) -> std::result::Result<(), String> {
-    engine.execute(session, sql).map(|_| ()).map_err(|e| format!("{e}"))
+    engine
+        .execute(session, sql)
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
 }
 
-fn q_rows(
-    engine: &Engine,
-    session: &mut Session,
-    sql: &str,
-) -> std::result::Result<usize, String> {
+fn q_rows(engine: &Engine, session: &mut Session, sql: &str) -> std::result::Result<usize, String> {
     match engine.execute(session, sql) {
         Ok(ExecResult::Query { batches, .. }) => {
             let mut n = 0usize;
@@ -45,7 +44,12 @@ const DDL: &str = "CREATE TABLE s8 (
     )";
 
 /// 每天 200 行 × 8 天；sector_code 含日期后缀避免主键冲突。
-fn seed_day(engine: &Engine, session: &mut Session, day: i64, rows: i64) -> std::result::Result<(), String> {
+fn seed_day(
+    engine: &Engine,
+    session: &mut Session,
+    day: i64,
+    rows: i64,
+) -> std::result::Result<(), String> {
     for i in 0..rows {
         let sql = format!(
             "INSERT INTO s8 VALUES ({}, 'BK{:04}', '板块{}', 1.5, -0.25, {}, 2, 12.3, '[]')",
@@ -69,7 +73,16 @@ fn s8_full_incident_sequence() {
         exec(&engine, &mut session, DDL).expect("create");
 
         // 11 月 8 个交易日 × 200 行，落盘成旧 schema 段
-        for day in [20261028i64, 20261029, 20261030, 20261102, 20261103, 20261104, 20261105, 20261106] {
+        for day in [
+            20261028i64,
+            20261029,
+            20261030,
+            20261102,
+            20261103,
+            20261104,
+            20261105,
+            20261106,
+        ] {
             seed_day(&engine, &mut session, day, 200).expect("seed");
         }
         exec(&engine, &mut session, "FLUSH TABLE s8").expect("flush");
@@ -77,18 +90,47 @@ fn s8_full_incident_sequence() {
 
         // 22:22 / 22:25 两轮回补：每轮先删全部 8 天、INSERT 因缺列失败 →
         // 到 22:43 前表里旧数据已全部删除（只剩删除位图挂在旧段上）
-        for day in [20261028i64, 20261029, 20261030, 20261102, 20261103, 20261104, 20261105, 20261106] {
-            exec(&engine, &mut session, &format!("DELETE FROM s8 WHERE deal_date = {day}"))
-                .unwrap_or_else(|e| println!("  delete {day} err: {e}"));
+        for day in [
+            20261028i64,
+            20261029,
+            20261030,
+            20261102,
+            20261103,
+            20261104,
+            20261105,
+            20261106,
+        ] {
+            exec(
+                &engine,
+                &mut session,
+                &format!("DELETE FROM s8 WHERE deal_date = {day}"),
+            )
+            .unwrap_or_else(|e| println!("  delete {day} err: {e}"));
         }
         println!("  deleted all 8 days (22:22+22:25 backfill rounds)");
 
         // ALTER（22:25~22:43 之间发生）
-        println!("  alter: {:?}", exec(&engine, &mut session, "ALTER TABLE s8 ADD COLUMN bottom_chg FLOAT64 DEFAULT 0"));
+        println!(
+            "  alter: {:?}",
+            exec(
+                &engine,
+                &mut session,
+                "ALTER TABLE s8 ADD COLUMN bottom_chg FLOAT64 DEFAULT 0"
+            )
+        );
 
         // 22:43 回补：重插全部 8 天（新 schema）
         let ins = |session: &mut Session| -> std::result::Result<(), String> {
-            for day in [20261028i64, 20261029, 20261030, 20261102, 20261103, 20261104, 20261105, 20261106] {
+            for day in [
+                20261028i64,
+                20261029,
+                20261030,
+                20261102,
+                20261103,
+                20261104,
+                20261105,
+                20261106,
+            ] {
                 for i in 0..200i64 {
                     let sql = format!(
                         "INSERT INTO s8 VALUES ({}, 'BK{:04}', '板块{}', 1.5, -0.25, {}, 2, 12.3, '[]', 0.4)",
@@ -107,14 +149,25 @@ fn s8_full_incident_sequence() {
         println!("  reinserted 8 days x 200 rows (new schema), flushed");
 
         // 读验证（此时应当正常）
-        match q_rows(&engine, &mut session, "SELECT deal_date FROM s8 WHERE deal_date = 20261106") {
+        match q_rows(
+            &engine,
+            &mut session,
+            "SELECT deal_date FROM s8 WHERE deal_date = 20261106",
+        ) {
             Ok(n) => println!("  read before optimize: OK rows={n}"),
             Err(e) => println!("  read before optimize: ERR {e}"),
         }
 
         // 模拟后台 auto-compact
-        println!("  optimize: {:?}", exec(&engine, &mut session, "OPTIMIZE TABLE s8"));
-        match q_rows(&engine, &mut session, "SELECT deal_date FROM s8 WHERE deal_date = 20261106") {
+        println!(
+            "  optimize: {:?}",
+            exec(&engine, &mut session, "OPTIMIZE TABLE s8")
+        );
+        match q_rows(
+            &engine,
+            &mut session,
+            "SELECT deal_date FROM s8 WHERE deal_date = 20261106",
+        ) {
             Ok(n) => println!("  read after optimize: OK rows={n}"),
             Err(e) => println!("  read after optimize: ERR {e}"),
         }
@@ -124,11 +177,19 @@ fn s8_full_incident_sequence() {
     // 重启后读（对应第二天才有人访问 /market）
     let engine = Engine::new(temp_dir.path(), "main").expect("engine restart");
     let mut session = Session::new("root".to_string(), "main".to_string());
-    match q_rows(&engine, &mut session, "SELECT deal_date FROM s8 WHERE deal_date = 20261106") {
+    match q_rows(
+        &engine,
+        &mut session,
+        "SELECT deal_date FROM s8 WHERE deal_date = 20261106",
+    ) {
         Ok(n) => println!("  read after restart: OK rows={n}"),
         Err(e) => println!("  read after restart: ERR {e}"),
     }
-    match q_rows(&engine, &mut session, "SELECT deal_date, bottom_chg FROM s8") {
+    match q_rows(
+        &engine,
+        &mut session,
+        "SELECT deal_date, bottom_chg FROM s8",
+    ) {
         Ok(n) => println!("  full scan after restart: OK rows={n}"),
         Err(e) => println!("  full scan after restart: ERR {e}"),
     }
@@ -164,7 +225,10 @@ fn s9_concurrent_dml_during_alter() {
                 i % 10
             );
             let _ = engine_w.execute(&mut session, &sql);
-            let _ = engine_w.execute(&mut session, "DELETE FROM s8 WHERE deal_date = 20261304 AND sector_code LIKE 'BKX99%'");
+            let _ = engine_w.execute(
+                &mut session,
+                "DELETE FROM s8 WHERE deal_date = 20261304 AND sector_code LIKE 'BKX99%'",
+            );
             i += 1;
         }
         i
@@ -193,7 +257,11 @@ fn s9_concurrent_dml_during_alter() {
     println!("  writer did {writes} ops");
 
     let mut session = Session::new("root".to_string(), "main".to_string());
-    match q_rows(&engine, &mut session, "SELECT deal_date, c0, c1, c2 FROM s8") {
+    match q_rows(
+        &engine,
+        &mut session,
+        "SELECT deal_date, c0, c1, c2 FROM s8",
+    ) {
         Ok(n) => println!("  final read: OK rows={n}"),
         Err(e) => println!("  final read: ERR {e}"),
     }

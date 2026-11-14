@@ -98,7 +98,11 @@ fn evicts_the_least_recently_used_entry_when_over_budget() {
     let b = write_segment(temp.path(), "b.seg", 16);
     let c = write_segment(temp.path(), "c.seg", 16);
     let cost = entry_cost(&a);
-    assert_eq!(cost, entry_cost(&b), "identical segments must cost the same");
+    assert_eq!(
+        cost,
+        entry_cost(&b),
+        "identical segments must cost the same"
+    );
 
     let mut cache = SegmentMetaCache::new(cost * 2);
     cache.put(a.clone(), snapshot(&a));

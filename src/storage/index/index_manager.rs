@@ -256,7 +256,9 @@ impl IndexManager {
         table: &str,
         index_name: &str,
     ) -> Result<bool> {
-        Ok(self.load_unique_index_state(db, table, index_name)?.is_some())
+        Ok(self
+            .load_unique_index_state(db, table, index_name)?
+            .is_some())
     }
 
     fn load_unique_index_state(

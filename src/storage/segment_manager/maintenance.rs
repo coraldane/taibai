@@ -499,7 +499,10 @@ impl SegmentManager {
             let names = committed
                 .iter()
                 .map(|candidate| candidate.path.clone())
-                .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+                .filter_map(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
                 .collect::<Vec<_>>();
             self.emit_segments_removed(table_dir, &names);
             rows_reclaimed += committed

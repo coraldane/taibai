@@ -303,21 +303,21 @@ impl Handler {
                     "panicked while rolling back open transaction on disconnect; \
                      forcing txn mutation cleanup"
                 );
-                if let Err(cleanup_err) = std::panic::catch_unwind(
-                    std::panic::AssertUnwindSafe(|| {
+                if let Err(cleanup_err) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let _ = self.engine.batch_writer().rollback_txn(txn_id);
                         self.engine
                             .index_manager()
                             .discard_txn_published_entries_at_rollback(txn_id);
-                    }),
-                ) {
+                    }))
+                {
                     tracing::error!(
                         txn_id,
                         "cleanup after rollback panic also panicked: {:?}",
                         cleanup_err
                     );
                 }
-            },
+            }
         }
     }
 
@@ -675,7 +675,8 @@ impl Handler {
             }
             Ok(ExecResult::Query { schema, batches }) => {
                 let encode_start = Instant::now();
-                let encoded = crate::protocol::result::encode_binary_result_batches(&schema, &batches);
+                let encoded =
+                    crate::protocol::result::encode_binary_result_batches(&schema, &batches);
                 drop(batches);
                 let timings = ServerTimings {
                     total: server_start.elapsed(),
@@ -1085,7 +1086,8 @@ impl Handler {
             }
             Ok(ExecResult::Query { schema, batches }) => {
                 let encode_start = Instant::now();
-                let encoded = crate::protocol::result::encode_binary_result_batches(&schema, &batches);
+                let encoded =
+                    crate::protocol::result::encode_binary_result_batches(&schema, &batches);
                 drop(batches);
                 let timings = ServerTimings {
                     total: server_start.elapsed(),

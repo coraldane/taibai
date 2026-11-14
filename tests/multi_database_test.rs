@@ -661,7 +661,11 @@ fn show_workload_reports_admission_canary_and_fast_path_counters() {
         .execute(&mut session, "CREATE TABLE t_wl (id INT64)")
         .expect("create table");
 
-    let rows = show_memory_rows(engine.execute(&mut session, "SHOW WORKLOAD").expect("show workload"));
+    let rows = show_memory_rows(
+        engine
+            .execute(&mut session, "SHOW WORKLOAD")
+            .expect("show workload"),
+    );
     let value = |component: &str, name: &str| -> Option<i64> {
         rows.iter()
             .find(|(c, n, _)| c == component && n == name)
@@ -699,7 +703,10 @@ fn show_workload_reports_admission_canary_and_fast_path_counters() {
         .find(|(c, n, _)| c == "fast_path" && n == "metadata_answers_total")
         .map(|(_, _, v)| *v)
         .expect("fast path counter");
-    assert!(folded >= 1, "MAX(id) should have folded to metadata, got {folded}");
+    assert!(
+        folded >= 1,
+        "MAX(id) should have folded to metadata, got {folded}"
+    );
 
     engine.segment_mgr().shutdown();
 }

@@ -448,17 +448,18 @@ impl PartitionedOuterJoin {
         let partitions = build_files
             .into_iter()
             .zip(probe_files)
-            .filter_map(|(build, probe)| {
-                match (build, probe) {
-                    (Some(b), Some(p)) => Some(JoinPartition { build: b, probe: p }),
-                    (Some(b), None) if emit_unmatched_build => {
-                        let empty_probe = SpillWriter::create(probe_schema.clone(), batch_rows)
-                            .and_then(|w| w.finish())
-                            .ok()?;
-                        Some(JoinPartition { build: b, probe: empty_probe })
-                    }
-                    _ => None,
+            .filter_map(|(build, probe)| match (build, probe) {
+                (Some(b), Some(p)) => Some(JoinPartition { build: b, probe: p }),
+                (Some(b), None) if emit_unmatched_build => {
+                    let empty_probe = SpillWriter::create(probe_schema.clone(), batch_rows)
+                        .and_then(|w| w.finish())
+                        .ok()?;
+                    Some(JoinPartition {
+                        build: b,
+                        probe: empty_probe,
+                    })
                 }
+                _ => None,
             })
             .collect();
         Ok(Self {
@@ -581,12 +582,7 @@ impl PartitionedOuterJoin {
                 } else {
                     (probe_row.clone(), build_row)
                 };
-                if join_rows_match_expr(
-                    &self.condition,
-                    &left_row,
-                    &right_row,
-                    left_col_count,
-                )? {
+                if join_rows_match_expr(&self.condition, &left_row, &right_row, left_col_count)? {
                     append_output_row(&mut output, &left_row, &right_row)?;
                 }
                 continue;

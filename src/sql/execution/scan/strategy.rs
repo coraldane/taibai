@@ -282,13 +282,14 @@ pub fn prune_segment(spec: &ScanSpec, reader: &SegmentReader) -> Option<RowGroup
             std::slice::from_ref(&clause.column_index),
         ) {
             if let Some(&footer_col) = footer_cols.first() {
-                aligned.predicate.clauses.push(
-                    crate::storage::partition::pruning::RangeClause {
+                aligned
+                    .predicate
+                    .clauses
+                    .push(crate::storage::partition::pruning::RangeClause {
                         column_index: footer_col,
                         op: clause.op,
                         value: clause.value.clone(),
-                    },
-                );
+                    });
             }
         }
     }

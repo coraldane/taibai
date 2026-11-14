@@ -166,7 +166,10 @@ fn limit_scan_skips_fully_expired_segments() {
     assert_eq!(scalar_i64(count), 2);
 
     let limit_one = engine
-        .execute(&mut session, "SELECT COUNT(*) FROM (SELECT * FROM ticks LIMIT 1) AS t")
+        .execute(
+            &mut session,
+            "SELECT COUNT(*) FROM (SELECT * FROM ticks LIMIT 1) AS t",
+        )
         .expect("limit one");
     assert_eq!(scalar_i64(limit_one), 1);
 
@@ -219,11 +222,18 @@ fn boundary_row_group_is_kept_and_row_filtered() {
     let count = engine
         .execute(&mut session, "SELECT COUNT(*) FROM boundary")
         .expect("count");
-    assert_eq!(scalar_i64(count), 3, "expired row filtered, three live kept");
+    assert_eq!(
+        scalar_i64(count),
+        3,
+        "expired row filtered, three live kept"
+    );
 
     let report = collect_text(
         engine
-            .execute(&mut session, "EXPLAIN ANALYZE SELECT COUNT(*) FROM boundary")
+            .execute(
+                &mut session,
+                "EXPLAIN ANALYZE SELECT COUNT(*) FROM boundary",
+            )
             .expect("explain"),
     );
     let read = row_groups_field(&report, "read");

@@ -1382,7 +1382,10 @@ fn batch_execute_rejects_oversized_batch_size() {
         .unwrap();
 
     let mut prep_payload = Vec::new();
-    write_len_prefixed_string(&mut prep_payload, "INSERT INTO batch_oversized VALUES (?, ?)");
+    write_len_prefixed_string(
+        &mut prep_payload,
+        "INSERT INTO batch_oversized VALUES (?, ?)",
+    );
     let prepared = handler
         .handle_message(Message::new(MSG_TYPE_PREPARE, Bytes::from(prep_payload)))
         .unwrap();
@@ -1402,7 +1405,11 @@ fn batch_execute_rejects_oversized_batch_size() {
     assert_eq!(response.len(), 1);
     assert_ne!(response[0].msg_type, MSG_TYPE_PREPARE);
     let text = String::from_utf8_lossy(&response[0].payload);
-    assert!(text.contains("exceeds limit"), "unexpected response: {}", text);
+    assert!(
+        text.contains("exceeds limit"),
+        "unexpected response: {}",
+        text
+    );
 
     // The prepared statement must still be usable after the rejection.
     let mut ok_payload = Vec::new();
@@ -1411,11 +1418,13 @@ fn batch_execute_rejects_oversized_batch_size() {
     append_int64_param(&mut ok_payload, 1);
     append_int64_param(&mut ok_payload, 10);
     let response = handler
-        .handle_message(Message::new(MSG_TYPE_BATCH_EXECUTE, Bytes::from(ok_payload)))
+        .handle_message(Message::new(
+            MSG_TYPE_BATCH_EXECUTE,
+            Bytes::from(ok_payload),
+        ))
         .unwrap();
     assert_eq!(ok_rows(&response), 1);
 }
-
 
 mod replication_push_bridge_tests {
     use super::*;

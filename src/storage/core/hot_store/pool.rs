@@ -86,8 +86,7 @@ impl StringPool {
                 // Ids are never reused; wrapping would silently alias a new
                 // string onto ids still embedded in live postings.
                 let next = self.base as u64 + self.reverse.len() as u64;
-                let id = u32::try_from(next)
-                    .expect("string pool id space exhausted (u32)");
+                let id = u32::try_from(next).expect("string pool id space exhausted (u32)");
                 self.reverse.push(Some(s.to_string()));
                 self.forward.insert(s.to_string(), id);
                 id

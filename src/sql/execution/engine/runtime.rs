@@ -57,10 +57,7 @@ impl Engine {
     /// shape. Tables without statistics sort last; an empty catalog yields
     /// no table and the caller falls back to a bare SELECT 1.
     pub fn canary_target(&self) -> (String, Option<String>) {
-        let catalogs = self
-            .catalogs
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let catalogs = self.catalogs.read().unwrap_or_else(|e| e.into_inner());
         let mut best: Option<(i64, String, String)> = None;
         for (db, catalog) in catalogs.iter() {
             if db.starts_with('.') {

@@ -609,7 +609,10 @@ fn executor_scan_sees_each_row_exactly_once_across_concurrent_flushes() {
         )
         .expect("create table");
     engine
-        .execute(&mut setup, "INSERT INTO t_snapshot_scan (pad) VALUES (1), (2), (3)")
+        .execute(
+            &mut setup,
+            "INSERT INTO t_snapshot_scan (pad) VALUES (1), (2), (3)",
+        )
         .expect("seed rows");
     engine
         .flush_table_buffers("main", "t_snapshot_scan")
@@ -670,7 +673,10 @@ fn executor_scan_sees_each_row_exactly_once_across_concurrent_flushes() {
 
     let mut verifier = session();
     let final_scan = engine
-        .execute(&mut verifier, "SELECT id FROM t_snapshot_scan WHERE id >= 0")
+        .execute(
+            &mut verifier,
+            "SELECT id FROM t_snapshot_scan WHERE id >= 0",
+        )
         .expect("final scan");
     let ids = int64_column_values(final_scan);
     assert_eq!(ids.len() as u64, inserted + 3, "final row count");

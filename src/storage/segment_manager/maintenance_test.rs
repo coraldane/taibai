@@ -184,37 +184,27 @@ fn ttl_cleanup_drops_only_fully_expired_segments() -> Result<()> {
         name: "ts".to_string(),
         previous_names: Vec::new(),
     };
-    let snapshot =
-        manager.capture_maintenance_snapshot("db", "t", &table_dir, Some(&ttl_ctx))?;
-    let rows = manager.cleanup_ttl_expired_segments(
-        "db",
-        "t",
-        &table_dir,
-        &snapshot,
-        "ts",
-        duration,
-        now,
-    )?;
-    assert_eq!(rows, 2, "only the fully-expired segment's rows are reclaimed");
+    let snapshot = manager.capture_maintenance_snapshot("db", "t", &table_dir, Some(&ttl_ctx))?;
+    let rows = manager
+        .cleanup_ttl_expired_segments("db", "t", &table_dir, &snapshot, "ts", duration, now)?;
+    assert_eq!(
+        rows, 2,
+        "only the fully-expired segment's rows are reclaimed"
+    );
     // The snapshot lease keeps retired files readable until it drops.
-    assert!(straddling.exists(), "cutoff-straddling segment must be kept");
+    assert!(
+        straddling.exists(),
+        "cutoff-straddling segment must be kept"
+    );
     assert!(live.exists(), "live segment must be kept");
     drop(snapshot);
     assert!(!expired.exists(), "expired segment file must be gone");
 
     // Idempotent.
-    let snapshot =
-        manager.capture_maintenance_snapshot("db", "t", &table_dir, Some(&ttl_ctx))?;
+    let snapshot = manager.capture_maintenance_snapshot("db", "t", &table_dir, Some(&ttl_ctx))?;
     assert_eq!(
-        manager.cleanup_ttl_expired_segments(
-            "db",
-            "t",
-            &table_dir,
-            &snapshot,
-            "ts",
-            duration,
-            now
-        )?,
+        manager
+            .cleanup_ttl_expired_segments("db", "t", &table_dir, &snapshot, "ts", duration, now)?,
         0
     );
     drop(snapshot);
@@ -240,7 +230,10 @@ fn ttl_cleanup_keeps_segments_with_null_timestamps() -> Result<()> {
         .column_mut(0)
         .unwrap()
         .push(&ScalarValue::Timestamp(Some(old)))?;
-    batch.column_mut(0).unwrap().push(&ScalarValue::Timestamp(None))?;
+    batch
+        .column_mut(0)
+        .unwrap()
+        .push(&ScalarValue::Timestamp(None))?;
     let mut writer = SegmentWriter::create(&path, schema, 8192, 3)?;
     writer.write_batch(&batch)?;
     writer.seal()?;
@@ -250,18 +243,10 @@ fn ttl_cleanup_keeps_segments_with_null_timestamps() -> Result<()> {
         name: "ts".to_string(),
         previous_names: Vec::new(),
     };
-    let snapshot =
-        manager.capture_maintenance_snapshot("db", "t", &table_dir, Some(&ttl_ctx))?;
+    let snapshot = manager.capture_maintenance_snapshot("db", "t", &table_dir, Some(&ttl_ctx))?;
     assert_eq!(
-        manager.cleanup_ttl_expired_segments(
-            "db",
-            "t",
-            &table_dir,
-            &snapshot,
-            "ts",
-            duration,
-            now
-        )?,
+        manager
+            .cleanup_ttl_expired_segments("db", "t", &table_dir, &snapshot, "ts", duration, now)?,
         0,
         "a NULL in the ttl zone must keep the segment"
     );

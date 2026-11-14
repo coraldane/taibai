@@ -70,10 +70,7 @@ fn fully_deleted_row_group_is_skipped_at_enumeration() {
     let mut session = Session::new("root".to_string(), "main".to_string());
 
     engine
-        .execute(
-            &mut session,
-            "CREATE TABLE delrg (id INT64, v DOUBLE)",
-        )
+        .execute(&mut session, "CREATE TABLE delrg (id INT64, v DOUBLE)")
         .expect("create delrg");
 
     // Two row groups' worth of rows (default row_group_size = 8192) in one

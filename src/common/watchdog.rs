@@ -10,7 +10,7 @@
 //! additionally cover total runtime stalls the canary thread itself cannot
 //! observe, via systemd's `WatchdogSec`.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -279,7 +279,9 @@ mod tests {
         let metrics = CanaryMetrics::new();
 
         let canary: Canary = Arc::new(|| {
-            Err(crate::common::error::TaibaiError::Internal("canary down".into()))
+            Err(crate::common::error::TaibaiError::Internal(
+                "canary down".into(),
+            ))
         });
         let fired_flag = Arc::clone(&fired);
         let seen = Arc::clone(&hook_seen);
@@ -302,10 +304,7 @@ mod tests {
         assert!(seen.message.contains("aborting"));
 
         assert_eq!(metrics.last_status.load(Ordering::Relaxed), CANARY_FAILED);
-        assert_eq!(
-            metrics.consecutive_failures.load(Ordering::Relaxed),
-            3
-        );
+        assert_eq!(metrics.consecutive_failures.load(Ordering::Relaxed), 3);
     }
 
     #[test]
@@ -318,7 +317,9 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let metrics = CanaryMetrics::new();
         let failing: Canary = Arc::new(|| {
-            Err(crate::common::error::TaibaiError::Internal("canary down".into()))
+            Err(crate::common::error::TaibaiError::Internal(
+                "canary down".into(),
+            ))
         });
         let ok: Canary = Arc::new(|| Ok(()));
         let never: WedgeHook = Arc::new(|_| panic!("wedge hook must not fire"));
@@ -359,7 +360,10 @@ mod tests {
         drop(hung_tx);
         assert!(wedged, "single-round threshold must fire on a timeout");
         assert!(fired.load(Ordering::Acquire));
-        assert_eq!(metrics.last_status.load(Ordering::Relaxed), CANARY_TIMED_OUT);
+        assert_eq!(
+            metrics.last_status.load(Ordering::Relaxed),
+            CANARY_TIMED_OUT
+        );
     }
 
     struct WatchdogReportSnapshot {

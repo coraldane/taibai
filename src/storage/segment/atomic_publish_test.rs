@@ -28,7 +28,10 @@ fn batch_two(rows: i64) -> RecordBatch {
     let schema = schema_two();
     let mut batch = RecordBatch::new(schema.clone());
     for i in 0..rows {
-        let _ = batch.column_mut(0).unwrap().push(&ScalarValue::Int64(Some(i)));
+        let _ = batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(i)));
         let _ = batch
             .column_mut(1)
             .unwrap()
@@ -139,7 +142,8 @@ fn corrupt_segment_is_quarantined_at_reader_open() {
     // 后续 discovery 只剩健康段；健康段照常可读
     let discovered = store::discover_segments(dir).unwrap();
     assert_eq!(discovered, vec![good_path.clone()]);
-    mgr.open_reader(&good_path).expect("good segment stays readable");
+    mgr.open_reader(&good_path)
+        .expect("good segment stays readable");
 }
 
 /// 隔离的坏文件内容保留（可取证），名字不再匹配段文件模式。

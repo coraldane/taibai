@@ -1092,11 +1092,15 @@ impl SegmentReader {
         // Narrow to the row group with a binary search over the resident
         // row-count prefix. The walk this replaced decoded every preceding
         // row group's metadata just to locate one row.
-        let target_rg = match self.row_group_starts.binary_search(&(global_row_idx as u64)) {
+        let target_rg = match self
+            .row_group_starts
+            .binary_search(&(global_row_idx as u64))
+        {
             Ok(index) => index.min(self.footer.index.num_row_groups().saturating_sub(1)),
             Err(index) => index.saturating_sub(1),
         };
-        let local_row_idx = global_row_idx.saturating_sub(self.row_group_start_row(target_rg) as usize);
+        let local_row_idx =
+            global_row_idx.saturating_sub(self.row_group_start_row(target_rg) as usize);
 
         let mut column_indices = Vec::with_capacity(column_names.len());
         for name in column_names {
