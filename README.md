@@ -4,11 +4,8 @@
 
 <sub>An open-source columnar database in Rust, built for market-data / tick workloads.</sub>
 
-![status](https://img.shields.io/badge/status-experimental-orange)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![rust](https://img.shields.io/badge/rust-stable-dea584)
-
-> **项目状态：实验性。** 当前 `0.x` 版本适合数据库内核研究、功能验证与性能压测，尚未声明生产就绪。数据格式、协议、配置与 SQL 行为仍可能发生不兼容变化，详见[项目状态与限制](docs/user-guide/limitations.md)。
 
 ---
 
