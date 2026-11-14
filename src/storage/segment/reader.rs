@@ -130,8 +130,34 @@ impl SegmentReader {
         Self::open_inner(path, false)
     }
 
+    /// Open a segment and read it into an owned buffer.
+    ///
+    /// An active segment is rewritten in place by the flush thread (append a
+    /// row group, republish the footer). An open that lands inside that window
+    /// either reads fewer bytes than its opening metadata reported or parses a
+    /// footer that is mid-rewrite; both surface as `Storage` errors and are
+    /// transient, so retry with a short backoff. Sealed segments are immutable
+    /// and succeed on the first attempt.
     pub fn open_owned(path: &Path) -> Result<Self> {
-        Self::open_inner(path, true)
+        const ATTEMPTS: usize = 5;
+        let mut last_error = None;
+        for attempt in 0..ATTEMPTS {
+            match Self::open_inner(path, true) {
+                Ok(reader) => return Ok(reader),
+                Err(error) => {
+                    let retryable = matches!(error, TaibaiError::Storage(_));
+                    last_error = Some(error);
+                    if !retryable || attempt + 1 == ATTEMPTS {
+                        break;
+                    }
+                    // 1, 2, 4, 8 ms: the flush window is microseconds wide, so
+                    // a few short naps keep the scan from re-entering it while
+                    // staying far below the cost of a wasted decode.
+                    std::thread::sleep(std::time::Duration::from_millis(1u64 << attempt));
+                }
+            }
+        }
+        Err(last_error.expect("at least one attempt ran"))
     }
 
     fn open_inner(path: &Path, owned: bool) -> Result<Self> {

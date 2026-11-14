@@ -460,13 +460,24 @@ impl ActiveSegmentWriter {
         }
 
         self.file.flush()?;
-        self.file.get_ref().set_len(self.data_end)?;
+        // Overwrite the previous footer in place and only trim afterwards when
+        // the new footer is shorter. Truncating to `data_end` first shrank the
+        // file while a concurrent reader could be opening it: the reader's
+        // opening metadata length then exceeded what the file still held, and
+        // `read_exact` failed with "segment file changed while opening" on
+        // Linux (on Windows the set_len itself blocks, see
+        // `apply_footer_bytes_with_retry`). Writing before trimming means the
+        // file never shrinks below the bytes already published.
         self.file.seek(SeekFrom::Start(self.data_end))?;
 
         let footer = self.encode_footer()?;
         self.file.write_all(&footer)?;
         self.file.write_all(&self.data_end.to_le_bytes())?;
         self.file.flush()?;
+        let published_len = self.data_end + footer.len() as u64 + 8;
+        if self.file.get_ref().metadata()?.len() > published_len {
+            self.file.get_ref().set_len(published_len)?;
+        }
         // A single sync_all is the durability barrier for both the row-group
         // bytes and the footer that publishes them; a second sync before the
         // footer doubled the per-row-group fsync cost without adding a
