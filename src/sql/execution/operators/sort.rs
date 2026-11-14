@@ -89,7 +89,7 @@ impl SortExec {
             buffered.push(batch);
             if buffered_bytes >= self.memory_limit_bytes || !memory.try_resize(buffered_bytes) {
                 let sorted = sort_batches(
-                    &buffered,
+                    std::mem::take(&mut buffered),
                     output_schema.as_ref().unwrap().clone(),
                     sort_exprs.as_ref().unwrap(),
                     self.limit,
@@ -99,7 +99,6 @@ impl SortExec {
                     &[sorted],
                     spill_rows,
                 )?);
-                buffered.clear();
                 buffered_bytes = 0;
                 memory.release();
             }
@@ -112,13 +111,13 @@ impl SortExec {
         let sort_exprs = sort_exprs.unwrap_or_default();
 
         if spills.is_empty() {
-            let sorted = sort_batches(&buffered, output_schema, &sort_exprs, self.limit)?;
+            let sorted = sort_batches(buffered, output_schema, &sort_exprs, self.limit)?;
             self.state = SortState::InMemory(Some(sorted));
             return Ok(());
         }
 
         if !buffered.is_empty() {
-            let sorted = sort_batches(&buffered, output_schema.clone(), &sort_exprs, self.limit)?;
+            let sorted = sort_batches(buffered, output_schema.clone(), &sort_exprs, self.limit)?;
             spills.push(SpillFile::write_batches(
                 sorted.schema.clone(),
                 &[sorted],
@@ -161,7 +160,7 @@ impl ExecutionOp for SortExec {
 }
 
 fn sort_batches(
-    batches: &[RecordBatch],
+    batches: Vec<RecordBatch>,
     output_schema: Schema,
     sort_exprs: &[(LogicalExpr, bool)],
     limit: Option<usize>,
@@ -175,11 +174,13 @@ fn sort_batches(
         .iter()
         .map(|column| ColumnArray::with_capacity(column.data_type, total_rows))
         .collect::<Vec<_>>();
-    for batch in batches {
+    for batch in &batches {
         for (index, column) in batch.columns.iter().enumerate() {
             columns[index].extend(column)?;
         }
     }
+    // Drop the originals before sorting to avoid 2x peak memory.
+    drop(batches);
     let merged = RecordBatch::try_new(output_schema.clone(), columns)?;
     let evaluated_keys = evaluate_batch_sort_key_columns(sort_exprs, &merged)?;
     let mut rows = (0..total_rows as u32).collect::<Vec<_>>();

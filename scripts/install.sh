@@ -6,6 +6,7 @@ PREFIX="/usr/local/taibai"
 INSTALL_SERVICE=true
 CONFIG_FILE=""
 DATA_DIR=""
+DATA_DIR_EXPLICIT=""
 
 print_help() {
     cat << EOF
@@ -43,6 +44,7 @@ for arg in "$@"; do
             ;;
         -data-dir=*)
             DATA_DIR="${arg#-data-dir=}"
+            DATA_DIR_EXPLICIT=1
             ;;
         -no-service)
             INSTALL_SERVICE=false
@@ -170,12 +172,17 @@ EOF
     fi
 fi
 
-if [ -f "$CONFIG_DEST" ]; then
-    if grep -q "data_dir:" "$CONFIG_DEST" 2>/dev/null; then
+# Rewrite the configured data_dir ONLY when the operator explicitly passed
+# -data-dir. Unconditionally rewriting it with the default silently pointed
+# existing deployments at an empty catalog on upgrade (hz-dev-204,
+# 2026-11-06): the server booted, every database "stopped existing", and the
+# real data directory sat untouched a mount point away.
+if [ -n "$DATA_DIR_EXPLICIT" ] && [ -f "$CONFIG_DEST" ]; then
+    if grep -q "^[[:space:]]*data_dir:" "$CONFIG_DEST" 2>/dev/null; then
         if [ "$OS" = "Darwin" ]; then
-            sed -i '' "s|data_dir:.*|data_dir: \"$DATA_DIR\"|" "$CONFIG_DEST" 2>/dev/null || true
+            sed -i '' "s|^[[:space:]]*data_dir:.*|data_dir: \"$DATA_DIR\"|" "$CONFIG_DEST" 2>/dev/null || true
         else
-            sed -i "s|data_dir:.*|data_dir: \"$DATA_DIR\"|" "$CONFIG_DEST" 2>/dev/null || true
+            sed -i "s|^[[:space:]]*data_dir:.*|data_dir: \"$DATA_DIR\"|" "$CONFIG_DEST" 2>/dev/null || true
         fi
     fi
 fi
@@ -191,9 +198,24 @@ After=network.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# Type=notify：服务在监听就绪后 sd_notify READY=1，看门狗线程每轮 canary
+# 发 WATCHDOG=1 心跳。进程"活着但卡死"（2026-11-05 事故形态）时 canary
+# 连续失败 3 次自动 abort，由 Restart 拉起；连看门狗自身都停摆的极端
+# 场景由 WatchdogSec 兜底（90s = 3×(15s 间隔+10s 超时) + 余量）。
+Type=notify
+WatchdogSec=90
 User=root
 Group=root
+# jemalloc 参数：background_thread 让 decay 在进程空闲时也持续推进，
+# 否则导入等大分配高峰结束后，已释放的 extent 会长期滞留在 RSS 里。
+# 注意：tikv-jemalloc 以 _rjem_ 前缀编译，实际读取的是 _RJEM_MALLOC_CONF
+# （配置文件名也是 /etc/_rjem_malloc.conf）。两个都设，避免依赖构建细节。
+Environment="MALLOC_CONF=background_thread:true,dirty_decay_ms:500,muzzy_decay_ms:0,narenas:16"
+Environment="_RJEM_MALLOC_CONF=background_thread:true,dirty_decay_ms:500,muzzy_decay_ms:0,narenas:16"
+# 内存护栏：MemoryHigh 触发软限回收（勿低于实际工作集，否则会持续节流），
+# MemoryMax 兜底防止异常增长拖垮整机。
+MemoryHigh=32G
+MemoryMax=64G
 ExecStart=$BIN_DIR/taibai --config $CONF_DIR/taibai.yaml
 Restart=on-failure
 RestartSec=5

@@ -302,7 +302,7 @@ pub(crate) fn match_segment_for_delete(
             continue;
         }
         if let Some(pred) = &aligned_predicate {
-            if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
+            if !pred.matches_row_group(&reader.zone_maps(rg_idx)) {
                 row_id += rg_rows;
                 continue;
             }

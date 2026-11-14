@@ -466,8 +466,69 @@ pub type SessionSink = crossbeam_channel::Sender<(u64, Arc<ReplicationEvent>)>;
 struct RepLogState {
     next_seq: u64,
     ring: VecDeque<(u64, Arc<ReplicationEvent>)>,
+    /// Approximate heap bytes held by `ring`. The ring is bounded by entry
+    /// count, not bytes, so this is the only visibility into how much memory
+    /// the retained events actually pin (exposed via `ring_stats`).
+    ring_bytes: u64,
     sessions: Vec<SessionSink>,
     unpersisted: u64,
+}
+
+/// Rough heap footprint of a buffered event — the payload Vec dominates for
+/// the frame-carrying variants; the rest is fixed fields plus strings. Used
+/// only for accounting/reporting, never for correctness.
+fn estimated_event_bytes(event: &ReplicationEvent) -> u64 {
+    const WORDS: u64 = 192;
+    match event {
+        ReplicationEvent::TailAppend {
+            db,
+            table,
+            partition,
+            frames,
+            ..
+        } => WORDS + (db.len() + table.len() + partition.len() + frames.len()) as u64,
+        ReplicationEvent::TailMutation {
+            db, table, payload, ..
+        } => WORDS + (db.len() + table.len() + payload.len()) as u64,
+        ReplicationEvent::DeleteFooterRewrite {
+            db,
+            table,
+            segment,
+            bitmap,
+            ..
+        } => WORDS + (db.len() + table.len() + segment.len() + bitmap.len()) as u64,
+        ReplicationEvent::SegmentUpdate {
+            db,
+            table,
+            segment,
+            memtable_ids,
+            ..
+        } => {
+            WORDS
+                + (db.len() + table.len() + segment.len()) as u64
+                + (memtable_ids.len() as u64) * 16
+        }
+        ReplicationEvent::SegmentsReplaced {
+            db,
+            table,
+            new_segments,
+            retired,
+        } => {
+            let names: usize = new_segments.iter().map(String::len).sum::<usize>()
+                + retired.iter().map(String::len).sum::<usize>();
+            WORDS + (db.len() + table.len()) as u64 + names as u64
+        }
+        ReplicationEvent::SegmentsRemoved {
+            db,
+            table,
+            segments,
+        } => {
+            let names: usize = segments.iter().map(String::len).sum();
+            WORDS + (db.len() + table.len()) as u64 + names as u64
+        }
+        ReplicationEvent::CatalogSnapshot { db, json } => WORDS + (db.len() + json.len()) as u64,
+        ReplicationEvent::AuthSnapshot { json } => WORDS + json.len() as u64,
+    }
 }
 
 /// Sequence source + ring + fan-out. All mutation happens on the tail-commit
@@ -477,6 +538,11 @@ struct RepLogState {
 pub struct RepLog {
     state: Mutex<RepLogState>,
     capacity: usize,
+    /// Byte ceiling for the ring; the entry cap alone lets write-heavy
+    /// primaries retain hundreds of GB (each event carries a whole
+    /// compressed write group, up to 16 MiB). At least the newest event is
+    /// always kept, even when it alone exceeds the ceiling.
+    ring_max_bytes: u64,
     /// `<data>/wal/replication_seq` — durable high-water for bootstrap.
     seq_file: Mutex<Option<PathBuf>>,
     persisted_seq: AtomicU64,
@@ -491,7 +557,7 @@ pub struct RepLog {
 const DEFAULT_PERSIST_EVERY: u64 = 256;
 
 impl RepLog {
-    pub fn new(capacity: usize, data_dir: &Path) -> Self {
+    pub fn new(capacity: usize, ring_max_bytes: u64, data_dir: &Path) -> Self {
         let seq_file = data_dir.join("wal").join("replication_seq");
         let persisted = read_seq_file(&seq_file).unwrap_or(0);
         Self {
@@ -500,10 +566,12 @@ impl RepLog {
                 // re-stamps events a standby may have already applied.
                 next_seq: persisted + 1,
                 ring: VecDeque::new(),
+                ring_bytes: 0,
                 sessions: Vec::new(),
                 unpersisted: 0,
             }),
             capacity: capacity.max(16),
+            ring_max_bytes: ring_max_bytes.max(1024 * 1024),
             seq_file: Mutex::new(Some(seq_file)),
             persisted_seq: AtomicU64::new(persisted),
             persist_every: DEFAULT_PERSIST_EVERY,
@@ -570,8 +638,18 @@ impl RepLog {
         state.next_seq += 1;
         let event = Arc::new(event);
         state.ring.push_back((seq, Arc::clone(&event)));
-        while state.ring.len() > self.capacity {
-            state.ring.pop_front();
+        state.ring_bytes += estimated_event_bytes(&event);
+        while state.ring.len() > self.capacity
+            || (state.ring.len() > 1 && state.ring_bytes > self.ring_max_bytes)
+        {
+            match state.ring.pop_front() {
+                Some((_, evicted)) => {
+                    state.ring_bytes = state
+                        .ring_bytes
+                        .saturating_sub(estimated_event_bytes(&evicted));
+                }
+                None => break,
+            }
         }
         // Fan out. A session that cannot keep up is dropped: it will
         // reconnect, resume from its persisted applied seq, and re-pull the
@@ -746,6 +824,18 @@ impl RepLog {
 
     pub fn session_count(&self) -> usize {
         self.state.lock().unwrap().sessions.len()
+    }
+
+    /// `(retained events, approximate heap bytes)` for the ring. The ring is
+    /// entry-bounded only, so bytes are what `SHOW MEMORY` needs to report.
+    pub fn ring_stats(&self) -> (usize, u64) {
+        let state = self.state.lock().unwrap();
+        (state.ring.len(), state.ring_bytes)
+    }
+
+    /// Configured byte ceiling for the ring (`SHOW MEMORY`).
+    pub fn ring_byte_limit(&self) -> u64 {
+        self.ring_max_bytes
     }
 }
 

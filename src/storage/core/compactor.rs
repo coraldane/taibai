@@ -17,7 +17,9 @@ use crate::storage::catalog::schema::TableMeta;
 use crate::storage::index::sort_key::compare_scalars_for_sort;
 use crate::storage::partition::partition::parse_partition_key;
 use crate::storage::segment::{store, SegmentWriter};
-use crate::storage::segment_manager::SegmentManager;
+use crate::storage::segment_manager::{
+    MaintenanceSnapshot, MaintenanceTtlColumn, PlannedSegment, SegmentManager,
+};
 use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::bitmap::NullBitmap;
@@ -86,12 +88,7 @@ pub struct CompactStats {
     pub rows_dropped_ttl: u64,
 }
 
-/// Identity of a compaction input file at the moment the unlocked heavy
-/// phase starts: (file length, row count, deleted rows). The commit phase
-/// re-reads it under the partition lock; any drift means another mutator
-/// touched the file while the rewrite ran without the lock, and the
-/// prepared output must be discarded.
-type SegmentFileIdentity = (u64, u64, u64);
+type SegmentFileIdentity = PlannedSegment;
 
 /// Memory budget for the clustered-compaction in-memory fast path. Beyond
 /// it the rewrite switches to an external merge sort (bounded-size sorted
@@ -173,35 +170,6 @@ enum PreparedCompaction {
 /// runs. Production value stays 0.
 static COMPACTION_HEAVY_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
-fn compaction_input_identity(
-    segment_mgr: &SegmentManager,
-    path: &Path,
-) -> Option<SegmentFileIdentity> {
-    let len = std::fs::metadata(path).ok()?.len();
-    let reader = segment_mgr.open_reader_cached(path).ok()?;
-    Some((len, reader.row_count(), reader.deleted_row_count()))
-}
-
-fn compaction_inputs_unchanged(
-    segment_mgr: &SegmentManager,
-    files: &[PathBuf],
-    identities: &[SegmentFileIdentity],
-) -> bool {
-    if let Some(parent) = files.first().and_then(|p| p.parent()) {
-        let Ok(live) = store::discover_segments(parent) else {
-            return false;
-        };
-        let live: std::collections::HashSet<_> = live.into_iter().collect();
-        if files.iter().any(|p| !live.contains(p)) {
-            return false;
-        }
-    }
-    files
-        .iter()
-        .zip(identities.iter())
-        .all(|(path, expected)| compaction_input_identity(segment_mgr, path) == Some(*expected))
-}
-
 /// True when a row is still visible under the table's TTL: the read-time
 /// filter hides rows whose TTL timestamp satisfies `ts + duration <= now`
 /// (and rows whose TTL column is NULL or not a timestamp), so every
@@ -220,34 +188,15 @@ fn ttl_row_visible(
     )
 }
 
-/// Cheap footer-only proof that EVERY row of a segment is TTL-expired: the
-/// TTL column's zone-map max plus the duration is already past `now_us`.
-/// Used to pull otherwise clean segments into a rewrite — the row-level TTL
-/// purge only runs inside compaction rewrites, so without this proof-based
-/// exception a clean segment's expired rows could never be physically
-/// removed. Anything the zone maps cannot prove returns false so the
-/// segment conservatively stays untouched: an uncomputed or empty map, a
-/// NULL max, NULL TTL values (`null_count` — those rows stay visible to
-/// the read filter), or a non-timestamp TTL column (never hidden either).
-fn segment_ttl_fully_expired(
-    reader: &crate::storage::segment::SegmentReader,
-    ttl_col_idx: usize,
-    duration_us: i64,
-    now_us: i64,
-) -> bool {
-    (0..reader.num_row_groups()).all(|rg_idx| {
-        reader
-            .zone_maps(rg_idx)
-            .get(ttl_col_idx)
-            .is_some_and(|zone| {
-                zone.row_count > 0
-                    && zone.null_count == 0
-                    && matches!(
-                        &zone.max_value,
-                        crate::types::scalar::ScalarValue::Timestamp(Some(ts))
-                            if ts.saturating_add(duration_us) <= now_us
-                    )
-            })
+/// The maintenance-catalog TTL context for a table: current column name plus
+/// pre-rename names, so plan stats can be resolved against each segment's own
+/// footer schema at capture time.
+fn maintenance_ttl_column(table_meta: &TableMeta, schema: &Schema) -> Option<MaintenanceTtlColumn> {
+    let index = table_meta.get_ttl_column_index_cached()?;
+    let column = schema.columns.get(index)?;
+    Some(MaintenanceTtlColumn {
+        name: column.name.clone(),
+        previous_names: column.previous_names.clone(),
     })
 }
 
@@ -289,7 +238,18 @@ impl Compactor {
         table: &str,
         table_meta: &TableMeta,
     ) -> Result<CompactStats> {
-        self.compact_table(db, table, table_meta, true, true)
+        self.compact_table(db, table, table_meta, true, true, None)
+    }
+
+    pub fn compact_table_for_auto_maintenance(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &TableMeta,
+        snapshot: MaintenanceSnapshot,
+        seal_active: bool,
+    ) -> Result<CompactStats> {
+        self.compact_table(db, table, table_meta, false, seal_active, Some(snapshot))
     }
 
     /// Rewrite segments to purge delete bitmaps without paying the cost of a
@@ -301,7 +261,7 @@ impl Compactor {
         table: &str,
         table_meta: &TableMeta,
     ) -> Result<CompactStats> {
-        self.compact_table(db, table, table_meta, false, false)
+        self.compact_table(db, table, table_meta, false, false, None)
     }
 
     /// Repair row-group/segment fragmentation, including a fragmented active
@@ -313,7 +273,7 @@ impl Compactor {
         table: &str,
         table_meta: &TableMeta,
     ) -> Result<CompactStats> {
-        self.compact_table(db, table, table_meta, false, true)
+        self.compact_table(db, table, table_meta, false, true, None)
     }
 
     fn compact_table(
@@ -323,6 +283,7 @@ impl Compactor {
         table_meta: &TableMeta,
         sort_by_cluster_key: bool,
         seal_active: bool,
+        maintenance_snapshot: Option<MaintenanceSnapshot>,
     ) -> Result<CompactStats> {
         *self.committed.lock().unwrap() = CompactStats::default();
         let start_time = Instant::now();
@@ -356,6 +317,7 @@ impl Compactor {
             let idx = table_meta.get_ttl_column_index_cached()?;
             Some((idx, info.duration_secs))
         });
+        let maintenance_ttl = maintenance_ttl_column(table_meta, &schema);
         let compression_level = crate::storage::segment_manager::resolve_compression_level(
             table_meta.compression_level,
         );
@@ -377,31 +339,31 @@ impl Compactor {
         if seal_active {
             self.segment_mgr.seal_table_active(db, table)?;
         }
-        let _input_snapshot = crate::storage::segment::snapshot::pin_directory(&table_dir);
-        let partition_groups = self.segment_mgr.with_table_mutation_lock(db, table, || {
-            let segment_files = self
-                .segment_mgr
-                .discover_inactive_segments(db, table, &table_dir)?;
-            if segment_files.is_empty() {
-                return Ok(Vec::new());
-            }
-
-            tracing::info!(
+        let mut maintenance_snapshot = match maintenance_snapshot {
+            Some(snapshot) => snapshot,
+            None => self.segment_mgr.capture_maintenance_snapshot(
                 db,
                 table,
-                cluster_key = ?table_meta.cluster_key,
-                sort_by_cluster_key,
-                segments = segment_files.len(),
-                "starting table optimization"
-            );
-
-            Ok(group_segments_by_partition(segment_files)
-                .into_iter()
-                .collect::<Vec<_>>())
-        })?;
+                &table_dir,
+                maintenance_ttl.as_ref(),
+            )?,
+        };
+        maintenance_snapshot.refresh_mutable_segments(&self.segment_mgr, maintenance_ttl.as_ref());
+        let (partition_groups, partition_errors) =
+            group_maintenance_snapshot(&maintenance_snapshot);
         if partition_groups.is_empty() {
             return Ok(CompactStats::default());
         }
+        let segment_count = partition_groups.values().map(Vec::len).sum::<usize>();
+        tracing::info!(
+            db,
+            table,
+            cluster_key = ?table_meta.cluster_key,
+            sort_by_cluster_key,
+            segments = segment_count,
+            "starting table optimization"
+        );
+        let partition_groups = partition_groups.into_iter().collect::<Vec<_>>();
 
         // `segments_read` counts segments actually consumed by the rewrite
         // (dirty inputs only on the non-clustered path), not every discovered
@@ -413,14 +375,17 @@ impl Compactor {
             .into_iter()
             .map(|(partition_key, files)| -> Result<CompactStats> {
                 let lock_key = partition_key.as_deref().unwrap_or("");
-                // Permits are acquired BEFORE the partition lock, in the same
-                // order as query scans (cpu then io). Sleeping on the global
-                // work limiter while holding the partition lock would freeze
+                if let Some(errors) = partition_errors.get(&partition_key) {
+                    return Err(maintenance_partition_error(db, table, lock_key, errors));
+                }
+                // Heavy decode/rewrite under the process-wide memory gate
+                // BEFORE the partition lock — the gate serializes all heavy
+                // rewrites (one prepare at a time process-wide), so no
+                // admission wait is needed or possible here. Holding any
+                // lock while queueing for a global resource would freeze
                 // that partition's INSERTs for the whole queue delay.
                 let prepared = {
                     let _memory = compaction_memory_gate();
-                    let _cpu_permit = crate::common::work_limiter::acquire_cpu();
-                    let _io_permit = crate::common::work_limiter::acquire_io();
                     self.prepare_compact_segment_group(
                         db,
                         table,
@@ -513,6 +478,7 @@ impl Compactor {
             let idx = table_meta.get_ttl_column_index_cached()?;
             Some((idx, info.duration_secs))
         });
+        let maintenance_ttl = maintenance_ttl_column(table_meta, &schema);
         let compression_level = crate::storage::segment_manager::resolve_compression_level(
             table_meta.compression_level,
         );
@@ -521,58 +487,48 @@ impl Compactor {
             self.segment_mgr
                 .seal_partition_active(db, table, candidate)?;
         }
-        let _input_snapshot = crate::storage::segment::snapshot::pin_directory(&table_dir);
-        let candidate_refs = candidates.iter().map(String::as_str).collect::<Vec<_>>();
-        let matched = self.segment_mgr.with_partition_set_mutation_lock(
+        let maintenance_snapshot = self.segment_mgr.capture_maintenance_snapshot(
             db,
             table,
-            &candidate_refs,
-            || {
-                let segment_files = self
-                    .segment_mgr
-                    .discover_inactive_segments(db, table, &table_dir)?;
-                let groups = group_segments_by_partition(segment_files);
-                let matched_key = candidates
-                    .iter()
-                    .find(|candidate| groups.contains_key(&Some((*candidate).clone())))
-                    .cloned();
-                let Some(matched_key) = matched_key else {
-                    let available = groups
-                        .keys()
-                        .filter_map(|key| key.as_deref())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(TaibaiError::Sql(format!(
-                        "partition '{}' not found for table '{}.{}'{}",
-                        partition_key,
-                        db,
-                        table,
-                        if available.is_empty() {
-                            String::new()
-                        } else {
-                            format!("; available partitions: {}", available)
-                        }
-                    )));
-                };
-
-                let files = groups
-                    .get(&Some(matched_key.clone()))
-                    .cloned()
-                    .unwrap_or_default();
-                Ok(Some((matched_key, files)))
-            },
+            &table_dir,
+            maintenance_ttl.as_ref(),
         )?;
-        let Some((matched_key, files)) = matched else {
-            return Ok(CompactStats::default());
+        let (groups, partition_errors) = group_maintenance_snapshot(&maintenance_snapshot);
+        let matched_key = candidates
+            .iter()
+            .find(|candidate| groups.contains_key(&Some((*candidate).clone())))
+            .cloned();
+        let Some(matched_key) = matched_key else {
+            let available = groups
+                .keys()
+                .filter_map(|key| key.as_deref())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(TaibaiError::Sql(format!(
+                "partition '{}' not found for table '{}.{}'{}",
+                partition_key,
+                db,
+                table,
+                if available.is_empty() {
+                    String::new()
+                } else {
+                    format!("; available partitions: {}", available)
+                }
+            )));
         };
+        let files = groups
+            .get(&Some(matched_key.clone()))
+            .cloned()
+            .unwrap_or_default();
+        if let Some(errors) = partition_errors.get(&Some(matched_key.clone())) {
+            return Err(maintenance_partition_error(db, table, &matched_key, errors));
+        }
 
-        // Permits before the partition lock, heavy decode/sort/write outside
-        // it — same split as `compact_table`'s partition workers.
+        // Heavy decode/rewrite under the process-wide memory gate before the
+        // partition lock — same split as `compact_table`'s partition workers.
         let stats = {
             let prepared = {
                 let _memory = compaction_memory_gate();
-                let _cpu_permit = crate::common::work_limiter::acquire_cpu();
-                let _io_permit = crate::common::work_limiter::acquire_io();
                 self.prepare_compact_segment_group(
                     db,
                     table,
@@ -635,11 +591,10 @@ impl Compactor {
         db: &str,
         table: &str,
         partition_label: &str,
-        segment_files: &[PathBuf],
         identities: &[SegmentFileIdentity],
         abort_label: &str,
     ) -> bool {
-        if !compaction_inputs_unchanged(&self.segment_mgr, segment_files, identities) {
+        if !self.segment_mgr.planned_segments_unchanged(identities) {
             tracing::info!(
                 db,
                 table,
@@ -705,7 +660,6 @@ impl Compactor {
                     db,
                     table,
                     partition_label,
-                    &segment_files,
                     &identities,
                     "deferring empty-input cleanup",
                 ) {
@@ -754,7 +708,6 @@ impl Compactor {
                     db,
                     table,
                     partition_label,
-                    &segment_files,
                     &identities,
                     "discarding prepared replacement",
                 ) {
@@ -828,25 +781,69 @@ impl Compactor {
 }
 
 /// Heavy rewrites share one process-wide memory allowance. Acquire on the
-/// calling thread, before CPU/IO permits and outside mutation locks; columns
-/// still decode/compress in parallel without blocking Rayon workers on permits.
+/// calling thread, outside mutation locks; columns decode/compress in
+/// parallel on the global pool. This gate is the concurrency bound on all
+/// heavy rewrite work — at most one prepare runs process-wide — which is
+/// what the removed work-limiter permits effectively enforced for
+/// compaction as well (see
+/// docs/design/resource-admission-and-backpressure.md).
 fn compaction_memory_gate() -> std::sync::MutexGuard<'static, ()> {
     static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     GATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+type PartitionGroups = BTreeMap<Option<String>, Vec<PlannedSegment>>;
+type PartitionErrors = BTreeMap<Option<String>, Vec<String>>;
+
+fn group_maintenance_snapshot(
+    snapshot: &MaintenanceSnapshot,
+) -> (PartitionGroups, PartitionErrors) {
+    let mut groups = group_segments_by_partition(snapshot.planned_segments());
+    let mut errors_by_partition: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
+    for segment_error in snapshot.segment_errors() {
+        groups
+            .entry(segment_error.partition_key.clone())
+            .or_default();
+        errors_by_partition
+            .entry(segment_error.partition_key.clone())
+            .or_default()
+            .push(format!(
+                "{}: {}",
+                segment_error.path.display(),
+                segment_error.error
+            ));
+    }
+    (groups, errors_by_partition)
+}
+
+fn maintenance_partition_error(
+    db: &str,
+    table: &str,
+    partition_key: &str,
+    errors: &[String],
+) -> TaibaiError {
+    TaibaiError::Storage(format!(
+        "maintenance snapshot failed for table '{}.{}' partition '{}': {}",
+        db,
+        table,
+        partition_key,
+        errors.join("; ")
+    ))
+}
+
 fn group_segments_by_partition(
-    segment_files: Vec<PathBuf>,
-) -> BTreeMap<Option<String>, Vec<PathBuf>> {
+    segment_files: Vec<PlannedSegment>,
+) -> BTreeMap<Option<String>, Vec<PlannedSegment>> {
     let mut groups = BTreeMap::new();
-    for path in segment_files {
-        let partition_key = path
+    for segment in segment_files {
+        let partition_key = segment
+            .path
             .file_name()
             .and_then(|name| parse_partition_key(&name.to_string_lossy()));
         groups
             .entry(partition_key)
             .or_insert_with(Vec::new)
-            .push(path);
+            .push(segment);
     }
     groups
 }

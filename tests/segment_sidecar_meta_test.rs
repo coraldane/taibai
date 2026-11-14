@@ -110,7 +110,7 @@ fn invalid_sidecar_data_end_falls_back_to_embedded_footer() {
     let footer = encode_segment_footer(
         original.schema(),
         original.row_count(),
-        &original.footer_row_groups_info(),
+        &original.footer_row_groups_info().unwrap(),
         original.delete_bitmap(),
         original.deleted_row_count(),
         "t",
@@ -160,7 +160,7 @@ fn sidecar_compaction_replaces_journal_with_full_snapshot() {
     let footer = encode_segment_footer(
         reader.schema(),
         reader.row_count(),
-        &reader.footer_row_groups_info(),
+        &reader.footer_row_groups_info().unwrap(),
         reader.delete_bitmap(),
         reader.deleted_row_count(),
         "t",
@@ -308,7 +308,8 @@ fn direct_bulk_row_group_writes_value_sets() {
     let table_dir = dir.path().join("main").join("t");
     let segments = SegmentManager::discover_segments(&table_dir).unwrap();
     let reader = SegmentReader::open(&segments[0]).unwrap();
-    let values = reader.value_sets(0)[0].as_ref().unwrap();
+    let value_sets = reader.value_sets(0);
+    let values = value_sets[0].as_ref().unwrap();
 
     assert_eq!(
         values,

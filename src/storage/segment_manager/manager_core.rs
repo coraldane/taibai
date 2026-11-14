@@ -22,6 +22,25 @@ fn flush_epoch_persist_lock(key: &str) -> &std::sync::Mutex<()> {
     &locks[(hash as usize) % locks.len()]
 }
 
+/// Whether the mutable reader cache must evict one entry before accepting an
+/// entry charged `charged_bytes`. An empty cache always accepts: refusing to
+/// cache an entry larger than the whole budget would disable the cache for
+/// big active segments entirely, and the entry ceiling reclaims it later.
+fn mutable_cache_needs_eviction(
+    entries: usize,
+    used_bytes: u64,
+    charged_bytes: u64,
+    entry_capacity: usize,
+    budget_bytes: u64,
+) -> bool {
+    entries >= entry_capacity
+        || (used_bytes.saturating_add(charged_bytes) > budget_bytes && entries > 0)
+}
+
+fn mutable_cache_used_bytes(cache: &HashMap<PathBuf, (std::sync::Arc<SegmentReader>, u64)>) -> u64 {
+    cache.values().map(|(_, charged)| *charged).sum()
+}
+
 impl SegmentManager {
     pub fn set_flush_transition_delay_for_tests(&self, ms: u64) {
         FLUSH_TRANSITION_DELAY_MS.store(ms, Ordering::Release);
@@ -116,8 +135,12 @@ impl SegmentManager {
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             tables: RwLock::new(tables),
-            reader_cache: Mutex::new(ReaderCache::new(reader_cache_capacity())),
-            segment_meta_cache: Mutex::new(SegmentMetaCache::new(reader_cache_capacity())),
+            reader_cache: Mutex::new(ReaderCache::with_budget_bytes(
+                crate::common::config::reader_cache_budget_bytes(),
+            )),
+            segment_meta_cache: Mutex::new(SegmentMetaCache::new(
+                crate::common::config::segment_meta_cache_budget_bytes(),
+            )),
             cluster_meta_cache: Mutex::new(ClusterMetaCache::new()),
             mutable_reader_cache: Mutex::new(HashMap::new()),
             flush_epochs: RwLock::new(HashMap::new()),
@@ -730,40 +753,6 @@ impl SegmentManager {
             .collect())
     }
 
-    pub fn cleanup_fully_deleted_segments(
-        &self,
-        db: &str,
-        table: &str,
-        table_dir: &Path,
-    ) -> Result<u64> {
-        self.with_table_mutation_lock(db, table, || {
-            // Same pin gate as compaction/TTL/DDL: an open transaction's
-            // deferred tombstones reference segment paths, and deleting a
-            // fully-deleted segment under them left that COMMIT retrying a
-            // vanished path forever.
-            if self
-                .txn_mutations()
-                .is_some_and(|registry| registry.table_has_pins(db, table))
-            {
-                tracing::debug!(
-                    db,
-                    table,
-                    "table pinned by an open transaction, skipping fully-deleted cleanup"
-                );
-                return Ok(0);
-            }
-            let mut removed = 0u64;
-            for path in self.discover_inactive_segments(db, table, table_dir)? {
-                let reader = self.open_reader_cached(&path)?;
-                if reader.row_count() > 0 && reader.deleted_row_count() >= reader.row_count() {
-                    self.remove_segment_file(&path)?;
-                    removed += 1;
-                }
-            }
-            Ok(removed)
-        })
-    }
-
     pub fn find_unsealed_segment(
         table_dir: &Path,
         min_seal_size: u64,
@@ -819,6 +808,7 @@ impl SegmentManager {
             let seq = state.seq.fetch_add(1, Ordering::Relaxed) + 1;
             let path = table_dir.join(store::regular_segment_filename(seq));
             if !path.exists() {
+                state.publish_maintenance_segment(&path);
                 return Ok(path);
             }
             // The in-process counter fell behind the directory — a scan-based
@@ -851,6 +841,7 @@ impl SegmentManager {
             };
             let path = table_dir.join(store::partition_segment_filename(partition_key, seq));
             if !path.exists() {
+                state.publish_maintenance_segment(&path);
                 return Ok(path);
             }
             let dir_max = store::max_segment_seq_by_scan(table_dir, Some(partition_key))?;
@@ -902,6 +893,9 @@ impl SegmentManager {
                 }
             }
         }
+        if let Ok(state) = self.get_or_create_state_for_table_dir(table_dir) {
+            state.publish_maintenance_segment(&path);
+        }
         Ok(path)
     }
 
@@ -913,8 +907,54 @@ impl SegmentManager {
         match SegmentReader::open(path) {
             Ok(reader) => Ok(reader),
             Err(err) if is_transient_footer_error(&err) => self.open_mutable_reader_owned(path),
-            Err(err) => Err(err),
+            Err(err) => Err(self.quarantine_on_permanent_open_error(path, err)),
         }
+    }
+
+    /// A reader-open failure that is NOT transient (footer-in-flux while a
+    /// writer holds the segment) and NOT on a mutable segment means the file
+    /// is permanently corrupt — e.g. a process died mid-write before the
+    /// atomic-publish protocol existed, leaving a torn segment. Quarantine it
+    /// by renaming it out of the segment-filename pattern: the bytes stay on
+    /// disk for forensics, the rest of the table keeps serving, and the next
+    /// discovery simply stops seeing the file. Without this, ONE bad segment
+    /// poisoned EVERY query (and DELETE) against the table with opaque
+    /// decode errors — the 2026-11-07 `t_theme_snapshot` outage.
+    fn quarantine_on_permanent_open_error(&self, path: &Path, err: TaibaiError) -> TaibaiError {
+        if is_transient_footer_error(&err) || self.is_mutable_segment_path(path) {
+            return err;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "segment".to_string());
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let quarantined = path.with_file_name(format!("{name}.corrupt-{epoch}"));
+        match std::fs::rename(path, &quarantined) {
+            Ok(()) => {
+                tracing::error!(
+                    original = %path.display(),
+                    quarantined = %quarantined.display(),
+                    error = %err,
+                    "corrupt segment quarantined; the rest of the table stays readable"
+                );
+                self.invalidate_reader(path);
+            }
+            Err(rename_err) => {
+                // Cannot move the file aside (locked, permission): keep it so
+                // the same precise error surfaces on every attempt.
+                tracing::error!(
+                    file = %path.display(),
+                    error = %err,
+                    rename_error = %rename_err,
+                    "corrupt segment could not be quarantined"
+                );
+            }
+        }
+        err
     }
 
     pub fn open_reader_cached(&self, path: &Path) -> Result<Arc<SegmentReader>> {
@@ -926,7 +966,12 @@ impl SegmentManager {
         // falls back to the reopen path, whose `open_mutable_reader_owned`
         // also publishes a dirty footer first (preserving old semantics).
         if self.is_mutable_segment_path(path) {
-            let cached = self.mutable_reader_cache.lock().unwrap().get(path).cloned();
+            let cached = self
+                .mutable_reader_cache
+                .lock()
+                .unwrap()
+                .get(path)
+                .map(|(reader, _)| reader.clone());
             if let Some(reader) = cached {
                 if !self.mutable_segment_has_pending_writes(path) {
                     return Ok(reader);
@@ -934,21 +979,34 @@ impl SegmentManager {
             }
             self.invalidate_reader(path);
             let reader = std::sync::Arc::new(self.open_mutable_reader_owned(path)?);
+            let charged_bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
             let mut cache = self.mutable_reader_cache.lock().unwrap();
-            if cache.len() >= reader_cache_capacity().max(1) * 4 {
-                // Evict ONE entry instead of clearing the whole cache: a full
-                // clear made every other active segment's next read pay a
-                // full reopen + footer parse at once. The cache field is a
-                // plain `HashMap` (defined with the struct, no order kept),
-                // so the victim is the first entry in iteration order — any
-                // single eviction bounds growth, and cache correctness never
-                // depended on the choice: `invalidate_reader` evicts on every
-                // visibility change regardless.
-                if let Some(victim) = cache.keys().next().cloned() {
-                    cache.remove(&victim);
+            // Evict single entries instead of clearing the whole cache: a full
+            // clear made every other active segment's next read pay a full
+            // reopen + footer parse at once. The victim is the first entry in
+            // iteration order — cache correctness never depended on the
+            // choice: `invalidate_reader` evicts on every visibility change
+            // regardless. Both ceilings apply: the entry count (4x the reader
+            // cache capacity) and the byte budget
+            // (`storage.mutable_reader_cache_mb`), because entries are full
+            // heap copies of up to `min_segment_seal_size` each.
+            let entry_capacity = reader_cache_capacity().max(1) * 4;
+            let budget = crate::common::config::mutable_reader_cache_budget_bytes();
+            while mutable_cache_needs_eviction(
+                cache.len(),
+                mutable_cache_used_bytes(&cache),
+                charged_bytes,
+                entry_capacity,
+                budget,
+            ) {
+                match cache.keys().next().cloned() {
+                    Some(victim) => {
+                        cache.remove(&victim);
+                    }
+                    None => break,
                 }
             }
-            cache.insert(path.to_path_buf(), reader.clone());
+            cache.insert(path.to_path_buf(), (reader.clone(), charged_bytes));
             return Ok(reader);
         }
 
@@ -968,7 +1026,7 @@ impl SegmentManager {
                 Err(err) if is_transient_footer_error(&err) => {
                     (self.open_mutable_reader_owned(path)?, true)
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(self.quarantine_on_permanent_open_error(path, err)),
             }
         } else {
             match SegmentReader::open(path) {
@@ -976,15 +1034,22 @@ impl SegmentManager {
                 Err(err) if is_transient_footer_error(&err) => {
                     (self.open_mutable_reader_owned(path)?, true)
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(self.quarantine_on_permanent_open_error(path, err)),
             }
         };
+        // Charge the parsed footer on BOTH paths. An mmap reader keeps its
+        // column payload in the page cache, but its footer is a heap object
+        // graph — ~68 MiB for a 2 GiB segment with 28k row groups. The old
+        // flat 256 KiB charge for mmap readers is how a nominal 256 MiB
+        // budget became effectively unbounded.
+        let footer_bytes = reader.footer_heap_bytes();
         let cost_bytes = if owned {
-            std::fs::metadata(path)
-                .map(|meta| meta.len())
-                .unwrap_or(reader_cache::AVG_READER_COST_BYTES)
+            footer_bytes
+                + std::fs::metadata(path)
+                    .map(|meta| meta.len())
+                    .unwrap_or(reader_cache::AVG_READER_COST_BYTES)
         } else {
-            reader_cache::AVG_READER_COST_BYTES
+            footer_bytes
         };
         Ok(self
             .reader_cache
@@ -1032,6 +1097,9 @@ impl SegmentManager {
         self.reader_cache.lock().unwrap().invalidate(path);
         self.segment_meta_cache.lock().unwrap().invalidate(path);
         self.cluster_meta_cache.lock().unwrap().invalidate(path);
+        if let Some(state) = self.state_for_segment_path(path) {
+            state.bump_maintenance_revision(path);
+        }
     }
 
     pub fn invalidate_readers_under(&self, dir: &Path) {
@@ -1048,6 +1116,49 @@ impl SegmentManager {
             .lock()
             .unwrap()
             .invalidate_under(dir);
+        if let Ok(key) = self.table_state_key_from_dir(dir) {
+            let state = self.tables.read().unwrap().get(&key).cloned();
+            if let Some(state) = state {
+                let paths = state
+                    .maintenance_entries
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .filter(|path| path.starts_with(dir))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for path in paths {
+                    state.bump_maintenance_revision(&path);
+                }
+            }
+        }
+    }
+
+    /// `(entries, charged heap bytes, budget bytes)` of the sealed-segment
+    /// reader cache, for `SHOW MEMORY`.
+    pub fn reader_cache_stats(&self) -> (usize, u64, u64) {
+        self.reader_cache.lock().unwrap().stats()
+    }
+
+    /// `(entries, charged heap bytes, budget bytes)` of the mutable-segment
+    /// reader cache. Each entry is a full heap copy of an active segment
+    /// file, so both ceilings apply: the entry count (4x the reader cache
+    /// capacity) and `storage.mutable_reader_cache_mb`.
+    pub fn mutable_reader_cache_stats(&self) -> (usize, u64) {
+        let cache = self.mutable_reader_cache.lock().unwrap();
+        (
+            cache.len(),
+            cache.values().map(|(_, charged)| *charged).sum(),
+        )
+    }
+
+    /// `(entries, charged heap bytes, budget bytes)` of the parsed
+    /// segment-metadata cache, for `SHOW MEMORY`. This is the cache that used
+    /// to be entry-counted and invisible: it held one parsed footer per
+    /// scanned segment — tens of MiB each — and grew to the whole RSS
+    /// without appearing in any memory report.
+    pub fn segment_meta_cache_stats(&self) -> (usize, u64, u64) {
+        self.segment_meta_cache.lock().unwrap().stats()
     }
 
     /// Read-side metadata cache for a sealed segment's cluster-key column zone map.
@@ -1165,6 +1276,9 @@ impl SegmentManager {
         self.invalidate_reader(path);
         std::fs::remove_file(path)?;
         remove_sidecar_meta(path)?;
+        if let Some(state) = self.state_for_segment_path(path) {
+            state.retire_maintenance_segment(path);
+        }
         Ok(())
     }
 
@@ -1208,11 +1322,17 @@ impl SegmentManager {
                 let _ = std::fs::remove_file(&journal);
                 return Err(error.into());
             }
+            if let Some(state) = self.state_for_segment_path(final_path) {
+                state.publish_maintenance_segment(final_path);
+            }
             // The journal now retires the old paths for discovery. Existing
             // leases retain their files; failed physical deletion remains
             // recoverable without exposing duplicate rows to new scans.
             for old_seg in old_segments {
                 self.invalidate_reader(old_seg);
+                if let Some(state) = self.state_for_segment_path(old_seg) {
+                    state.retire_maintenance_segment(old_seg);
+                }
             }
             directory.retire(journal, old_segments.to_vec());
             Ok(())
@@ -1236,6 +1356,9 @@ impl SegmentManager {
             write_replace_journal(&journal, paths)?;
             for path in paths {
                 self.invalidate_reader(path);
+                if let Some(state) = self.state_for_segment_path(path) {
+                    state.retire_maintenance_segment(path);
+                }
             }
             directory.retire(journal, paths.to_vec());
             Ok(())
@@ -1644,7 +1767,20 @@ impl SegmentManager {
 
     fn open_mutable_reader_owned(&self, path: &Path) -> Result<SegmentReader> {
         let Some(state) = self.state_for_segment_path(path) else {
-            return SegmentReader::open_owned(path);
+            // No table state (table never opened this process): still guard
+            // against a corrupt segment file leaking into every later read —
+            // quarantine only files that match the segment naming pattern.
+            return SegmentReader::open_owned(path).map_err(|err| {
+                let is_segment_named = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(crate::storage::segment::store::is_segment_filename);
+                if is_segment_named {
+                    self.quarantine_on_permanent_open_error(path, err)
+                } else {
+                    err
+                }
+            });
         };
 
         // A segment removed from the active map is sealed outside every lock:
@@ -1661,22 +1797,35 @@ impl SegmentManager {
             state.wait_sealing_segments_drained(timeout)?;
         }
 
-        let mut active_guard = state.active_segments.lock().unwrap();
-        for segment in active_guard.values_mut() {
-            if same_segment_path(&segment.path, path) {
-                // Flush buffered rows as well, not just dirty metadata:
-                // rows sitting in the writer's buffer are invisible to a
-                // reader, which made DELETE skip them.
-                if segment.buffered_rows > 0 {
-                    segment.flush_buffer(&|path| self.invalidate_reader(path))?;
+        let mut active_hit = false;
+        {
+            let mut active_guard = state.active_segments.lock().unwrap();
+            for segment in active_guard.values_mut() {
+                if same_segment_path(&segment.path, path) {
+                    // Flush buffered rows as well, not just dirty metadata:
+                    // rows sitting in the writer's buffer are invisible to a
+                    // reader, which made DELETE skip them.
+                    if segment.buffered_rows > 0 {
+                        segment.flush_buffer(&|path| self.invalidate_reader(path))?;
+                    }
+                    if segment.dirty_meta {
+                        segment.flush_meta(&|path| self.invalidate_reader(path))?;
+                    }
+                    active_hit = true;
+                    break;
                 }
-                if segment.dirty_meta {
-                    segment.flush_meta(&|path| self.invalidate_reader(path))?;
-                }
-                return SegmentReader::open_owned(path);
             }
         }
+        if active_hit {
+            // Active segment: the sidecar footer carries visibility while the
+            // embedded one is unwritten; a failure here is the writer's
+            // in-flight state, never a quarantine candidate.
+            return SegmentReader::open_owned(path);
+        }
+        // Not active, not sealing: a permanent open failure means the sealed
+        // file is corrupt.
         SegmentReader::open_owned(path)
+            .map_err(|err| self.quarantine_on_permanent_open_error(path, err))
     }
 
     fn is_mutable_segment_path(&self, path: &Path) -> bool {
@@ -1703,7 +1852,7 @@ impl SegmentManager {
             .any(|segment| same_segment_path(&segment.path, path))
     }
 
-    fn state_for_segment_path(&self, path: &Path) -> Option<Arc<TableSegmentState>> {
+    pub(super) fn state_for_segment_path(&self, path: &Path) -> Option<Arc<TableSegmentState>> {
         let tables = self.tables.read().unwrap();
         let table_dir = path.parent()?;
         let key = self.table_state_key_from_dir(table_dir).ok()?;
@@ -1775,6 +1924,9 @@ impl SegmentManager {
         let (Some(db), Some(table)) = (components.next(), components.next()) else {
             return;
         };
+        if let Some(state) = self.state_for_segment_path(path) {
+            state.publish_maintenance_segment(path);
+        }
         self.note_segments_changed(
             &db.as_os_str().to_string_lossy(),
             &table.as_os_str().to_string_lossy(),
@@ -2306,4 +2458,36 @@ pub mod manager_core_test_support {
         replace_journal_path as replace_journal_path_for_test,
         write_replace_journal as write_replace_journal_for_test,
     };
+}
+
+#[cfg(test)]
+mod mutable_cache_budget_tests {
+    use super::mutable_cache_needs_eviction as needs_eviction;
+
+    #[test]
+    fn empty_cache_always_accepts_even_an_oversized_entry() {
+        // Refusing here would disable the cache for large active segments
+        // entirely; the entry ceiling reclaims the oversized entry later.
+        assert!(!needs_eviction(0, 0, u64::MAX, 4, 1024));
+    }
+
+    #[test]
+    fn entry_ceiling_triggers_eviction() {
+        assert!(needs_eviction(4, 0, 1, 4, u64::MAX));
+        assert!(!needs_eviction(3, 0, 1, 4, u64::MAX));
+    }
+
+    #[test]
+    fn byte_budget_triggers_eviction_only_over_the_ceiling() {
+        assert!(needs_eviction(1, 900, 200, 4, 1024));
+        assert!(!needs_eviction(1, 900, 100, 4, 1024));
+        // Exactly at the budget plus one more byte evicts.
+        assert!(needs_eviction(1, 1024, 1, 4, 1024));
+    }
+
+    #[test]
+    fn used_bytes_saturate_instead_of_overflowing() {
+        // A wrapping add would compute u64::MAX + 1 == 0 and wrongly accept.
+        assert!(needs_eviction(1, u64::MAX, 1, 4, 100));
+    }
 }

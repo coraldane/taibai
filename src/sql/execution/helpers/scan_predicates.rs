@@ -210,7 +210,7 @@ pub(crate) fn segment_may_match(
     if !segment_zone_maps.is_empty() {
         return aligned.matches_row_group(segment_zone_maps);
     }
-    (0..reader.num_row_groups()).any(|rg_idx| aligned.matches_row_group(reader.zone_maps(rg_idx)))
+    (0..reader.num_row_groups()).any(|rg_idx| aligned.matches_row_group(&reader.zone_maps(rg_idx)))
 }
 
 /// Decide one range clause against the constant value a pre-ALTER segment's

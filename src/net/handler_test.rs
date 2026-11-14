@@ -193,6 +193,70 @@ fn streaming_query_emits_chunks_and_end_marker() {
 }
 
 #[test]
+fn streaming_query_sends_schema_chunk_for_empty_result() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
+    handler.session.as_mut().unwrap().streaming_results = true;
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "CREATE TABLE empty_stream (id INT64, label VARCHAR)",
+        )
+        .unwrap();
+
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+    let consumer = std::thread::spawn(move || {
+        let mut chunks = Vec::new();
+        while let Some(message) = receiver.blocking_recv() {
+            chunks.push(message);
+        }
+        chunks
+    });
+    let mut payload = Vec::new();
+    write_len_prefixed_string(&mut payload, "");
+    write_len_prefixed_string(&mut payload, "SELECT id, label FROM empty_stream");
+    let responses = handler
+        .handle_message_cancellable(
+            Message::new(MSG_TYPE_QUERY, Bytes::from(payload)),
+            Arc::new(crate::common::query_cancel::QueryContext::new(Arc::new(
+                AtomicBool::new(false),
+            ))),
+            Some(sender),
+        )
+        .unwrap();
+    drop(handler);
+    let chunks = consumer.join().unwrap();
+
+    assert_eq!(
+        chunks.len(),
+        1,
+        "an empty result must still deliver its schema, got {} chunk(s)",
+        chunks.len()
+    );
+    assert_eq!(chunks[0].msg_type, MSG_TYPE_RESULT_CHUNK);
+    let crate::net::client::QueryResult::Rows {
+        schema, batches, ..
+    } = crate::net::client::parse_binary_result(&chunks[0].payload).unwrap()
+    else {
+        panic!("schema-only chunk did not decode to rows")
+    };
+    let names: Vec<&str> = schema
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["id", "label"]);
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        0
+    );
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].msg_type, MSG_TYPE_RESULT_END);
+}
+
+#[test]
 fn query_response_size_reserves_timing_trailer() {
     let dir = tempfile::TempDir::new().unwrap();
     let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
@@ -1307,7 +1371,6 @@ fn batch_execute_rejects_oversized_batch_size() {
     let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
     let config = Arc::new(ServerConfig::default());
     let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
-
     let mut sql_payload = Vec::new();
     write_len_prefixed_string(&mut sql_payload, "main");
     write_len_prefixed_string(
@@ -1351,4 +1414,158 @@ fn batch_execute_rejects_oversized_batch_size() {
         .handle_message(Message::new(MSG_TYPE_BATCH_EXECUTE, Bytes::from(ok_payload)))
         .unwrap();
     assert_eq!(ok_rows(&response), 1);
+}
+
+
+mod replication_push_bridge_tests {
+    use super::*;
+    use crate::storage::replication::{RepLog, ReplicationEvent};
+    use std::time::Duration;
+
+    fn bridge_tail_event() -> ReplicationEvent {
+        ReplicationEvent::TailAppend {
+            db: "main".into(),
+            table: "t".into(),
+            partition: "2026".into(),
+            memtable_id: uuid::Uuid::new_v4(),
+            first_lsn: 1,
+            last_lsn: 2,
+            frames: vec![1, 2, 3, 4],
+        }
+    }
+
+    /// Join a bridge thread through a bounded wait so a regression hangs the
+    /// assert instead of the whole test binary.
+    fn join_with_timeout(bridge: std::thread::JoinHandle<()>) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = bridge.join();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bridge thread did not exit");
+    }
+
+    #[test]
+    fn bridge_exits_when_client_disconnects_on_idle_primary() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let rep_log = std::sync::Arc::new(RepLog::new(64, u64::MAX, temp.path()));
+        let (push_tx, push_rx) = tokio::sync::mpsc::channel::<Message>(1);
+        // Standby vanishes; the primary publishes nothing afterwards, so the
+        // only exit signal is the park-timeout disconnect probe.
+        drop(push_rx);
+
+        let bridge = spawn_replication_push_bridge(
+            rep_log.clone(),
+            push_tx,
+            0,
+            Vec::new(),
+            Duration::from_millis(100),
+        );
+        join_with_timeout(bridge);
+        assert_eq!(rep_log.session_count(), 0);
+    }
+
+    #[test]
+    fn bridge_caps_pending_buffer_on_permanent_seq_gap() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let rep_log = std::sync::Arc::new(RepLog::new(64, u64::MAX, temp.path()));
+        let (push_tx, _push_rx) = tokio::sync::mpsc::channel::<Message>(16);
+
+        // History missing seq 1: `next` never advances, so every replayed
+        // event piles up in `pending` until the cap drops the session.
+        let history: Vec<(u64, std::sync::Arc<ReplicationEvent>)> =
+            (2..=(REPL_PUSH_MAX_PENDING as u64 + 3))
+                .map(|seq| (seq, std::sync::Arc::new(bridge_tail_event())))
+                .collect();
+
+        let bridge = spawn_replication_push_bridge(
+            rep_log.clone(),
+            push_tx,
+            0,
+            history,
+            Duration::from_millis(100),
+        );
+        join_with_timeout(bridge);
+        assert_eq!(rep_log.session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn bridge_streams_history_in_seq_order_and_releases_session() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let rep_log = std::sync::Arc::new(RepLog::new(64, u64::MAX, temp.path()));
+        let (push_tx, mut push_rx) = tokio::sync::mpsc::channel::<Message>(64);
+
+        let history: Vec<(u64, std::sync::Arc<ReplicationEvent>)> = (1..=4)
+            .map(|seq| (seq, std::sync::Arc::new(bridge_tail_event())))
+            .collect();
+        let bridge = spawn_replication_push_bridge(
+            rep_log.clone(),
+            push_tx,
+            0,
+            history,
+            Duration::from_millis(100),
+        );
+
+        for expected_seq in 1..=4u64 {
+            let message = tokio::time::timeout(Duration::from_secs(5), push_rx.recv())
+                .await
+                .expect("push timed out")
+                .expect("push channel closed");
+            let seq = u64::from_le_bytes(message.payload[..8].try_into().unwrap());
+            assert_eq!(seq, expected_seq);
+        }
+
+        // Client disappears; the probe must reap the bridge and session.
+        drop(push_rx);
+        join_with_timeout(bridge);
+        assert_eq!(rep_log.session_count(), 0);
+    }
+}
+
+#[test]
+fn empty_result_keeps_columns_without_streaming() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "CREATE TABLE empty_single (id INT64, label VARCHAR)",
+        )
+        .unwrap();
+
+    let mut payload = Vec::new();
+    write_len_prefixed_string(&mut payload, "");
+    write_len_prefixed_string(&mut payload, "SELECT id, label FROM empty_single");
+    let responses = handler
+        .handle_message_cancellable(
+            Message::new(MSG_TYPE_QUERY, Bytes::from(payload)),
+            Arc::new(crate::common::query_cancel::QueryContext::new(Arc::new(
+                AtomicBool::new(false),
+            ))),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].msg_type, MSG_TYPE_BINARY_QUERY_RESULT);
+    let crate::net::client::QueryResult::Rows {
+        schema, batches, ..
+    } = crate::net::client::parse_binary_result(&responses[0].payload).unwrap()
+    else {
+        panic!("empty result did not decode to rows")
+    };
+    let names: Vec<&str> = schema
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["id", "label"]);
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        0
+    );
 }

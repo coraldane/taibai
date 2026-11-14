@@ -100,3 +100,34 @@ fn result_chunks_merge_and_enforce_schema_stability() {
         "a non-rows chunk payload must fail instead of silently merging"
     );
 }
+
+/// A zero-row SELECT arrives as one schema-only chunk (the server sends no
+/// row chunks at all when nothing matched). The merge must keep the column
+/// metadata, otherwise the caller sees a result set with zero columns.
+#[test]
+fn zero_row_chunk_preserves_schema() {
+    let mut stream_schema = None;
+    let mut batches = Vec::new();
+    let empty = RecordBatch::new(Schema::new(vec![
+        ColumnDef::new("id", DataType::Int64),
+        ColumnDef::new("label", DataType::VarChar),
+    ]));
+    let chunk = Message::new(
+        MSG_TYPE_RESULT_CHUNK,
+        Bytes::from(crate::protocol::result::encode_binary_result(&empty)),
+    );
+
+    merge_result_chunk(&chunk, &mut stream_schema, &mut batches).unwrap();
+
+    let schema = stream_schema.expect("a schema-only chunk must still set the schema");
+    let names: Vec<&str> = schema
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["id", "label"]);
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        0
+    );
+}

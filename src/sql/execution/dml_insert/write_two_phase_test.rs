@@ -1,4 +1,3 @@
-use super::write::{fingerprints_stable, segment_fingerprints};
 use super::Engine;
 use crate::net::session::Session;
 use crate::sql::execution::engine::ExecResult;
@@ -140,7 +139,60 @@ fn optimize_table_uses_two_phase_rebuild_and_keeps_unique_enforcement() {
 }
 
 #[test]
-fn delete_during_unlocked_scan_is_detected_by_fingerprint_check() {
+fn memtable_drift_is_detected_without_a_segment_epoch_change() {
+    let (_dir, engine, mut session) = create_engine();
+    exec(
+        &engine,
+        &mut session,
+        "CREATE TABLE memtable_drift_t (id INT64 PRIMARY KEY)",
+    );
+    insert_rows_single_col(&engine, &mut session, "memtable_drift_t", 1, 10);
+    let before = engine
+        .segment_mgr()
+        .memtable_flush_epoch("main", "memtable_drift_t");
+    super::FORCE_TWO_PHASE_MEMTABLE_STALE.with(|force| force.set(true));
+    let meta = table_meta(&engine, "main", "memtable_drift_t");
+    let schema = crate::types::batch::Schema::new(meta.columns.clone());
+    let error = super::rebuild_table_location_indexes_two_phase(
+        engine.index_manager(),
+        engine.segment_mgr(),
+        engine.memtable_manager(),
+        engine.data_dir(),
+        "main",
+        "memtable_drift_t",
+        &meta,
+        &schema,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::common::error::TaibaiError::ResourceBusy(_)
+    ));
+    assert_eq!(
+        engine
+            .segment_mgr()
+            .memtable_flush_epoch("main", "memtable_drift_t"),
+        before,
+        "the test hook changes only memtable content version"
+    );
+    super::rebuild_table_location_indexes_two_phase(
+        engine.index_manager(),
+        engine.segment_mgr(),
+        engine.memtable_manager(),
+        engine.data_dir(),
+        "main",
+        "memtable_drift_t",
+        &meta,
+        &schema,
+    )
+    .unwrap();
+    assert!(engine
+        .execute(&mut session, "INSERT INTO memtable_drift_t VALUES (1)")
+        .is_err());
+}
+
+#[test]
+fn drift_aborts_without_locked_full_scan_fallback() {
     let (_dir, engine, mut session) = create_engine();
     exec(
         &engine,
@@ -151,38 +203,41 @@ fn delete_during_unlocked_scan_is_detected_by_fingerprint_check() {
     engine.flush_table_buffers("main", "fingerprint_t").unwrap();
     exec(&engine, &mut session, "OPTIMIZE TABLE fingerprint_t");
 
-    let segment_mgr = engine.segment_mgr();
-    let table_dir = engine.data_dir().join("main").join("fingerprint_t");
-    let before = segment_mgr
-        .discover_inactive_segments("main", "fingerprint_t", &table_dir)
-        .unwrap();
-    assert!(
-        !before.is_empty(),
-        "OPTIMIZE must leave inactive segments for this test"
-    );
-    let prints = segment_fingerprints(segment_mgr, &before).unwrap();
-    assert!(fingerprints_stable(&prints, segment_mgr, &before).unwrap());
-
-    // A delete rewrites the immutable segment footer: row count unchanged,
-    // deleted count bumped — exactly the race the locked phase must catch.
+    // A delete rewrites an immutable segment footer. Force one additional
+    // epoch change after the unlocked scan to deterministically exercise the
+    // old fallback point. The new protocol must return Stale/Retry instead of
+    // succeeding via a full scan inside the mutation lock.
     exec(
         &engine,
         &mut session,
         "DELETE FROM fingerprint_t WHERE id = 1",
     );
-    let after = segment_mgr
-        .discover_inactive_segments("main", "fingerprint_t", &table_dir)
-        .unwrap();
-    assert!(!fingerprints_stable(&prints, segment_mgr, &after).unwrap());
-
-    // The full two-phase call still succeeds on the changed table (it
-    // re-fingerprints after the delete, then falls back or fast-paths
-    // consistently) and the snapshot stays exact.
+    super::FORCE_TWO_PHASE_REBUILD_STALE.with(|force| force.set(true));
     let meta = table_meta(&engine, "main", "fingerprint_t");
     let schema = crate::types::batch::Schema::new(meta.columns.clone());
+    let error = super::rebuild_table_location_indexes_two_phase(
+        engine.index_manager(),
+        engine.segment_mgr(),
+        engine.memtable_manager(),
+        engine.data_dir(),
+        "main",
+        "fingerprint_t",
+        &meta,
+        &schema,
+    )
+    .unwrap_err();
+    match error {
+        crate::common::error::TaibaiError::ResourceBusy(message) => {
+            assert!(message.contains("stale"), "{message}");
+            assert!(message.contains("retry"), "{message}");
+        }
+        other => panic!("expected retryable stale build, got {other}"),
+    }
+
+    // A later unlocked attempt succeeds and publishes an exact snapshot.
     super::rebuild_table_location_indexes_two_phase(
         engine.index_manager(),
-        segment_mgr,
+        engine.segment_mgr(),
         engine.memtable_manager(),
         engine.data_dir(),
         "main",

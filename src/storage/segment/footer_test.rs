@@ -252,3 +252,113 @@ fn empty_footer_tail_encodes_to_nothing() {
     use crate::storage::segment::footer_ext::encode_footer_tail;
     assert!(encode_footer_tail(&[]).is_empty());
 }
+
+/// A synthetic row group with three columns, enough to exercise the sizes,
+/// zone-map, bloom and extension sections of the record layout.
+fn synthetic_row_group(index: u64) -> RowGroupMeta {
+    const COLUMNS: usize = 3;
+    RowGroupMeta {
+        offset: index * 4096,
+        length: 4096,
+        row_count: 8192,
+        column_compressed_sizes: vec![100; COLUMNS],
+        compressed_sizes: vec![100; COLUMNS],
+        uncompressed_sizes: vec![1000; COLUMNS],
+        zone_maps: (0..COLUMNS)
+            .map(|_| ZoneMap {
+                min_value: ScalarValue::Int64(Some(index as i64)),
+                max_value: ScalarValue::Int64(Some(index as i64 + 100)),
+                null_count: 0,
+                row_count: 8192,
+            })
+            .collect(),
+        bloom_filters: vec![None; COLUMNS],
+        value_sets: vec![None; COLUMNS],
+        col_sums: vec![0; COLUMNS],
+        column_crcs: vec![0; COLUMNS],
+    }
+}
+
+fn synthetic_footer(row_group_count: u64) -> Vec<u8> {
+    let schema = Schema::new(
+        (0..3)
+            .map(|index| ColumnDef::new(&format!("c{index}"), DataType::Int64))
+            .collect(),
+    );
+    let row_groups: Vec<RowGroupMeta> = (0..row_group_count).map(synthetic_row_group).collect();
+    encode_segment_footer(
+        &schema,
+        row_group_count * 8192,
+        &row_groups,
+        &[],
+        0,
+        "t",
+        &[],
+    )
+}
+
+#[test]
+fn lazy_index_decodes_every_row_group_identically_to_the_eager_parse() {
+    let footer = synthetic_footer(512);
+    let eager = parse_segment_footer(&footer).unwrap();
+    let index = parse_segment_footer_index(&footer).unwrap();
+
+    assert_eq!(index.num_row_groups(), eager.row_groups.len());
+    for (row_group, expected) in eager.row_groups.iter().enumerate() {
+        let actual = index
+            .decode_row_group(&footer, row_group)
+            .unwrap_or_else(|err| panic!("row group {row_group}: {err}"));
+        assert_eq!(actual.offset, expected.offset, "row group {row_group} offset");
+        assert_eq!(
+            actual.row_count, expected.row_count,
+            "row group {row_group} row count"
+        );
+        assert_eq!(
+            actual.column_compressed_sizes, expected.column_compressed_sizes,
+            "row group {row_group} column sizes"
+        );
+        assert_eq!(
+            actual.zone_maps.len(),
+            expected.zone_maps.len(),
+            "row group {row_group} zone-map width"
+        );
+        assert_eq!(
+            actual.zone_maps[0].min_value, expected.zone_maps[0].min_value,
+            "row group {row_group} zone-map content"
+        );
+    }
+}
+
+#[test]
+fn lazy_index_costs_a_fixed_small_charge_per_row_group() {
+    let small = parse_segment_footer_index(&synthetic_footer(64)).unwrap();
+    let large_footer = synthetic_footer(1024);
+    let large = parse_segment_footer_index(&large_footer).unwrap();
+
+    let per_row_group = large.heap_bytes() / large.num_row_groups() as u64;
+    assert!(
+        per_row_group <= 32,
+        "the resident index charges {per_row_group} B per row group; anything \
+         above the 12-byte offset+row-count pair means row-group records are \
+         leaking back into the index"
+    );
+
+    // And the point of the index: the decoded graph it replaces is an order
+    // of magnitude larger for the same segment.
+    let eager = parse_segment_footer(&large_footer).unwrap();
+    let eager_per_row_group =
+        crate::storage::segment::row_groups_heap_bytes(&eager.row_groups)
+            / eager.row_groups.len() as u64;
+    assert!(
+        eager_per_row_group > 10 * per_row_group,
+        "eager {eager_per_row_group} B vs index {per_row_group} B per row group"
+    );
+
+    // Footprint must scale with the row-group count, not with record content.
+    let small_per_row_group = small.heap_bytes() / small.num_row_groups() as u64;
+    assert!(
+        small_per_row_group <= per_row_group * 4,
+        "per-row-group cost must not depend on segment size \
+         ({small_per_row_group} B at 64 groups vs {per_row_group} B at 1024)"
+    );
+}

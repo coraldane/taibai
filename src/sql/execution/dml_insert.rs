@@ -50,12 +50,22 @@ pub(super) fn acquire_constraint_insert_lock(
     table: &str,
 ) -> Result<std::sync::MutexGuard<'static, ()>> {
     let lock = constraint_insert_lock(db, table);
+    let start = Instant::now();
+    let timeout = std::time::Duration::from_secs(
+        crate::common::config::storage_timeouts().mutation_lock_timeout_secs,
+    );
     loop {
         crate::common::query_cancel::check()?;
         match lock.try_lock() {
             Ok(guard) => return Ok(guard),
             Err(std::sync::TryLockError::WouldBlock) => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                if start.elapsed() >= timeout {
+                    return Err(TaibaiError::ResourceBusy(format!(
+                        "constraint insert lock for {}.{} timed out after {:?}",
+                        db, table, timeout
+                    )));
+                }
+                std::thread::yield_now();
             }
             Err(std::sync::TryLockError::Poisoned(_)) => {
                 return Err(TaibaiError::Internal(
@@ -69,6 +79,8 @@ pub(super) fn acquire_constraint_insert_lock(
 #[cfg(test)]
 thread_local! {
     static FORCE_REPLACE_INSERT_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static FORCE_TWO_PHASE_REBUILD_STALE: Cell<bool> = const { Cell::new(false) };
+    static FORCE_TWO_PHASE_MEMTABLE_STALE: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -100,15 +112,13 @@ pub use constraints::{
     collect_unique_index_entries, validate_primary_key_uniqueness,
     validate_unique_indexes_in_batches, validate_unique_key_uniqueness, IntroducedKeyValidator,
 };
-pub(crate) use constraints::{
-    primary_key_indices, primary_keys_for_batch, unique_constraints,
-    visit_unique_index_entries_from,
-};
+pub(crate) use constraints::{primary_key_indices, primary_keys_for_batch, unique_constraints};
 pub use fast::{set_fast_insert_disabled_for_tests, try_exec_fast_insert_sql};
 pub(crate) use write::{
     append_unique_index_entries_after_insert, build_unique_index_entries_for_batch,
-    primary_location_entries_for_batch, rebuild_table_location_indexes,
-    rebuild_table_location_indexes_two_phase, write_batch_by_partition,
+    exec_insert_select_batch, primary_location_entries_for_batch,
+    rebuild_single_location_index_two_phase, rebuild_table_location_indexes_two_phase,
+    resolve_insert_select_plan, write_batch_by_partition,
 };
 pub use write::{exec_insert, exec_replace};
 

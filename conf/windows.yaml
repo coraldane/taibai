@@ -13,13 +13,12 @@ storage:
   hot_store_memory_limit_mb: 8192
   row_group_target_rows: 65536
   reader_cache_capacity: 1024
+  mutable_reader_cache_mb: 4096
 
 buffer:
   query_memory_limit_mb: 4096
   execution_threads: 16
   max_parallel_row_groups: 8
-  global_io_permits: 4
-  global_cpu_permits: 16
 
 compression:
   enabled: true

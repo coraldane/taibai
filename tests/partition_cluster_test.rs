@@ -273,7 +273,7 @@ fn direct_bulk_preserves_nulls_when_partition_groups_reorder_rows() {
             .expect("discover nullable bulk segments")
     {
         let reader = taibai::storage::segment::SegmentReader::open(&path).unwrap();
-        for rg_idx in 0..reader.footer_row_groups_info().len() {
+        for rg_idx in 0..reader.num_row_groups() {
             let zone_maps = reader.zone_maps(rg_idx);
             metadata_rows += zone_maps[2].row_count;
             score_nulls += zone_maps[2].null_count;

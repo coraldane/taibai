@@ -34,10 +34,62 @@ struct RequestLimiters {
     control: Arc<Semaphore>,
 }
 
+/// Admission counters for `SHOW WORKLOAD`: capacity is captured once when
+/// the limiters are built (a server runs one limiter set per process in
+/// practice; the last construction wins), acquired/rejected are monotonic.
+/// The 2026-11-05 incident made queue rejections the first visible symptom
+/// forty minutes before anyone looked — these counters make the pressure
+/// queryable instead of log-scrape-only.
+pub(crate) mod admission {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub const QUERY: usize = 0;
+    pub const SHARED: usize = 1;
+    pub const CONTROL: usize = 2;
+    pub const POOL_LABELS: [&str; 3] = ["query", "shared", "control"];
+
+    static ACQUIRED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static REJECTED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static CAPACITY: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+    pub fn note_capacity(pool: usize, capacity: u64) {
+        CAPACITY[pool].store(capacity, Ordering::Relaxed);
+    }
+
+    pub fn note_acquired(pool: usize) {
+        ACQUIRED[pool].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Only overload rejections count; KILL-cancelled queue waiters are an
+    /// operator action, not pressure.
+    pub fn note_rejected(pool: usize) {
+        REJECTED[pool].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// (pool, capacity, acquired_total, rejected_overload_total) rows.
+    pub fn snapshot() -> Vec<(&'static str, u64, u64, u64)> {
+        POOL_LABELS
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| {
+                (
+                    *name,
+                    CAPACITY[idx].load(Ordering::Relaxed),
+                    ACQUIRED[idx].load(Ordering::Relaxed),
+                    REJECTED[idx].load(Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+}
+
 impl RequestLimiters {
     fn new(max_concurrent_requests: usize, reserved_bulk_slots: usize) -> Self {
         let shared = max_concurrent_requests.max(1);
         let reserved = reserved_bulk_slots.min(shared - 1);
+        admission::note_capacity(admission::SHARED, shared as u64);
+        admission::note_capacity(admission::QUERY, (shared - reserved) as u64);
+        admission::note_capacity(admission::CONTROL, 2);
         Self {
             shared: Arc::new(Semaphore::new(shared)),
             query: Arc::new(Semaphore::new(shared - reserved)),
@@ -63,13 +115,19 @@ impl Server {
                 Ok(()) => match tls_config.load_server_config() {
                     Ok(server_config) => Some(TlsAcceptor::from(server_config)),
                     Err(e) => {
-                        tracing::error!("Failed to load TLS configuration: {}", e);
-                        None
+                        panic!(
+                            "TLS is enabled but certificate/key loading failed: {}; \
+                             refusing to start — fix the TLS configuration or disable TLS",
+                            e
+                        );
                     }
                 },
                 Err(e) => {
-                    tracing::error!("TLS configuration invalid: {}", e);
-                    None
+                    panic!(
+                        "TLS configuration is invalid: {}; \
+                         refusing to start — fix the TLS configuration or disable TLS",
+                        e
+                    );
                 }
             },
             TlsMode::Disable => None,
@@ -155,17 +213,15 @@ async fn handle_connection(
     if let Some(acceptor) = tls_acceptor {
         tracing::debug!("Performing TLS handshake");
         let handshake = acceptor.accept(stream);
-        let tls_stream = if config.server.tls_handshake_timeout_secs == 0 {
-            handshake.await
+        let handshake_timeout = if config.server.tls_handshake_timeout_secs == 0 {
+            Duration::from_secs(30)
         } else {
-            timeout(
-                Duration::from_secs(config.server.tls_handshake_timeout_secs),
-                handshake,
-            )
+            Duration::from_secs(config.server.tls_handshake_timeout_secs)
+        };
+        let tls_stream = timeout(handshake_timeout, handshake)
             .await
             .map_err(|_| TaibaiError::Network("TLS handshake timed out".into()))?
-        }
-        .map_err(|e| TaibaiError::Network(format!("TLS handshake failed: {}", e)))?;
+            .map_err(|e| TaibaiError::Network(format!("TLS handshake failed: {}", e)))?;
         tracing::debug!("TLS handshake completed");
         handle_framed(tls_stream, config, engine, limiters).await
     } else {
@@ -287,7 +343,7 @@ where
         requests_in_flight += 1;
 
         let context = build_query_context(&config, Arc::new(AtomicBool::new(false)));
-        let (stream_sender, mut stream_receiver) = tokio::sync::mpsc::channel(1);
+        let (stream_sender, mut stream_receiver) = tokio::sync::mpsc::channel(8);
         let mut worker = run_handler(
             handler.take().expect("handler available between requests"),
             msg,
@@ -587,7 +643,7 @@ async fn acquire_slot(
     context: &Arc<crate::common::query_cancel::QueryContext>,
     msg_type: u8,
     queue_timeout_secs: u64,
-    slot_pool: &'static str,
+    slot_pool: usize,
 ) -> std::result::Result<SlotAcquisition, TaibaiError> {
     // Wait for a request slot while watching the cancellation context, so
     // a disconnect (or KILL) during a full queue does not stall cleanup
@@ -603,9 +659,10 @@ async fn acquire_slot(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            admission::note_rejected(slot_pool);
             tracing::warn!(
                 msg_type,
-                slot_pool,
+                slot_pool = admission::POOL_LABELS[slot_pool],
                 queue_timeout_secs,
                 "request queue wait timeout; rejecting request with overload error"
             );
@@ -614,7 +671,10 @@ async fn acquire_slot(
             ));
         }
         match timeout(remaining.min(QUEUE_CANCEL_POLL), &mut acquisition).await {
-            Ok(Ok(permit)) => return Ok(SlotAcquisition::Permit(permit)),
+            Ok(Ok(permit)) => {
+                admission::note_acquired(slot_pool);
+                return Ok(SlotAcquisition::Permit(permit));
+            }
             Ok(Err(_)) => {
                 return Err(TaibaiError::Internal("request limiter closed".into()));
             }
@@ -653,7 +713,7 @@ fn run_handler(
                 &context,
                 msg.msg_type,
                 queue_timeout_secs,
-                "query",
+                admission::QUERY,
             )
             .await
             {
@@ -679,7 +739,11 @@ fn run_handler(
             &context,
             msg.msg_type,
             queue_timeout_secs,
-            "shared",
+            if control_request {
+                admission::CONTROL
+            } else {
+                admission::SHARED
+            },
         )
         .await
         {

@@ -1389,3 +1389,28 @@ fn alter_table_compression_level_set_and_reset() {
         .expect("drop table");
     engine.segment_mgr().shutdown();
 }
+
+#[test]
+fn show_version_returns_build_identity() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    match engine
+        .execute(&mut session, "SHOW VERSION")
+        .expect("show version")
+    {
+        ExecResult::Query { batches, .. } => match batches[0].scalar(0, 0) {
+            Some(ScalarValue::VarChar(Some(version))) => {
+                assert!(
+                    !version.is_empty()
+                        && version.contains("commit")
+                        && version.contains("built"),
+                    "version must carry the build identity, got: {version}"
+                );
+            }
+            other => panic!("unexpected version value: {other:?}"),
+        },
+        other => panic!("unexpected result: {other:?}"),
+    }
+    engine.segment_mgr().shutdown();
+}

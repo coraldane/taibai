@@ -33,6 +33,16 @@ use sort::SortExec;
 pub trait ExecutionOp {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>>;
 
+    /// Output schema known *before* any row is produced.
+    ///
+    /// Result metadata must not depend on the data: `SELECT id FROM t` has
+    /// the column `id` even when `t` is empty. Operators that can describe
+    /// their output from the plan alone (projections, scans) return it here;
+    /// `None` means "only known from the produced batches".
+    fn output_schema(&self) -> Option<Schema> {
+        None
+    }
+
     fn add_runtime_in_filter(&mut self, _filter: RuntimeInFilter) -> bool {
         false
     }

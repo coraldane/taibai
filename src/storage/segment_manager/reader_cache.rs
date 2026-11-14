@@ -133,6 +133,11 @@ impl LruOrder {
         self.unlink(id);
         self.free.push(id);
     }
+
+    fn shrink(&mut self) {
+        self.index.shrink_to(self.index.len() * 2);
+        self.free.shrink_to(self.free.len() * 2);
+    }
 }
 
 pub(super) struct ReaderCache {
@@ -150,9 +155,33 @@ impl ReaderCache {
     /// (at least one entry's worth). The count-based config knob stays the
     /// only tunable so existing deployments keep working unchanged; only the
     /// internal bound switches from "N entries" to "N * 256 KiB bytes".
+    /// Test-only constructor: derives the budget from an entry count via
+    /// [`AVG_READER_COST_BYTES`]. Production builds set the budget directly
+    /// (`with_budget_bytes`), because real entries are charged their true
+    /// parsed-footer size.
+    #[cfg(test)]
     pub(super) fn new(capacity: usize) -> Self {
         Self {
             budget_bytes: capacity.max(1) as u64 * AVG_READER_COST_BYTES,
+            used_bytes: 0,
+            entries: HashMap::new(),
+            order: LruOrder::new(),
+        }
+    }
+
+    /// Build a cache with an explicit byte budget
+    /// (`storage.reader_cache_mb`).
+    ///
+    /// Entries are charged their real parsed-footer size
+    /// ([`crate::storage::segment::SegmentReader::footer_heap_bytes`]), which
+    /// for a 28k-row-group segment is tens of MiB rather than the
+    /// `AVG_READER_COST_BYTES` constant the count-derived budget assumed.
+    /// Keeping one knob for the budget — in bytes — is what stops a
+    /// "segment count" from silently pricing a cache that holds object
+    /// graphs.
+    pub(super) fn with_budget_bytes(budget_bytes: u64) -> Self {
+        Self {
+            budget_bytes: budget_bytes.max(AVG_READER_COST_BYTES),
             used_bytes: 0,
             entries: HashMap::new(),
             order: LruOrder::new(),
@@ -195,6 +224,13 @@ impl ReaderCache {
         reader
     }
 
+    /// `(entries, charged heap bytes, budget bytes)` for `SHOW MEMORY`. The
+    /// charge covers owned readers' heap copies; mmap readers are
+    /// page-cache-backed and only their metadata is charged.
+    pub(super) fn stats(&self) -> (usize, u64, u64) {
+        (self.entries.len(), self.used_bytes, self.budget_bytes)
+    }
+
     pub(super) fn invalidate(&mut self, path: &Path) {
         if let Some((_, cost)) = self.entries.remove(path) {
             self.used_bytes -= cost;
@@ -215,9 +251,6 @@ impl ReaderCache {
     }
 
     fn evict_if_needed(&mut self) {
-        // The newest entry sits at the back of `order` and costs at most the
-        // whole budget (oversized entries never reach the map), so this loop
-        // always terminates with the just-inserted entry surviving.
         while self.used_bytes > self.budget_bytes {
             if let Some(oldest) = self.order.pop_front() {
                 if let Some((_, cost)) = self.entries.remove(&oldest) {
@@ -226,6 +259,10 @@ impl ReaderCache {
             } else {
                 break;
             }
+        }
+        if self.entries.capacity() > self.entries.len().max(16) * 4 {
+            self.entries.shrink_to(self.entries.len() * 2);
+            self.order.shrink();
         }
     }
 }

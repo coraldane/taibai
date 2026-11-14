@@ -657,10 +657,9 @@ impl SegmentManager {
         let data_end = reader.data_end();
 
         // Recovery rehydrates the writer's row-group metadata once per
-        // recovered segment — the deep clone is fine here (not per row-group
-        // read); use the borrowed accessor and clone only what the writer
-        // takes ownership of.
-        let row_groups = reader.footer_row_groups().to_vec();
+        // recovered segment, so a full decode is the point — this is the one
+        // caller that genuinely needs the whole graph at once.
+        let row_groups = reader.footer_row_groups_info()?;
 
         let mut file = std::fs::OpenOptions::new()
             .write(true)

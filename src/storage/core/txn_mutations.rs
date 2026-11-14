@@ -689,6 +689,17 @@ impl TxnMutationRegistry {
         })
     }
 
+    pub fn segment_pin_conflicts(&self, db: &str, table: &str, path: &Path) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.values().any(|txn| {
+            txn.tables.iter().any(|entry| {
+                entry.db == db
+                    && entry.table == table
+                    && entry.segments.iter().any(|segment| segment.path == path)
+            })
+        })
+    }
+
     /// True when a transaction *other* than `txn_id` pins the table. DML
     /// outside the pinning transaction (auto-commit statements, other open
     /// transactions) must not run while pins exist: an auto-commit DELETE

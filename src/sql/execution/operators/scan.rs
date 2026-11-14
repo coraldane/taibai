@@ -134,6 +134,19 @@ impl ScanExec {
 }
 
 impl ExecutionOp for ScanExec {
+    fn output_schema(&self) -> Option<Schema> {
+        let table_schema = self.table_schema.as_ref()?;
+        Some(match &self.projection {
+            Some(indices) => Schema::new(
+                indices
+                    .iter()
+                    .filter_map(|index| table_schema.columns.get(*index).cloned())
+                    .collect(),
+            ),
+            None => table_schema.clone(),
+        })
+    }
+
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         crate::common::query_cancel::check()?;
         if let ScanSource::Cursor(cursor) = &mut self.source {

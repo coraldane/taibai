@@ -75,7 +75,8 @@ fn optimize_audit_prepared_outputs_are_isolated() -> Result<()> {
     write_segment(&dir.join("seg_00002.dat"), &schema, &[(2, "b")])?;
     let mgr = Arc::new(SegmentManager::new(tmp.path())?);
     let c = Compactor::new(mgr.clone(), tmp.path().to_path_buf());
-    let files = SegmentManager::discover_segments(&dir)?;
+    let _maintenance = mgr.capture_maintenance_snapshot("default", "t", &dir, None)?;
+    let files = _maintenance.planned_segments();
     let a = c.prepare_compact_segment_group(
         "default",
         "t",
@@ -147,12 +148,13 @@ fn optimize_audit_retirement_failure_must_not_publish_duplicates() -> Result<()>
     write_segment(&input, &schema, &[(3, "c"), (1, "a")])?;
     let mgr = Arc::new(SegmentManager::new(tmp.path())?);
     let c = Compactor::new(mgr.clone(), tmp.path().to_path_buf());
+    let maintenance = mgr.capture_maintenance_snapshot("default", "t", &dir, None)?;
     let a = c.prepare_compact_segment_group(
         "default",
         "t",
         &dir,
         None,
-        vec![input.clone()],
+        maintenance.planned_segments(),
         &schema,
         &[0],
         &[0],
@@ -168,6 +170,11 @@ fn optimize_audit_retirement_failure_must_not_publish_duplicates() -> Result<()>
     let result = mgr.with_partition_mutation_lock("default", "t", "", || {
         c.commit_prepared_compaction("default", "t", &dir, None, a)
     });
+    // Release the maintenance plan lease before verifying recovery: exactly
+    // like production, where `optimize_table` returns and drops its snapshot.
+    // Retirement is only drained once the last directory reader leaves, so
+    // recovery called under an active lease can only queue, not delete.
+    drop(maintenance);
     let outputs = SegmentManager::discover_segments(&dir)?;
     drop(held);
     assert!(
@@ -424,6 +431,14 @@ fn oversized_row_group_fails_without_changing_inputs_or_leaking_runs() -> Result
         Err(TaibaiError::ResourceBusy(_))
     ));
     assert_eq!(SegmentManager::discover_segments(&dir)?, vec![input]);
-    assert_eq!(std::fs::read_dir(&dir)?.count(), 1);
+    // segment_catalog is a persistent capture artifact, not a leaked merge run.
+    assert_eq!(
+        std::fs::read_dir(&dir)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with("segment_catalog"))
+            .count(),
+        1
+    );
     Ok(())
 }

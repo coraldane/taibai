@@ -11,13 +11,15 @@ members = [
 
 [package]
 name = "taibai"
-version = "0.2.7"
+version = "0.2.9"
 edition = "2021"
 autotests = false
-description = "An experimental Rust columnar database server for analytical workloads"
+description = "An experimental columnar database server in Rust, built for market-data and tick workloads"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/coraldane/taibai"
+homepage = "https://github.com/coraldane/taibai"
 readme = "README.md"
-keywords = ["database", "columnar", "analytics", "sql"]
+keywords = ["database", "columnar", "olap", "timeseries", "market-data"]
 categories = ["database-implementations"]
 
 [lib]
@@ -76,6 +78,16 @@ csv = "1"
 argon2 = "0.5"
 # Salt generation for argon2 (OsRng needs the getrandom feature).
 rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Production allocators: jemalloc on unix (page-decay returns freed memory to
+# the OS — glibc arenas on many-core servers retain their peak forever), and
+# mimalloc on Windows where jemalloc cannot build (no MSVC support; mimalloc
+# needs CMake on the Windows build machine). Wired in main.rs.
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+mimalloc = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
@@ -226,6 +238,14 @@ path = "tests/cluster_composite_test.rs"
 [[test]]
 name = "ttl_purge_test"
 path = "tests/ttl_purge_test.rs"
+
+[[test]]
+name = "ttl_scan_prune_test"
+path = "tests/ttl_scan_prune_test.rs"
+
+[[test]]
+name = "deleted_row_group_skip_test"
+path = "tests/deleted_row_group_skip_test.rs"
 
 [[test]]
 name = "window_function_test"

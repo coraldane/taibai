@@ -100,6 +100,10 @@ pub struct BatchWriterConfig {
     /// Ack durable-tail appends after the page-cache write; the tail commit
     /// thread performs the fsync for every group in the background.
     pub tail_async_fsync: bool,
+    /// Hard memory ceiling for memtables. Writes are rejected with
+    /// `ResourceBusy` when total estimated memtable bytes exceed this value.
+    /// Defaults to 2 × `max_total_memory` (the soft high-water mark).
+    pub memory_hard_limit: u64,
 }
 
 impl Default for BatchWriterConfig {
@@ -114,6 +118,7 @@ impl Default for BatchWriterConfig {
             spill_enabled: true,
             spill_min_age_secs: DEFAULT_SPILL_MIN_AGE_SECS,
             tail_async_fsync: false,
+            memory_hard_limit: DEFAULT_MAX_TOTAL_MEMORY.saturating_mul(2),
         }
     }
 }
@@ -566,6 +571,26 @@ impl BatchWriter {
                 db, table
             )));
         }
+        // --- Write-side memory backpressure (H1 fix) ---
+        if txn_id == 0 {
+            let current_mem = self.memtable_mgr.total_estimated_memory_bytes();
+            if current_mem >= self.config.memory_hard_limit {
+                return Err(TaibaiError::ResourceBusy(format!(
+                    "memtable memory pressure: {} bytes exceeds hard limit {} bytes; \
+                     retry after pending flushes complete",
+                    current_mem, self.config.memory_hard_limit
+                )));
+            }
+            if current_mem >= self.config.max_total_memory {
+                let _ = self.sender.send_timeout(
+                    WriteCommand::Flush {
+                        db: db.to_string(),
+                        table: table.to_string(),
+                    },
+                    std::time::Duration::from_millis(50),
+                );
+            }
+        }
         let get_start = Instant::now();
         let mt =
             self.memtable_mgr
@@ -600,10 +625,9 @@ impl BatchWriter {
             self.charge_txn_insert_bytes(txn_id, db, table, batch.estimated_size_bytes() as u64)?;
         }
         let pending = if txn_id == 0 {
-            // `PreparedTailAppend` already owns the durable representation of
-            // this delta, so the materialized column buffers can move into the
-            // memtable. Borrowing here cloned every column once per INSERT.
-            mt.append_owned(batch)?;
+            // Submit the durable tail frame BEFORE the memtable append: if the
+            // commit queue is full the write is rejected cleanly without leaving
+            // undurable rows in the memtable (H2 fix).
             let prepared = prepared.ok_or_else(|| {
                 TaibaiError::Internal("missing prepared durable tail append".into())
             })?;
@@ -613,6 +637,14 @@ impl BatchWriter {
                 partition_key.to_string(),
                 prepared,
             );
+            if ticket.is_immediate_failure() {
+                return Err(TaibaiError::ResourceBusy(
+                    "durable tail commit queue full; write rejected to prevent \
+                     data loss on restart — retry after backlog drains"
+                        .into(),
+                ));
+            }
+            mt.append_owned(batch)?;
             Some((ticket, Arc::clone(&mt)))
         } else {
             mt.append_owned(batch)?;
@@ -631,10 +663,23 @@ impl BatchWriter {
                 .note_hot_unfed_rows(db, table, partition_key, row_count);
         }
         if txn_id == 0 && mt.row_count() >= self.config.max_rows_per_memtable {
-            let _ = self.sender.try_send(WriteCommand::Flush {
-                db: db.to_string(),
-                table: table.to_string(),
-            });
+            match self.sender.send_timeout(
+                WriteCommand::Flush {
+                    db: db.to_string(),
+                    table: table.to_string(),
+                },
+                std::time::Duration::from_millis(100),
+            ) {
+                Ok(()) => {}
+                Err(_) => {
+                    tracing::warn!(
+                        db,
+                        table,
+                        "flush command channel full; memtable will be flushed \
+                         by the background pressure pass"
+                    );
+                }
+            }
         }
         Ok((row_count, pending))
     }

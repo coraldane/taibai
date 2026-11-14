@@ -85,6 +85,38 @@ pub fn statement_is_read_only(sql: &str) -> bool {
     )
 }
 
+/// Login handshake options — everything the server reads from the LOGIN
+/// payload after the three length-prefixed strings.
+///
+/// Wire layout (`docs/design/wire-protocol.md`):
+/// `[string user][string password][string db][i32 LE timezone_hours][u8 streaming]`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoginOptions {
+    /// Whole-hour UTC offset applied when rendering TIMESTAMP values.
+    pub timezone_offset_hours: i32,
+    /// Ask the server to stream SELECT results.
+    ///
+    /// `true` (default): a SELECT is answered by a sequence of
+    /// `MSG_TYPE_RESULT_CHUNK` (0x26) frames — one binary batch each, every
+    /// frame carrying the full column metadata — terminated by
+    /// `MSG_TYPE_RESULT_END` (0x27). Chunking lifts the single-frame size
+    /// ceiling. A zero-row result still sends one schema-only chunk, so the
+    /// column list survives.
+    ///
+    /// `false`: results arrive as a single `MSG_TYPE_BINARY_QUERY_RESULT`
+    /// (0x24) frame, bounded by `server.max_message_size`.
+    pub streaming_results: bool,
+}
+
+impl Default for LoginOptions {
+    fn default() -> Self {
+        Self {
+            timezone_offset_hours: 0,
+            streaming_results: true,
+        }
+    }
+}
+
 pub struct Client {
     framed: Framed<tokio::net::TcpStream, MessageCodec>,
     session_id: Option<String>,
@@ -199,7 +231,7 @@ impl Client {
     }
 
     pub async fn login(&mut self, username: &str, password: &str, database: &str) -> Result<()> {
-        self.login_with_timezone(username, password, database, 0)
+        self.login_with_options(username, password, database, LoginOptions::default())
             .await
     }
 
@@ -210,12 +242,37 @@ impl Client {
         database: &str,
         timezone_offset_hours: i32,
     ) -> Result<()> {
+        self.login_with_options(
+            username,
+            password,
+            database,
+            LoginOptions {
+                timezone_offset_hours,
+                ..LoginOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Full login handshake. Everything the server reads from the LOGIN
+    /// payload is spelled out in [`LoginOptions`]; in particular the
+    /// streaming bit decides whether SELECT results arrive as
+    /// `RESULT_CHUNK` (0x26) frames or as one `BINARY_QUERY_RESULT` (0x24).
+    /// Set `streaming_results: false` when the caller (or a proxy in front
+    /// of it) only understands the single-frame form.
+    pub async fn login_with_options(
+        &mut self,
+        username: &str,
+        password: &str,
+        database: &str,
+        options: LoginOptions,
+    ) -> Result<()> {
         let mut payload = Vec::new();
         write_len_prefixed_string(&mut payload, username);
         write_len_prefixed_string(&mut payload, password);
         write_len_prefixed_string(&mut payload, database);
-        payload.extend_from_slice(&timezone_offset_hours.to_le_bytes());
-        payload.push(1);
+        payload.extend_from_slice(&options.timezone_offset_hours.to_le_bytes());
+        payload.push(u8::from(options.streaming_results));
 
         self.send(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
             .await?;
@@ -251,6 +308,13 @@ impl Client {
     }
 
     /// Execute `sql` and return the full result.
+    ///
+    /// Framing: independent of [`LoginOptions::streaming_results`], this
+    /// method accepts both result shapes — a single `BINARY_QUERY_RESULT`
+    /// frame (0x24) and a `RESULT_CHUNK` stream (0x26 … 0x27). Streamed
+    /// results are accumulated in memory, so peak client memory tracks the
+    /// result set; use [`query_each_batch`](Self::query_each_batch) when the
+    /// result may not fit.
     ///
     /// Retry boundary: when the server answers a READ-ONLY statement
     /// (leading SELECT/SHOW/EXPLAIN, see [`statement_is_read_only`]) with a
@@ -368,6 +432,12 @@ impl Client {
 
     /// Stream `sql` result batch-by-batch.
     ///
+    /// `on_batch` is called once per batch, in order, and at least once per
+    /// result set: a zero-row result invokes it with an empty batch so the
+    /// caller still receives the schema (column names and types). Both
+    /// framings are accepted, so this works whether or not
+    /// [`LoginOptions::streaming_results`] is enabled.
+    ///
     /// No automatic retry here, by design: batches are handed to `on_batch`
     /// as they arrive, so a mid-stream retry would re-deliver rows the
     /// callback has already seen — not idempotent from the consumer's
@@ -398,8 +468,16 @@ impl Client {
                     else {
                         unreachable!()
                     };
-                    for batch in batches {
-                        on_batch(&schema, batch)?;
+                    if batches.is_empty() {
+                        // Zero-row result: the frame still carries the
+                        // schema. Deliver it as one empty batch so callers
+                        // can render headers for an empty result set instead
+                        // of never being called at all.
+                        on_batch(&schema, RecordBatch::new(schema.clone()))?;
+                    } else {
+                        for batch in batches {
+                            on_batch(&schema, batch)?;
+                        }
                     }
                     if response.msg_type == MSG_TYPE_BINARY_QUERY_RESULT {
                         return Ok(None);
@@ -436,7 +514,25 @@ impl Client {
         }
     }
 
+    /// Send one statement on the pipelined write path.
+    ///
+    /// Only statements that answer with `MSG_TYPE_OK` (INSERT / UPDATE /
+    /// DELETE / DDL / transaction control) belong here. Row-returning
+    /// statements are rejected up front: their reply is a
+    /// `BINARY_QUERY_RESULT` frame or a `RESULT_CHUNK` stream, neither of
+    /// which fits the `u64 rows_affected` contract of
+    /// [`recv_execute_result`](Self::recv_execute_result).
     pub async fn send_execute(&mut self, sql: &str) -> Result<()> {
+        if statement_is_read_only(sql) {
+            let first_word = sql
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_uppercase();
+            return Err(TaibaiError::Sql(format!(
+                "send_execute carries only statements that return rows_affected, but {first_word} returns a result set; use query() or query_each_batch() instead"
+            )));
+        }
         let mut payload = Vec::new();
         write_len_prefixed_string(&mut payload, "");
         write_len_prefixed_string(&mut payload, sql);
@@ -444,6 +540,11 @@ impl Client {
             .await
     }
 
+    /// Read the reply to one [`send_execute`](Self::send_execute) request.
+    ///
+    /// A row-returning reply is drained to the end of its stream before the
+    /// error is returned: leaving frames unread would desynchronize every
+    /// later request on this pipelined connection.
     pub async fn recv_execute_result(&mut self) -> Result<u64> {
         let resp = self.recv().await?;
         match resp.msg_type {
@@ -456,6 +557,28 @@ impl Client {
             MSG_TYPE_ERROR => Err(TaibaiError::Sql(
                 String::from_utf8_lossy(&resp.payload).to_string(),
             )),
+            MSG_TYPE_RESULT_CHUNK => {
+                let mut chunks = 1usize;
+                loop {
+                    let next = self.recv().await?;
+                    match next.msg_type {
+                        MSG_TYPE_RESULT_CHUNK => chunks += 1,
+                        MSG_TYPE_RESULT_END | MSG_TYPE_ERROR => break,
+                        other => {
+                            return Err(TaibaiError::Protocol(format!(
+                                "unexpected frame {other:#04X} inside a result stream"
+                            )))
+                        }
+                    }
+                }
+                Err(TaibaiError::Sql(format!(
+                    "send_execute received a streamed result set ({chunks} chunk(s)); the pipelined write path only accepts statements that return rows_affected — use query_each_batch() for row-returning statements"
+                )))
+            }
+            MSG_TYPE_RESULT_END | MSG_TYPE_BINARY_QUERY_RESULT => Err(TaibaiError::Sql(format!(
+                "send_execute received a result set ({:#04X}); the pipelined write path only accepts statements that return rows_affected — use query() or query_each_batch() for row-returning statements",
+                resp.msg_type
+            ))),
             other => Err(TaibaiError::Protocol(format!(
                 "unexpected execute response type: {other:#04X}"
             ))),

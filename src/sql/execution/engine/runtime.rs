@@ -52,6 +52,40 @@ impl Engine {
         Arc::clone(&self.query_registry)
     }
 
+    /// Pick the watchdog canary target: the table with the fewest rows by
+    /// collected statistics, so the probe stays cheap on any deployment
+    /// shape. Tables without statistics sort last; an empty catalog yields
+    /// no table and the caller falls back to a bare SELECT 1.
+    pub fn canary_target(&self) -> (String, Option<String>) {
+        let catalogs = self
+            .catalogs
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut best: Option<(i64, String, String)> = None;
+        for (db, catalog) in catalogs.iter() {
+            if db.starts_with('.') {
+                continue;
+            }
+            for name in catalog.table_names() {
+                let Some(meta) = catalog.get_table(name) else {
+                    continue;
+                };
+                let rows = meta
+                    .statistics
+                    .as_ref()
+                    .map(|stats| stats.row_count)
+                    .unwrap_or(i64::MAX);
+                if best.as_ref().map_or(true, |(fewest, ..)| rows < *fewest) {
+                    best = Some((rows, db.clone(), name.to_string()));
+                }
+            }
+        }
+        match best {
+            Some((_, db, table)) => (db, Some(table)),
+            None => (String::new(), None),
+        }
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
@@ -895,15 +929,17 @@ impl Engine {
         }
         if stats.segments_written > 0 || stats.rows_dropped > 0 {
             let schema = Schema::new(table_meta.columns.clone());
-            let rebuilt = self.segment_mgr.with_table_mutation_lock(db, table, || {
-                crate::sql::execution::dml_insert::rebuild_table_location_indexes(
-                    self,
+            let rebuilt =
+                crate::sql::execution::dml_insert::rebuild_table_location_indexes_two_phase(
+                    &self.index_manager,
+                    &self.segment_mgr,
+                    self.memtable_manager(),
+                    &self.data_dir,
                     db,
                     table,
                     &table_meta,
                     &schema,
-                )
-            });
+                );
             if let Err(error) = rebuilt {
                 tracing::warn!(
                     db,
@@ -1296,6 +1332,40 @@ impl Engine {
                     }
                 }
             }
+        }
+    }
+
+    pub fn warmup_unique_indexes(&self) {
+        let catalogs = self.catalogs.read().unwrap();
+        let mut warmed = 0usize;
+        let mut failed = 0usize;
+        for (db, catalog) in catalogs.iter() {
+            for (table, table_meta) in catalog.tables.iter() {
+                for idx in &table_meta.unique_indexes {
+                    match self
+                        .index_manager
+                        .preload_unique_index(db, table, &idx.name)
+                    {
+                        Ok(true) => {
+                            warmed += 1;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                db,
+                                table,
+                                index = %idx.name,
+                                error = %e,
+                                "warmup: load unique index state failed"
+                            );
+                            failed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if warmed > 0 || failed > 0 {
+            tracing::info!(warmed, failed, "warmup: unique index states preloaded");
         }
     }
 

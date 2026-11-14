@@ -259,6 +259,13 @@ impl BloomFilter {
         self.bits.iter().all(|&b| b == 0)
     }
 
+    /// Heap bytes held by the bit array, for cache byte accounting. A bloom
+    /// filter is the per-row-group, per-column allocation most likely to
+    /// dominate a cached footer, so the metadata cache charges this in full.
+    pub fn heap_bytes(&self) -> usize {
+        self.bits.capacity()
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(8 + self.bits.len());
         buf.extend_from_slice(&(self.num_bits as u64).to_le_bytes());

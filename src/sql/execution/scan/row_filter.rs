@@ -386,7 +386,7 @@ pub fn predicate_first_read(
         .filter(|(column, value)| {
             !can_eliminate
                 || !zone_map_proves_clause(
-                    zone_maps,
+                    &zone_maps,
                     footer_index(*column),
                     crate::storage::partition::pruning::RangeOp::Eq,
                     value,
@@ -398,7 +398,7 @@ pub fn predicate_first_read(
         .filter(|clause| {
             !can_eliminate
                 || !zone_map_proves_clause(
-                    zone_maps,
+                    &zone_maps,
                     footer_index(clause.column_index),
                     clause.op,
                     &clause.value,
@@ -1539,13 +1539,13 @@ pub(super) fn meta_prune_row_groups(
         // stays a candidate (the reader gate routes drifted segments
         // through default-filled evaluation).
         return Ok(MetaPrune::Candidates(
-            (0..meta.footer_row_groups().len()).collect(),
+            (0..meta.row_group_count()).collect(),
         ));
     }
     let aligned = match align_prune_checks_to_footer(
         &spec.table_schema,
         footer_schema,
-        &spec.to_row_group_predicate(),
+        &spec.to_row_group_predicate_with_ttl(),
         &super::row_group::build_bloom_check_list(spec),
         &super::row_group::build_in_check_list(spec),
         &super::row_group::build_set_check_list(spec),
@@ -1569,7 +1569,7 @@ pub(super) fn meta_prune_row_groups(
     let set_in_refs = aligned.set_in_check_refs();
     Ok(MetaPrune::Candidates(
         super::row_group::prune_row_group_meta(
-            meta.footer_row_groups(),
+            meta,
             &aligned.predicate,
             &aligned.bloom_checks,
             &in_refs,

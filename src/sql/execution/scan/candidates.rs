@@ -53,5 +53,32 @@ pub(super) fn open_segment_with_candidates(
             .map(|result| result.candidate_indices)
             .unwrap_or_default(),
     };
+    let indices = skip_fully_deleted_row_groups(&reader, indices);
     Ok(Some(SegmentCandidates { reader, indices }))
+}
+
+/// Drop row groups the delete bitmap already empties: they decode to
+/// zero-row batches, which defeats LIMIT-style early termination exactly
+/// like an expired row group does. Bitmap-range check only — never touches
+/// column data; the read path keeps its own delete filtering for partial
+/// groups.
+pub(super) fn skip_fully_deleted_row_groups(
+    reader: &Arc<SegmentReader>,
+    indices: Vec<usize>,
+) -> Vec<usize> {
+    if reader.delete_bitmap().is_empty() {
+        return indices;
+    }
+    indices
+        .into_iter()
+        .filter(|&rg_idx| {
+            let start = reader.row_group_start_row(rg_idx);
+            let rows = reader.row_group_rows(rg_idx);
+            !crate::storage::segment::delete_bitmap::row_range_all_deleted(
+                reader.delete_bitmap(),
+                start,
+                rows,
+            )
+        })
+        .collect()
 }

@@ -29,6 +29,7 @@
 ## 架构与设计
 
 - [Taibai 列式数据库服务器](design/TAIBAI_DESIGN_ZH.md)：整体架构与各子系统设计。
+- [二进制协议（线上格式参考）](design/wire-protocol.md)：帧格式、消息类型表、登录能力字节、流式结果的 `0x26`/`0x27` 语义与客户端接入检查清单。
 - [分区级 mutation lock 设计](design/partition-mutation-locks.md)：写入互斥的锁粒度与锁序。
 - [元数据折叠聚合执行](design/folded-aggregate-execution.md)：COUNT(*)/分组聚合从段 footer 元数据直接作答的设计。
 - [Direct Bulk 二进制协议](design/direct-bulk-binary-protocol.md)
@@ -47,7 +48,10 @@
 
 报告中的数据只适用于文档记录的版本、配置和测试环境。
 
-- [Taibai vs DuckDB vs kdb+ 性能对比报告](reports/benchmark-vs-duckdb-kdb-2026-09.md)：当前版本的对照基准与后续优化方向。
+性能数据目前分散在运维文档中，没有单独维护的对比报告。要得到可引用的数字，请用仓库自带的基准工具在自己的环境重测，并按[性能数据说明](user-guide/limitations.md)记录版本、配置、硬件、数据集、预热方式和完整命令：
+
+- [示例工具使用指南](operations/examples-guide.md)：`batch_import`、`multi_insert`、`insert_csv`、`load_csv` 等导入路径的吞吐对比与用法。
+- [金融行情场景验证与测试清单](operations/financial-market-data-validation-checklist.md)：行情场景应测的指标与判定口径。
 
 ## 项目治理
 

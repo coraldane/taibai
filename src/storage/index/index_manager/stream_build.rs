@@ -162,6 +162,7 @@ impl IndexManager {
             chunk_limit,
             chunk: Vec::new(),
             bytes: 0,
+            flush_epoch: self.segment_mgr.memtable_flush_epoch(db, table),
         })
     }
 
@@ -194,25 +195,27 @@ impl IndexManager {
         Ok(())
     }
 
-    /// Merge the pending runs into the on-disk base, publish it atomically,
-    /// and swap the in-memory snapshot. Must be called while holding the
-    /// table mutation lock so the recorded flush epoch and segment
-    /// watermarks describe the state the base covers. Duplicate keys across
-    /// runs keep the last occurrence: two-phase builds can transiently hold
-    /// a row at both its old and new location, and the later scan is the
-    /// authoritative one.
-    pub(crate) fn unique_index_stream_publish(
+    /// Merge the pending runs, fsync a complete temporary base, and open its
+    /// snapshot outside the table mutation lock. Duplicate keys across runs
+    /// keep the last occurrence: a full rebuild can transiently hold a row at
+    /// both its old and new location, and the later scan is authoritative.
+    ///
+    /// The epoch is captured when the build begins. A producer that raced a
+    /// segment change fails here or at the final publish instead of stamping
+    /// later watermarks on entries from an earlier table state.
+    pub(crate) fn unique_index_stream_prepare(
         &self,
         db: &str,
         table: &str,
         index_name: &str,
         columns: &[String],
         mut build: UniqueIndexStreamBuild,
-    ) -> Result<()> {
-        let dir = self.unique_index_dir(db, table);
+    ) -> Result<PreparedUniqueIndexStream> {
+        if self.segment_mgr.memtable_flush_epoch(db, table) != build.flush_epoch {
+            return Err(stale_stream_build(db, table, index_name));
+        }
         flush_chunk(&mut build.chunk, &mut build.runs)?;
         let run = build.runs.finish()?;
-        let data_path = dir.join(format!("{}.keys.tbi", sanitize_file_component(index_name)));
         let tmp = build.runs.dir.join("base.tmp");
         let mut writer = UniqueIndexBaseWriter::new(
             BufWriter::new(std::fs::File::create(&tmp)?),
@@ -263,17 +266,48 @@ impl IndexManager {
             reserve_base_entry(&mut build.memory, &build.chunk, &writer, &key, &location)?;
             writer.push_entry(&key, &location)?;
         }
+        #[cfg(test)]
+        if FAIL_STREAM_PREPARE.with(|fail| fail.replace(false)) {
+            return Err(TaibaiError::Storage(
+                "forced unique index stream prepare failure".into(),
+            ));
+        }
         let watermarks = self.current_segment_watermarks(db, table)?;
         let file = writer
-            .finish(
-                Some(self.segment_mgr.memtable_flush_epoch(db, table)),
-                &watermarks,
-            )?
+            .finish(Some(build.flush_epoch), &watermarks)?
             .into_inner()
             .map_err(|e| TaibaiError::Storage(e.to_string()))?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&tmp, &data_path)?;
+        // Opening here both validates the completed file before touching the
+        // old path and keeps all directory/footer parsing out of the short
+        // publication lock. The handle follows the inode across the rename.
+        let base = UniqueIndexBase::open(&tmp)?;
+        Ok(PreparedUniqueIndexStream {
+            runs: build.runs,
+            tmp,
+            base,
+            flush_epoch: build.flush_epoch,
+        })
+    }
+
+    /// Atomically install a prepared base. The caller holds the table
+    /// mutation lock; this method performs only bounded epoch validation, the
+    /// rename, sidecar cleanup, and the in-memory swap. On drift the prepared
+    /// files are discarded and the previous base and delta remain usable.
+    pub(crate) fn unique_index_stream_publish(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        prepared: PreparedUniqueIndexStream,
+    ) -> Result<()> {
+        if self.segment_mgr.memtable_flush_epoch(db, table) != prepared.flush_epoch {
+            return Err(stale_stream_build(db, table, index_name));
+        }
+        let dir = self.unique_index_dir(db, table);
+        let data_path = dir.join(format!("{}.keys.tbi", sanitize_file_component(index_name)));
+        std::fs::rename(&prepared.tmp, &data_path)?;
         let base = sanitize_file_component(index_name);
         for suffix in ["delta.tbi", "progress.tbi", "invalid"] {
             let _ = std::fs::remove_file(dir.join(format!("{}.{}", base, suffix)));
@@ -281,16 +315,20 @@ impl IndexManager {
         self.unique_indexes.write().unwrap().insert(
             unique_index_key(db, table, index_name),
             Arc::new(UniqueIndexState::new(
-                UniqueIndexBase::open(&data_path)?,
+                prepared.base,
                 UniqueIndexDeltaState::default(),
             )),
         );
+        // Keep the scratch owner alive until after the swap. Its Drop removes
+        // the now-empty run directory and never touches the renamed base.
+        drop(prepared.runs);
         Ok(())
     }
 
     /// Scan entries once into bounded sorted runs, merge with bounded fan-in,
     /// and publish the normal on-demand base. Producer errors/collisions leave
     /// the old index intact; the RAII run directory removes all scratch files.
+    #[allow(dead_code)] // retained for component users and external-build regression tests
     pub(crate) fn persist_unique_index_stream<F>(
         &self,
         db: &str,
@@ -304,8 +342,28 @@ impl IndexManager {
     {
         let mut build = self.unique_index_stream_begin(db, table, index_name)?;
         producer(&mut |entry| self.unique_index_stream_push(&mut build, entry))?;
-        self.unique_index_stream_publish(db, table, index_name, columns, build)
+        let prepared = self.unique_index_stream_prepare(db, table, index_name, columns, build)?;
+        self.segment_mgr.with_table_mutation_lock(db, table, || {
+            self.unique_index_stream_publish(db, table, index_name, prepared)
+        })
     }
+}
+
+fn stale_stream_build(db: &str, table: &str, index_name: &str) -> TaibaiError {
+    TaibaiError::ResourceBusy(format!(
+        "stale unique index build for {}.{}.{index_name}; retry outside the table mutation lock",
+        db, table
+    ))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_STREAM_PREPARE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_stream_prepare() {
+    FAIL_STREAM_PREPARE.with(|fail| fail.set(true));
 }
 
 fn reserve_base_entry<W: std::io::Write>(
@@ -337,4 +395,12 @@ pub(crate) struct UniqueIndexStreamBuild {
     chunk_limit: usize,
     chunk: Vec<Entry>,
     bytes: usize,
+    flush_epoch: u64,
+}
+
+pub(crate) struct PreparedUniqueIndexStream {
+    runs: Runs,
+    tmp: PathBuf,
+    base: UniqueIndexBase,
+    flush_epoch: u64,
 }

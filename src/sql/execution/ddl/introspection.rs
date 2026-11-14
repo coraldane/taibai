@@ -636,6 +636,148 @@ pub fn exec_show_engines(_engine: &Engine) -> Result<ExecResult> {
     })
 }
 
+/// `SHOW MEMORY`: resident-memory accounting of the engine's long-lived
+/// structures. Every row is a point-in-time counter; none of these were
+/// observable before, which made server-side RSS growth impossible to
+/// attribute from outside the process.
+pub fn exec_show_memory(engine: &Engine) -> Result<ExecResult> {
+    let mut rows: Vec<(&'static str, String, u64)> = Vec::new();
+
+    let hot_mgr = engine.hot_store_manager();
+    let snapshot = hot_mgr.memory_snapshot();
+    rows.push(("hot_store", "stores".into(), snapshot.len() as u64));
+    rows.push((
+        "hot_store",
+        "stale_tables".into(),
+        hot_mgr.stale_table_count() as u64,
+    ));
+    for ((db, table), bytes) in snapshot {
+        rows.push(("hot_store", format!("{db}.{table}"), bytes));
+    }
+
+    match engine.rep_log() {
+        Some(rep_log) => {
+            let (ring_events, ring_bytes) = rep_log.ring_stats();
+            rows.push(("replication", "enabled".into(), 1));
+            rows.push(("replication", "ring_events".into(), ring_events as u64));
+            rows.push(("replication", "ring_bytes_est".into(), ring_bytes));
+            rows.push((
+                "replication",
+                "ring_max_bytes".into(),
+                rep_log.ring_byte_limit(),
+            ));
+            rows.push((
+                "replication",
+                "sessions".into(),
+                rep_log.session_count() as u64,
+            ));
+        }
+        None => {
+            rows.push(("replication", "enabled".into(), 0));
+            // The ceiling is config-sourced, so it stays visible even where
+            // no RepLog instance exists (standby / replication off).
+            rows.push((
+                "replication",
+                "ring_max_bytes".into(),
+                crate::common::config::replication_settings().ring_max_bytes,
+            ));
+        }
+    }
+
+    let (cached_entries, cached_bytes, budget_bytes) = engine.segment_mgr().reader_cache_stats();
+    rows.push((
+        "segment_readers",
+        "cached_entries".into(),
+        cached_entries as u64,
+    ));
+    rows.push(("segment_readers", "cached_heap_bytes".into(), cached_bytes));
+    rows.push(("segment_readers", "cache_budget_bytes".into(), budget_bytes));
+    let (mutable_entries, mutable_bytes) = engine.segment_mgr().mutable_reader_cache_stats();
+    rows.push((
+        "segment_readers",
+        "mutable_entries".into(),
+        mutable_entries as u64,
+    ));
+    rows.push((
+        "segment_readers",
+        "mutable_heap_bytes".into(),
+        mutable_bytes,
+    ));
+    rows.push((
+        "segment_readers",
+        "mutable_budget_bytes".into(),
+        crate::common::config::mutable_reader_cache_budget_bytes(),
+    ));
+
+    // The segment-metadata cache. Entries are the compact footer index
+    // (~12 B per row group) plus the footer bytes, not a parsed object graph.
+    // It was once the only metadata cache missing from this report, which is
+    // exactly how it grew to 25 GiB unnoticed.
+    let (meta_entries, meta_bytes, meta_budget) = engine.segment_mgr().segment_meta_cache_stats();
+    rows.push((
+        "segment_meta",
+        "cached_entries".into(),
+        meta_entries as u64,
+    ));
+    rows.push(("segment_meta", "cached_heap_bytes".into(), meta_bytes));
+    rows.push(("segment_meta", "cache_budget_bytes".into(), meta_budget));
+    rows.push((
+        "caches",
+        "charged_heap_bytes_total".into(),
+        cached_bytes + mutable_bytes + meta_bytes,
+    ));
+
+    rows.push((
+        "memtable",
+        "estimated_bytes".into(),
+        engine.memtable_manager().total_estimated_memory_bytes(),
+    ));
+
+    let schema = Schema::new(vec![
+        ColumnDef::new("Component", DataType::VarChar),
+        ColumnDef::new("Name", DataType::VarChar),
+        ColumnDef::new("Value", DataType::Int64),
+    ]);
+    let mut batch = RecordBatch::new(schema.clone());
+    for (component, name, value) in rows {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(component.to_string())))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(name)))?;
+        batch
+            .column_mut(2)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(value as i64)))?;
+    }
+    Ok(ExecResult::Query {
+        schema,
+        batches: vec![batch],
+    })
+}
+
+/// `SHOW VERSION` — one row carrying the full build identity (version +
+/// git commit + build time). Exists so a deployed server's exact source
+/// revision is always queryable; before this, pinning a running binary to a
+/// source state required filesystem access that remote hosts often deny.
+pub fn exec_show_version() -> Result<ExecResult> {
+    let schema = Schema::new(vec![ColumnDef::new("Version", DataType::VarChar)]);
+    let mut batch = RecordBatch::new(schema.clone());
+    batch
+        .column_mut(0)
+        .unwrap()
+        .push(&ScalarValue::VarChar(Some(
+            crate::version::get_full_version(),
+        )))?;
+    Ok(ExecResult::Query {
+        schema,
+        batches: vec![batch],
+    })
+}
+
 pub fn exec_show_processlist(engine: &Engine, full: bool) -> Result<ExecResult> {
     let entries = engine.query_registry().list();
     let schema = Schema::new(vec![
@@ -869,56 +1011,67 @@ pub fn exec_analyze_table(engine: &Engine, db: &str, table: &str) -> Result<Exec
     // partition's INSERTs for the scan duration. The flush-visibility
     // read lock only keeps the scan from observing a memtable→segment
     // transition mid-flip.
-    let (row_count, columns, composite_columns) =
-        engine
-            .segment_mgr()
-            .with_table_flush_read_lock(db, table, || {
-                let paths =
-                    crate::storage::segment_manager::SegmentManager::discover_segments(&table_dir)?;
-                let mut collectors = table_meta
-                    .columns
-                    .iter()
-                    .map(|_| AnalyzeColumnCollector::new())
-                    .collect::<Vec<_>>();
-                let mut composite_collectors = composite_groups
-                    .iter()
-                    .map(|group| AnalyzeCompositeCollector::new(group.clone()))
-                    .collect::<Vec<_>>();
-                let mut row_count = 0u64;
-                for path in paths {
-                    let reader = engine.segment_mgr().open_reader_cached(&path)?;
-                    for row_group in 0..reader.num_row_groups() {
-                        let mut batch = reader.read_row_group(row_group)?;
-                        if !reader.delete_bitmap().is_empty() {
-                            batch = crate::storage::segment::delete_bitmap::filter_batch(
-                                batch,
-                                reader.row_group_start_row(row_group),
-                                reader.delete_bitmap(),
-                            )?;
-                        }
-                        row_count = row_count.saturating_add(batch.num_rows() as u64);
-                        for (column, collector) in collectors.iter_mut().enumerate() {
-                            if let Some(values) = batch.column(column) {
-                                collector.update(values);
-                            }
-                        }
-                        for collector in &mut composite_collectors {
-                            collector.update(&batch);
-                        }
+    // Snapshot the segment list under the flush read lock (consistent with
+    // the flush that just ran), then decode outside it: ANALYZE holds the
+    // lease for the whole scan, so compaction defers physical deletion of
+    // the listed files, while a long statistics pass cannot stall the flush
+    // writer the way the previous lock-spanning-decode did.
+    let snapshot = engine.segment_mgr().with_table_flush_read_lock(db, table, || {
+        if !table_dir.exists() {
+            return Ok(None);
+        }
+        crate::storage::segment::snapshot::snapshot_segments(&table_dir).map(Some)
+    })?;
+    let _lease = snapshot.as_ref();
+    let paths = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.paths.clone())
+        .unwrap_or_default();
+    let (row_count, columns, composite_columns) = {
+        let mut collectors = table_meta
+            .columns
+            .iter()
+            .map(|_| AnalyzeColumnCollector::new())
+            .collect::<Vec<_>>();
+        let mut composite_collectors = composite_groups
+            .iter()
+            .map(|group| AnalyzeCompositeCollector::new(group.clone()))
+            .collect::<Vec<_>>();
+        let mut row_count = 0u64;
+        for path in paths {
+            let reader = engine.segment_mgr().open_reader_cached(&path)?;
+            for row_group in 0..reader.num_row_groups() {
+                let mut batch = reader.read_row_group(row_group)?;
+                if !reader.delete_bitmap().is_empty() {
+                    batch = crate::storage::segment::delete_bitmap::filter_batch(
+                        batch,
+                        reader.row_group_start_row(row_group),
+                        reader.delete_bitmap(),
+                    )?;
+                }
+                row_count = row_count.saturating_add(batch.num_rows() as u64);
+                for (column, collector) in collectors.iter_mut().enumerate() {
+                    if let Some(values) = batch.column(column) {
+                        collector.update(values);
                     }
                 }
-                let columns = table_meta
-                    .columns
-                    .iter()
-                    .zip(collectors)
-                    .map(|(column, collector)| (column.name.clone(), collector.finish()))
-                    .collect::<HashMap<_, _>>();
-                let composite_columns = composite_collectors
-                    .into_iter()
-                    .map(AnalyzeCompositeCollector::finish)
-                    .collect();
-                Ok((row_count, columns, composite_columns))
-            })?;
+                for collector in &mut composite_collectors {
+                    collector.update(&batch);
+                }
+            }
+        }
+        let columns = table_meta
+            .columns
+            .iter()
+            .zip(collectors)
+            .map(|(column, collector)| (column.name.clone(), collector.finish()))
+            .collect::<HashMap<_, _>>();
+        let composite_columns = composite_collectors
+            .into_iter()
+            .map(AnalyzeCompositeCollector::finish)
+            .collect();
+        (row_count, columns, composite_columns)
+    };
 
     let collected_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1234,4 +1387,72 @@ fn estimate_hll(registers: &[u8]) -> u64 {
         raw
     };
     corrected.round().max(0.0) as u64
+}
+
+/// `SHOW WORKLOAD`: the admission, canary and fast-path telemetry that made
+/// the 2026-11-05 incident invisible until clients timed out — queue
+/// pressure is meant to be watched here, not scraped from logs after the
+/// fact. Canary status codes: 0 ok, 1 failed, 2 timed out, 3 never ran.
+pub fn exec_show_workload(engine: &Engine) -> Result<ExecResult> {
+    let mut rows: Vec<(&'static str, String, u64)> = Vec::new();
+
+    for (pool, capacity, acquired, rejected) in crate::net::server::admission::snapshot() {
+        rows.push(("admission", format!("{pool}.capacity"), capacity));
+        rows.push(("admission", format!("{pool}.acquired_total"), acquired));
+        rows.push(("admission", format!("{pool}.rejected_overload_total"), rejected));
+    }
+
+    rows.push((
+        "queries",
+        "running".into(),
+        engine.query_registry().list().len() as u64,
+    ));
+
+    let (latency_ms, status, failures) = crate::common::watchdog::canary_snapshot();
+    if latency_ms != u64::MAX {
+        rows.push(("canary", "last_latency_ms".into(), latency_ms));
+    }
+    rows.push(("canary", "last_status".into(), status as u64));
+    rows.push((
+        "canary",
+        "consecutive_failures".into(),
+        failures as u64,
+    ));
+
+    rows.push((
+        "pools",
+        "rayon_global_threads".into(),
+        rayon::current_num_threads() as u64,
+    ));
+
+    rows.push((
+        "fast_path",
+        "metadata_answers_total".into(),
+        crate::sql::execution::scan::fast_path::metadata_answers_total(),
+    ));
+
+    let schema = Schema::new(vec![
+        ColumnDef::new("Component", DataType::VarChar),
+        ColumnDef::new("Name", DataType::VarChar),
+        ColumnDef::new("Value", DataType::Int64),
+    ]);
+    let mut batch = RecordBatch::new(schema.clone());
+    for (component, name, value) in rows {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(component.to_string())))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(name)))?;
+        batch
+            .column_mut(2)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(value as i64)))?;
+    }
+    Ok(ExecResult::Query {
+        schema,
+        batches: vec![batch],
+    })
 }

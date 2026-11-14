@@ -132,6 +132,11 @@ pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Resul
             engine.segment_mgr().remove_database_state(name);
             for (table_name, _) in &table_indexes {
                 engine.batch_writer().clear_memtables(name, table_name);
+                // Same cleanup DROP TABLE performs: without it the dropped
+                // tables' resident hot mirrors (each allowed to grow to the
+                // full per-store memory limit) and their hot_unfed bookkeeping
+                // stay registered until process restart.
+                engine.invalidate_hot_store(name, table_name);
             }
             Ok(tombstone)
         };

@@ -88,7 +88,23 @@ fn delete_read_failure_preserves_resident_rows_and_indexes() -> Result<()> {
     let broken = dir.path().join("main/t/seg_99999.dat");
     std::fs::write(&broken, b"broken")?;
     assert!(engine.execute(&mut s, "DELETE FROM t").is_err());
-    std::fs::remove_file(broken)?;
+    // The corrupt segment is now quarantined at reader-open: renamed out of
+    // the segment pattern (bytes preserved under a `.corrupt-<epoch>` name)
+    // so it stops poisoning reads. Remove the quarantined file for the rest
+    // of the test — the resident row must survive either way.
+    let quarantined: Vec<_> = std::fs::read_dir(broken.parent().unwrap())?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("seg_99999.dat.corrupt-"))
+        })
+        .collect();
+    assert_eq!(quarantined.len(), 1, "corrupt segment must be quarantined");
+    for path in quarantined {
+        std::fs::remove_file(path)?;
+    }
     assert_eq!(
         first_i64(engine.execute(&mut s, "SELECT COUNT(*) FROM t")?, 0, 0),
         1
@@ -325,7 +341,21 @@ fn transaction_delete_read_failure_preserves_own_inserts() -> Result<()> {
     let broken = dir.path().join("main/t/seg_99999.dat");
     std::fs::write(&broken, b"broken")?;
     assert!(engine.execute(&mut s, "DELETE FROM t").is_err());
-    std::fs::remove_file(broken)?;
+    // Quarantine (see delete_read_failure_preserves_resident_rows_and_indexes)
+    // moves the corrupt file aside; remove the quarantined copy instead.
+    let quarantined: Vec<_> = std::fs::read_dir(broken.parent().unwrap())?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("seg_99999.dat.corrupt-"))
+        })
+        .collect();
+    assert_eq!(quarantined.len(), 1, "corrupt segment must be quarantined");
+    for path in quarantined {
+        std::fs::remove_file(path)?;
+    }
     assert_eq!(
         first_i64(engine.execute(&mut s, "SELECT COUNT(*) FROM t")?, 0, 0),
         2

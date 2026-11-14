@@ -240,35 +240,33 @@ impl TablePhysicalHealth {
 }
 
 fn table_physical_health(
-    segment_mgr: &SegmentManager,
-    _db: &str,
-    _table: &str,
-    table_dir: &Path,
+    snapshot: &crate::storage::segment_manager::MaintenanceSnapshot,
     target_row_group_rows: u64,
     collect_fragmentation: bool,
-) -> Result<TablePhysicalHealth> {
+) -> TablePhysicalHealth {
     let mut health = TablePhysicalHealth::default();
     let small_limit = target_row_group_rows.max(1).div_ceil(4);
-    for path in SegmentManager::discover_segments(table_dir)? {
-        let reader = segment_mgr.open_reader_cached(&path)?;
+    for segment in &snapshot.segments {
         health.deleted_rows = health
             .deleted_rows
-            .saturating_add(reader.deleted_row_count());
-        health.live_rows = health.live_rows.saturating_add(
-            reader
-                .row_count()
-                .saturating_sub(reader.deleted_row_count()),
-        );
+            .saturating_add(segment.deleted_row_count);
+        health.live_rows = health
+            .live_rows
+            .saturating_add(segment.row_count.saturating_sub(segment.deleted_row_count));
         if collect_fragmentation {
-            health.row_groups = health.row_groups.saturating_add(reader.num_row_groups());
-            for row_group_idx in 0..reader.num_row_groups() {
-                if reader.row_group_rows(row_group_idx) <= small_limit {
-                    health.small_row_groups = health.small_row_groups.saturating_add(1);
-                }
-            }
+            health.row_groups = health
+                .row_groups
+                .saturating_add(segment.row_group_rows.len());
+            health.small_row_groups = health.small_row_groups.saturating_add(
+                segment
+                    .row_group_rows
+                    .iter()
+                    .filter(|&&rows| rows <= small_limit)
+                    .count(),
+            );
         }
     }
-    Ok(health)
+    health
 }
 
 fn rebuild_compacted_location_indexes(
@@ -405,15 +403,42 @@ fn start_auto_compaction_thread(
                 continue;
             }
             let target_row_group_rows = table_meta.row_group_size.max(1) as u64;
-            match table_physical_health(
-                &segment_mgr,
+            let maintenance_ttl = table_meta.ttl.as_ref().and_then(|_| {
+                let idx = table_meta.get_ttl_column_index_cached()?;
+                let column = table_meta.columns.get(idx)?;
+                Some(crate::storage::segment_manager::MaintenanceTtlColumn {
+                    name: column.name.clone(),
+                    previous_names: column.previous_names.clone(),
+                })
+            });
+            let maintenance_snapshot = match segment_mgr.capture_maintenance_snapshot(
                 &db,
                 &table,
                 &table_dir,
+                maintenance_ttl.as_ref(),
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(db, table, %error, "auto compact snapshot failed");
+                    continue;
+                }
+            };
+            for segment_error in maintenance_snapshot.segment_errors() {
+                tracing::warn!(
+                    db,
+                    table,
+                    path = %segment_error.path.display(),
+                    error = %segment_error.error,
+                    "auto compact segment snapshot failed"
+                );
+            }
+            let health = table_physical_health(
+                &maintenance_snapshot,
                 target_row_group_rows,
                 collect_fragmentation,
-            ) {
-                Ok(health) if health.needs_delete_cleanup(&config) => {
+            );
+            match health {
+                health if health.needs_delete_cleanup(&config) => {
                     // With a resident active segment, the no-seal cleanup
                     // could not see its tombstones, so the table would
                     // stay past the dirtiness gate forever: route through
@@ -422,12 +447,14 @@ fn start_auto_compaction_thread(
                     // the rewrite when it is itself dirty or under-full
                     // (the compactor's dirty-segment input selection);
                     // clean full-size segments are never rewritten.
-                    let compact_result =
-                        if segment_mgr.active_partition_keys(&db, &table).is_empty() {
-                            compactor.compact_table_for_delete_cleanup(&db, &table, &table_meta)
-                        } else {
-                            compactor.compact_table_for_fragmentation(&db, &table, &table_meta)
-                        };
+                    let seal_active = !segment_mgr.active_partition_keys(&db, &table).is_empty();
+                    let compact_result = compactor.compact_table_for_auto_maintenance(
+                        &db,
+                        &table,
+                        &table_meta,
+                        maintenance_snapshot,
+                        seal_active,
+                    );
                     match compact_result {
                         Ok(stats) => {
                             adjust_row_count_for_ttl_drops(
@@ -471,7 +498,7 @@ fn start_auto_compaction_thread(
                         }
                     }
                 }
-                Ok(health)
+                health
                     if health.needs_fragmentation_cleanup(target_row_group_rows, &config)
                         && fragmentation_last_run
                             .lock()
@@ -479,7 +506,13 @@ fn start_auto_compaction_thread(
                             .get(&(db.clone(), table.clone()))
                             .is_none_or(|last| last.elapsed() >= config.fragmentation_cooldown) =>
                 {
-                    match compactor.compact_table_for_fragmentation(&db, &table, &table_meta) {
+                    match compactor.compact_table_for_auto_maintenance(
+                        &db,
+                        &table,
+                        &table_meta,
+                        maintenance_snapshot,
+                        true,
+                    ) {
                         Ok(stats) => {
                             adjust_row_count_for_ttl_drops(
                                 &catalogs,
@@ -528,17 +561,16 @@ fn start_auto_compaction_thread(
                         }
                     }
                 }
-                Ok(_) => {
-                    match segment_mgr.cleanup_fully_deleted_segments(&db, &table, &table_dir) {
+                _ => {
+                    match segment_mgr.cleanup_fully_deleted_segments(
+                        &db,
+                        &table,
+                        &table_dir,
+                        &maintenance_snapshot,
+                    ) {
                         Ok(removed) if removed > 0 => {
-                            rebuild_compacted_location_indexes(
-                                &index_manager,
-                                &segment_mgr,
-                                &memtable_manager,
-                                &data_dir,
-                                &db,
-                                &table,
-                                &table_meta,
+                            crate::sql::execution::scan::aggregate_meta::invalidate_segment_sum_cache_under(
+                                &table_dir,
                             );
                             compacted += 1;
                             tracing::info!(
@@ -553,9 +585,6 @@ fn start_auto_compaction_thread(
                             tracing::warn!(db, table, error = %err, "delete bitmap cleanup failed");
                         }
                     }
-                }
-                Err(err) => {
-                    tracing::warn!(db, table, error = %err, "auto compact scan failed");
                 }
             }
         }

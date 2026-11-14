@@ -319,29 +319,9 @@ fn load_existing_unique_keys(
     index_name: &str,
     new_keys: &HashSet<Vec<ScalarValue>>,
 ) -> Result<()> {
-    let columns = indices
-        .iter()
-        .map(|&idx| schema.columns[idx].name.clone())
-        .collect::<Vec<_>>();
-    engine
-        .index_manager()
-        .persist_unique_index_stream(db, table, index_name, &columns, |emit| {
-            visit_unique_index_entries_from(
-                engine.segment_mgr(),
-                &engine.memtable_manager().get_by_table(db, table),
-                &engine.data_dir().join(db).join(table),
-                table,
-                schema,
-                indices,
-                "unique key validation fallback",
-                &mut |entry| {
-                    if new_keys.contains(&entry.key) {
-                        return Err(duplicate_unique_key_error(table, index_name, &entry.key));
-                    }
-                    emit(entry)
-                },
-            )
-        })
+    super::write::rebuild_unique_index_for_validation(
+        engine, db, table, schema, indices, index_name, new_keys,
+    )
 }
 
 pub(super) fn unique_key_for_row(
@@ -596,7 +576,11 @@ pub fn validate_unique_indexes_in_batches(
     Ok(())
 }
 
-fn duplicate_unique_key_error(table: &str, index_name: &str, key: &[ScalarValue]) -> TaibaiError {
+pub(super) fn duplicate_unique_key_error(
+    table: &str,
+    index_name: &str,
+    key: &[ScalarValue],
+) -> TaibaiError {
     let key_text = key
         .iter()
         .map(|v| v.to_text().unwrap_or_else(|| "NULL".to_string()))

@@ -1,283 +1,136 @@
 # Taibai
 
-Taibai 是一个用 Rust 编写的列式数据库服务端。
+**为行情与 tick 数据准备的开源列式数据库。** 单二进制部署、SQL 即用、中文文档齐备，面向「大量写入 + 按标的与时间聚合」的分析场景。
 
-第一次使用请从[五分钟快速开始](docs/getting-started/quick-start.md)开始。
+<sub>An open-source columnar database in Rust, built for market-data / tick workloads.</sub>
 
-简单说，它是一个偏分析场景的数据库：适合写入大量数据，然后按列扫描、统计、聚合和查询。生产部署前的准备事项见[兼容性与部署指引](docs/user-guide/limitations.md)。
+![status](https://img.shields.io/badge/status-experimental-orange)
+![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
+![rust](https://img.shields.io/badge/rust-stable-dea584)
 
-## 它能做什么
+> **项目状态：实验性。** 当前 `0.x` 版本适合数据库内核研究、功能验证与性能压测，尚未声明生产就绪。数据格式、协议、配置与 SQL 行为仍可能发生不兼容变化，详见[项目状态与限制](docs/user-guide/limitations.md)。
 
-- 启动一个数据库服务，客户端可以连接上来执行 SQL。
-- 支持创建数据库、创建表、插入数据、查询数据、更新数据和删除数据。
-- 数据按列存储，更适合统计分析类查询。
-- 支持批量导入，适合一次性写入大量数据。
-- 支持事务、用户权限、分区、数据过期清理和变更订阅等数据库能力。
-- 支持查询管理：`SHOW PROCESSLIST` 查看运行中的查询，`KILL QUERY` 终止失控语句，可配置语句超时。
-- 支持压缩数据，减少存储空间和网络传输开销；压缩级别可按表调整。
-- 支持可选的 TLS 加密连接。
-- 支持独立 SQL Query Log，可通过 `log.query_file` 配置查询日志文件。
-- 提供命令行客户端和若干示例程序。
+---
 
-## 项目结构
+## 为什么会有 Taibai
 
-```text
-.
-├── src/
-│   ├── main.rs           # 服务端和命令行入口
-│   ├── lib.rs            # 库入口
-│   ├── common/           # 配置、错误处理等通用代码
-│   ├── net/              # 网络连接、客户端、服务端会话
-│   ├── protocol/         # 客户端和服务端通信时使用的数据格式
-│   ├── sql/              # SQL 解析、查询计划、优化和执行
-│   ├── storage/          # 数据存储、表元数据、写入日志、索引、分区
-│   ├── types/            # 数据类型、列数据和查询结果批次
-│   ├── tools/            # 辅助工具
-│   └── bin/              # 独立工具入口
-├── conf/                 # 配置文件示例
-├── docs/                 # 设计、功能和运维文档
-├── examples/             # 使用示例
-├── scripts/              # 构建、安装和服务管理脚本
-├── Cargo.toml
-└── Makefile
-```
+做行情数据的人大多在这几个选项里打转：
 
-## 快速开始
+- **kdb+** 的 `aj` 语义和 tick 架构确实是行业标杆，但授权费按年计、以万美元为单位，q 语言也不是团队里每个人都能上手。
+- **ClickHouse** 足够强，但要为一份日内 tick 数据拉起整套集群、调好分区键和物化视图，往往比数据本身更费劲。
+- **QuestDB / InfluxDB** 面向时序指标很顺手，但「逐笔成交匹配最近一条报价」这类关系型时序语义写起来别扭。
+- 自己用 Parquet + DuckDB 拼一套，能查，但没有服务端、没有权限、没有订阅推送，每个项目重写一遍。
 
-### 构建
+Taibai 想填的是这个缝：**一个单二进制、说 SQL、原生懂 tick 数据的列式库**。写入侧按列式直写，查询侧用 `ASOF JOIN` 和窗口函数直接表达行情逻辑，运维侧只有进程、目录和配置文件。
+
+## 和现成方案的差别
+
+| | Taibai | kdb+ | ClickHouse | QuestDB | DuckDB |
+|---|---|---|---|---|---|
+| 形态 | 单二进制服务端 + 内置客户端 | 单二进制 | 服务端（集群需配套组件） | JVM 服务端 | 嵌入式库，无服务端 |
+| 授权 | MIT / Apache-2.0 | 商业授权 | Apache-2.0 | Apache-2.0 | MIT |
+| `ASOF JOIN`（最近匹配） | 原生，支持 4 种方向 | 原生（`aj`） | 支持 | 支持 | 支持 |
+| 内置变更订阅推送 | 支持，可回放与断点续传 | 原生（tick 架构） | 无（需外接消息队列） | 无 | 无 |
+| 常驻热分区内存索引 | 内置，按日自动切换 | 原生 | 需自行调优 | 部分 | 不适用 |
+| 按表 TTL 过期 | 支持 | 需自建 | 支持 | 支持 | 不支持 |
+| 中文文档 | 完整 | 稀少 | 部分 | 无 | 部分 |
+
+> 对比只描述各项目的能力形态，不构成性能结论；同类能力的具体表现请以各自官方文档与实测为准。这里不列性能数字，是因为诚实的数字必须能在你的机器上复现，见[性能数据说明](docs/user-guide/limitations.md)。
+
+**它不适合的场合**（先写在前头，省得你白试）：需要 BI 工具用 MySQL/PostgreSQL 驱动直连、需要分布式多副本强一致、需要厂商 SLA 的生产系统。
+
+## 30 秒上手
+
+需要 Rust stable 工具链。
 
 ```bash
+git clone https://github.com/coraldane/taibai.git && cd taibai
 cargo build --release
-```
 
-也可以使用 Makefile：
-
-```bash
-make build
-```
-
-### 启动服务端
-
-```bash
+# 终端 1：起服务（默认 0.0.0.0:5151，数据落在 ./data）
 cargo run --release -- --config conf/example.yaml
+
+# 终端 2：进交互客户端（默认 root/taibai，仅限本地开发）
+cargo run --release -- client --host 127.0.0.1:5151 --user root --password taibai --database main
 ```
 
-也可以直接启动：
-
-```bash
-cargo run --release
-```
-
-默认服务端口是 `5151`，默认数据库是 `main`。
-
-启动前无需修改示例配置；`storage.data_dir` 默认使用仓库下的 `./data`。生产部署时应将它改为独立的持久化目录。
-
-### 使用命令行客户端
-
-启动服务端后，可以用内置客户端连接：
-
-```bash
-cargo run --release -- client \
-  --host 127.0.0.1:5151 \
-  --user root \
-  --password taibai \
-  --database main
-```
-
-执行单条 SQL：
-
-```bash
-cargo run --release -- client \
-  --host 127.0.0.1:5151 \
-  --user root \
-  --password taibai \
-  --database main \
-  --query "SHOW TABLES"
-```
-
-默认 root 用户密码是 `taibai`，仅用于本地开发。部署到共享或生产环境前必须修改默认凭据，并限制服务端口的网络访问。
-
-## SQL 示例
+然后在客户端里跑一段**能看出差别**的 SQL —— 逐笔成交匹配它之前最近的一条报价：
 
 ```sql
 CREATE DATABASE demo;
 USE demo;
 
-CREATE TABLE ticks (
-  symbol VARCHAR,
-  ts TIMESTAMP,
-  price FLOAT64,
-  volume INT64
-) CLUSTER BY (symbol, ts);
+-- 按 (标的, 时间) 聚簇：等值前缀 + 时间范围的扫描走复合二分裁剪
+CREATE TABLE trades (symbol VARCHAR, ts TIMESTAMP, qty INT64) CLUSTER BY (symbol, ts);
+CREATE TABLE quotes (symbol VARCHAR, ts TIMESTAMP, bid FLOAT64) CLUSTER BY (symbol, ts);
 
--- 归档表可提高压缩级别（1..=22，默认跟随配置 compression.bulk_zstd_level）
-CREATE TABLE ticks_archive (
-  symbol VARCHAR,
-  ts TIMESTAMP,
-  price FLOAT64,
-  volume INT64
-) COMPRESSION_LEVEL = 19;
+INSERT INTO quotes VALUES
+  ('AAPL', 1717200000000, 191.10),
+  ('AAPL', 1717200060000, 191.30),
+  ('AAPL', 1717200120000, 191.25);
 
-INSERT INTO ticks VALUES
-  ('AAPL', 1717200000000, 191.2, 1000),
-  ('AAPL', 1717200001000, 191.5, 800),
-  ('MSFT', 1717200000000, 420.1, 600);
+INSERT INTO trades VALUES
+  ('AAPL', 1717200030000, 100),
+  ('AAPL', 1717200090000, 200),
+  ('AAPL', 1717200150000, 300);
 
-SELECT symbol, COUNT(*) AS cnt, AVG(price) AS avg_price
-FROM ticks
-GROUP BY symbol
-ORDER BY cnt DESC;
+-- kdb+ aj 语义：每个左行取右表中时间不晚于它的最后一行
+SELECT t.ts, t.qty, q.bid
+FROM trades t ASOF JOIN quotes q
+  ON t.symbol = q.symbol AND t.ts >= q.ts
+ORDER BY t.ts;
 ```
 
-更多功能说明见 `docs/overview/project-summary.md`。
+结果里每笔成交都带上了成交时刻的有效报价。`LEFT ASOF JOIN` 会保留匹配不到的左行（价格为空）。四种不等式方向（`>=` `>` `<=` `<`）的语义见 [SQL 语法参考](docs/user-guide/sql-reference.md)。
 
-## 配置文件
+## 为行情数据专门做的事
 
-示例配置在 `conf/example.yaml`。
+- **`ASOF JOIN`**：`ON` 条件由若干等值键 + 恰好一个时间不等式组成，按等值键分区、时间键二分匹配；`ASOF LEFT JOIN` 拼写同样接受。
+- **`CLUSTER BY (symbol, ts)`**：写入即按聚簇键有序，查询走「前缀等值 + 范围」复合裁剪，不扫全表。
+- **常驻热存（HOT）**：`ALTER TABLE ... SET HOT BY (ts)` 让当日分区驻留内存倒排索引，点查不落盘；重启只预热日结之后写入的段。
+- **可靠变更订阅**：`SUBSCRIBE_V2` 支持序列回放、ack 确认、具名书签续传与列过滤——下游策略进程断线重连不丢数据。
+- **列式直写导入**：`DIRECT BULK` 二进制列载荷跳过 SQL 解析与逐值求值，配合 pipeline 多批并发；CSV 导入示例见 `examples/batch_import`。
+- **按表 TTL 与压缩级别**：`TTL ts, 86400` 自动清理过期分区，`COMPRESSION_LEVEL = 19` 让归档表单独吃满压缩率。
+- **分区级写锁**：写入、flush 与 compaction 按 `(库, 表, 分区)` 互不阻塞，压缩期间目标分区仍可写入。
+- **查询可管可控**：`SHOW PROCESSLIST` 看真实运行中的查询，`KILL QUERY` 终止失控语句，`statement_timeout_secs` 兜底。
 
-常用配置项：
+## 能力清单
 
-```yaml
-server:
-  host: "0.0.0.0"
-  port: 5151
-  max_message_size: 67108864
+- **SQL**：DDL / DML / `INSERT INTO ... SELECT` / `REPLACE INTO`；Inner、Left、Right、Full、Cross、Semi、Anti、ASOF 各类 Join；子查询、CTE、`UNION`/`INTERSECT`/`EXCEPT`、窗口函数（`ROW_NUMBER`、`RANK`、`LEAD`、`LAG` 与窗口聚合）；`EXPLAIN` / `EXPLAIN ANALYZE`。
+- **存储**：自定义列式 segment 格式，Row Group 默认 8192 行，定宽列 Raw / BitPacked / DeltaRle 编码，低基数 `VARCHAR` 走字典编码，统一 zstd 压缩；durable tail 承担写路径持久化与崩溃恢复。
+- **优化器**：谓词下推、列裁剪、Zone Map 与 Bloom Filter 裁剪、分区裁剪、Limit / TopN / Order 下推、索引选择、Join 重排、子查询重写；`COUNT(*)` 与单列 `DISTINCT` 由段元数据直接应答。
+- **服务端**：异步 TCP 与可选 TLS、用户/角色/`GRANT` 权限、事务、多数据库、主备流复制、备份与 `migrate` 工具、`segment` 段文件检查器、Windows MSI 安装包与 systemd 服务。
+- **数据类型**：19 种，含 `Decimal`、`Timestamp`、`Blob`、`Vector`（配套 `vector_distance` / `vector_dot` 等函数）。
 
-storage:
-  data_dir: "/path/to/taibai/data"
-  default_database: "main"
-  flush_threshold_rows: 65536
-  min_segment_seal_size_mb: 500
+## 已知边界
 
-buffer:
-  batch_size: 4096
+- SQL 是自有实现，**不兼容** MySQL / PostgreSQL 方言，现有 BI 与 ORM 驱动不能直接对接。
+- 相关子查询仅支持直接外层引用，更深嵌套会明确报错（不会静默给错结果）；`JOIN ON` 内的子查询不支持。
+- 单机为主：有 primary/standby 流复制，没有分片与多副本一致性协议。
+- `0.x` 期间段格式与协议仍会变；升级前请按[兼容性指引](docs/user-guide/limitations.md)备份并跑 `migrate`。
 
-compression:
-  enabled: true
+## 项目现状
 
-tls:
-  enabled: false
-  cert_path: ""
-  key_path: ""
+约 15 万行 Rust（`src/` 下 373 个文件），54 组集成测试覆盖类型、约束、事务、分区、索引、Join、窗口、聚合、Pub/Sub、复制与并发稳定性；CI 在每次推送执行 `cargo fmt --check`、`cargo clippy --workspace --all-targets`、`cargo test --workspace`。
 
+## 文档
 
-log:
-  level: "info"
-```
+- [五分钟快速开始](docs/getting-started/quick-start.md)
+- [SQL 语法参考](docs/user-guide/sql-reference.md)：全部支持的语法，以及明确不支持的清单
+- [建表选项](docs/user-guide/table-options.md)：`CLUSTER BY`、`PARTITION BY`、`TTL`、`HOT`、`DURABILITY`、`COMPRESSION_LEVEL`
+- [事务与并发语义](docs/user-guide/transactions-and-concurrency.md)
+- [变更订阅 Pub/Sub](docs/user-guide/pubsub.md)｜[查询管理](docs/user-guide/query-management.md)｜[主备流复制](docs/operations/replication.md)
+- [架构设计](docs/design/TAIBAI_DESIGN_ZH.md)｜[二进制协议](docs/design/wire-protocol.md)｜[工程功能总览](docs/overview/project-summary.md)
+- [兼容性与部署指引](docs/user-guide/limitations.md)｜[备份与迁移](docs/operations/backup-and-migrate.md)｜[示例工具指南](docs/operations/examples-guide.md)
+- 完整目录见 [docs/README.md](docs/README.md)
 
-说明：
+## 开发与贡献
 
-- `server.host`：服务监听地址。
-- `server.port`：服务监听端口。
-- `storage.data_dir`：数据文件保存目录。
-- `storage.default_database`：默认数据库。
-- `compression.enabled`：是否启用通信压缩。
-- `tls.enabled`：是否启用加密连接。
-- `log.level`：日志级别。
-
-## 常用命令
-
-| 命令 | 说明 |
-| --- | --- |
-| `cargo build --release` | 构建 release 版本 |
-| `cargo run --release -- --config conf/example.yaml` | 启动服务端 |
-| `cargo test` | 运行测试 |
-| `cargo fmt --check` | 检查代码格式 |
-| `cargo clippy` | 运行代码检查 |
-| `make build` | 使用脚本构建当前平台产物 |
-| `make package` | 打包当前平台发行包 |
-| `make install PREFIX=/opt/taibai` | 安装到指定目录 |
-| `make start` | 启动已安装的服务 |
-| `make stop` | 停止已安装的服务 |
-| `make status` | 查看已安装服务的状态 |
-| `make clean` | 清理构建产物 |
-
-## 示例程序
-
-| 目录 | 说明 |
-| --- | --- |
-| `examples/batch_import` | 批量导入示例，适合大批量 CSV 或行情数据写入 |
-| `examples/multi_insert` | 多行插入示例 |
-| `examples/prepare_test` | 预处理语句示例 |
-| `examples/hot_insert` | 热数据持续写入示例 |
-| `examples/pubsub_demo` | 变更订阅示例：订阅表插入变更并接收服务端推送 |
-| `examples/export_csv` | 把查询结果导出为 CSV |
-| `examples/load_csv` / `examples/insert_csv` | 把 CSV 分别经 bulk 直写与普通 INSERT 路径导入 |
-
-各示例的参数与用法见[示例工具使用指南](docs/operations/examples-guide.md)。
-
-运行示例前，请先启动 Taibai 服务端，并根据示例源码调整连接参数。
-
-## 更多文档
-
-- `docs/getting-started/quick-start.md`：五分钟快速开始。
-- `docs/user-guide/sql-reference.md`：SQL 语法参考（全部支持的语法与不兼容主流数据库的差异说明）。
-- `docs/overview/project-summary.md`：工程功能总览。
-- `docs/user-guide/transactions-and-concurrency.md`：事务与并发语义。
-- `docs/user-guide/query-management.md`：查询管理与语句超时。
-- `docs/user-guide/pubsub.md`：变更订阅（pub/sub）协议、权限与配置。
-- `docs/user-guide/limitations.md`：兼容性与部署指引。
-- `docs/design/TAIBAI_DESIGN_ZH.md`：整体设计说明。
-- `docs/operations/data-import-flow.md`：数据导入流程。
-- `docs/operations/windows-installation.md`：Windows 图形安装包和系统服务安装说明。
-- `docs/reports/benchmark-vs-duckdb-kdb-2026-09.md`：性能对比报告（vs DuckDB/kdb+）。
-- `CONTRIBUTING.md`：开发环境、质量检查和贡献流程。
-- `SECURITY.md`：漏洞报告和部署安全注意事项。
-
-完整文档目录见 `docs/README.md`。
-
-## 打包和安装
-
-```bash
-make build
-make package
-sudo make install PREFIX=/usr/local/taibai
-```
-
-Windows 平台生成 MSI 安装包：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\windows\build.ps1 -AcceptWixEula
-```
-
-生成的安装包位于 `target\release\Taibai-<version>.msi`，其中 `<version>` 与 `Cargo.toml` 中的包版本一致。
-
-安装后的默认目录结构：
-
-```text
-/usr/local/taibai/
-├── bin/                  # 可执行文件
-├── conf/                 # 配置文件
-├── data/                 # 数据文件
-├── log/                  # 日志文件
-└── run/                  # 运行时文件
-```
-
-服务管理：
-
-```bash
-make start
-make status
-make stop
-```
-
-## 开发入口
-
-- 看启动流程：从 `src/main.rs` 开始。
-- 看 SQL：从 `src/sql/` 开始。
-- 看存储：从 `src/storage/` 开始。
-- 看网络通信：从 `src/net/` 和 `src/protocol/` 开始。
-- 看数据类型：从 `src/types/` 开始。
-
-## 参与贡献
-
-提交改动前请阅读 `CONTRIBUTING.md` 和 `CODE_OF_CONDUCT.md`。安全漏洞请按 `SECURITY.md` 私密报告，不要创建公开 Issue。
+- 代码入口：`src/main.rs`（启动流程）、`src/sql/`（解析/计划/优化/执行）、`src/storage/`（段格式/事务/分区）、`src/net/` 与 `src/protocol/`（连接与协议）。
+- 提交改动前请读 [CONTRIBUTING.md](CONTRIBUTING.md) 与 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。
+- 安全漏洞请按 [SECURITY.md](SECURITY.md) 私密报告，不要开公开 Issue。
+- 欢迎的贡献方向：更全的函数覆盖、文档与示例、真实数据集上的性能调优、客户端语言绑定。
 
 ## 许可证
 
-Taibai 按以下任一许可证提供：
-
-- Apache License, Version 2.0（`LICENSE-APACHE`）
-- MIT License（`LICENSE-MIT`）
-
-贡献内容同样按 `MIT OR Apache-2.0` 双许可证提供。
+按 [Apache-2.0](LICENSE-APACHE) 或 [MIT](LICENSE-MIT) 双许可提供，贡献内容同样按 `MIT OR Apache-2.0` 提供。

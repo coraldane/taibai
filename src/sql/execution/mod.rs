@@ -29,3 +29,7 @@ pub use engine::{AutoCompactConfig, Engine, ExecResult};
 #[cfg(test)]
 #[path = "expr_vec_test.rs"]
 mod expr_vec_tests;
+
+#[cfg(test)]
+#[path = "schema_evolution_repro_test.rs"]
+mod schema_evolution_repro_tests;

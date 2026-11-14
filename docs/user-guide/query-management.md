@@ -69,6 +69,20 @@ server:
 
 过载与超时错误会返回给客户端。重试应有退避和次数上限；写入遇到网络断开时，应先核对提交结果或使用幂等键，避免盲目重试重复写入。
 
+### 观测准入压力：`SHOW WORKLOAD`
+
+`SHOW WORKLOAD`（全局管理员权限）返回三列 `Component / Name / Value`：
+
+- `admission.*`：三个请求池（query/shared/control）各自的容量、累计准入数与累计过载拒绝数。拒绝数持续增长是队列压力的第一信号，不要等客户端报 `server overloaded` 才发现；
+- `canary.*`：看门狗最近一轮探活延迟（ms）、状态（0 正常 / 1 失败 / 2 超时 / 3 尚未运行）与连续失败计数；
+- `queries.running`：运行中（含排队中）的请求数；
+- `pools.rayon_global_threads`：全局执行池线程数；
+- `fast_path.metadata_answers_total`：被元数据快速路径（zone map 折叠）直接回答的查询累计数——`MAX`/`MIN`/`COUNT` 类夜间探测查询走没走折叠，看这一行即可，不必翻服务日志。
+
+### 卡死自愈（看门狗）
+
+服务每 15 秒跑一轮 canary 探活（选统计行数最少的表做 `SELECT * ... LIMIT 1`，真实经过段打开与行组解码；无表时退化为 `SELECT 1`），单轮超时 10 秒；连续 3 轮失败会把全部运行中查询写入日志后主动 `abort`，交给 systemd `Restart=on-failure` 拉起。systemd unit 同时启用 `Type=notify` + `WatchdogSec=90`：canary 心跳停摆的极端场景由 systemd 兜底重启。历史上"进程活着但整体卡死"只能等人工重启（2026-11-05 事故当晚 40 分钟内人工重启 4 次）；自愈介入后恢复时间为秒级。
+
 ## 查询结果内存上限
 
 结果集在服务端缓冲后以单条消息发回。缓冲上限为：
@@ -82,10 +96,10 @@ min(buffer.query_memory_limit_mb / 2, server.max_message_size / 2)
 超限报 `query result exceeded memory limit of ... (bounded by <配置键> = ...)`。这是**确定性错误**：同样的查询对同样的数据重试必然复现，服务端不会标记 `[RETRYABLE]`，内置客户端也不会自动重试。处理方式按优先级：
 
 1. 加 WHERE 过滤或 LIMIT 分页，减少单次返回的数据量；
-2. 会话内执行 `SET streaming_results = true` 切换为**分块流式结果**：结果按批次以 `RESULT_CHUNK` 消息逐块发送、以 `RESULT_END` 收尾，单批超过帧上限一半时自动按行切片。结果集不再受 64 MB 单消息上限约束，只受查询内存预算（聚合/连接/排序算子内部预算与 `buffer.query_memory_limit_mb`）约束。内置客户端已支持聚合分块；`SET streaming_results = false`（或重连）恢复默认单消息模式。流式路径仅覆盖无子查询/派生表的普通 SELECT，其余语句自动回落单消息路径；
+2. 会话内执行 `SET streaming_results = true` 切换为**分块流式结果**：结果按批次以 `RESULT_CHUNK`（`0x26`）消息逐块发送、以 `RESULT_END`（`0x27`）收尾，单批超过帧上限一半时自动按行切片。结果集不再受 64 MB 单消息上限约束，只受查询内存预算（聚合/连接/排序算子内部预算与 `buffer.query_memory_limit_mb`）约束。内置客户端已支持聚合分块；`SET streaming_results = false`（或重连）恢复默认单消息模式。流式路径仅覆盖无子查询/派生表的普通 SELECT，其余语句自动回落单消息路径；**预编译语句（`PREPARE`/`EXECUTE`）目前不走流式**。逐字段的线上格式、零行结果仍携带列定义的约定，见[二进制协议](../design/wire-protocol.md)；
 3. 确需更大的单消息结果时，同步调大 `server.max_message_size` **和所有客户端的接收上限**（内置客户端与 JDBC 客户端均硬编码 64 MB），缺一会导致大结果在客户端解码阶段报协议错误；`max_bulk_message_size` 是 bulk 导入独立上限，与结果集无关。
 
-注意：JDBC / Go 等未改造的客户端不会发送 `SET streaming_results`，行为完全不变；流式模式是会话级显式选择。
+注意：流式模式是会话级显式选择，有两个入口——`SET streaming_results = true`，或登录握手的流式能力字节（`LOGIN` payload 最后 1 字节，内置客户端默认填 1）。因此自研客户端若照抄内置客户端的登录包，即使从不发送 `SET streaming_results`，也会收到 `0x26`/`0x27`；只识别 `0x24` 的客户端会直接报“未识别的控制消息”。把该字节填 0 即可回到单消息模式，或在客户端实现分块累积。
 
 ## 代码索引
 
@@ -96,3 +110,5 @@ min(buffer.query_memory_limit_mb / 2, server.max_message_size / 2)
 | `SHOW PROCESSLIST` / `KILL QUERY` 执行 | `src/sql/execution/ddl/introspection.rs`（`exec_show_processlist` / `exec_kill_query`） |
 | 语句超时配置 | `src/common/config.rs`（`statement_timeout_secs`） |
 | 取消与超时行为测试 | `src/sql/execution/engine_test/cancellation.rs` |
+| `SHOW WORKLOAD` 执行 | `src/sql/execution/ddl/introspection.rs`（`exec_show_workload`） |
+| 看门狗与 sd_notify | `src/common/watchdog.rs` |

@@ -278,6 +278,9 @@ pub enum Statement {
     ShowStats,
     ShowPerformanceBaselines,
     ShowEngines,
+    ShowMemory,
+    ShowWorkload,
+    ShowVersion,
     ShowProcesslist {
         full: bool,
     },

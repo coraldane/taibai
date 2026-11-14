@@ -7,6 +7,19 @@ use net::server::Server;
 use sql::execution::{AutoCompactConfig, Engine};
 use storage::segment_manager::SegmentConfig;
 
+// Long-running server process: jemalloc's decay-based page return keeps RSS
+// tracking live data (glibc arenas on many-core boxes retain their peak
+// forever). Windows has no jemalloc/MSVC support, so it gets mimalloc.
+// Runtime tuning (decay aggressiveness, profiling) goes through the
+// allocator's own env var: MALLOC_CONF on unix, MIMALLOC_* on Windows.
+#[cfg(unix)]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(windows)]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Clone)]
 struct AsyncTracingWriter {
     sender: crossbeam_channel::Sender<Vec<u8>>,
@@ -188,6 +201,32 @@ where
         config.compression.bulk_zstd_level,
         config.storage.reader_cache_capacity,
     );
+    common::config::set_reader_cache_budget_bytes(
+        config.storage.reader_cache_mb.saturating_mul(1024 * 1024),
+    );
+    common::config::set_mutable_reader_cache_budget_bytes(
+        config
+            .storage
+            .mutable_reader_cache_mb
+            .saturating_mul(1024 * 1024),
+    );
+    common::config::set_segment_meta_cache_budget_bytes(
+        config
+            .storage
+            .segment_meta_cache_mb
+            .saturating_mul(1024 * 1024),
+    );
+    // One startup line that makes every cache ceiling auditable. The
+    // segment-metadata cache grew to the whole RSS because its limit was an
+    // entry COUNT that no operator could translate into bytes, and no report
+    // showed its size. Logging the byte ceilings at boot makes the next such
+    // regression visible in the log instead of in `free -g`.
+    tracing::info!(
+        reader_cache_mb = config.storage.reader_cache_mb,
+        mutable_reader_cache_mb = config.storage.mutable_reader_cache_mb,
+        segment_meta_cache_mb = config.storage.segment_meta_cache_mb,
+        "cache byte ceilings configured"
+    );
     common::config::set_storage_timeouts(common::config::StorageTimeouts {
         mutation_lock_timeout_secs: config.storage.mutation_lock_timeout_secs,
         mutation_lock_warn_secs: config.storage.mutation_lock_warn_secs,
@@ -242,8 +281,6 @@ where
         spill_batch_rows: config.buffer.spill_batch_rows.max(1),
         join_spill_partitions: config.buffer.join_spill_partitions.max(2),
         max_parallel_segments: config.buffer.max_parallel_segments.max(1),
-        global_io_permits: config.buffer.global_io_permits.max(1),
-        global_cpu_permits: config.buffer.global_cpu_permits.max(1),
         hybrid_hot_scan_enabled: config.storage.hybrid_hot_scan_enabled,
     });
     let engine = Arc::new(engine);
@@ -269,7 +306,11 @@ where
         tracing::info!("close-of-day scheduler started");
     }
 
+    start_watchdog(engine.clone());
     let server = Server::new(config, engine.clone());
+    if common::watchdog::sd_notify("READY=1\n") {
+        tracing::info!("sd_notify READY=1 sent; systemd watchdog pings follow each canary round");
+    }
 
     if let Err(e) = server.run_with_shutdown(shutdown).await {
         tracing::error!(error = %e, "server error");
@@ -970,4 +1011,46 @@ fn install_dir_from_config_path(config_path: &str) -> Option<std::path::PathBuf>
     let config_path = std::path::Path::new(config_path);
     let config_dir = config_path.parent()?;
     config_dir.parent().map(std::path::Path::to_path_buf)
+}
+
+/// Start the self-healing watchdog: a real scan canary on a fixed cadence
+/// plus systemd sd_notify pings. After three consecutive failures the wedge
+/// hook dumps every running query to the log and aborts, handing recovery
+/// to systemd's Restart=on-failure instead of a human.
+fn start_watchdog(engine: Arc<Engine>) {
+    let wedge_engine = Arc::clone(&engine);
+    let canary: common::watchdog::Canary = Arc::new(move || {
+        let (db, table) = engine.canary_target();
+        let mut session = net::session::Session::new("root".to_string(), db);
+        // LIMIT 1 through the general scan path exercises segment open,
+        // row-group decode and the background decode pool — the machinery
+        // that wedged on 2026-11-05. With no tables at all, SELECT 1 still
+        // walks parse → plan → execute → encode.
+        let sql = match &table {
+            Some(table) => format!("SELECT * FROM {table} LIMIT 1"),
+            None => "SELECT 1".to_string(),
+        };
+        engine.execute(&mut session, &sql).map(|_| ())
+    });
+    let on_wedge: common::watchdog::WedgeHook = Arc::new(move |report| {
+        tracing::error!(
+            consecutive_failures = report.consecutive_failures,
+            timeout_secs = report.timeout.as_secs(),
+            "{}",
+            report.message
+        );
+        for query in wedge_engine.query_registry().list() {
+            tracing::error!(
+                query_id = query.query_id,
+                elapsed_secs = query.elapsed_secs,
+                phase = ?query.phase,
+                cancelled = query.cancelled,
+                sql = %query.sql,
+                "running query at wedge time"
+            );
+        }
+        std::process::abort();
+    });
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    common::watchdog::spawn_supervised(common::watchdog::WatchdogConfig::default(), stop, canary, on_wedge);
 }

@@ -69,8 +69,6 @@ pub struct QueryLimits {
     pub spill_batch_rows: usize,
     pub join_spill_partitions: usize,
     pub max_parallel_segments: usize,
-    pub global_io_permits: usize,
-    pub global_cpu_permits: usize,
     /// Hybrid partial-residency scans: let the resident hot mirror answer
     /// rows above its close-aware coverage bound while segment scans handle
     /// the complement. See `TableMeta::hot_mirror_covers_from`.
@@ -88,8 +86,6 @@ impl Default for QueryLimits {
             spill_batch_rows: default_spill_batch_rows(),
             join_spill_partitions: default_join_spill_partitions(),
             max_parallel_segments: default_max_parallel_segments(),
-            global_io_permits: default_global_io_permits(),
-            global_cpu_permits: default_global_cpu_permits(),
             hybrid_hot_scan_enabled: default_hybrid_hot_scan_enabled(),
         }
     }
@@ -173,6 +169,52 @@ pub fn reader_cache_capacity() -> usize {
     *READER_CACHE_CAPACITY.get().unwrap_or(&1024)
 }
 
+static MUTABLE_READER_CACHE_BUDGET_BYTES: OnceLock<u64> = OnceLock::new();
+
+/// Install the mutable-segment reader cache byte budget
+/// (`storage.mutable_reader_cache_mb` in the config file), sourced from the
+/// same startup pass as the other storage runtime tunables.
+pub fn set_mutable_reader_cache_budget_bytes(budget_bytes: u64) {
+    let _ = MUTABLE_READER_CACHE_BUDGET_BYTES.set(budget_bytes.max(1024 * 1024));
+}
+
+pub fn mutable_reader_cache_budget_bytes() -> u64 {
+    *MUTABLE_READER_CACHE_BUDGET_BYTES
+        .get()
+        .unwrap_or(&(4096 * 1024 * 1024))
+}
+
+static READER_CACHE_BUDGET_BYTES: OnceLock<u64> = OnceLock::new();
+
+/// Install the sealed-reader cache byte budget (`storage.reader_cache_mb`).
+pub fn set_reader_cache_budget_bytes(budget_bytes: u64) {
+    let _ = READER_CACHE_BUDGET_BYTES.set(budget_bytes.max(1024 * 1024));
+}
+
+/// Byte ceiling for the sealed-segment reader cache.
+pub fn reader_cache_budget_bytes() -> u64 {
+    *READER_CACHE_BUDGET_BYTES
+        .get()
+        .unwrap_or(&(2048 * 1024 * 1024))
+}
+
+static SEGMENT_META_CACHE_BUDGET_BYTES: OnceLock<u64> = OnceLock::new();
+
+/// Install the segment-metadata cache byte budget
+/// (`storage.segment_meta_cache_mb`), sourced from the same startup pass as
+/// the other storage runtime tunables.
+pub fn set_segment_meta_cache_budget_bytes(budget_bytes: u64) {
+    let _ = SEGMENT_META_CACHE_BUDGET_BYTES.set(budget_bytes.max(1024 * 1024));
+}
+
+/// Byte ceiling for the parsed segment-metadata cache (`SHOW MEMORY` reports
+/// the live figure as `segment_meta.cache_budget_bytes`).
+pub fn segment_meta_cache_budget_bytes() -> u64 {
+    *SEGMENT_META_CACHE_BUDGET_BYTES
+        .get()
+        .unwrap_or(&(2048 * 1024 * 1024))
+}
+
 /// Install the process-wide query limits. Called once during startup.
 /// Returns an error if called more than once (limits are immutable thereafter).
 pub fn set_query_limits(limits: QueryLimits) -> Result<(), QueryLimits> {
@@ -191,8 +233,6 @@ pub fn query_limits() -> QueryLimits {
         spill_batch_rows: default_spill_batch_rows(),
         join_spill_partitions: default_join_spill_partitions(),
         max_parallel_segments: default_max_parallel_segments(),
-        global_io_permits: default_global_io_permits(),
-        global_cpu_permits: default_global_cpu_permits(),
     })
 }
 
@@ -419,19 +459,25 @@ fn default_join_spill_partitions() -> usize {
 fn default_max_parallel_segments() -> usize {
     default_execution_threads().clamp(1, 8)
 }
-fn default_global_io_permits() -> usize {
-    default_execution_threads().clamp(1, 16)
-}
-fn default_global_cpu_permits() -> usize {
-    default_execution_threads().max(1)
-}
 
 fn default_row_group_target_rows() -> usize {
     8_192
 }
 
+fn default_mutable_reader_cache_mb() -> u64 {
+    4096
+}
+
+fn default_segment_meta_cache_mb() -> u64 {
+    2048
+}
+
 fn default_reader_cache_capacity() -> usize {
     1024
+}
+
+fn default_reader_cache_mb() -> u64 {
+    2048
 }
 
 fn default_bulk_zstd_level() -> i32 {
@@ -537,6 +583,14 @@ pub struct ReplicationSettings {
     /// Primary only: events retained for reconnecting standbys.
     #[serde(default = "default_replication_ring_capacity")]
     pub ring_capacity: usize,
+    /// Primary only: byte ceiling for the retained-event ring. The ring is
+    /// also entry-bounded (`ring_capacity`), but entries carry whole
+    /// compressed write groups (up to 16 MiB each), so without a byte
+    /// ceiling the retained history can reach hundreds of GB on write-heavy
+    /// primaries. Oldest events are evicted past the ceiling; a lagging
+    /// standby re-bootstraps via segment fetch instead.
+    #[serde(default = "default_replication_ring_max_bytes")]
+    pub ring_max_bytes: u64,
 }
 
 impl Default for ReplicationSettings {
@@ -547,12 +601,17 @@ impl Default for ReplicationSettings {
             user: String::new(),
             password: String::new(),
             ring_capacity: default_replication_ring_capacity(),
+            ring_max_bytes: default_replication_ring_max_bytes(),
         }
     }
 }
 
 fn default_replication_ring_capacity() -> usize {
     65_536
+}
+
+fn default_replication_ring_max_bytes() -> u64 {
+    1024 * 1024 * 1024
 }
 
 impl ReplicationSettings {
@@ -713,6 +772,29 @@ pub struct StorageSettings {
     /// Number of segments kept in the reader and segment-metadata caches.
     #[serde(default = "default_reader_cache_capacity")]
     pub reader_cache_capacity: usize,
+    /// Byte ceiling for the sealed-segment reader cache. Each entry is a
+    /// parsed footer plus (for owned readers) the file copy; the footer of a
+    /// 2 GiB segment measures ~68 MiB, so this is the ceiling that actually
+    /// binds. `reader_cache_capacity` remains an entry-count cap on top.
+    #[serde(default = "default_reader_cache_mb")]
+    pub reader_cache_mb: u64,
+    /// Byte ceiling for the mutable-segment reader cache. Each entry is a
+    /// full heap copy of an active segment file (up to `min_segment_seal_size`),
+    /// and the cache is additionally entry-bounded at 4x the reader cache
+    /// capacity; without a byte ceiling many concurrently-written partitions
+    /// pin one copy each, which showed up as unbounded anon RSS growth.
+    #[serde(default = "default_mutable_reader_cache_mb")]
+    pub mutable_reader_cache_mb: u64,
+    /// Byte ceiling for the parsed segment-metadata (footer) cache. One entry
+    /// is a segment's parsed footer: row-group metadata, zone maps and bloom
+    /// filters — tens of MiB for a multi-GiB segment.
+    ///
+    /// Sized in BYTES on purpose. The cache used to be sized in ENTRIES
+    /// (`reader_cache_capacity`, default 1024) while the per-entry cost grew
+    /// with segment size: a 24 MiB footer turned a stable-looking knob into a
+    /// 25 GiB resident set, with no metric anywhere to show it.
+    #[serde(default = "default_segment_meta_cache_mb")]
+    pub segment_meta_cache_mb: u64,
     /// Maximum time a write may wait for the per-table mutation lock before
     /// failing with a lock timeout error instead of blocking forever.
     #[serde(default = "default_mutation_lock_timeout_secs")]
@@ -756,14 +838,6 @@ pub struct BufferSettings {
     pub join_spill_partitions: usize,
     #[serde(default = "default_max_parallel_segments")]
     pub max_parallel_segments: usize,
-    /// Process-wide storage work permits shared by query scans and OPTIMIZE
-    /// partition workers. These bound concurrent decode/read/write pressure.
-    #[serde(default = "default_global_io_permits")]
-    pub global_io_permits: usize,
-    /// Process-wide CPU work permits shared by query kernels and OPTIMIZE
-    /// partition workers.
-    #[serde(default = "default_global_cpu_permits")]
-    pub global_cpu_permits: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1019,6 +1093,9 @@ fn default_storage_settings() -> StorageSettings {
         hybrid_hot_scan_enabled: default_hybrid_hot_scan_enabled(),
         row_group_target_rows: default_row_group_target_rows(),
         reader_cache_capacity: default_reader_cache_capacity(),
+        reader_cache_mb: default_reader_cache_mb(),
+        mutable_reader_cache_mb: default_mutable_reader_cache_mb(),
+        segment_meta_cache_mb: default_segment_meta_cache_mb(),
         tail_async_fsync: false,
         tail_archive: false,
         mutation_lock_timeout_secs: default_mutation_lock_timeout_secs(),
@@ -1039,8 +1116,6 @@ fn default_buffer_settings() -> BufferSettings {
         spill_batch_rows: default_spill_batch_rows(),
         join_spill_partitions: default_join_spill_partitions(),
         max_parallel_segments: default_max_parallel_segments(),
-        global_io_permits: default_global_io_permits(),
-        global_cpu_permits: default_global_cpu_permits(),
     }
 }
 
