@@ -21,4 +21,24 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features
       - name: Test
-        run: cargo test --workspace
+        run: |
+          set -o pipefail
+          if cargo test --workspace --no-fail-fast 2>&1 | tee test-output.log; then
+            exit 0
+          fi
+          # Surface which tests failed as a check annotation: the job log is
+          # not readable without admin rights, and "exit code 101" alone says
+          # nothing about what broke.
+          {
+            echo "### 失败的测试用例"
+            grep -E '^test .* FAILED$|^error: [0-9]+ targets? failed' test-output.log \
+              | sort -u | head -40
+          } > failing.txt
+          echo "::error title=Test failures::$(tr '\n' ' ' < failing.txt | cut -c1-900)"
+          exit 1
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output
+          path: test-output.log
